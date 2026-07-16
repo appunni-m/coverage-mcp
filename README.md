@@ -41,7 +41,7 @@ When the report format is lossy, the snapshot keeps a warning. For example, Go c
 Coverage MCP currently installs from GitHub:
 
 ```bash
-python -m pip install "git+ssh://git@github.com/appunni-m/coverage-mcp.git"
+python -m pip install "git+https://github.com/appunni-m/coverage-mcp.git"
 ```
 
 For development from this checkout:
@@ -112,7 +112,7 @@ The plugin expects Coverage MCP at `http://127.0.0.1:8000/mcp/`. Start the serve
 ### Codex
 
 ```bash
-codex plugin marketplace add git@github.com:appunni-m/codegen-marketplace.git --ref main
+codex plugin marketplace add appunni-m/codegen-marketplace
 codex plugin add testing@codegen-marketplace
 ```
 
@@ -140,7 +140,7 @@ claude mcp add --transport http --scope user coverage-mcp http://127.0.0.1:8000/
 Pi intentionally has no built-in MCP client, so install the testing skill and the MCP adapter:
 
 ```bash
-git clone git@github.com:appunni-m/codegen-marketplace.git
+git clone https://github.com/appunni-m/codegen-marketplace.git
 pi install ./codegen-marketplace/plugins/testing
 pi install npm:pi-mcp-adapter
 node ./codegen-marketplace/plugins/testing/scripts/install-pi-mcp.mjs
