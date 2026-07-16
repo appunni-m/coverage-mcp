@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from coverage_mcp import git_utils
+from coverage_mcp import git_utils, models
 from coverage_mcp.app import default_db_path
 from coverage_mcp.models import CoverageBuilder, LineCoverage, normalize_report_path, rate
 
@@ -105,3 +105,20 @@ def test_model_helpers_and_merge_paths(tmp_path):
     report = builder.build(format="test", report_path="report")
     assert report.total_lines == 1
     assert report.covered_lines == 0
+
+
+def test_coverage_builder_caches_normalized_paths(monkeypatch, tmp_path):
+    calls: list[str] = []
+    original = models.normalize_report_path
+
+    def tracked(path: str, repo_path: str | None = None) -> str:
+        calls.append(path)
+        return original(path, repo_path)
+
+    monkeypatch.setattr(models, "normalize_report_path", tracked)
+    builder = CoverageBuilder(tmp_path.as_posix())
+    builder.add_line("src/a.py", 1, 1)
+    builder.add_line("src/a.py", 2, 0)
+    builder.add_file_metrics("src/a.py", total_regions=2, covered_regions=1)
+
+    assert calls == ["src/a.py"]

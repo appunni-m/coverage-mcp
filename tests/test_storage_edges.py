@@ -150,6 +150,52 @@ def test_trend_returns_all_available_coverage_dimensions(tmp_path):
         store.close()
 
 
+def test_bulk_copy_preserves_structured_data_and_removes_batches(tmp_path):
+    file_path = 'src/a,"quoted".py'
+    report = CoverageReport(
+        format="test",
+        report_path="coverage.json",
+        files=[
+            FileCoverage(
+                file_path=file_path,
+                total_lines=1,
+                covered_lines=1,
+                raw_metrics={"note": 'comma, quote " and\nnewline'},
+            )
+        ],
+        lines=[
+            LineCoverage(
+                file_path=file_path,
+                line_number=7,
+                hits=3,
+                covered=True,
+                details={"condition": 'left, "right"\nnext'},
+            )
+        ],
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        snapshot_id = store.store_report(
+            report,
+            repo_path=tmp_path.as_posix(),
+            repo_key=tmp_path.as_posix(),
+            branch="main",
+            commit_sha="abc",
+            base_ref=None,
+            suite="unit",
+        )
+
+        file = store.file_coverage(snapshot_id, file_path)
+        lines = store.lines(snapshot_id, file_path)
+
+        assert file["raw_metrics"] == {"note": 'comma, quote " and\nnewline'}
+        assert file["branch_rate"] is None
+        assert lines[0]["details"] == {"condition": 'left, "right"\nnext'}
+        assert not list(tmp_path.glob("coverage-mcp-*.csv"))
+    finally:
+        store.close()
+
+
 def test_worktree_progress_isolated_from_other_lineages(tmp_path):
     repo = tmp_path / "repo"
     worktree_path = tmp_path / "feature"

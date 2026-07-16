@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -632,15 +634,8 @@ class CoverageStore:
                     ],
                 )
                 if report.files:
-                    self._conn.executemany(
-                        """
-                        INSERT INTO files (
-                            snapshot_id, file_path,
-                            total_lines, covered_lines, total_branches, covered_branches,
-                            total_functions, covered_functions, total_regions, covered_regions,
-                            line_rate, branch_rate, function_rate, region_rate, raw_metrics
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                    self._copy_rows(
+                        "files",
                         [
                             [
                                 snapshot_id,
@@ -663,10 +658,8 @@ class CoverageStore:
                         ],
                     )
                 if report.lines:
-                    self._conn.executemany(
-                        """
-                        INSERT INTO lines VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
+                    self._copy_rows(
+                        "lines",
                         [
                             [
                                 snapshot_id,
@@ -689,6 +682,24 @@ class CoverageStore:
                 self._conn.execute("ROLLBACK")
                 raise
         return snapshot_id
+
+    def _copy_rows(self, table: str, rows: list[list[Any]]) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            prefix=f"coverage-mcp-{table}-",
+            suffix=".csv",
+            dir=self.db_path.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            csv.writer(stream, lineterminator="\n").writerows(rows)
+        try:
+            sql_path = temporary_path.as_posix().replace("'", "''")
+            self._conn.execute(f"COPY {table} FROM '{sql_path}' (FORMAT CSV, HEADER false, NULL '')")
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def register_worktree(self, path: str, *, base_ref: str, name: str | None = None) -> dict[str, Any]:
         git = inspect_git(path)

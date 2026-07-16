@@ -139,6 +139,14 @@ class CoverageBuilder:
         self.repo_path = repo_path
         self._lines: dict[tuple[str, int], LineCoverage] = {}
         self._file_metrics: dict[str, dict[str, Any]] = {}
+        self._normalized_paths: dict[str, str] = {}
+
+    def _normalize_path(self, path: str) -> str:
+        normalized = self._normalized_paths.get(path)
+        if normalized is None:
+            normalized = normalize_report_path(path, self.repo_path)
+            self._normalized_paths[path] = normalized
+        return normalized
 
     def add_line(
         self,
@@ -156,7 +164,7 @@ class CoverageBuilder:
     ) -> None:
         if line_number <= 0:
             return
-        normalized = normalize_report_path(file_path, self.repo_path)
+        normalized = self._normalize_path(file_path)
         line_hits = max(0, int(hits)) if count_line else 0
         is_covered = (line_hits > 0 if covered is None else covered) if count_line else False
         line = LineCoverage(
@@ -179,7 +187,7 @@ class CoverageBuilder:
             existing.merge(line)
 
     def add_file_metrics(self, file_path: str, **metrics: Any) -> None:
-        normalized = normalize_report_path(file_path, self.repo_path)
+        normalized = self._normalize_path(file_path)
         self._file_metrics.setdefault(normalized, {}).update(metrics)
 
     def build(
