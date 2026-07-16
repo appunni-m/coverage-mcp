@@ -161,6 +161,57 @@ sys.exit(1)
         store.close()
 
 
+def test_mcp_remains_responsive_while_registered_command_runs(tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        command = store.register_command(
+            name="slow-suite",
+            command=f"{sys.executable} -c 'import time; time.sleep(0.5)'",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="verify concurrent MCP queries",
+        )
+        mcp = create_mcp(store)
+
+        async def scenario():
+            started = asyncio.get_running_loop().time()
+            run_task = asyncio.create_task(
+                mcp.call_tool(
+                    "run_command_profiled",
+                    {"command_ref": command["id"]},
+                )
+            )
+            queued_run_task = asyncio.create_task(
+                mcp.call_tool(
+                    "run_command_profiled",
+                    {"command_ref": command["id"]},
+                )
+            )
+            await asyncio.sleep(0.05)
+
+            assert asyncio.get_running_loop().time() - started < 0.3
+            commands = structured(
+                await asyncio.wait_for(
+                    mcp.call_tool("list_registered_commands", {"limit": 1}),
+                    timeout=0.3,
+                )
+            )
+            assert commands[0]["id"] == command["id"]
+            assert not run_task.done()
+            assert not queued_run_task.done()
+
+            run_result = structured(await run_task)
+            assert run_result["status"] == "passed"
+            assert not queued_run_task.done()
+            queued_run_result = structured(await queued_run_task)
+            assert queued_run_result["status"] == "passed"
+
+        run(scenario())
+    finally:
+        store.close()
+
+
 def test_mcp_coverage_query_surface_and_resources(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

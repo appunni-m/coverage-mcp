@@ -40,6 +40,7 @@ class CoverageStore:
         self.run_dir = self.db_path.parent / "runs"
         self._conn = duckdb.connect(self.db_path.as_posix())
         self._lock = threading.RLock()
+        self._run_lock = threading.Lock()
         self._init_schema()
 
     def close(self) -> None:
@@ -316,6 +317,20 @@ class CoverageStore:
         *,
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        with self._run_lock:
+            return self._run_command_profiled(
+                command_ref,
+                max_summary_lines=max_summary_lines,
+                timeout_seconds=timeout_seconds,
+            )
+
+    def _run_command_profiled(
+        self,
+        command_ref: str,
+        *,
+        max_summary_lines: int,
+        timeout_seconds: int | None,
     ) -> dict[str, Any]:
         registered = self.registered_command(command_ref)
         if not registered.get("enabled", True):

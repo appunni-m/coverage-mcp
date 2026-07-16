@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -77,7 +78,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(
         title="Coverage MCP",
         description="Local-first coverage time-series dashboard and MCP server.",
-        version="0.1.1",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.coverage_store = store
@@ -384,12 +385,12 @@ def create_mcp(store: CoverageStore) -> FastMCP:
     )
 
     @mcp.tool()
-    def project_summaries(limit: int = 100) -> list[dict[str, Any]]:
+    async def project_summaries(limit: int = 100) -> list[dict[str, Any]]:
         """List projects with latest coverage, snapshot count, and branch count."""
-        return store.projects(limit=limit)
+        return await asyncio.to_thread(store.projects, limit=limit)
 
     @mcp.tool()
-    def register_test_command(
+    async def register_test_command(
         name: str,
         command: str,
         cwd: str | None = None,
@@ -400,7 +401,8 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         approval_note: str = "",
     ) -> dict[str, Any]:
         """Register an approved command that can be run later by id or name."""
-        return store.register_command(
+        return await asyncio.to_thread(
+            store.register_command,
             name=name,
             command=command,
             cwd=cwd,
@@ -412,43 +414,44 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         )
 
     @mcp.tool()
-    def list_registered_commands(limit: int = 100) -> list[dict[str, Any]]:
+    async def list_registered_commands(limit: int = 100) -> list[dict[str, Any]]:
         """List approved registered commands, newest first."""
-        return store.list_registered_commands(limit=limit)
+        return await asyncio.to_thread(store.list_registered_commands, limit=limit)
 
     @mcp.tool()
-    def run_command_profiled(
+    async def run_command_profiled(
         command_ref: str,
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Run an approved registered command and return a bounded profiled summary."""
-        return store.run_command_profiled(
+        return await asyncio.to_thread(
+            store.run_command_profiled,
             command_ref,
             max_summary_lines=max_summary_lines,
             timeout_seconds=timeout_seconds,
         )
 
     @mcp.tool()
-    def run_result(run_id: str, max_summary_lines: int = 80) -> dict[str, Any]:
+    async def run_result(run_id: str, max_summary_lines: int = 80) -> dict[str, Any]:
         """Return a bounded summary for a previously recorded run."""
-        return store.run_result(run_id, max_summary_lines=max_summary_lines)
+        return await asyncio.to_thread(store.run_result, run_id, max_summary_lines=max_summary_lines)
 
     @mcp.tool()
-    def latest_artifact(kind: str, command_ref: str | None = None) -> dict[str, Any]:
+    async def latest_artifact(kind: str, command_ref: str | None = None) -> dict[str, Any]:
         """Return the latest registered artifact for a command and artifact kind."""
-        artifact = store.latest_artifact(command_ref=command_ref, kind=kind)
+        artifact = await asyncio.to_thread(store.latest_artifact, command_ref=command_ref, kind=kind)
         if artifact is None:
             raise KeyError("artifact not found")
         return artifact
 
     @mcp.tool()
-    def object_topology(object_kind: str, object_ref: str) -> dict[str, Any]:
+    async def object_topology(object_kind: str, object_ref: str) -> dict[str, Any]:
         """Return computed topology for a project, command, run, snapshot, or worktree."""
-        return store.object_topology(object_kind, object_ref)
+        return await asyncio.to_thread(store.object_topology, object_kind, object_ref)
 
     @mcp.tool()
-    def ingest_coverage(
+    async def ingest_coverage(
         report_path: str,
         format: str = "auto",
         repo_path: str | None = None,
@@ -458,7 +461,8 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         base_ref: str | None = None,
     ) -> dict[str, Any]:
         """Ingest a local coverage report into an immutable snapshot."""
-        return store.ingest_report(
+        return await asyncio.to_thread(
+            store.ingest_report,
             report_path,
             format=format,
             repo_path=repo_path,
@@ -469,19 +473,20 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         )
 
     @mcp.tool()
-    def register_worktree(path: str, base_ref: str, name: str | None = None) -> dict[str, Any]:
+    async def register_worktree(path: str, base_ref: str, name: str | None = None) -> dict[str, Any]:
         """Register a worktree and freeze its current baseline snapshot reference."""
-        return store.register_worktree(path, base_ref=base_ref, name=name)
+        return await asyncio.to_thread(store.register_worktree, path, base_ref=base_ref, name=name)
 
     @mcp.tool()
-    def worktree_progress(
+    async def worktree_progress(
         worktree_id: str,
         suite: str | None = None,
         file_path: str | None = None,
         limit: int = 200,
     ) -> dict[str, Any]:
         """Return one worktree's frozen baseline, independent trend, and metric deltas."""
-        return store.worktree_progress(
+        return await asyncio.to_thread(
+            store.worktree_progress,
             worktree_id,
             suite=suite,
             file_path=file_path,
@@ -489,7 +494,7 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         )
 
     @mcp.tool()
-    def coverage_summary(
+    async def coverage_summary(
         snapshot_id: str | None = None,
         repo_path: str | None = None,
         branch: str | None = None,
@@ -497,40 +502,41 @@ def create_mcp(store: CoverageStore) -> FastMCP:
     ) -> dict[str, Any]:
         """Return a compact overall coverage summary."""
         if snapshot_id:
-            return store.snapshot(snapshot_id)
-        snapshot = store.latest_snapshot(repo_path=repo_path, branch=branch, suite=suite)
+            return await asyncio.to_thread(store.snapshot, snapshot_id)
+        snapshot = await asyncio.to_thread(store.latest_snapshot, repo_path=repo_path, branch=branch, suite=suite)
         if snapshot is None:
             raise KeyError("no snapshots found")
         return snapshot
 
     @mcp.tool()
-    def coverage_files(snapshot_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    async def coverage_files(snapshot_id: str, limit: int = 100) -> list[dict[str, Any]]:
         """List files for a snapshot, ordered by lowest line coverage first."""
-        return store.files(snapshot_id, limit=limit)
+        return await asyncio.to_thread(store.files, snapshot_id, limit=limit)
 
     @mcp.tool()
-    def coverage_file(snapshot_id: str, file_path: str, include_lines: bool = True) -> dict[str, Any]:
+    async def coverage_file(snapshot_id: str, file_path: str, include_lines: bool = True) -> dict[str, Any]:
         """Inspect one file's coverage, optionally including line records."""
-        result: dict[str, Any] = {"file": store.file_coverage(snapshot_id, file_path)}
+        result: dict[str, Any] = {"file": await asyncio.to_thread(store.file_coverage, snapshot_id, file_path)}
         if include_lines:
-            result["lines"] = store.lines(snapshot_id, file_path)
+            result["lines"] = await asyncio.to_thread(store.lines, snapshot_id, file_path)
         return result
 
     @mcp.tool()
-    def coverage_insights(
+    async def coverage_insights(
         snapshot_id: str,
         baseline_snapshot_id: str | None = None,
         limit: int = 10,
     ) -> dict[str, Any]:
         """Return prioritized coverage investigation items for a snapshot."""
-        return store.insights(
+        return await asyncio.to_thread(
+            store.insights,
             snapshot_id=snapshot_id,
             baseline_snapshot_id=baseline_snapshot_id,
             limit=limit,
         )
 
     @mcp.tool()
-    def compare_to_baseline(
+    async def compare_to_baseline(
         snapshot_id: str | None = None,
         baseline_snapshot_id: str | None = None,
         worktree_id: str | None = None,
@@ -539,10 +545,11 @@ def create_mcp(store: CoverageStore) -> FastMCP:
     ) -> dict[str, Any]:
         """Compare a snapshot to a baseline snapshot or a registered worktree baseline."""
         if worktree_id:
-            return store.compare_worktree(worktree_id, snapshot_id=snapshot_id)
+            return await asyncio.to_thread(store.compare_worktree, worktree_id, snapshot_id=snapshot_id)
         if not snapshot_id or not baseline_snapshot_id:
             raise ValueError("snapshot_id and baseline_snapshot_id are required without worktree_id")
-        return store.compare(
+        return await asyncio.to_thread(
+            store.compare,
             snapshot_id=snapshot_id,
             baseline_snapshot_id=baseline_snapshot_id,
             file_limit=file_limit,
@@ -550,7 +557,7 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         )
 
     @mcp.tool()
-    def changed_lines(
+    async def changed_lines(
         snapshot_id: str,
         baseline_snapshot_id: str,
         file_path: str | None = None,
@@ -558,7 +565,8 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         """Return exact changed line records between two snapshots."""
-        return store.changed_lines(
+        return await asyncio.to_thread(
+            store.changed_lines,
             snapshot_id=snapshot_id,
             baseline_snapshot_id=baseline_snapshot_id,
             file_path=file_path,
@@ -567,7 +575,7 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         )
 
     @mcp.tool()
-    def line_history(
+    async def line_history(
         file_path: str,
         line_number: int,
         repo_path: str | None = None,
@@ -575,7 +583,8 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Return coverage history for one path-based file line."""
-        return store.line_history(
+        return await asyncio.to_thread(
+            store.line_history,
             file_path=file_path,
             line_number=line_number,
             repo_path=repo_path,
@@ -584,30 +593,36 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         )
 
     @mcp.tool()
-    def source_context(snapshot_id: str, file_path: str, start: int, end: int) -> list[dict[str, Any]]:
+    async def source_context(snapshot_id: str, file_path: str, start: int, end: int) -> list[dict[str, Any]]:
         """Read a bounded source line range for a covered file."""
-        return store.source_lines(snapshot_id=snapshot_id, file_path=file_path, start=start, end=end)
+        return await asyncio.to_thread(
+            store.source_lines,
+            snapshot_id=snapshot_id,
+            file_path=file_path,
+            start=start,
+            end=end,
+        )
 
     @mcp.resource("coverage://snapshots/latest", mime_type="application/json")
-    def latest_snapshot_resource() -> dict[str, Any]:
-        snapshot = store.latest_snapshot()
+    async def latest_snapshot_resource() -> dict[str, Any]:
+        snapshot = await asyncio.to_thread(store.latest_snapshot)
         return snapshot or {"error": "no snapshots found"}
 
     @mcp.resource("coverage://projects", mime_type="application/json")
-    def projects_resource() -> list[dict[str, Any]]:
-        return store.projects(limit=100)
+    async def projects_resource() -> list[dict[str, Any]]:
+        return await asyncio.to_thread(store.projects, limit=100)
 
     @mcp.resource("coverage://snapshot/{snapshot_id}/summary", mime_type="application/json")
-    def snapshot_summary_resource(snapshot_id: str) -> dict[str, Any]:
-        return store.snapshot(snapshot_id)
+    async def snapshot_summary_resource(snapshot_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(store.snapshot, snapshot_id)
 
     @mcp.resource("coverage://snapshot/{snapshot_id}/insights", mime_type="application/json")
-    def snapshot_insights_resource(snapshot_id: str) -> dict[str, Any]:
-        return store.insights(snapshot_id=snapshot_id)
+    async def snapshot_insights_resource(snapshot_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(store.insights, snapshot_id=snapshot_id)
 
     @mcp.resource("coverage://snapshot/{snapshot_id}/files", mime_type="application/json")
-    def snapshot_files_resource(snapshot_id: str) -> list[dict[str, Any]]:
-        return store.files(snapshot_id, limit=500)
+    async def snapshot_files_resource(snapshot_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(store.files, snapshot_id, limit=500)
 
     return mcp
 

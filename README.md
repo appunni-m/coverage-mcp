@@ -304,6 +304,10 @@ Each run is stored as an immutable ledger record:
 - registered artifact paths
 
 The MCP response does not return full raw logs by default. It returns a bounded summary and tells you where the full logs are stored.
+Managed commands run outside the MCP event loop, so dashboards, health checks,
+coverage insights, and other agents remain responsive during long test suites.
+The server serializes managed commands to avoid running multiple expensive
+suites concurrently.
 
 ## Object Topology
 
