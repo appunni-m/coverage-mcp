@@ -728,9 +728,7 @@ class CoverageStore:
         try:
             sql_path = temporary_path.as_posix().replace("'", "''")
             column_sql = ", ".join(columns)
-            self._conn.execute(
-                f"COPY {table} ({column_sql}) FROM '{sql_path}' (FORMAT CSV, HEADER false, NULL '')"
-            )
+            self._conn.execute(f"COPY {table} ({column_sql}) FROM '{sql_path}' (FORMAT CSV, HEADER false, NULL '')")
         finally:
             temporary_path.unlink(missing_ok=True)
 

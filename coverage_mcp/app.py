@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from coverage_mcp import __version__
 from coverage_mcp.git_utils import inspect_git
 from coverage_mcp.storage import CoverageStore
 
@@ -76,7 +77,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(
         title="Coverage MCP",
         description="Local-first coverage time-series dashboard and MCP server.",
-        version="0.1.0",
+        version="0.1.1",
         lifespan=lifespan,
     )
     app.state.coverage_store = store
@@ -87,7 +88,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "db_path": store.db_path.as_posix()}
+        return {"ok": True, "version": __version__, "db_path": store.db_path.as_posix()}
 
     @app.post("/api/ingest")
     def ingest(request: IngestRequest) -> dict[str, Any]:

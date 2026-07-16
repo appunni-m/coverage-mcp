@@ -41,7 +41,7 @@ When the report format is lossy, the snapshot keeps a warning. For example, Go c
 Coverage MCP currently installs from GitHub:
 
 ```bash
-python -m pip install "git+https://github.com/appunni-m/coverage-mcp.git"
+python -m pip install "coverage-mcp @ git+https://github.com/appunni-m/coverage-mcp.git@main"
 ```
 
 For development from this checkout:
@@ -51,6 +51,37 @@ python -m pip install -e '.[dev]'
 ```
 
 Python 3.12 or newer is required.
+
+### Update The Server
+
+The agent plugin and the Python server are updated separately. Updating
+`testing@codegen-marketplace` does not download or restart Coverage MCP.
+
+For a Git-installed server, stop the running process and update it:
+
+```bash
+python -m pip install --upgrade \
+  "coverage-mcp @ git+https://github.com/appunni-m/coverage-mcp.git@main"
+```
+
+For an editable development checkout:
+
+```bash
+git -C /path/to/coverage-mcp pull --ff-only
+python -m pip install -e '/path/to/coverage-mcp[dev]'
+```
+
+Restart `coverage-mcp` after updating. The existing `.coverage-mcp/coverage.duckdb`
+is not replaced, so snapshots, run history, approvals, and worktree baselines
+remain available.
+
+Confirm the new process loaded the expected release:
+
+```bash
+curl http://127.0.0.1:59471/health
+```
+
+The response includes the running `version` and active `db_path`.
 
 ## Start The Shared Server
 
@@ -108,6 +139,17 @@ The `testing` plugin in
 agent instructions for approved test runs, bounded summaries, artifact ingestion, and worktree comparisons.
 
 The plugin expects Coverage MCP at `http://127.0.0.1:59471/mcp/`. Start the server before opening a new agent session.
+
+The plugin installs only:
+
+- the `use-coverage-mcp` skill
+- the HTTP MCP connection metadata
+- plugin documentation and prompts
+
+It does not install the Python server, start a background process, or copy the
+DuckDB. Upgrade the plugin for agent instructions and connection changes;
+upgrade Coverage MCP for parser, storage, API, dashboard, or performance
+changes.
 
 ### Codex
 
