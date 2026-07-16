@@ -16,6 +16,7 @@ from coverage_mcp.git_utils import inspect_git
 from coverage_mcp.storage import CoverageStore
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
+DEFAULT_PORT = 59471
 
 
 class IngestRequest(BaseModel):
@@ -2373,7 +2374,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 def main() -> None:
     host = os.environ.get("COVERAGE_MCP_HOST", "127.0.0.1")
-    port = int(os.environ.get("COVERAGE_MCP_PORT", "8000"))
+    port = int(os.environ.get("COVERAGE_MCP_PORT", str(DEFAULT_PORT)))
     uvicorn.run(create_app(), host=host, port=port, reload=False)
 
 

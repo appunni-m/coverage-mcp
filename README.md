@@ -64,19 +64,19 @@ coverage-mcp
 Verify it:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:59471/health
 ```
 
 Dashboard:
 
 ```text
-http://127.0.0.1:8000/
+http://127.0.0.1:59471/
 ```
 
 MCP endpoint:
 
 ```text
-http://127.0.0.1:8000/mcp/
+http://127.0.0.1:59471/mcp/
 ```
 
 Default database:
@@ -107,7 +107,7 @@ The `testing` plugin in
 [codegen-marketplace](https://github.com/appunni-m/codegen-marketplace) includes the Coverage MCP connection and
 agent instructions for approved test runs, bounded summaries, artifact ingestion, and worktree comparisons.
 
-The plugin expects Coverage MCP at `http://127.0.0.1:8000/mcp/`. Start the server before opening a new agent session.
+The plugin expects Coverage MCP at `http://127.0.0.1:59471/mcp/`. Start the server before opening a new agent session.
 
 ### Codex
 
@@ -119,7 +119,7 @@ codex plugin add testing@codegen-marketplace
 Start a new Codex thread after installation. To install only the MCP connection without the testing skill:
 
 ```bash
-codex mcp add coverage-mcp --url http://127.0.0.1:8000/mcp/
+codex mcp add coverage-mcp --url http://127.0.0.1:59471/mcp/
 ```
 
 ### Claude Code
@@ -132,7 +132,7 @@ claude plugin install testing@codegen-marketplace
 Start a new Claude Code session after installation. To install only the MCP connection:
 
 ```bash
-claude mcp add --transport http --scope user coverage-mcp http://127.0.0.1:8000/mcp/
+claude mcp add --transport http --scope user coverage-mcp http://127.0.0.1:59471/mcp/
 ```
 
 ### Pi
@@ -175,7 +175,7 @@ frozen baseline.
 Example with LCOV:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/ingest \
+curl -X POST http://127.0.0.1:59471/api/ingest \
   -H 'content-type: application/json' \
   -d '{
     "report_path": "coverage/lcov.info",
@@ -296,7 +296,7 @@ Some formats are lossy when normalized. For example, Go reports blocks, Istanbul
 Connect your MCP client to:
 
 ```text
-http://127.0.0.1:8000/mcp/
+http://127.0.0.1:59471/mcp/
 ```
 
 The most common tools are:
@@ -506,7 +506,7 @@ The design goal is reproducible baseline comparison.
 When you register a worktree, Coverage MCP stores a reference to one baseline snapshot:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/worktrees/register \
+curl -X POST http://127.0.0.1:59471/api/worktrees/register \
   -H 'content-type: application/json' \
   -d '{
     "path": "/path/to/worktree",
@@ -533,7 +533,7 @@ after registration. Branch names alone are not used to join lanes.
 
 ## Dashboard
 
-The dashboard at `http://127.0.0.1:8000/` shows:
+The dashboard at `http://127.0.0.1:59471/` shows:
 
 - project selector with latest coverage for each project
 - latest snapshot summary
