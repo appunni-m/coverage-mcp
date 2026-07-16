@@ -55,6 +55,8 @@ class FileCoverage:
     covered_branches: int = 0
     total_functions: int = 0
     covered_functions: int = 0
+    total_regions: int = 0
+    covered_regions: int = 0
     raw_metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -68,6 +70,10 @@ class FileCoverage:
     @property
     def function_rate(self) -> float | None:
         return rate(self.covered_functions, self.total_functions)
+
+    @property
+    def region_rate(self) -> float | None:
+        return rate(self.covered_regions, self.total_regions)
 
 
 @dataclass(slots=True)
@@ -104,6 +110,14 @@ class CoverageReport:
         return sum(file.covered_functions for file in self.files)
 
     @property
+    def total_regions(self) -> int:
+        return sum(file.total_regions for file in self.files)
+
+    @property
+    def covered_regions(self) -> int:
+        return sum(file.covered_regions for file in self.files)
+
+    @property
     def line_rate(self) -> float | None:
         return rate(self.covered_lines, self.total_lines)
 
@@ -114,6 +128,10 @@ class CoverageReport:
     @property
     def function_rate(self) -> float | None:
         return rate(self.covered_functions, self.total_functions)
+
+    @property
+    def region_rate(self) -> float | None:
+        return rate(self.covered_regions, self.total_regions)
 
 
 class CoverageBuilder:
@@ -178,14 +196,24 @@ class CoverageBuilder:
             by_file.setdefault(line.file_path, []).append(line)
 
         files: list[FileCoverage] = []
-        for file_path, file_lines in sorted(by_file.items()):
+        file_paths = sorted(set(by_file) | set(self._file_metrics))
+        for file_path in file_paths:
+            file_lines = by_file.get(file_path, [])
             total_lines = sum(1 for line in file_lines if line.count_line)
             covered_lines = sum(1 for line in file_lines if line.count_line and line.covered)
             total_branches = sum(line.total_branches for line in file_lines)
             covered_branches = sum(line.covered_branches for line in file_lines)
             total_functions = sum(line.total_functions for line in file_lines)
             covered_functions = sum(line.covered_functions for line in file_lines)
-            raw_metrics = self._file_metrics.get(file_path, {})
+            raw_metrics = dict(self._file_metrics.get(file_path, {}))
+            total_lines = _normalized_metric(raw_metrics, "total_lines", total_lines)
+            covered_lines = _normalized_metric(raw_metrics, "covered_lines", covered_lines)
+            total_branches = _normalized_metric(raw_metrics, "total_branches", total_branches)
+            covered_branches = _normalized_metric(raw_metrics, "covered_branches", covered_branches)
+            total_functions = _normalized_metric(raw_metrics, "total_functions", total_functions)
+            covered_functions = _normalized_metric(raw_metrics, "covered_functions", covered_functions)
+            total_regions = _normalized_metric(raw_metrics, "total_regions", 0)
+            covered_regions = _normalized_metric(raw_metrics, "covered_regions", 0)
             files.append(
                 FileCoverage(
                     file_path=file_path,
@@ -195,6 +223,8 @@ class CoverageBuilder:
                     covered_branches=covered_branches,
                     total_functions=total_functions,
                     covered_functions=covered_functions,
+                    total_regions=total_regions,
+                    covered_regions=covered_regions,
                     raw_metrics=raw_metrics,
                 )
             )
@@ -207,3 +237,10 @@ class CoverageBuilder:
             warnings=warnings or [],
             metadata=metadata or {},
         )
+
+
+def _normalized_metric(metrics: dict[str, Any], key: str, fallback: int) -> int:
+    value = metrics.pop(key, None)
+    if value is None:
+        return fallback
+    return max(0, int(value))

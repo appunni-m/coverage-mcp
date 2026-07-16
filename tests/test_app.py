@@ -4,7 +4,7 @@ import sys
 
 from fastapi.testclient import TestClient
 
-from coverage_mcp.app import create_app
+from coverage_mcp.app import create_app, default_db_path
 
 
 def test_app_ingests_and_lists_snapshot(tmp_path):
@@ -30,6 +30,9 @@ end_of_record
         assert 'id="fileList"' in dashboard.text
         assert 'id="coverageMap"' in dashboard.text
         assert 'id="diagnosisPane"' in dashboard.text
+        assert 'id="trendLegend"' in dashboard.text
+        assert 'id="trendScope"' in dashboard.text
+        assert "region_rate" in dashboard.text
         assert "Selected File Lines" not in dashboard.text
 
         response = client.post(
@@ -56,6 +59,10 @@ end_of_record
         insights = client.get(f"/api/snapshots/{snapshot['id']}/insights").json()
         assert "summary" in insights
         assert "items" in insights
+
+
+def test_default_database_is_anchored_to_repository_root(tmp_path):
+    assert default_db_path(tmp_path.as_posix()) == (tmp_path / ".coverage-mcp" / "coverage.duckdb").as_posix()
 
 
 def test_app_registers_and_runs_approved_command(tmp_path):

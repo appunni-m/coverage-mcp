@@ -154,6 +154,7 @@ def test_go_and_llvm_edge_cases(tmp_path):
                                 "filename": "src/a.cc",
                                 "segments": [["bad"], [1, 1, 1, False], [2, 1, 1, True]],
                                 "branches": [{"line": 2, "true_count": 1, "false_count": 0}, "bad"],
+                                "summary": {"lines": "bad"},
                             },
                         ]
                     },

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 
 from coverage_mcp import git_utils
+from coverage_mcp.app import default_db_path
 from coverage_mcp.models import CoverageBuilder, LineCoverage, normalize_report_path, rate
 
 
@@ -29,11 +30,36 @@ def test_git_helpers_with_real_repository(tmp_path):
     info = git_utils.inspect_git(repo.as_posix())
 
     assert info.repo_path == repo.as_posix()
+    assert info.repo_key == repo.as_posix()
     assert info.branch == "feature"
     assert info.commit_sha is not None
     assert git_utils.merge_base(repo.as_posix(), "main") == base_sha
     assert git_utils.is_ancestor(repo.as_posix(), "main", "HEAD") is True
     assert git_utils.is_ancestor(repo.as_posix(), "HEAD", "main") is False
+
+
+def test_linked_worktree_uses_main_repository_database(tmp_path):
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "feature"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature", worktree.as_posix(), "main"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    main_info = git_utils.inspect_git(repo.as_posix())
+    worktree_info = git_utils.inspect_git(worktree.as_posix())
+
+    assert worktree_info.repo_key == main_info.repo_key == repo.as_posix()
+    assert default_db_path(worktree.as_posix()) == (repo / ".coverage-mcp" / "coverage.duckdb").as_posix()
 
 
 def test_git_private_runner_handles_failures(monkeypatch, tmp_path):

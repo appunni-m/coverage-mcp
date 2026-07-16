@@ -203,7 +203,12 @@ def test_llvm_parser_normalizes_segments_and_branch_counts(tmp_path):
                                 "filename": "/repo/src/a.cc",
                                 "segments": [[1, 1, 3, True, True], [2, 1, 0, True, True], [3, 1, 9, False, True]],
                                 "branches": [[2, 3, 2, 8, 0, 1]],
-                                "summary": {"lines": {"count": 2, "covered": 1}},
+                                "summary": {
+                                    "lines": {"count": 2, "covered": 1},
+                                    "branches": {"count": 2, "covered": 1},
+                                    "functions": {"count": 3, "covered": 2},
+                                    "regions": {"count": 5, "covered": 4},
+                                },
                             }
                         ]
                     }
@@ -221,6 +226,12 @@ def test_llvm_parser_normalizes_segments_and_branch_counts(tmp_path):
     assert parsed.covered_lines == 1
     assert parsed.total_branches == 2
     assert parsed.covered_branches == 1
+    assert parsed.total_functions == 3
+    assert parsed.covered_functions == 2
+    assert parsed.function_rate == pytest.approx(2 / 3)
+    assert parsed.total_regions == 5
+    assert parsed.covered_regions == 4
+    assert parsed.region_rate == pytest.approx(0.8)
     assert ("src/a.cc", 3) not in lines
     assert parsed.files[0].raw_metrics["llvm_summary"]["lines"]["count"] == 2
 
@@ -235,7 +246,7 @@ def test_llvm_parser_normalizes_segments_and_branch_counts(tmp_path):
             "coveragepy",
         ),
         ("cobertura.xml", "<coverage><packages /></coverage>", "cobertura"),
-        ("jacoco.xml", "<report><counter type=\"LINE\" missed=\"0\" covered=\"1\" /></report>", "jacoco"),
+        ("jacoco.xml", '<report><counter type="LINE" missed="0" covered="1" /></report>', "jacoco"),
         (
             "coverage-final.json",
             json.dumps({"a.js": {"statementMap": {"0": {"start": {"line": 1}}}, "s": {"0": 1}}}),
@@ -263,4 +274,3 @@ def test_parse_errors_are_clear_for_missing_and_unknown_reports(tmp_path):
 
     with pytest.raises(CoverageParseError, match="could not detect"):
         parse_coverage_report(report)
-

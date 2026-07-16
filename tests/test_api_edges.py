@@ -60,36 +60,58 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
         assert client.get(f"/api/snapshots/{current_snapshot['id']}/files").status_code == 200
         assert client.get(f"/api/snapshots/{current_snapshot['id']}/files/src/a.py").status_code == 200
         assert client.get(f"/api/snapshots/{current_snapshot['id']}/files/nope.py").status_code == 404
-        assert client.get(
-            f"/api/snapshots/{current_snapshot['id']}/insights?baseline_snapshot_id={base_snapshot['id']}"
-        ).status_code == 200
+        assert (
+            client.get(
+                f"/api/snapshots/{current_snapshot['id']}/insights?baseline_snapshot_id={base_snapshot['id']}"
+            ).status_code
+            == 200
+        )
         assert client.get(f"/api/trend?repo_path={tmp_path.as_posix()}&branch=feature&suite=unit").status_code == 200
-        assert client.get(
-            f"/api/trend?repo_path={tmp_path.as_posix()}&file_path=src/a.py"
-        ).status_code == 200
-        assert client.post(
-            "/api/compare",
-            json={"snapshot_id": current_snapshot["id"], "baseline_snapshot_id": base_snapshot["id"]},
-        ).status_code == 200
-        assert client.get(
-            f"/api/compare?snapshot_id={current_snapshot['id']}&baseline_snapshot_id={base_snapshot['id']}"
-        ).status_code == 200
+        assert client.get(f"/api/trend?repo_path={tmp_path.as_posix()}&file_path=src/a.py").status_code == 200
+        assert (
+            client.post(
+                "/api/compare",
+                json={"snapshot_id": current_snapshot["id"], "baseline_snapshot_id": base_snapshot["id"]},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/api/compare?snapshot_id={current_snapshot['id']}&baseline_snapshot_id={base_snapshot['id']}"
+            ).status_code
+            == 200
+        )
         assert client.get("/api/compare?snapshot_id=missing&baseline_snapshot_id=missing").status_code == 404
-        assert client.get(
-            f"/api/changed-lines?snapshot_id={current_snapshot['id']}&baseline_snapshot_id={base_snapshot['id']}&file_path=src/a.py&only_regressions=true"
-        ).json()[0]["status"] == "regressed"
-        assert client.get(
-            f"/api/line-history?file_path=src/a.py&line_number=1&repo_path={tmp_path.as_posix()}&branch=feature"
-        ).status_code == 200
-        assert client.get(
-            f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=src/a.py&start=1&end=500"
-        ).json()[-1]["line_number"] == 3
-        assert client.get(
-            f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=../secret&start=1&end=1"
-        ).status_code == 400
-        assert client.get(
-            f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=missing.py&start=1&end=1"
-        ).status_code == 400
+        assert (
+            client.get(
+                f"/api/changed-lines?snapshot_id={current_snapshot['id']}&baseline_snapshot_id={base_snapshot['id']}&file_path=src/a.py&only_regressions=true"
+            ).json()[0]["status"]
+            == "regressed"
+        )
+        assert (
+            client.get(
+                f"/api/line-history?file_path=src/a.py&line_number=1&repo_path={tmp_path.as_posix()}&branch=feature"
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=src/a.py&start=1&end=500"
+            ).json()[-1]["line_number"]
+            == 3
+        )
+        assert (
+            client.get(
+                f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=../secret&start=1&end=1"
+            ).status_code
+            == 400
+        )
+        assert (
+            client.get(
+                f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=missing.py&start=1&end=1"
+            ).status_code
+            == 400
+        )
         assert client.get("/api/worktrees").json() == []
         worktree_response = client.post(
             "/api/worktrees/register",
@@ -97,6 +119,9 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
         )
         assert worktree_response.status_code == 200
         worktree = client.get("/api/worktrees").json()[0]
+        progress_response = client.get(f"/api/worktrees/{worktree['id']}/progress?suite=unit")
+        assert progress_response.status_code == 200
+        assert progress_response.json()["baseline"]["id"] == base_snapshot["id"]
         comparison_response = client.get(
             f"/api/worktrees/{worktree['id']}/compare?snapshot_id={current_snapshot['id']}"
         )
@@ -134,6 +159,7 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     store = app.state.coverage_store
     with TestClient(app) as client:
+
         def value_error(*args, **kwargs):
             raise ValueError("bad input")
 
@@ -146,6 +172,7 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
                 "register_worktree",
                 lambda: client.post("/api/worktrees/register", json={"path": "missing", "base_ref": "main"}),
             ),
+            ("worktree_progress", lambda: client.get("/api/worktrees/w/progress")),
             ("files", lambda: client.get("/api/snapshots/s/files")),
             ("insights", lambda: client.get("/api/snapshots/s/insights")),
             ("compare", lambda: client.post("/api/compare", json={"snapshot_id": "s", "baseline_snapshot_id": "b"})),

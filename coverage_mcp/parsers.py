@@ -356,7 +356,10 @@ def parse_go_coverprofile(path: Path, *, repo_path: str | None = None) -> Covera
 def parse_llvm_json(path: Path, *, repo_path: str | None = None) -> CoverageReport:
     data = json.loads(path.read_text(encoding="utf-8"))
     builder = CoverageBuilder(repo_path)
-    warnings = ["LLVM JSON segments are normalized to segment start lines; region-level detail is not fully preserved."]
+    warnings = [
+        "LLVM JSON segments are normalized to segment start lines; "
+        "aggregate region coverage is preserved from summaries."
+    ]
     for unit in data.get("data", []) if isinstance(data, dict) else []:
         for file_payload in unit.get("files", []) if isinstance(unit, dict) else []:
             file_path = file_payload.get("filename")
@@ -382,9 +385,29 @@ def parse_llvm_json(path: Path, *, repo_path: str | None = None) -> CoverageRepo
                         total_branches=2,
                         covered_branches=(1 if true_count > 0 else 0) + (1 if false_count > 0 else 0),
                     )
-            if "summary" in file_payload:
-                builder.add_file_metrics(file_path, llvm_summary=file_payload["summary"])
+            summary = file_payload.get("summary")
+            if isinstance(summary, dict):
+                builder.add_file_metrics(
+                    file_path,
+                    llvm_summary=summary,
+                    **_llvm_summary_metrics(summary),
+                )
     return builder.build(format="llvm", report_path=str(path), warnings=warnings)
+
+
+def _llvm_summary_metrics(summary: dict[str, Any]) -> dict[str, int]:
+    metrics: dict[str, int] = {}
+    for name in ("lines", "branches", "functions", "regions"):
+        payload = summary.get(name)
+        if not isinstance(payload, dict):
+            continue
+        count = payload.get("count")
+        covered = payload.get("covered")
+        if count is not None:
+            metrics[f"total_{name}"] = _safe_int(str(count))
+        if covered is not None:
+            metrics[f"covered_{name}"] = _safe_int(str(covered))
+    return metrics
 
 
 def _parse_cobertura_branch_counts(line_node: ET.Element) -> tuple[int, int]:
@@ -403,10 +426,7 @@ def _parse_cobertura_branch_counts(line_node: ET.Element) -> tuple[int, int]:
 
 
 def _looks_like_istanbul(data: dict[str, Any]) -> bool:
-    return any(
-        isinstance(value, dict) and "statementMap" in value and "s" in value
-        for value in data.values()
-    )
+    return any(isinstance(value, dict) and "statementMap" in value and "s" in value for value in data.values())
 
 
 def _location_line(loc: Any) -> int | None:

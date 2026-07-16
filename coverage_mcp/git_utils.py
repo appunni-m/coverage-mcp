@@ -34,7 +34,8 @@ def inspect_git(path: str | None) -> GitInfo:
         common = Path(common_dir)
         if not common.is_absolute():
             common = repo / common
-        repo_key = common.resolve().as_posix()
+        common = common.resolve()
+        repo_key = (common.parent if common.name == ".git" else common).as_posix()
 
     branch = _git(root, ["branch", "--show-current"]) or None
     commit_sha = _git(root, ["rev-parse", "HEAD"]) or None
@@ -78,4 +79,3 @@ def _git(path: Path, args: list[str]) -> str | None:
         return None
     value = result.stdout.strip()
     return value or None
-

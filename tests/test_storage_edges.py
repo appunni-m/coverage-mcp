@@ -81,15 +81,20 @@ def test_storage_query_edges_and_worktree_without_baseline(tmp_path):
         assert store.lines(snapshot["id"], "src/a.py", limit=0)
         assert store.trend(repo_path=tmp_path.as_posix(), branch="main", suite="unit")
         assert store.line_history(file_path="src/a.py", line_number=1, repo_path=tmp_path.as_posix(), branch="main")
-        assert store.changed_lines(
-            snapshot_id=snapshot["id"],
-            baseline_snapshot_id=snapshot["id"],
-            only_regressions=True,
-        ) == []
+        assert (
+            store.changed_lines(
+                snapshot_id=snapshot["id"],
+                baseline_snapshot_id=snapshot["id"],
+                only_regressions=True,
+            )
+            == []
+        )
 
         worktree = store.register_worktree(tmp_path.as_posix(), base_ref="no-such-branch")
         with pytest.raises(KeyError, match="baseline"):
             store.compare_worktree(worktree["id"], snapshot_id=snapshot["id"])
+        with pytest.raises(KeyError, match="baseline"):
+            store.worktree_progress(worktree["id"])
         with pytest.raises(KeyError, match="file"):
             store.file_coverage(snapshot["id"], "missing.py")
         assert store.object_topology("project", tmp_path.as_posix())["topology"]["kind"] == "project"
@@ -97,6 +102,184 @@ def test_storage_query_edges_and_worktree_without_baseline(tmp_path):
             store.object_topology("project", "missing")
         with pytest.raises(ValueError, match="unsupported"):
             store.object_topology("unsupported", "x")
+    finally:
+        store.close()
+
+
+def test_trend_returns_all_available_coverage_dimensions(tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        report = CoverageReport(
+            format="llvm",
+            report_path="coverage.json",
+            files=[
+                FileCoverage(
+                    file_path="src/a.cc",
+                    total_lines=10,
+                    covered_lines=9,
+                    total_branches=8,
+                    covered_branches=6,
+                    total_functions=4,
+                    covered_functions=3,
+                    total_regions=20,
+                    covered_regions=17,
+                )
+            ],
+            lines=[],
+        )
+        store.store_report(
+            report,
+            repo_path=tmp_path.as_posix(),
+            repo_key=tmp_path.as_posix(),
+            branch="main",
+            commit_sha="abc",
+            base_ref=None,
+            suite="unit",
+        )
+
+        overall = store.trend(repo_path=tmp_path.as_posix())
+        file_trend = store.trend(repo_path=tmp_path.as_posix(), file_path="src/a.cc")
+
+        assert overall[0]["line_rate"] == pytest.approx(0.9)
+        assert overall[0]["branch_rate"] == pytest.approx(0.75)
+        assert overall[0]["function_rate"] == pytest.approx(0.75)
+        assert overall[0]["region_rate"] == pytest.approx(0.85)
+        assert file_trend[0]["total_regions"] == 20
+        assert file_trend[0]["covered_regions"] == 17
+    finally:
+        store.close()
+
+
+def test_worktree_progress_isolated_from_other_lineages(tmp_path):
+    repo = tmp_path / "repo"
+    worktree_path = tmp_path / "feature"
+    other_path = tmp_path / "other"
+    repo.mkdir()
+    other_path.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        baseline_id = store.store_report(
+            CoverageReport(
+                format="llvm",
+                report_path="base.json",
+                files=[FileCoverage("src/a.cc", total_lines=10, covered_lines=7, total_branches=4, covered_branches=2)],
+                lines=[],
+            ),
+            repo_path=repo.as_posix(),
+            repo_key=repo.as_posix(),
+            branch="main",
+            commit_sha=base_sha,
+            base_ref=None,
+            suite="unit",
+        )
+        integration_baseline_id = store.store_report(
+            CoverageReport(
+                format="llvm",
+                report_path="integration-base.json",
+                files=[FileCoverage("src/a.cc", total_lines=10, covered_lines=5, total_branches=4, covered_branches=1)],
+                lines=[],
+            ),
+            repo_path=repo.as_posix(),
+            repo_key=repo.as_posix(),
+            branch="main",
+            commit_sha=base_sha,
+            base_ref=None,
+            suite="integration",
+        )
+        subprocess.run(
+            ["git", "worktree", "add", "-b", "feature", worktree_path.as_posix(), "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        worktree = store.register_worktree(worktree_path.as_posix(), base_ref="main", name="feature")
+        store.store_report(
+            CoverageReport(
+                format="llvm",
+                report_path="late-main.json",
+                files=[
+                    FileCoverage(
+                        "src/a.cc",
+                        total_lines=10,
+                        covered_lines=10,
+                        total_branches=4,
+                        covered_branches=4,
+                    )
+                ],
+                lines=[],
+            ),
+            repo_path=repo.as_posix(),
+            repo_key=repo.as_posix(),
+            branch="main",
+            commit_sha=base_sha,
+            base_ref=None,
+            suite="unit",
+        )
+        current_id = store.store_report(
+            CoverageReport(
+                format="llvm",
+                report_path="current.json",
+                files=[FileCoverage("src/a.cc", total_lines=10, covered_lines=9, total_branches=4, covered_branches=3)],
+                lines=[],
+            ),
+            repo_path=worktree_path.as_posix(),
+            repo_key=repo.as_posix(),
+            branch="feature",
+            commit_sha="feature-head",
+            base_ref="main",
+            suite="unit",
+        )
+        store.store_report(
+            CoverageReport(
+                format="llvm",
+                report_path="unrelated.json",
+                files=[FileCoverage("src/a.cc", total_lines=10, covered_lines=1, total_branches=4, covered_branches=0)],
+                lines=[],
+            ),
+            repo_path=other_path.as_posix(),
+            repo_key=repo.as_posix(),
+            branch="feature",
+            commit_sha="other-head",
+            base_ref="main",
+            suite="unit",
+        )
+
+        progress = store.worktree_progress(worktree["id"], suite="unit")
+        default_progress = store.worktree_progress(worktree["id"])
+        integration_progress = store.worktree_progress(worktree["id"], suite="integration")
+        file_progress = store.worktree_progress(worktree["id"], suite="unit", file_path="src/a.cc")
+        comparison = store.compare_worktree(worktree["id"])
+
+        assert worktree["baseline_snapshot_id"] == integration_baseline_id
+        assert progress["baseline"]["id"] == baseline_id
+        assert progress["current"]["id"] == current_id
+        assert [point["id"] for point in progress["points"]] == [baseline_id, current_id]
+        assert progress["deltas"]["line_rate"] == pytest.approx(0.2)
+        assert progress["deltas"]["branch_rate"] == pytest.approx(0.25)
+        assert default_progress["suite"] == "unit"
+        assert default_progress["baseline"]["id"] == baseline_id
+        assert integration_progress["baseline"]["id"] == integration_baseline_id
+        assert integration_progress["current"] is None
+        assert file_progress["baseline"]["file_path"] == "src/a.cc"
+        assert file_progress["current"]["line_rate"] == pytest.approx(0.9)
+        assert comparison["current"]["id"] == current_id
+        assert comparison["baseline"]["id"] == baseline_id
+        with pytest.raises(KeyError, match="suite missing"):
+            store.worktree_progress(worktree["id"], suite="missing")
     finally:
         store.close()
 
@@ -126,6 +309,7 @@ def test_storage_insights_source_and_worktree_latest_paths(tmp_path):
             branch="main",
             commit_sha="base",
         )
+        worktree = store.register_worktree(tmp_path.as_posix(), base_ref="main")
         current_snapshot = store.ingest_report(
             current.as_posix(),
             format="lcov",
@@ -140,7 +324,6 @@ def test_storage_insights_source_and_worktree_latest_paths(tmp_path):
             branch="warning",
             commit_sha="warning",
         )
-        worktree = store.register_worktree(tmp_path.as_posix(), base_ref="main")
 
         insights = store.insights(snapshot_id=current_snapshot["id"], baseline_snapshot_id=base_snapshot["id"])
         warning_insights = store.insights(snapshot_id=warning_snapshot["id"])
@@ -347,6 +530,10 @@ def test_existing_schema_migration(tmp_path):
     try:
         columns = {row[1] for row in store._conn.execute("PRAGMA table_info('lines')").fetchall()}
         assert "count_line" in columns
+        snapshot_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('snapshots')").fetchall()}
+        file_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('files')").fetchall()}
+        assert {"total_regions", "covered_regions", "region_rate"} <= snapshot_columns
+        assert {"total_regions", "covered_regions", "region_rate"} <= file_columns
     finally:
         store.close()
 

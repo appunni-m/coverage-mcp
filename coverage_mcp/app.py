@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -11,9 +12,10 @@ from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from coverage_mcp.git_utils import inspect_git
 from coverage_mcp.storage import CoverageStore
 
-DEFAULT_DB_PATH = ".coverage-mcp/coverage.duckdb"
+DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 
 
 class IngestRequest(BaseModel):
@@ -58,7 +60,7 @@ class RunCommandRequest(BaseModel):
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
-    store = CoverageStore(db_path or os.environ.get("COVERAGE_MCP_DB", DEFAULT_DB_PATH))
+    store = CoverageStore(db_path or os.environ.get("COVERAGE_MCP_DB", default_db_path()))
     mcp = create_mcp(store)
     mcp_app = mcp.streamable_http_app()
 
@@ -111,6 +113,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/worktrees")
     def worktrees(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
         return store.list_worktrees(limit=limit)
+
+    @app.get("/api/worktrees/{worktree_id}/progress")
+    def worktree_progress(
+        worktree_id: str,
+        suite: str | None = None,
+        file_path: str | None = None,
+        limit: int = Query(default=200, ge=1, le=2000),
+    ) -> dict[str, Any]:
+        try:
+            return store.worktree_progress(
+                worktree_id,
+                suite=suite,
+                file_path=file_path,
+                limit=limit,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
 
     @app.get("/api/projects")
     def projects(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
@@ -252,6 +271,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         branch: str | None = None,
         suite: str | None = None,
         file_path: str | None = None,
+        worktree_id: str | None = None,
         limit: int = Query(default=200, ge=1, le=2000),
     ) -> list[dict[str, Any]]:
         return store.trend(
@@ -259,6 +279,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             branch=branch,
             suite=suite,
             file_path=file_path,
+            worktree_id=worktree_id,
             limit=limit,
         )
 
@@ -451,6 +472,21 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         return store.register_worktree(path, base_ref=base_ref, name=name)
 
     @mcp.tool()
+    def worktree_progress(
+        worktree_id: str,
+        suite: str | None = None,
+        file_path: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return one worktree's frozen baseline, independent trend, and metric deltas."""
+        return store.worktree_progress(
+            worktree_id,
+            suite=suite,
+            file_path=file_path,
+            limit=limit,
+        )
+
+    @mcp.tool()
     def coverage_summary(
         snapshot_id: str | None = None,
         repo_path: str | None = None,
@@ -580,6 +616,11 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, (FileNotFoundError, ValueError)):
         return HTTPException(status_code=400, detail=str(exc))
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def default_db_path(path: str | None = None) -> str:
+    root = inspect_git(path).repo_key
+    return (Path(root) / DEFAULT_DB_NAME).as_posix()
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -824,6 +865,41 @@ DASHBOARD_HTML = r"""<!doctype html>
       display: block;
       width: 100%;
       min-height: 240px;
+    }
+    .trend-meta {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      min-width: 0;
+    }
+    .trend-scope {
+      min-width: 190px;
+      min-height: 30px;
+      height: 30px;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+    .trend-legend {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+    }
+    .trend-key {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: #475467;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .trend-swatch {
+      width: 16px;
+      height: 3px;
+      border-radius: 2px;
+      background: var(--series-color);
     }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -1376,6 +1452,13 @@ DASHBOARD_HTML = r"""<!doctype html>
         align-items: stretch;
         flex-direction: column;
       }
+      .overview-grid .panel-head {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      .trend-meta {
+        justify-content: flex-start;
+      }
       .comparison-banner {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -1442,7 +1525,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
     <section class="grid overview-grid">
       <div class="panel">
-        <div class="panel-head"><h2>Coverage Trend</h2><span class="muted" id="trendLabel"></span></div>
+        <div class="panel-head">
+          <h2>Coverage Trend</h2>
+          <div class="trend-meta">
+            <select id="trendScope" class="trend-scope" title="Trend lineage"></select>
+            <div id="trendLegend" class="trend-legend"></div>
+            <span class="muted" id="trendLabel"></span>
+          </div>
+        </div>
         <div class="panel-body"><svg id="trend" viewBox="0 0 900 240" role="img" aria-label="Coverage trend"></svg></div>
       </div>
       <div class="panel">
@@ -1534,6 +1624,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       selectedFile: null,
       selectedPayload: null,
       sourceByLine: new Map(),
+      trendScope: null,
       comparison: null,
       changedByFile: new Map(),
       fileComparison: new Map(),
@@ -1559,6 +1650,42 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function projectSnapshots() {
       return state.projectKey ? state.snapshots.filter(snapshot => snapshot.repo_key === state.projectKey) : state.snapshots;
+    }
+
+    function projectWorktrees() {
+      return state.projectKey ? state.worktrees.filter(worktree => worktree.repo_key === state.projectKey) : state.worktrees;
+    }
+
+    function referenceBranches() {
+      const snapshots = projectSnapshots();
+      const available = new Set(snapshots.map(snapshot => snapshot.branch).filter(Boolean));
+      const configured = projectWorktrees().map(worktree => worktree.base_ref).filter(branch => available.has(branch));
+      const preferred = ['main', 'master'].filter(branch => available.has(branch));
+      const references = [...new Set([...configured, ...preferred])];
+      if (references.length) return references;
+      return [state.selected?.base_ref, state.selected?.branch, snapshots[0]?.branch].filter(Boolean).slice(0, 1);
+    }
+
+    function renderTrendScopes() {
+      const select = document.getElementById('trendScope');
+      const references = referenceBranches();
+      const worktrees = projectWorktrees();
+      const options = [
+        ...references.map(branch => ({
+          value: `reference:${branch}`,
+          label: `Reference: ${branch}`
+        })),
+        ...worktrees.map(worktree => ({
+          value: `worktree:${worktree.id}`,
+          label: `Worktree: ${worktree.name || worktree.branch || shortPath(worktree.path)}`
+        }))
+      ];
+      if (!options.some(option => option.value === state.trendScope)) {
+        state.trendScope = options[0]?.value || null;
+      }
+      select.innerHTML = options.map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('')
+        || '<option>No lineage available</option>';
+      if (state.trendScope) select.value = state.trendScope;
     }
 
     function optionLabel(snapshot) {
@@ -1616,10 +1743,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       state.files = await getJSON(`/api/snapshots/${snapshot.id}/files?limit=1000`);
       document.getElementById('fileCount').textContent = state.files.length;
       if (!state.files.some(file => file.file_path === state.selectedFile)) state.selectedFile = null;
+      renderTrendScopes();
       await loadComparison(false, true);
       renderFiles();
       await renderInsights(document.getElementById('baselineSelect').value);
-      renderTrend(await getJSON(`/api/trend?repo_path=${encodeURIComponent(snapshot.repo_path)}&limit=200`));
+      await loadScopedTrend();
       if (state.files.length) await loadFile(state.selectedFile || state.files[0].file_path);
     }
 
@@ -2005,31 +2133,123 @@ DASHBOARD_HTML = r"""<!doctype html>
       const health = document.getElementById('fileHealth');
       health.textContent = pct(rate);
       health.className = `health-badge ${rate >= 0.85 ? 'good' : rate >= 0.6 ? 'warn' : 'danger'}`;
-      renderTrend(await getJSON(`/api/trend?repo_path=${encodeURIComponent(state.selected.repo_path)}&file_path=${encodeURIComponent(filePath)}&limit=200`), filePath);
       if (targetLine) requestAnimationFrame(() => showLine(targetLine));
+    }
+
+    function trendDeltaSummary(deltas) {
+      const metrics = [
+        ['line_rate', 'Line'],
+        ['branch_rate', 'Branch'],
+        ['function_rate', 'Function'],
+        ['region_rate', 'Region']
+      ];
+      return metrics
+        .filter(([key]) => deltas[key] !== null && deltas[key] !== undefined)
+        .map(([key, label]) => `${label} ${formatPointDelta(deltas[key])}`)
+        .join(' · ');
+    }
+
+    async function loadScopedTrend() {
+      if (!state.selected || !state.trendScope) {
+        renderTrend([], 'No lineage selected');
+        return;
+      }
+      const [kind, reference] = state.trendScope.split(':', 2);
+      if (kind === 'worktree') {
+        const params = new URLSearchParams({suite: state.selected.suite, limit: '200'});
+        let progress;
+        try {
+          progress = await getJSON(`/api/worktrees/${encodeURIComponent(reference)}/progress?${params}`);
+        } catch {
+          renderTrend([], `No frozen ${state.selected.suite} baseline for this worktree`);
+          return;
+        }
+        const worktree = progress.worktree;
+        const deltas = Object.values(progress.deltas).filter(value => value !== null && value !== undefined);
+        const verdict = deltas.some(value => value < 0)
+          ? 'regressed'
+          : deltas.some(value => value > 0) ? 'improved' : 'unchanged';
+        const name = worktree.name || worktree.branch || shortPath(worktree.path);
+        const summary = trendDeltaSummary(progress.deltas);
+        renderTrend(
+          progress.points,
+          `${name} vs frozen ${worktree.base_ref} · ${verdict}${summary ? ` · ${summary}` : ''}`
+        );
+        return;
+      }
+      const params = new URLSearchParams({
+        repo_path: state.selected.repo_path,
+        branch: reference,
+        suite: state.selected.suite,
+        limit: '200'
+      });
+      const points = await getJSON(`/api/trend?${params}`);
+      renderTrend(points, `Reference ${reference} · ${state.selected.suite}`);
     }
 
     function renderTrend(points, label) {
       const svg = document.getElementById('trend');
+      const legend = document.getElementById('trendLegend');
       document.getElementById('trendLabel').textContent = label || 'overall';
       svg.innerHTML = '';
-      const width = 900, height = 240, pad = 28;
+      const series = [
+        {key: 'line_rate', label: 'Line', color: '#0f766e'},
+        {key: 'branch_rate', label: 'Branch', color: '#d97706'},
+        {key: 'function_rate', label: 'Function', color: '#2563eb'},
+        {key: 'region_rate', label: 'Region', color: '#c0265e'}
+      ].filter(item => points.some(point => point[item.key] !== null && point[item.key] !== undefined));
+      legend.innerHTML = series.map(item => {
+        const latest = [...points].reverse().find(point => point[item.key] !== null && point[item.key] !== undefined);
+        return `
+          <span class="trend-key" style="--series-color:${item.color}">
+            <span class="trend-swatch"></span>${item.label} <strong>${pct(latest?.[item.key])}</strong>
+          </span>
+        `;
+      }).join('');
+      const width = 900, height = 240, padX = 36, padY = 24;
       const grid = document.createElementNS('http://www.w3.org/2000/svg', 'g');
       for (let i = 0; i <= 4; i++) {
-        const y = pad + (height - pad * 2) * i / 4;
-        grid.innerHTML += `<line x1="${pad}" y1="${y}" x2="${width - pad}" y2="${y}" stroke="#d8dde6" stroke-width="1"/><text x="4" y="${y + 4}" fill="#687385" font-size="11">${100 - i * 25}%</text>`;
+        const y = padY + (height - padY * 2) * i / 4;
+        grid.innerHTML += `<line x1="${padX}" y1="${y}" x2="${width - padX}" y2="${y}" stroke="#d8dde6" stroke-width="1"/><text x="2" y="${y + 4}" fill="#687385" font-size="11">${100 - i * 25}%</text>`;
       }
       svg.appendChild(grid);
-      if (!points.length) return;
-      const coords = points.map((point, index) => {
-        const x = pad + (width - pad * 2) * (points.length === 1 ? 1 : index / (points.length - 1));
-        const y = height - pad - ((point.line_rate || 0) * (height - pad * 2));
-        return `${x},${y}`;
-      });
-      svg.innerHTML += `<polyline fill="none" stroke="#0f766e" stroke-width="3" points="${coords.join(' ')}"/>`;
-      for (const coord of coords) {
-        const [x, y] = coord.split(',');
-        svg.innerHTML += `<circle cx="${x}" cy="${y}" r="3.5" fill="#2563eb"/>`;
+      if (!points.length || !series.length) return;
+      const xFor = index => padX + (width - padX * 2) * (points.length === 1 ? 0.5 : index / (points.length - 1));
+      const yFor = value => height - padY - (value * (height - padY * 2));
+      const baselineIndex = points.findIndex(point => point.point_kind === 'baseline');
+      if (baselineIndex >= 0) {
+        const x = xFor(baselineIndex);
+        svg.innerHTML += `
+          <line x1="${x}" y1="${padY}" x2="${x}" y2="${height - padY}" stroke="#98a2b3" stroke-width="1" stroke-dasharray="4 4"/>
+          <text x="${x + 5}" y="${padY + 11}" fill="#667085" font-size="10">frozen baseline</text>
+        `;
+      }
+      for (const item of series) {
+        let segment = [];
+        const segments = [];
+        const circles = [];
+        points.forEach((point, index) => {
+          const value = point[item.key];
+          if (value === null || value === undefined) {
+            if (segment.length) segments.push(segment);
+            segment = [];
+            return;
+          }
+          const x = xFor(index);
+          const y = yFor(value);
+          segment.push(`${x},${y}`);
+          const isBaseline = point.point_kind === 'baseline';
+          circles.push(
+            `<circle cx="${x}" cy="${y}" r="${isBaseline ? 4.5 : 3.25}" fill="${item.color}" stroke="${isBaseline ? '#344054' : '#ffffff'}" stroke-width="${isBaseline ? 2 : 1.5}"><title>${isBaseline ? 'Frozen baseline | ' : ''}${item.label}: ${pct(value)} | ${new Date(point.created_at).toLocaleString()}</title></circle>`
+          );
+        });
+        if (segment.length) segments.push(segment);
+        for (const coordinates of segments) {
+          if (coordinates.length > 1) {
+            svg.innerHTML += `<polyline fill="none" stroke="${item.color}" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" points="${coordinates.join(' ')}"/>`;
+          }
+        }
+        svg.innerHTML += circles.join('');
       }
     }
 
@@ -2124,8 +2344,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       renderFiles();
     });
     document.getElementById('fileSort').addEventListener('change', renderFiles);
+    document.getElementById('trendScope').addEventListener('change', async event => {
+      state.trendScope = event.target.value;
+      await loadScopedTrend();
+    });
     document.getElementById('projectSelect').addEventListener('change', async event => {
       state.projectKey = event.target.value;
+      state.trendScope = null;
       renderSnapshotSelectors();
       state.selected = projectSnapshots()[0] || null;
       if (state.selected) document.getElementById('snapshotSelect').value = state.selected.id;

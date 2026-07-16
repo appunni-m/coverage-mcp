@@ -68,9 +68,12 @@ class CoverageStore:
                     covered_branches INTEGER NOT NULL,
                     total_functions INTEGER NOT NULL,
                     covered_functions INTEGER NOT NULL,
+                    total_regions INTEGER NOT NULL,
+                    covered_regions INTEGER NOT NULL,
                     line_rate DOUBLE,
                     branch_rate DOUBLE,
-                    function_rate DOUBLE
+                    function_rate DOUBLE,
+                    region_rate DOUBLE
                 )
                 """
             )
@@ -85,9 +88,12 @@ class CoverageStore:
                     covered_branches INTEGER NOT NULL,
                     total_functions INTEGER NOT NULL,
                     covered_functions INTEGER NOT NULL,
+                    total_regions INTEGER NOT NULL,
+                    covered_regions INTEGER NOT NULL,
                     line_rate DOUBLE,
                     branch_rate DOUBLE,
                     function_rate DOUBLE,
+                    region_rate DOUBLE,
                     raw_metrics VARCHAR NOT NULL
                 )
                 """
@@ -196,12 +202,18 @@ class CoverageStore:
             self._migrate_schema()
 
     def _migrate_schema(self) -> None:
-        line_columns = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info('lines')").fetchall()
-        }
+        line_columns = {row[1] for row in self._conn.execute("PRAGMA table_info('lines')").fetchall()}
         if "count_line" not in line_columns:
             self._conn.execute("ALTER TABLE lines ADD COLUMN count_line BOOLEAN DEFAULT true")
+        for table in ("snapshots", "files"):
+            columns = {row[1] for row in self._conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+            for name, definition in (
+                ("total_regions", "INTEGER DEFAULT 0"),
+                ("covered_regions", "INTEGER DEFAULT 0"),
+                ("region_rate", "DOUBLE"),
+            ):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def register_command(
         self,
@@ -293,8 +305,7 @@ class CoverageStore:
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [
-            self._with_topology(self._decode_json_fields(row_dict(columns, row), ["artifact_specs"]))
-            for row in rows
+            self._with_topology(self._decode_json_fields(row_dict(columns, row), ["artifact_specs"])) for row in rows
         ]
 
     def run_command_profiled(
@@ -320,11 +331,14 @@ class CoverageStore:
         exit_code: int | None = None
         status = "failed"
         try:
-            with stdout_path.open("w", encoding="utf-8", errors="replace") as stdout, stderr_path.open(
-                "w",
-                encoding="utf-8",
-                errors="replace",
-            ) as stderr:
+            with (
+                stdout_path.open("w", encoding="utf-8", errors="replace") as stdout,
+                stderr_path.open(
+                    "w",
+                    encoding="utf-8",
+                    errors="replace",
+                ) as stderr,
+            ):
                 completed = subprocess.run(
                     registered["command"],
                     shell=True,
@@ -581,7 +595,13 @@ class CoverageStore:
             try:
                 self._conn.execute(
                     """
-                    INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO snapshots (
+                        id, created_at, minute_bucket, repo_path, repo_key, branch, commit_sha, base_ref,
+                        suite, format, report_path, warnings, metadata,
+                        total_lines, covered_lines, total_branches, covered_branches,
+                        total_functions, covered_functions, total_regions, covered_regions,
+                        line_rate, branch_rate, function_rate, region_rate
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         snapshot_id,
@@ -603,15 +623,23 @@ class CoverageStore:
                         report.covered_branches,
                         report.total_functions,
                         report.covered_functions,
+                        report.total_regions,
+                        report.covered_regions,
                         report.line_rate,
                         report.branch_rate,
                         report.function_rate,
+                        report.region_rate,
                     ],
                 )
                 if report.files:
                     self._conn.executemany(
                         """
-                        INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO files (
+                            snapshot_id, file_path,
+                            total_lines, covered_lines, total_branches, covered_branches,
+                            total_functions, covered_functions, total_regions, covered_regions,
+                            line_rate, branch_rate, function_rate, region_rate, raw_metrics
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
                             [
@@ -623,9 +651,12 @@ class CoverageStore:
                                 file.covered_branches,
                                 file.total_functions,
                                 file.covered_functions,
+                                file.total_regions,
+                                file.covered_regions,
                                 file.line_rate,
                                 file.branch_rate,
                                 file.function_rate,
+                                file.region_rate,
                                 json.dumps(file.raw_metrics),
                             ]
                             for file in report.files
@@ -695,30 +726,33 @@ class CoverageStore:
         repo_key: str,
         base_ref: str,
         base_sha: str | None = None,
+        suite: str | None = None,
+        before: datetime | None = None,
     ) -> str | None:
-        with self._lock:
-            if base_sha:
-                row = self._conn.execute(
-                    """
-                    SELECT id FROM snapshots
-                    WHERE repo_key = ? AND commit_sha = ?
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    [repo_key, base_sha],
-                ).fetchone()
-                if row:
-                    return str(row[0])
+        def find(filters: list[str], args: list[Any]) -> str | None:
+            if suite:
+                filters.append("suite = ?")
+                args.append(suite)
+            if before:
+                filters.append("created_at <= ?")
+                args.append(before)
             row = self._conn.execute(
-                """
+                f"""
                 SELECT id FROM snapshots
-                WHERE repo_key = ? AND branch = ?
+                WHERE {" AND ".join(filters)}
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                [repo_key, base_ref],
+                args,
             ).fetchone()
             return str(row[0]) if row else None
+
+        with self._lock:
+            if base_sha:
+                snapshot_id = find(["repo_key = ?", "commit_sha = ?"], [repo_key, base_sha])
+                if snapshot_id:
+                    return snapshot_id
+            return find(["repo_key = ?", "branch = ?"], [repo_key, base_ref])
 
     def list_snapshots(
         self,
@@ -851,6 +885,12 @@ class CoverageStore:
                     l.total_branches,
                     l.covered_branches,
                     l.branch_rate,
+                    l.total_functions,
+                    l.covered_functions,
+                    l.function_rate,
+                    l.total_regions,
+                    l.covered_regions,
+                    l.region_rate,
                     l.warnings
                 FROM project_keys p
                 LEFT JOIN snapshot_aggregate a ON a.repo_key = p.repo_key
@@ -926,10 +966,17 @@ class CoverageStore:
         branch: str | None = None,
         suite: str | None = None,
         file_path: str | None = None,
+        worktree_id: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         filters: list[str] = []
         args: list[Any] = []
+        worktree = self.worktree(worktree_id) if worktree_id else None
+        if worktree:
+            filters.extend(["s.repo_key = ?", "s.repo_path = ?", "s.created_at >= ?"])
+            args.extend([worktree["repo_key"], worktree["repo_path"], worktree["created_at"]])
+            if not branch:
+                branch = worktree.get("branch")
         if repo_path:
             filters.append("s.repo_key = ?")
             args.append(inspect_git(repo_path).repo_key)
@@ -945,7 +992,9 @@ class CoverageStore:
             source = """
                 SELECT s.id, s.created_at, s.minute_bucket, s.branch, s.commit_sha, s.suite,
                        f.file_path, f.total_lines, f.covered_lines, f.line_rate,
-                       f.total_branches, f.covered_branches, f.branch_rate
+                       f.total_branches, f.covered_branches, f.branch_rate,
+                       f.total_functions, f.covered_functions, f.function_rate,
+                       f.total_regions, f.covered_regions, f.region_rate
                 FROM snapshots s
                 JOIN files f ON f.snapshot_id = s.id
             """
@@ -953,7 +1002,9 @@ class CoverageStore:
             source = """
                 SELECT s.id, s.created_at, s.minute_bucket, s.branch, s.commit_sha, s.suite,
                        NULL AS file_path, s.total_lines, s.covered_lines, s.line_rate,
-                       s.total_branches, s.covered_branches, s.branch_rate
+                       s.total_branches, s.covered_branches, s.branch_rate,
+                       s.total_functions, s.covered_functions, s.function_rate,
+                       s.total_regions, s.covered_regions, s.region_rate
                 FROM snapshots s
             """
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
@@ -969,6 +1020,116 @@ class CoverageStore:
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._serialize(row_dict(columns, row)) for row in reversed(rows)]
+
+    def worktree_progress(
+        self,
+        worktree_id: str,
+        *,
+        suite: str | None = None,
+        file_path: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        worktree = self.worktree(worktree_id)
+        baseline_snapshot_id = worktree.get("baseline_snapshot_id")
+        if not baseline_snapshot_id:
+            raise KeyError(f"worktree has no baseline snapshot: {worktree_id}")
+        baseline_snapshot = self.snapshot(baseline_snapshot_id)
+        latest_points = self.trend(worktree_id=worktree_id, limit=1) if suite is None else []
+        selected_suite = suite or (latest_points[-1]["suite"] if latest_points else baseline_snapshot["suite"])
+        baseline_snapshot_id = self._worktree_baseline_snapshot_id(worktree, selected_suite)
+        baseline = self._trend_point(baseline_snapshot_id, file_path=file_path)
+        points = self.trend(
+            branch=worktree.get("branch"),
+            suite=selected_suite,
+            file_path=file_path,
+            worktree_id=worktree_id,
+            limit=limit,
+        )
+        current = points[-1] if points else None
+        metrics = ("line_rate", "branch_rate", "function_rate", "region_rate")
+        deltas = {
+            metric: _delta(
+                current.get(metric) if current else None,
+                baseline.get(metric),
+            )
+            for metric in metrics
+        }
+        return {
+            "worktree": worktree,
+            "suite": selected_suite,
+            "file_path": file_path,
+            "baseline": baseline,
+            "current": current,
+            "deltas": deltas,
+            "points": [{**baseline, "point_kind": "baseline"}]
+            + [{**point, "point_kind": "worktree"} for point in points if point["id"] != baseline["id"]],
+        }
+
+    def _worktree_baseline_snapshot_id(self, worktree: dict[str, Any], suite: str) -> str:
+        stored_id = worktree.get("baseline_snapshot_id")
+        if not stored_id:
+            raise KeyError(f"worktree has no baseline snapshot: {worktree['id']}")
+        stored = self.snapshot(stored_id)
+        if stored["suite"] == suite:
+            return str(stored_id)
+        created_at = datetime.fromisoformat(str(worktree["created_at"]).removesuffix("Z"))
+        snapshot_id = self.find_baseline_snapshot(
+            repo_key=str(worktree["repo_key"]),
+            base_ref=str(worktree["base_ref"]),
+            base_sha=worktree.get("base_sha"),
+            suite=suite,
+            before=created_at,
+        )
+        if not snapshot_id:
+            raise KeyError(f"worktree has no frozen baseline snapshot for suite {suite}: {worktree['id']}")
+        return snapshot_id
+
+    def _trend_point(self, snapshot_id: str, *, file_path: str | None = None) -> dict[str, Any]:
+        snapshot = self.snapshot(snapshot_id)
+        if file_path:
+            file = self.file_coverage(snapshot_id, file_path)
+            return {
+                "id": snapshot["id"],
+                "created_at": snapshot["created_at"],
+                "minute_bucket": snapshot["minute_bucket"],
+                "branch": snapshot["branch"],
+                "commit_sha": snapshot["commit_sha"],
+                "suite": snapshot["suite"],
+                "file_path": file_path,
+                "total_lines": file["total_lines"],
+                "covered_lines": file["covered_lines"],
+                "line_rate": file["line_rate"],
+                "total_branches": file["total_branches"],
+                "covered_branches": file["covered_branches"],
+                "branch_rate": file["branch_rate"],
+                "total_functions": file["total_functions"],
+                "covered_functions": file["covered_functions"],
+                "function_rate": file["function_rate"],
+                "total_regions": file["total_regions"],
+                "covered_regions": file["covered_regions"],
+                "region_rate": file["region_rate"],
+            }
+        keys = (
+            "id",
+            "created_at",
+            "minute_bucket",
+            "branch",
+            "commit_sha",
+            "suite",
+            "total_lines",
+            "covered_lines",
+            "line_rate",
+            "total_branches",
+            "covered_branches",
+            "branch_rate",
+            "total_functions",
+            "covered_functions",
+            "function_rate",
+            "total_regions",
+            "covered_regions",
+            "region_rate",
+        )
+        return {**{key: snapshot[key] for key in keys}, "file_path": None}
 
     def compare(
         self,
@@ -1131,8 +1292,7 @@ class CoverageStore:
                     "category": "low-branch-coverage",
                     "title": "Branch coverage needs attention",
                     "detail": (
-                        f"{file['file_path']} covers {file['covered_branches']}/"
-                        f"{file['total_branches']} branches."
+                        f"{file['file_path']} covers {file['covered_branches']}/{file['total_branches']} branches."
                     ),
                     "file_path": file["file_path"],
                     "uncovered_branches": file["uncovered_branches"],
@@ -1173,11 +1333,9 @@ class CoverageStore:
                             "line_rate_delta": delta,
                         }
                     )
-            regressed_lines = [
-                line
-                for line in comparison["changed_lines"]
-                if line.get("status") == "regressed"
-            ][:limit]
+            regressed_lines = [line for line in comparison["changed_lines"] if line.get("status") == "regressed"][
+                :limit
+            ]
             for line in regressed_lines:
                 items.append(
                     {
@@ -1205,15 +1363,14 @@ class CoverageStore:
 
     def compare_worktree(self, worktree_id: str, *, snapshot_id: str | None = None) -> dict[str, Any]:
         worktree = self.worktree(worktree_id)
-        baseline_snapshot_id = worktree.get("baseline_snapshot_id")
-        if not baseline_snapshot_id:
-            raise KeyError(f"worktree has no baseline snapshot: {worktree_id}")
         current_id = snapshot_id
         if current_id is None:
-            latest = self.latest_snapshot(repo_path=worktree["repo_path"], branch=worktree.get("branch"))
-            if not latest:
+            points = self.trend(worktree_id=worktree_id, limit=1)
+            if not points:
                 raise KeyError(f"no current snapshot found for worktree: {worktree_id}")
-            current_id = latest["id"]
+            current_id = points[-1]["id"]
+        current = self.snapshot(current_id)
+        baseline_snapshot_id = self._worktree_baseline_snapshot_id(worktree, current["suite"])
         comparison = self.compare(snapshot_id=current_id, baseline_snapshot_id=baseline_snapshot_id)
         comparison["worktree"] = worktree
         return comparison
@@ -1315,7 +1472,7 @@ class CoverageStore:
                        l.total_branches, l.covered_branches
                 FROM lines l
                 JOIN snapshots s ON s.id = l.snapshot_id
-                WHERE {' AND '.join(filters)}
+                WHERE {" AND ".join(filters)}
                 ORDER BY s.created_at DESC
                 LIMIT ?
                 """,

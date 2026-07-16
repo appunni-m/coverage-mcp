@@ -36,25 +36,44 @@ Coverage details are normalized into four levels:
 
 When the report format is lossy, the snapshot keeps a warning. For example, Go coverprofiles report blocks, Istanbul reports statements, and LLVM reports segments.
 
-## Install
+## Install The Server
+
+Coverage MCP currently installs from GitHub:
+
+```bash
+python -m pip install "git+https://github.com/appunni-m/coverage-mcp.git"
+```
+
+For development from this checkout:
 
 ```bash
 python -m pip install -e '.[dev]'
 ```
 
-## Run
+Python 3.12 or newer is required.
+
+## Start The Shared Server
+
+Start one server from the main checkout, not one server per worktree:
 
 ```bash
+cd /path/to/main-checkout
 coverage-mcp
 ```
 
-Open the dashboard:
+Verify it:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+Dashboard:
 
 ```text
 http://127.0.0.1:8000/
 ```
 
-MCP Streamable HTTP endpoint:
+MCP endpoint:
 
 ```text
 http://127.0.0.1:8000/mcp/
@@ -63,11 +82,15 @@ http://127.0.0.1:8000/mcp/
 Default database:
 
 ```text
-.coverage-mcp/coverage.duckdb
+<main-repository>/.coverage-mcp/coverage.duckdb
 ```
 
-When you start Coverage MCP from a repository root, this keeps history in that repository under `.coverage-mcp/`.
-This project ignores that directory in `.gitignore` so the local DuckDB history is preserved on disk without being committed.
+Coverage MCP resolves Git's shared repository root before choosing the default database. Starting it from `main` or
+from any linked worktree therefore opens the same DuckDB. This preserves baseline and worktree lineage without
+committing local history. The `.coverage-mcp/` directory should remain ignored by Git.
+
+Do not start another Coverage MCP process from each worktree. Every agent and worktree should connect to this one
+server so DuckDB has one writer and one continuous project history.
 
 Override host, port, or DB:
 
@@ -76,6 +99,71 @@ COVERAGE_MCP_HOST=127.0.0.1 \
 COVERAGE_MCP_PORT=8765 \
 COVERAGE_MCP_DB=/path/to/coverage.duckdb \
 coverage-mcp
+```
+
+## Install In An Agent
+
+The `testing` plugin in
+[codegen-marketplace](https://github.com/appunni-m/codegen-marketplace) includes the Coverage MCP connection and
+agent instructions for approved test runs, bounded summaries, artifact ingestion, and worktree comparisons.
+
+The plugin expects Coverage MCP at `http://127.0.0.1:8000/mcp/`. Start the server before opening a new agent session.
+
+### Codex
+
+```bash
+codex plugin marketplace add appunni-m/codegen-marketplace
+codex plugin add testing@codegen-marketplace
+```
+
+Start a new Codex thread after installation. To install only the MCP connection without the testing skill:
+
+```bash
+codex mcp add coverage-mcp --url http://127.0.0.1:8000/mcp/
+```
+
+### Claude Code
+
+```bash
+claude plugin marketplace add appunni-m/codegen-marketplace
+claude plugin install testing@codegen-marketplace
+```
+
+Start a new Claude Code session after installation. To install only the MCP connection:
+
+```bash
+claude mcp add --transport http --scope user coverage-mcp http://127.0.0.1:8000/mcp/
+```
+
+### Pi
+
+Pi intentionally has no built-in MCP client, so install the testing skill and the MCP adapter:
+
+```bash
+git clone https://github.com/appunni-m/codegen-marketplace.git
+pi install ./codegen-marketplace/plugins/testing
+pi install npm:pi-mcp-adapter
+node ./codegen-marketplace/plugins/testing/scripts/install-pi-mcp.mjs
+```
+
+Restart Pi after installing the adapter. The installer merges Coverage MCP into
+`~/.config/mcp/mcp.json`; it does not replace other configured MCP servers. In Pi, MCP tools are accessed through the
+adapter's `mcp` proxy tool.
+
+### Confirm Agent Access
+
+Ask the agent:
+
+```text
+Use coverage-mcp to list the registered test commands for this project.
+```
+
+If no command is registered, give the agent the complete test command, working directory, and artifact paths, then
+explicitly approve that exact registration. After a run, ask:
+
+```text
+Run the approved test suite, ingest its coverage artifact, and tell me whether this worktree improved against its
+frozen baseline.
 ```
 
 ## Quick Workflow
@@ -96,6 +184,28 @@ curl -X POST http://127.0.0.1:8000/api/ingest \
     "branch": "main",
     "suite": "unit"
   }'
+```
+
+## `AGENTS.md` Snippet
+
+Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
+
+```md
+## Coverage MCP
+
+- Reuse the repository's single Coverage MCP server and shared DuckDB. Never copy the database into a worktree or set
+  `COVERAGE_MCP_DB` to a worktree-local path.
+- Register a new worktree once with `register_worktree(path, base_ref, name)` before its first coverage run. Keep the
+  returned `worktree_id`; its frozen baseline defines the lineage for that worktree.
+- Run tests through an existing human-approved command with `run_command_profiled`. If no approved command exists,
+  ask for explicit approval before registering one.
+- Ingest generated coverage with the actual worktree path as `repo_path`, its branch/commit, and a stable suite name.
+- Use `worktree_progress(worktree_id, suite)` or `compare_to_baseline(worktree_id=...)` to report whether line, branch,
+  function, and region coverage improved. Do not compare one worktree's snapshots to another worktree.
+- Keep suite names stable: each suite is compared with the matching base snapshot that existed when the worktree was
+  registered, never with a later reference-branch run.
+- Treat the reference branch trend (normally `main`) as project health. Treat each worktree trend as independent
+  progress from its frozen reference baseline.
 ```
 
 The same operation through MCP:
@@ -177,7 +287,7 @@ This means a registered command is project-specific because registration stores 
 | JaCoCo XML | `jacoco` | Java/Kotlin/JVM line, instruction, branch counters |
 | Istanbul/nyc JSON | `istanbul` or `nyc` | Statements become line records; branches/functions kept separately |
 | Go coverprofile | `go` | Block ranges expanded to lines |
-| LLVM JSON export | `llvm` | Segments become line records; branches kept separately |
+| LLVM JSON export | `llvm` | Segments become line records; branch, function, and aggregate region coverage are preserved |
 
 Some formats are lossy when normalized. For example, Go reports blocks, Istanbul reports statements, and LLVM reports segments. Coverage MCP stores warnings on snapshots when it has to approximate line records.
 
@@ -341,6 +451,15 @@ For a registered worktree:
 compare_to_baseline(worktree_id="...")
 ```
 
+### `worktree_progress`
+
+Returns one registered worktree's frozen baseline, exact-path trend, latest point, and line/branch/function/region
+deltas. This is the preferred compact answer to "did this worktree improve coverage?"
+
+```text
+worktree_progress(worktree_id="...", suite="unit")
+```
+
 ### `changed_lines`
 
 Returns exact line-level coverage changes between two snapshots.
@@ -408,13 +527,17 @@ register_worktree(
 
 That worktree stores `baseline_snapshot_id`. Later uploads to `main` do not change this baseline automatically. This lets you ask, "what changed compared with the base coverage when this worktree started?"
 
+All linked worktrees share one project identity and one database, but each registered worktree is a separate progress
+lane. A lane contains its frozen reference snapshot followed only by snapshots ingested from that exact worktree path
+after registration. Branch names alone are not used to join lanes.
+
 ## Dashboard
 
 The dashboard at `http://127.0.0.1:8000/` shows:
 
 - project selector with latest coverage for each project
 - latest snapshot summary
-- coverage trend
+- lineage-scoped multi-series trends for every available dimension: line, branch, function, and region
 - investigation queue with high/medium/info items
 - searchable file navigator ranked by missed lines, branch gaps, and baseline regressions
 - editor-style source coverage with hit counts, branch gaps, and baseline changes in the gutter
@@ -424,6 +547,16 @@ The dashboard at `http://127.0.0.1:8000/` shows:
 - automatic comparison with the preceding project snapshot, with an explicit baseline selector when another reference is needed
 
 It uses the same REST API and DuckDB storage as the MCP tools.
+
+The trend selector has two kinds of views:
+
+- **Reference: `main`** shows only that branch and suite over time. It represents the health of the common parent tree.
+- **Worktree: `<name>`** starts at the worktree's frozen baseline and then shows only runs from that worktree. Its label
+  reports independent metric deltas such as `Line +1.2 pp` or `Branch -0.5 pp`. Baselines are frozen separately for
+  each suite.
+
+The graph never connects points from different worktrees. This follows the same reference-branch model used by
+[GitHub coverage comparisons](https://docs.github.com/en/code-security/reference/code-quality/metrics-and-ratings).
 
 The investigation layout follows established coverage workflows rather than treating coverage as a spreadsheet:
 
@@ -454,6 +587,7 @@ Useful endpoints:
 - `GET /api/topology/{object_kind}/{object_ref}`
 - `POST /api/ingest`
 - `POST /api/worktrees/register`
+- `GET /api/worktrees/{worktree_id}/progress`
 - `GET /api/snapshots`
 - `GET /api/snapshots/latest`
 - `GET /api/snapshots/{snapshot_id}/insights`
@@ -475,6 +609,7 @@ Snapshots are immutable. Each ingest creates a new snapshot with:
 - suite name
 - normalized file records
 - normalized line records
+- line, branch, function, and region totals when supplied by the report format
 
 Registered commands and runs are immutable too. Changing a command means registering a new approved command record. Run stdout/stderr are written under the database directory's `runs/` folder, and the database stores the paths plus bounded parsed summaries.
 
@@ -487,7 +622,7 @@ DuckDB is used because this is local-first and query-heavy. There is no backgrou
 The test suite covers:
 
 - parser normalization for all supported formats
-- exact line, branch, and function counters
+- exact line, branch, function, and aggregate region counters
 - auto-detection for all supported formats
 - lossy-format warnings
 - parser error paths
