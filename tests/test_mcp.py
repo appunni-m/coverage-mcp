@@ -43,6 +43,7 @@ end_of_record
                 "list_registered_commands",
                 "run_command_profiled",
                 "run_result",
+                "latest_run",
                 "object_topology",
                 "coverage_summary",
                 "coverage_files",
@@ -66,6 +67,8 @@ end_of_record
                 )
             )
             assert snapshot["total_lines"] == 2
+            assert snapshot["age_seconds"] >= 0
+            assert snapshot["age"].endswith(" ago")
 
             summary = structured(await mcp.call_tool("coverage_summary", {"snapshot_id": snapshot["id"]}))
             assert summary["line_rate"] == 0.5
@@ -133,6 +136,12 @@ sys.exit(1)
                 )
             )
             result = structured(await mcp.call_tool("run_result", {"run_id": run["id"], "max_summary_lines": 1}))
+            latest_run = structured(
+                await mcp.call_tool(
+                    "latest_run",
+                    {"command_ref": command["id"], "max_summary_lines": 1},
+                )
+            )
             commands = structured(await mcp.call_tool("list_registered_commands", {"limit": 5}))
             topology = structured(
                 await mcp.call_tool(
@@ -146,15 +155,21 @@ sys.exit(1)
                     {"command_ref": "failing-suite", "kind": "text"},
                 )
             )
+            projects = structured(await mcp.call_tool("project_summaries", {"limit": 5}))
 
             assert run["status"] == "failed"
             assert result["id"] == run["id"]
+            assert latest_run["id"] == run["id"]
+            assert latest_run["age_seconds"] >= 0
+            assert latest_run["age"].endswith(" ago")
             assert commands[0]["id"] == command["id"]
             assert run["topology"]["command"]["id"] == command["id"]
             assert topology["topology"]["kind"] == "run"
             assert run["parsed_summary"]["stdout_line_count"] == 20
             assert len(run["parsed_summary"]["excerpts"]) <= 2
             assert artifact["exists"] is True
+            assert projects[0]["latest_run_age_seconds"] >= 0
+            assert projects[0]["latest_run_age"].endswith(" ago")
 
         run(scenario())
     finally:
@@ -330,6 +345,8 @@ def test_mcp_coverage_query_surface_and_resources(tmp_path):
             assert files_resource
             with pytest.raises(ToolError):
                 await mcp.call_tool("latest_artifact", {"kind": "missing"})
+            with pytest.raises(ToolError):
+                await mcp.call_tool("latest_run", {"command_ref": "missing"})
             with pytest.raises(ToolError):
                 await mcp.call_tool("coverage_summary", {"branch": "missing"})
             with pytest.raises(ToolError):

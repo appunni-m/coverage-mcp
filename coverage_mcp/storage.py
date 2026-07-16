@@ -453,9 +453,7 @@ class CoverageStore:
             if row is None:
                 raise KeyError(f"run not found: {run_id}")
             columns = [column[0] for column in self._conn.description]
-        return self._with_topology(
-            self._decode_json_fields(row_dict(columns, row), ["parsed_summary", "artifact_paths"])
-        )
+        return self._run_from_row(columns, row)
 
     def latest_run(self, command_ref: str | None = None) -> dict[str, Any] | None:
         args: list[Any] = []
@@ -484,9 +482,7 @@ class CoverageStore:
             if row is None:
                 return None
             columns = [column[0] for column in self._conn.description]
-        return self._with_topology(
-            self._decode_json_fields(row_dict(columns, row), ["parsed_summary", "artifact_paths"])
-        )
+        return self._run_from_row(columns, row)
 
     def latest_artifact(self, *, command_ref: str | None = None, kind: str) -> dict[str, Any] | None:
         args: list[Any] = [kind]
@@ -520,7 +516,11 @@ class CoverageStore:
             if row is None:
                 return None
             columns = [column[0] for column in self._conn.description]
-        return self._with_topology(self._serialize(row_dict(columns, row)))
+        return self._with_relative_age(
+            self._with_topology(self._serialize(row_dict(columns, row))),
+            "ended_at",
+            prefix="run",
+        )
 
     def object_topology(self, object_kind: str, object_ref: str) -> dict[str, Any]:
         kind = object_kind.strip().lower().replace("-", "_")
@@ -916,7 +916,7 @@ class CoverageStore:
                 run_aggregate AS (
                     SELECT repo_key,
                            count(*) AS run_count,
-                           max(started_at) AS latest_run_at
+                           max(ended_at) AS latest_run_at
                     FROM runs
                     GROUP BY repo_key
                 )
@@ -964,7 +964,13 @@ class CoverageStore:
                 [min(max(limit, 1), 1000)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
-        return [self._with_topology(self._decode_json_fields(row_dict(columns, row), ["warnings"])) for row in rows]
+        projects = []
+        for row in rows:
+            project = self._with_topology(self._decode_json_fields(row_dict(columns, row), ["warnings"]))
+            self._with_relative_age(project, "latest_snapshot_at", prefix="latest_snapshot")
+            self._with_relative_age(project, "latest_run_at", prefix="latest_run")
+            projects.append(project)
+        return projects
 
     def worktree(self, worktree_id: str) -> dict[str, Any]:
         with self._lock:
@@ -1566,7 +1572,14 @@ class CoverageStore:
         return result
 
     def _snapshot_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
-        return self._with_topology(self._decode_json_fields(row_dict(columns, row), ["warnings", "metadata"]))
+        snapshot = self._with_topology(self._decode_json_fields(row_dict(columns, row), ["warnings", "metadata"]))
+        return self._with_relative_age(snapshot, "created_at")
+
+    def _run_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
+        run = self._with_topology(
+            self._decode_json_fields(row_dict(columns, row), ["parsed_summary", "artifact_paths"])
+        )
+        return self._with_relative_age(run, "ended_at")
 
     def _worktree_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
         return self._with_topology(self._serialize(row_dict(columns, row)))
@@ -1590,6 +1603,22 @@ class CoverageStore:
                 serialized[key] = item
         return serialized
 
+    def _with_relative_age(
+        self,
+        value: dict[str, Any],
+        timestamp_field: str,
+        *,
+        prefix: str = "",
+    ) -> dict[str, Any]:
+        relative = relative_age(value.get(timestamp_field))
+        if relative is None:
+            return value
+        age_seconds, age = relative
+        field_prefix = f"{prefix}_" if prefix else ""
+        value[f"{field_prefix}age_seconds"] = age_seconds
+        value[f"{field_prefix}age"] = age
+        return value
+
     def _with_topology(self, value: dict[str, Any]) -> dict[str, Any]:
         if "topology" not in value:
             topology = infer_topology(value)
@@ -1602,6 +1631,43 @@ def _delta(current: float | None, baseline: float | None) -> float | None:
     if current is None or baseline is None:
         return None
     return current - baseline
+
+
+def relative_age(
+    value: datetime | str | None,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, str] | None:
+    if value is None:
+        return None
+    timestamp = value
+    if isinstance(timestamp, str):
+        try:
+            timestamp = datetime.fromisoformat(
+                timestamp.removesuffix("Z") + ("+00:00" if timestamp.endswith("Z") else "")
+            )
+        except ValueError:
+            return None
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(UTC).replace(tzinfo=None)
+    current = now or utcnow()
+    if current.tzinfo is not None:
+        current = current.astimezone(UTC).replace(tzinfo=None)
+    seconds = max(0, int((current - timestamp).total_seconds()))
+    return seconds, format_age(seconds)
+
+
+def format_age(seconds: int) -> str:
+    remaining = max(0, seconds)
+    parts: list[str] = []
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
+        amount, remaining = divmod(remaining, size)
+        if amount:
+            suffix = "" if amount == 1 else "s"
+            parts.append(f"{amount} {unit}{suffix}")
+    if not parts:
+        parts.append("0 seconds")
+    return " ".join(parts) + " ago"
 
 
 def infer_topology(value: dict[str, Any]) -> dict[str, Any] | None:

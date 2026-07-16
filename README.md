@@ -392,6 +392,19 @@ run_command_profiled(command_ref="unit", max_summary_lines=80)
 ```
 
 The response includes pass/fail, exit code, duration, key counters, selected error/tail excerpts, full log paths, and artifact paths.
+It also includes the exact completion time plus freshness fields such as
+`age_seconds: 603` and `age: "10 minutes 3 seconds ago"`.
+
+### `latest_run`
+
+Returns the latest bounded run result, optionally for one registered command.
+
+```text
+latest_run(command_ref="unit", max_summary_lines=80)
+```
+
+Use this before rerunning a suite. The `age` and `age_seconds` fields make it
+clear whether the previous result is fresh enough for the current task.
 
 ### `run_result`
 

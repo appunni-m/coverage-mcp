@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -11,6 +12,7 @@ import pytest
 from coverage_mcp.models import CoverageReport, FileCoverage, LineCoverage
 from coverage_mcp.storage import (
     CoverageStore,
+    format_age,
     infer_topology,
     is_interesting_log_line,
     merge_counters,
@@ -18,6 +20,7 @@ from coverage_mcp.storage import (
     percent,
     percent_delta,
     profile_log,
+    relative_age,
     summarize_run_logs,
     update_log_counters,
 )
@@ -426,6 +429,14 @@ def test_log_summary_and_topology_helpers(tmp_path):
     assert counters["errors"] == 4
     assert merge_counters({"passed": 1}, {"passed": 2}) == {"passed": 3}
     assert is_interesting_log_line("fatal panic")
+    assert format_age(0) == "0 seconds ago"
+    assert format_age(603) == "10 minutes 3 seconds ago"
+    assert format_age(90061) == "1 day 1 hour 1 minute 1 second ago"
+    now = datetime(2026, 7, 16, 15, 0, tzinfo=UTC)
+    assert relative_age(now - timedelta(seconds=603), now=now) == (603, "10 minutes 3 seconds ago")
+    assert relative_age(now + timedelta(seconds=3), now=now) == (0, "0 seconds ago")
+    assert relative_age("invalid", now=now) is None
+    assert relative_age(None, now=now) is None
     assert profile_log(tmp_path / "missing.log", stream="stdout", max_lines=2)["line_count"] == 0
     summary = summarize_run_logs(
         stdout_path=stdout,

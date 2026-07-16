@@ -438,6 +438,21 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         return await asyncio.to_thread(store.run_result, run_id, max_summary_lines=max_summary_lines)
 
     @mcp.tool()
+    async def latest_run(
+        command_ref: str | None = None,
+        max_summary_lines: int = 80,
+    ) -> dict[str, Any]:
+        """Return the latest bounded run result with relative freshness fields."""
+        latest = await asyncio.to_thread(store.latest_run, command_ref=command_ref)
+        if latest is None:
+            raise KeyError("no runs found")
+        return await asyncio.to_thread(
+            store.run_result,
+            latest["id"],
+            max_summary_lines=max_summary_lines,
+        )
+
+    @mcp.tool()
     async def latest_artifact(kind: str, command_ref: str | None = None) -> dict[str, Any]:
         """Return the latest registered artifact for a command and artifact kind."""
         artifact = await asyncio.to_thread(store.latest_artifact, command_ref=command_ref, kind=kind)

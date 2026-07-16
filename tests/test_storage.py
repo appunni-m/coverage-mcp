@@ -157,6 +157,10 @@ end_of_record
         assert projects[0]["repo_key"] == "repo-key"
         assert projects[0]["latest_snapshot_id"] == current_id
         assert projects[0]["snapshot_count"] == 2
+        assert projects[0]["latest_snapshot_age_seconds"] >= 0
+        assert projects[0]["latest_snapshot_age"].endswith(" ago")
+        assert insights["snapshot"]["age_seconds"] >= 0
+        assert insights["snapshot"]["age"].endswith(" ago")
         categories = {item["category"] for item in insights["items"]}
         assert "zero-coverage-file" in categories
         assert "low-branch-coverage" in categories
@@ -215,8 +219,12 @@ sys.exit(2)
         assert run["exit_code"] == 2
         assert run["artifact_paths"][0]["kind"] == "lcov"
         assert run["artifact_paths"][0]["exists"] is True
+        assert run["age_seconds"] >= 0
+        assert run["age"].endswith(" ago")
         assert latest is not None
         assert latest["run_id"] == run["id"]
+        assert latest["run_age_seconds"] >= 0
+        assert latest["run_age"].endswith(" ago")
         assert run["parsed_summary"]["stdout_line_count"] == 30
         assert run["parsed_summary"]["stderr_line_count"] == 1
         assert len(run["parsed_summary"]["excerpts"]) <= 3
