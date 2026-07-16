@@ -637,6 +637,23 @@ class CoverageStore:
                     self._copy_rows(
                         "files",
                         [
+                            "snapshot_id",
+                            "file_path",
+                            "total_lines",
+                            "covered_lines",
+                            "total_branches",
+                            "covered_branches",
+                            "total_functions",
+                            "covered_functions",
+                            "total_regions",
+                            "covered_regions",
+                            "line_rate",
+                            "branch_rate",
+                            "function_rate",
+                            "region_rate",
+                            "raw_metrics",
+                        ],
+                        [
                             [
                                 snapshot_id,
                                 file.file_path,
@@ -661,6 +678,19 @@ class CoverageStore:
                     self._copy_rows(
                         "lines",
                         [
+                            "snapshot_id",
+                            "file_path",
+                            "line_number",
+                            "hits",
+                            "covered",
+                            "count_line",
+                            "total_branches",
+                            "covered_branches",
+                            "total_functions",
+                            "covered_functions",
+                            "details",
+                        ],
+                        [
                             [
                                 snapshot_id,
                                 line.file_path,
@@ -683,7 +713,7 @@ class CoverageStore:
                 raise
         return snapshot_id
 
-    def _copy_rows(self, table: str, rows: list[list[Any]]) -> None:
+    def _copy_rows(self, table: str, columns: list[str], rows: list[list[Any]]) -> None:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -697,7 +727,10 @@ class CoverageStore:
             csv.writer(stream, lineterminator="\n").writerows(rows)
         try:
             sql_path = temporary_path.as_posix().replace("'", "''")
-            self._conn.execute(f"COPY {table} FROM '{sql_path}' (FORMAT CSV, HEADER false, NULL '')")
+            column_sql = ", ".join(columns)
+            self._conn.execute(
+                f"COPY {table} ({column_sql}) FROM '{sql_path}' (FORMAT CSV, HEADER false, NULL '')"
+            )
         finally:
             temporary_path.unlink(missing_ok=True)
 
