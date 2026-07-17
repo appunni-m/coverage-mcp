@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import Queue
 from typing import Any
 
 import duckdb
@@ -41,9 +42,23 @@ class CoverageStore:
         self._conn = duckdb.connect(self.db_path.as_posix())
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
+        self._job_queue: Queue[str | None] = Queue()
+        self._closing = threading.Event()
         self._init_schema()
+        queued_jobs = self._recover_run_jobs()
+        self._worker = threading.Thread(
+            target=self._run_worker,
+            name="coverage-mcp-runner",
+            daemon=True,
+        )
+        self._worker.start()
+        for run_id in queued_jobs:
+            self._job_queue.put(run_id)
 
     def close(self) -> None:
+        self._closing.set()
+        self._job_queue.put(None)
+        self._worker.join()
         with self._lock:
             self._conn.close()
 
@@ -175,7 +190,9 @@ class CoverageStore:
                     stdout_path VARCHAR NOT NULL,
                     stderr_path VARCHAR NOT NULL,
                     parsed_summary VARCHAR NOT NULL,
-                    artifact_paths VARCHAR NOT NULL
+                    artifact_paths VARCHAR NOT NULL,
+                    queued_at TIMESTAMP,
+                    queue_duration_ms INTEGER
                 )
                 """
             )
@@ -190,6 +207,30 @@ class CoverageStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_jobs (
+                    id VARCHAR PRIMARY KEY,
+                    command_id VARCHAR NOT NULL,
+                    command_name VARCHAR NOT NULL,
+                    command VARCHAR NOT NULL,
+                    cwd VARCHAR NOT NULL,
+                    repo_path VARCHAR NOT NULL,
+                    repo_key VARCHAR NOT NULL,
+                    branch VARCHAR,
+                    commit_sha VARCHAR,
+                    queued_at TIMESTAMP NOT NULL,
+                    started_at TIMESTAMP,
+                    ended_at TIMESTAMP,
+                    timeout_seconds INTEGER,
+                    max_summary_lines INTEGER NOT NULL,
+                    status VARCHAR NOT NULL,
+                    stdout_path VARCHAR NOT NULL,
+                    stderr_path VARCHAR NOT NULL,
+                    error VARCHAR NOT NULL
+                )
+                """
+            )
             for statement in [
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_repo_time ON snapshots(repo_key, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_commit ON snapshots(repo_key, commit_sha)",
@@ -199,6 +240,7 @@ class CoverageStore:
                 "CREATE INDEX IF NOT EXISTS idx_registered_commands_name ON registered_commands(name, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_runs_command_time ON runs(command_id, started_at)",
                 "CREATE INDEX IF NOT EXISTS idx_run_artifacts_kind ON run_artifacts(kind)",
+                "CREATE INDEX IF NOT EXISTS idx_run_jobs_status_time ON run_jobs(status, queued_at)",
             ]:
                 with suppress(duckdb.Error):
                     self._conn.execute(statement)
@@ -217,6 +259,10 @@ class CoverageStore:
             ):
                 if name not in columns:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        run_columns = {row[1] for row in self._conn.execute("PRAGMA table_info('runs')").fetchall()}
+        for name, definition in (("queued_at", "TIMESTAMP"), ("queue_duration_ms", "INTEGER")):
+            if name not in run_columns:
+                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
 
     def register_command(
         self,
@@ -318,20 +364,22 @@ class CoverageStore:
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
-        with self._run_lock:
-            return self._run_command_profiled(
-                command_ref,
-                max_summary_lines=max_summary_lines,
-                timeout_seconds=timeout_seconds,
-            )
+        job = self.submit_command_profiled(
+            command_ref,
+            max_summary_lines=max_summary_lines,
+            timeout_seconds=timeout_seconds,
+        )
+        return self.wait_for_run(job["id"], max_summary_lines=max_summary_lines)
 
-    def _run_command_profiled(
+    def submit_command_profiled(
         self,
         command_ref: str,
         *,
-        max_summary_lines: int,
-        timeout_seconds: int | None,
+        max_summary_lines: int = 80,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
+        if self._closing.is_set():
+            raise RuntimeError("coverage store is shutting down")
         registered = self.registered_command(command_ref)
         if not registered.get("enabled", True):
             raise ValueError(f"registered command is disabled: {command_ref}")
@@ -343,65 +391,190 @@ class CoverageStore:
         stderr_path = run_path / "stderr.log"
         cwd = registered["cwd"]
         git = inspect_git(cwd)
-        started_at = utcnow()
-        start = time.monotonic()
-        exit_code: int | None = None
-        status = "failed"
-        try:
-            with (
-                stdout_path.open("w", encoding="utf-8", errors="replace") as stdout,
-                stderr_path.open(
-                    "w",
-                    encoding="utf-8",
-                    errors="replace",
-                ) as stderr,
-            ):
-                completed = subprocess.run(
+        queued_at = utcnow()
+        stdout_path.touch()
+        stderr_path.touch()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO run_jobs (
+                    id, command_id, command_name, command, cwd, repo_path, repo_key,
+                    branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds,
+                    max_summary_lines, status, stdout_path, stderr_path, error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    run_id,
+                    registered["id"],
+                    registered["name"],
                     registered["command"],
-                    shell=True,
-                    cwd=cwd,
-                    executable=registered["shell"],
-                    stdout=stdout,
-                    stderr=stderr,
-                    text=True,
-                    timeout=timeout_seconds,
-                    check=False,
+                    cwd,
+                    git.repo_path,
+                    git.repo_key,
+                    git.branch,
+                    git.commit_sha,
+                    queued_at,
+                    None,
+                    None,
+                    timeout_seconds,
+                    max(max_summary_lines, 1),
+                    "queued",
+                    stdout_path.as_posix(),
+                    stderr_path.as_posix(),
+                    "",
+                ],
+            )
+        self._job_queue.put(run_id)
+        return self.run_result(run_id, max_summary_lines=max_summary_lines)
+
+    def wait_for_run(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
+        while True:
+            result = self.run_result(run_id, max_summary_lines=max_summary_lines)
+            if result["terminal"]:
+                if result["status"] == "internal_error":
+                    raise RuntimeError(result.get("error") or "run worker failed")
+                return result
+            time.sleep(0.02)
+
+    def list_run_queue(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM run_jobs
+                WHERE status IN ('queued', 'running')
+                ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, queued_at
+                LIMIT ?
+                """,
+                [min(max(limit, 1), 1000)],
+            ).fetchall()
+            columns = [column[0] for column in self._conn.description]
+        return [self._job_from_row(columns, row) for row in rows]
+
+    def _run_worker(self) -> None:
+        while True:
+            run_id = self._job_queue.get()
+            try:
+                if run_id is None:
+                    return
+                if self._closing.is_set():
+                    continue
+                try:
+                    self._execute_run_job(run_id)
+                except Exception as exc:
+                    self._mark_job_error(run_id, exc)
+            finally:
+                self._job_queue.task_done()
+
+    def _execute_run_job(self, run_id: str) -> None:
+        with self._run_lock:
+            job = self._run_job(run_id)
+            if job is None or job["status"] != "queued":
+                return
+            registered = self.registered_command(job["command_id"])
+            started_at = utcnow()
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE run_jobs SET status = 'running', started_at = ?, error = '' WHERE id = ?",
+                    [started_at, run_id],
                 )
-            exit_code = completed.returncode
-            status = "passed" if exit_code == 0 else "failed"
-        except subprocess.TimeoutExpired:
-            status = "timeout"
-            exit_code = None
-            with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
-                stderr.write(f"\nCommand timed out after {timeout_seconds} seconds.\n")
-        ended_at = utcnow()
-        duration_ms = int((time.monotonic() - start) * 1000)
-        artifact_paths = self._collect_run_artifacts(registered["artifact_specs"], cwd)
+
+            start = time.monotonic()
+            exit_code: int | None = None
+            status = "failed"
+            error = ""
+            stdout_path = Path(job["stdout_path"])
+            stderr_path = Path(job["stderr_path"])
+            try:
+                with (
+                    stdout_path.open("w", encoding="utf-8", errors="replace") as stdout,
+                    stderr_path.open("w", encoding="utf-8", errors="replace") as stderr,
+                ):
+                    completed = subprocess.run(
+                        job["command"],
+                        shell=True,
+                        cwd=job["cwd"],
+                        executable=registered["shell"],
+                        stdout=stdout,
+                        stderr=stderr,
+                        text=True,
+                        timeout=job["timeout_seconds"],
+                        check=False,
+                    )
+                exit_code = completed.returncode
+                status = "passed" if exit_code == 0 else "failed"
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+                with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
+                    stderr.write(f"\nCommand timed out after {job['timeout_seconds']} seconds.\n")
+            except Exception as exc:
+                status = "failed"
+                error = f"{type(exc).__name__}: {exc}"
+                with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
+                    stderr.write(f"\nCommand execution failed: {error}\n")
+
+            ended_at = utcnow()
+            duration_ms = int((time.monotonic() - start) * 1000)
+            self._finalize_run_job(
+                job=job,
+                registered=registered,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_ms=duration_ms,
+                exit_code=exit_code,
+                status=status,
+                error=error,
+            )
+
+    def _finalize_run_job(
+        self,
+        *,
+        job: dict[str, Any],
+        registered: dict[str, Any],
+        started_at: datetime,
+        ended_at: datetime,
+        duration_ms: int,
+        exit_code: int | None,
+        status: str,
+        error: str,
+    ) -> None:
+        run_id = job["id"]
+        stdout_path = Path(job["stdout_path"])
+        stderr_path = Path(job["stderr_path"])
+        artifact_paths = self._collect_run_artifacts(registered["artifact_specs"], job["cwd"])
         summary = summarize_run_logs(
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             exit_code=exit_code,
             status=status,
             duration_ms=duration_ms,
-            max_summary_lines=max(max_summary_lines, 1),
+            max_summary_lines=job["max_summary_lines"],
         )
+        if error:
+            summary["execution_error"] = error
+        queued_at = parse_datetime(job["queued_at"])
+        queue_duration_ms = int((started_at - (queued_at or started_at)).total_seconds() * 1000)
         with self._lock:
             self._conn.execute("BEGIN")
             try:
                 self._conn.execute(
                     """
-                    INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO runs (
+                        id, command_id, command_name, command, cwd, repo_path, repo_key,
+                        branch, commit_sha, started_at, ended_at, duration_ms, exit_code,
+                        status, stdout_path, stderr_path, parsed_summary, artifact_paths,
+                        queued_at, queue_duration_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
-                        run_id,
-                        registered["id"],
-                        registered["name"],
-                        registered["command"],
-                        cwd,
-                        git.repo_path,
-                        git.repo_key,
-                        git.branch,
-                        git.commit_sha,
+                        job["id"],
+                        job["command_id"],
+                        job["command_name"],
+                        job["command"],
+                        job["cwd"],
+                        job["repo_path"],
+                        job["repo_key"],
+                        job["branch"],
+                        job["commit_sha"],
                         started_at,
                         ended_at,
                         duration_ms,
@@ -411,6 +584,8 @@ class CoverageStore:
                         stderr_path.as_posix(),
                         json.dumps(summary),
                         json.dumps(artifact_paths),
+                        queued_at,
+                        max(queue_duration_ms, 0),
                     ],
                 )
                 if artifact_paths:
@@ -429,22 +604,69 @@ class CoverageStore:
                             for artifact in artifact_paths
                         ],
                     )
+                self._conn.execute("DELETE FROM run_jobs WHERE id = ?", [run_id])
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-        return self.run_result(run_id, max_summary_lines=max_summary_lines)
+
+    def _mark_job_error(self, run_id: str, exc: Exception) -> None:
+        message = f"{type(exc).__name__}: {exc}"
+        ended_at = utcnow()
+        with suppress(OSError):
+            job = self._run_job(run_id)
+            if job is not None:
+                with Path(job["stderr_path"]).open("a", encoding="utf-8", errors="replace") as stderr:
+                    stderr.write(f"\nRun worker failed: {message}\n")
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE run_jobs
+                SET status = 'internal_error', ended_at = ?, error = ?
+                WHERE id = ?
+                """,
+                [ended_at, message, run_id],
+            )
+
+    def _recover_run_jobs(self) -> list[str]:
+        recovered_at = utcnow()
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE run_jobs
+                SET status = 'interrupted', ended_at = ?,
+                    error = 'Coverage MCP restarted while this command was running.'
+                WHERE status = 'running'
+                """,
+                [recovered_at],
+            )
+            rows = self._conn.execute("SELECT id FROM run_jobs WHERE status = 'queued' ORDER BY queued_at").fetchall()
+        return [str(row[0]) for row in rows]
 
     def run_result(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
-        run = self.run(run_id)
-        run["parsed_summary"] = summarize_run_logs(
-            stdout_path=Path(run["stdout_path"]),
-            stderr_path=Path(run["stderr_path"]),
-            exit_code=run["exit_code"],
-            status=run["status"],
-            duration_ms=run["duration_ms"],
-            max_summary_lines=max(max_summary_lines, 1),
-        )
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM runs WHERE id = ?", [run_id]).fetchone()
+            if row is not None:
+                columns = [column[0] for column in self._conn.description]
+                run = self._run_from_row(columns, row)
+            else:
+                row = self._conn.execute("SELECT * FROM run_jobs WHERE id = ?", [run_id]).fetchone()
+                if row is None:
+                    raise KeyError(f"run not found: {run_id}")
+                columns = [column[0] for column in self._conn.description]
+                job = self._serialize(row_dict(columns, row))
+                run = None
+        if run is None:
+            return self._job_response(job, max_summary_lines=max_summary_lines)
+        summary = dict(run["parsed_summary"])
+        excerpts = summary.get("excerpts")
+        if isinstance(excerpts, list):
+            limit = max(max_summary_lines, 1)
+            summary["excerpts"] = excerpts[:limit]
+            summary["truncated"] = bool(summary.get("truncated") or len(excerpts) > limit)
+        run["parsed_summary"] = summary
+        run["terminal"] = True
+        run["poll_after_ms"] = None
         return run
 
     def run(self, run_id: str) -> dict[str, Any]:
@@ -456,6 +678,7 @@ class CoverageStore:
         return self._run_from_row(columns, row)
 
     def latest_run(self, command_ref: str | None = None) -> dict[str, Any] | None:
+        job = self._latest_run_job(command_ref)
         args: list[Any] = []
         where = ""
         if command_ref:
@@ -480,9 +703,111 @@ class CoverageStore:
                 args,
             ).fetchone()
             if row is None:
+                return job
+            columns = [column[0] for column in self._conn.description]
+        completed = self._run_from_row(columns, row)
+        if job is not None and str(job["queued_at"]) > str(completed["started_at"]):
+            return job
+        return completed
+
+    def _latest_run_job(self, command_ref: str | None) -> dict[str, Any] | None:
+        args: list[Any] = []
+        where = ""
+        if command_ref:
+            try:
+                command = self.registered_command(command_ref)
+            except KeyError:
+                command = None
+            if command:
+                where = "WHERE command_id = ?"
+                args.append(command["id"])
+            else:
+                where = "WHERE command_name = ?"
+                args.append(command_ref)
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT * FROM run_jobs
+                {where}
+                ORDER BY queued_at DESC
+                LIMIT 1
+                """,
+                args,
+            ).fetchone()
+            if row is None:
                 return None
             columns = [column[0] for column in self._conn.description]
-        return self._run_from_row(columns, row)
+        return self._job_from_row(columns, row)
+
+    def _run_job(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM run_jobs WHERE id = ?", [run_id]).fetchone()
+            if row is None:
+                return None
+            columns = [column[0] for column in self._conn.description]
+        return self._serialize(row_dict(columns, row))
+
+    def _job_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
+        return self._job_response(self._serialize(row_dict(columns, row)))
+
+    def _job_response(self, job: dict[str, Any], *, max_summary_lines: int | None = None) -> dict[str, Any]:
+        status = str(job["status"])
+        terminal = status not in {"queued", "running"}
+        started_at = parse_datetime(job.get("started_at"))
+        queued_at = parse_datetime(job.get("queued_at"))
+        ended_at = parse_datetime(job.get("ended_at"))
+        now = utcnow()
+        duration_ms = int(((ended_at or now) - (started_at or queued_at or now)).total_seconds() * 1000)
+        result = {
+            **job,
+            "duration_ms": max(duration_ms, 0),
+            "exit_code": None,
+            "artifact_paths": [],
+            "terminal": terminal,
+            "poll_after_ms": None if terminal else 1000,
+            "execution_mode": "background",
+        }
+        if terminal:
+            result["parsed_summary"] = summarize_run_logs(
+                stdout_path=Path(job["stdout_path"]),
+                stderr_path=Path(job["stderr_path"]),
+                exit_code=None,
+                status=status,
+                duration_ms=result["duration_ms"],
+                max_summary_lines=max(max_summary_lines or job["max_summary_lines"], 1),
+            )
+        else:
+            result["parsed_summary"] = {
+                "status": status,
+                "exit_code": None,
+                "duration_ms": result["duration_ms"],
+                "stdout_line_count": None,
+                "stderr_line_count": None,
+                "counters": {},
+                "excerpts": [],
+                "truncated": False,
+                "stdout_path": job["stdout_path"],
+                "stderr_path": job["stderr_path"],
+                "summary_deferred": True,
+            }
+        if status == "queued":
+            with self._lock:
+                position = self._conn.execute(
+                    """
+                    SELECT count(*) FROM run_jobs
+                    WHERE status = 'queued' AND queued_at <= ?
+                    """,
+                    [job["queued_at"]],
+                ).fetchone()
+            result["queue_position"] = int(position[0]) if position else 1
+            self._with_relative_age(result, "queued_at", prefix="queued")
+        elif status == "running":
+            result["queue_position"] = 0
+            self._with_relative_age(result, "started_at", prefix="running")
+        else:
+            result["queue_position"] = None
+            self._with_relative_age(result, "ended_at")
+        return self._with_topology(result)
 
     def latest_artifact(self, *, command_ref: str | None = None, kind: str) -> dict[str, Any] | None:
         args: list[Any] = [kind]
@@ -533,7 +858,7 @@ class CoverageStore:
             command = self.registered_command(object_ref)
             return {"object_kind": "registered_command", "object_ref": object_ref, "topology": command["topology"]}
         if kind == "run":
-            run = self.run(object_ref)
+            run = self.run_result(object_ref)
             return {"object_kind": "run", "object_ref": object_ref, "topology": run["topology"]}
         if kind in {"snapshot", "coverage_snapshot"}:
             snapshot = self.snapshot(object_ref)
@@ -1579,6 +1904,10 @@ class CoverageStore:
         run = self._with_topology(
             self._decode_json_fields(row_dict(columns, row), ["parsed_summary", "artifact_paths"])
         )
+        run["terminal"] = True
+        run["poll_after_ms"] = None
+        run["queue_position"] = None
+        run["execution_mode"] = "background"
         return self._with_relative_age(run, "ended_at")
 
     def _worktree_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
@@ -1638,6 +1967,17 @@ def relative_age(
     *,
     now: datetime | None = None,
 ) -> tuple[int, str] | None:
+    timestamp = parse_datetime(value)
+    if timestamp is None:
+        return None
+    current = now or utcnow()
+    if current.tzinfo is not None:
+        current = current.astimezone(UTC).replace(tzinfo=None)
+    seconds = max(0, int((current - timestamp).total_seconds()))
+    return seconds, format_age(seconds)
+
+
+def parse_datetime(value: datetime | str | None) -> datetime | None:
     if value is None:
         return None
     timestamp = value
@@ -1649,12 +1989,8 @@ def relative_age(
         except ValueError:
             return None
     if timestamp.tzinfo is not None:
-        timestamp = timestamp.astimezone(UTC).replace(tzinfo=None)
-    current = now or utcnow()
-    if current.tzinfo is not None:
-        current = current.astimezone(UTC).replace(tzinfo=None)
-    seconds = max(0, int((current - timestamp).total_seconds()))
-    return seconds, format_age(seconds)
+        return timestamp.astimezone(UTC).replace(tzinfo=None)
+    return timestamp
 
 
 def format_age(seconds: int) -> str:

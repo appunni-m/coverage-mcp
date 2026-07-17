@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -392,7 +393,7 @@ def test_storage_insights_source_and_worktree_latest_paths(tmp_path):
 
 def test_run_latest_fallbacks_and_missing_artifacts(tmp_path):
     script = tmp_path / "run.py"
-    script.write_text("print('1 passed')\n", encoding="utf-8")
+    script.write_text("import time\ntime.sleep(0.1)\nprint('1 passed')\n", encoding="utf-8")
     store = CoverageStore(tmp_path / "coverage.duckdb")
     try:
         command = store.register_command(
@@ -407,13 +408,95 @@ def test_run_latest_fallbacks_and_missing_artifacts(tmp_path):
             approval_note="approved run fallback command",
         )
         run = store.run_command_profiled(command["name"])
+        assert store.run(run["id"])["id"] == run["id"]
+        with pytest.raises(KeyError, match="run not found"):
+            store.run("missing")
         assert store.latest_run()["id"] == run["id"]
         assert store.latest_run(command_ref="suite")["id"] == run["id"]
         assert store.latest_run(command_ref="unknown") is None
+        pending = store.submit_command_profiled(command["id"])
+        assert store.latest_run()["id"] == pending["id"]
+        assert store.latest_run(command_ref="suite")["id"] == pending["id"]
+        store.wait_for_run(pending["id"])
+        assert store._run_job("missing") is None
+        store._execute_run_job("missing")
         artifact = store.latest_artifact(command_ref="suite", kind="missing")
         assert artifact is not None
         assert artifact["exists"] is False
         assert store.latest_artifact(command_ref="unknown", kind="missing") is None
+    finally:
+        store.close()
+
+
+def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_path):
+    db_path = tmp_path / "coverage.duckdb"
+    store = CoverageStore(db_path)
+    command = store.register_command(
+        name="recoverable-suite",
+        command=f"{sys.executable} -c 'import time; time.sleep(0.1); print(\"1 passed\")'",
+        cwd=tmp_path.as_posix(),
+        human_approved=True,
+        approved_by="tester",
+        approval_note="approved queue recovery test",
+    )
+    active = store.submit_command_profiled(command["id"])
+    for _ in range(100):
+        active = store.run_result(active["id"])
+        if active["status"] == "running":
+            break
+        time.sleep(0.01)
+    assert active["status"] == "running"
+    interrupted = store.submit_command_profiled(command["id"])
+    pending = store.submit_command_profiled(command["id"])
+    store.close()
+
+    with pytest.raises(RuntimeError, match="shutting down"):
+        store.submit_command_profiled(command["id"])
+
+    conn = duckdb.connect(db_path.as_posix())
+    conn.execute(
+        "UPDATE run_jobs SET status = 'running', started_at = ? WHERE id = ?",
+        [datetime.now(UTC), interrupted["id"]],
+    )
+    conn.close()
+
+    recovered = CoverageStore(db_path)
+    try:
+        interrupted_result = recovered.run_result(interrupted["id"])
+        pending_result = recovered.wait_for_run(pending["id"])
+        active_result = recovered.run_result(active["id"])
+
+        assert interrupted_result["status"] == "interrupted"
+        assert interrupted_result["terminal"] is True
+        assert interrupted_result["queue_position"] is None
+        assert "restarted" in interrupted_result["error"]
+        assert pending_result["status"] == "passed"
+        assert pending_result["terminal"] is True
+        assert pending_result["queue_duration_ms"] >= 0
+        assert active_result["status"] == "passed"
+        assert recovered.list_run_queue() == []
+    finally:
+        recovered.close()
+
+
+def test_run_execution_error_is_recorded_without_killing_worker(tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        command = store.register_command(
+            name="missing-shell",
+            command="echo unreachable",
+            cwd=tmp_path.as_posix(),
+            shell=(tmp_path / "missing-shell").as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved execution failure test",
+        )
+
+        result = store.run_command_profiled(command["id"])
+
+        assert result["status"] == "failed"
+        assert result["exit_code"] is None
+        assert "FileNotFoundError" in result["parsed_summary"]["execution_error"]
     finally:
         store.close()
 
@@ -434,6 +517,7 @@ def test_log_summary_and_topology_helpers(tmp_path):
     assert format_age(90061) == "1 day 1 hour 1 minute 1 second ago"
     now = datetime(2026, 7, 16, 15, 0, tzinfo=UTC)
     assert relative_age(now - timedelta(seconds=603), now=now) == (603, "10 minutes 3 seconds ago")
+    assert relative_age(datetime(2026, 7, 16, 14, 59, 57), now=now) == (3, "3 seconds ago")
     assert relative_age(now + timedelta(seconds=3), now=now) == (0, "0 seconds ago")
     assert relative_age("invalid", now=now) is None
     assert relative_age(None, now=now) is None
@@ -582,6 +666,30 @@ def test_existing_schema_migration(tmp_path):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE runs (
+            id VARCHAR PRIMARY KEY,
+            command_id VARCHAR NOT NULL,
+            command_name VARCHAR NOT NULL,
+            command VARCHAR NOT NULL,
+            cwd VARCHAR NOT NULL,
+            repo_path VARCHAR NOT NULL,
+            repo_key VARCHAR NOT NULL,
+            branch VARCHAR,
+            commit_sha VARCHAR,
+            started_at TIMESTAMP NOT NULL,
+            ended_at TIMESTAMP NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            exit_code INTEGER,
+            status VARCHAR NOT NULL,
+            stdout_path VARCHAR NOT NULL,
+            stderr_path VARCHAR NOT NULL,
+            parsed_summary VARCHAR NOT NULL,
+            artifact_paths VARCHAR NOT NULL
+        )
+        """
+    )
     conn.close()
     store = CoverageStore(db)
     try:
@@ -591,6 +699,9 @@ def test_existing_schema_migration(tmp_path):
         file_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('files')").fetchall()}
         assert {"total_regions", "covered_regions", "region_rate"} <= snapshot_columns
         assert {"total_regions", "covered_regions", "region_rate"} <= file_columns
+        run_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('runs')").fetchall()}
+        assert {"queued_at", "queue_duration_ms"} <= run_columns
+        assert store._conn.execute("SELECT count(*) FROM run_jobs").fetchone() == (0,)
     finally:
         store.close()
 
@@ -617,7 +728,7 @@ def test_index_creation_failures_do_not_block_schema_init():
 
     CoverageStore._init_schema(store)
 
-    assert store._conn.index_failures == 8
+    assert store._conn.index_failures == 9
 
 
 def test_git_metadata_is_captured_for_registered_commands(tmp_path):

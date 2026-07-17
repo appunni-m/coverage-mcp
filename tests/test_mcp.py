@@ -19,6 +19,20 @@ def structured(payload):
     return value["result"] if isinstance(value, dict) and set(value) == {"result"} else value
 
 
+async def completed_run(mcp, run_id, max_summary_lines=80):
+    for _ in range(200):
+        result = structured(
+            await mcp.call_tool(
+                "run_result",
+                {"run_id": run_id, "max_summary_lines": max_summary_lines},
+            )
+        )
+        if result["terminal"]:
+            return result
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"run did not complete: {run_id}")
+
+
 def test_mcp_tools_ingest_summarize_and_drill_down(tmp_path):
     report = tmp_path / "lcov.info"
     report.write_text(
@@ -42,6 +56,7 @@ end_of_record
                 "register_test_command",
                 "list_registered_commands",
                 "run_command_profiled",
+                "run_queue",
                 "run_result",
                 "latest_run",
                 "object_topology",
@@ -135,6 +150,11 @@ sys.exit(1)
                     {"command_ref": command["id"], "max_summary_lines": 2},
                 )
             )
+            assert run["status"] in {"queued", "running"}
+            assert run["terminal"] is False
+            assert run["poll_after_ms"] == 1000
+            assert run["parsed_summary"]["summary_deferred"] is True
+            run = await completed_run(mcp, run["id"], max_summary_lines=2)
             result = structured(await mcp.call_tool("run_result", {"run_id": run["id"], "max_summary_lines": 1}))
             latest_run = structured(
                 await mcp.call_tool(
@@ -191,21 +211,15 @@ def test_mcp_remains_responsive_while_registered_command_runs(tmp_path):
 
         async def scenario():
             started = asyncio.get_running_loop().time()
-            run_task = asyncio.create_task(
-                mcp.call_tool(
-                    "run_command_profiled",
-                    {"command_ref": command["id"]},
-                )
-            )
-            queued_run_task = asyncio.create_task(
-                mcp.call_tool(
-                    "run_command_profiled",
-                    {"command_ref": command["id"]},
-                )
-            )
-            await asyncio.sleep(0.05)
+            first = structured(await mcp.call_tool("run_command_profiled", {"command_ref": command["id"]}))
+            second = structured(await mcp.call_tool("run_command_profiled", {"command_ref": command["id"]}))
 
             assert asyncio.get_running_loop().time() - started < 0.3
+            assert first["terminal"] is False
+            assert second["terminal"] is False
+            queue = structured(await mcp.call_tool("run_queue", {"limit": 5}))
+            assert {item["id"] for item in queue} == {first["id"], second["id"]}
+            assert sum(item["status"] == "running" for item in queue) <= 1
             commands = structured(
                 await asyncio.wait_for(
                     mcp.call_tool("list_registered_commands", {"limit": 1}),
@@ -213,14 +227,13 @@ def test_mcp_remains_responsive_while_registered_command_runs(tmp_path):
                 )
             )
             assert commands[0]["id"] == command["id"]
-            assert not run_task.done()
-            assert not queued_run_task.done()
-
-            run_result = structured(await run_task)
-            assert run_result["status"] == "passed"
-            assert not queued_run_task.done()
-            queued_run_result = structured(await queued_run_task)
-            assert queued_run_result["status"] == "passed"
+            first_result, second_result = await asyncio.gather(
+                completed_run(mcp, first["id"]),
+                completed_run(mcp, second["id"]),
+            )
+            assert first_result["status"] == "passed"
+            assert second_result["status"] == "passed"
+            assert first_result["ended_at"] <= second_result["started_at"]
 
         run(scenario())
     finally:

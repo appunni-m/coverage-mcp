@@ -21,7 +21,7 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
 
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     with TestClient(app) as client:
-        assert client.get("/health").json()["version"] == "0.1.3"
+        assert client.get("/health").json()["version"] == "0.2.0"
         assert client.get("/api/snapshots/latest").status_code == 404
         assert client.get("/api/artifacts/latest?kind=missing").status_code == 404
         assert client.get("/api/runs/latest").status_code == 404
@@ -148,7 +148,7 @@ def test_rest_run_errors_and_timeout(tmp_path):
         ).json()
         run = client.post(
             "/api/runs/profiled",
-            json={"command_ref": command["id"], "timeout_seconds": 1, "max_summary_lines": 5},
+            json={"command_ref": command["id"], "timeout_seconds": 1, "max_summary_lines": 5, "wait": True},
         ).json()
         assert run["status"] == "timeout"
         assert client.get(f"/api/runs/{run['id']}?max_summary_lines=1").json()["id"] == run["id"]

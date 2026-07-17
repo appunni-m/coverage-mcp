@@ -60,6 +60,7 @@ class RunCommandRequest(BaseModel):
     command_ref: str
     max_summary_lines: int = Field(default=80, ge=1, le=500)
     timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
+    wait: bool = False
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -169,13 +170,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/runs/profiled")
     def run_profiled(request: RunCommandRequest) -> dict[str, Any]:
         try:
-            return store.run_command_profiled(
+            runner = store.run_command_profiled if request.wait else store.submit_command_profiled
+            return runner(
                 request.command_ref,
                 max_summary_lines=request.max_summary_lines,
                 timeout_seconds=request.timeout_seconds,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
+
+    @app.get("/api/runs/queue")
+    def run_queue(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
+        return store.list_run_queue(limit=limit)
 
     @app.get("/api/runs/latest")
     def latest_run(command_ref: str | None = None) -> dict[str, Any]:
@@ -423,14 +429,21 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         command_ref: str,
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
+        wait: bool = False,
     ) -> dict[str, Any]:
-        """Run an approved registered command and return a bounded profiled summary."""
+        """Queue an approved command and return immediately; set wait=true for the final result."""
+        runner = store.run_command_profiled if wait else store.submit_command_profiled
         return await asyncio.to_thread(
-            store.run_command_profiled,
+            runner,
             command_ref,
             max_summary_lines=max_summary_lines,
             timeout_seconds=timeout_seconds,
         )
+
+    @mcp.tool()
+    async def run_queue(limit: int = 100) -> list[dict[str, Any]]:
+        """List running and queued approved commands in FIFO execution order."""
+        return await asyncio.to_thread(store.list_run_queue, limit=limit)
 
     @mcp.tool()
     async def run_result(run_id: str, max_summary_lines: int = 80) -> dict[str, Any]:

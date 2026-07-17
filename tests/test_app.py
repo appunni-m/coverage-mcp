@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import time
 
 from fastapi.testclient import TestClient
 
@@ -113,6 +114,14 @@ print("1 passed")
         )
         assert response.status_code == 200
         run = response.json()
+        assert run["status"] in {"queued", "running"}
+        assert run["terminal"] is False
+        assert client.get("/api/runs/queue").json()
+        for _ in range(100):
+            run = client.get(f"/api/runs/{run['id']}?max_summary_lines=5").json()
+            if run["terminal"]:
+                break
+            time.sleep(0.02)
         assert run["status"] == "passed"
         assert run["topology"]["command"]["id"] == command["id"]
         assert run["parsed_summary"]["counters"]["passed"] == 1

@@ -239,8 +239,9 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
   `COVERAGE_MCP_DB` to a worktree-local path.
 - Register a new worktree once with `register_worktree(path, base_ref, name)` before its first coverage run. Keep the
   returned `worktree_id`; its frozen baseline defines the lineage for that worktree.
-- Run tests through an existing human-approved command with `run_command_profiled`. If no approved command exists,
-  ask for explicit approval before registering one.
+- Run tests through an existing human-approved command with `run_command_profiled`. Record the returned run id and
+  poll `run_result` no faster than `poll_after_ms`; never submit a second run because the first is still queued or
+  running. If no approved command exists, ask for explicit approval before registering one.
 - Ingest generated coverage with the actual worktree path as `repo_path`, its branch/commit, and a stable suite name.
 - Use `worktree_progress(worktree_id, suite)` or `compare_to_baseline(worktree_id=...)` to report whether line, branch,
   function, and region coverage improved. Do not compare one worktree's snapshots to another worktree.
@@ -291,7 +292,17 @@ After that, agents run only the registered command id or name:
 run_command_profiled(command_ref="condition", max_summary_lines=80)
 ```
 
-Each run is stored as an immutable ledger record:
+Submission returns immediately with a durable run id and `status` set to `queued` or `running`. Poll that id until
+`terminal` is true:
+
+```text
+run_result(run_id="returned-run-id", max_summary_lines=80)
+```
+
+Use `run_queue()` to inspect FIFO position. Set `wait=true` only for a command known to finish quickly; the default
+background mode keeps the MCP call responsive during long suites.
+
+Each completed run is stored as an immutable ledger record:
 
 - exact command
 - cwd
@@ -303,11 +314,14 @@ Each run is stored as an immutable ledger record:
 - bounded parsed summary
 - registered artifact paths
 
-The MCP response does not return full raw logs by default. It returns a bounded summary and tells you where the full logs are stored.
-Managed commands run outside the MCP event loop, so dashboards, health checks,
-coverage insights, and other agents remain responsive during long test suites.
-The server serializes managed commands to avoid running multiple expensive
-suites concurrently.
+The MCP response does not return full raw logs by default. It returns a bounded summary and tells you where the full
+logs are stored. While a run is active, polling is constant-time and defers log parsing until completion.
+
+Managed commands run outside the MCP event loop. One local worker executes them in FIFO order, so dashboards, health
+checks, coverage insights, and other agents remain responsive without running several expensive suites concurrently.
+Queued jobs survive a clean restart and resume from the same DuckDB. Graceful shutdown lets the current command
+finish. If the server exits unexpectedly during a command, restart recovery preserves that run as `interrupted`
+instead of rerunning it automatically.
 
 ## Object Topology
 
@@ -385,15 +399,29 @@ list_registered_commands(limit=50)
 
 ### `run_command_profiled`
 
-Runs a registered command and returns a bounded profile.
+Queues a registered command and immediately returns its durable run id.
 
 ```text
 run_command_profiled(command_ref="unit", max_summary_lines=80)
 ```
 
-The response includes pass/fail, exit code, duration, key counters, selected error/tail excerpts, full log paths, and artifact paths.
-It also includes the exact completion time plus freshness fields such as
-`age_seconds: 603` and `age: "10 minutes 3 seconds ago"`.
+The normal response has `status: "queued"` or `status: "running"`, `terminal: false`, `queue_position`, and
+`poll_after_ms`. Save the run id and poll `run_result`; do not call `run_command_profiled` again for the same intended
+run. Use `wait=true` only for a command known to be short when a single blocking call is explicitly useful.
+
+Once complete, the response includes pass/fail, exit code, execution and queue duration, key counters, selected
+error/tail excerpts, full log paths, and artifact paths. It also includes the exact completion time plus freshness
+fields such as `age_seconds: 603` and `age: "10 minutes 3 seconds ago"`.
+
+### `run_queue`
+
+Lists the currently running command followed by queued commands in FIFO order.
+
+```text
+run_queue(limit=50)
+```
+
+There is at most one running command per server. `queue_position: 0` means running; positive positions are waiting.
 
 ### `latest_run`
 
@@ -408,11 +436,15 @@ clear whether the previous result is fresh enough for the current task.
 
 ### `run_result`
 
-Returns a bounded summary for a previous run.
+Returns current status or a bounded final summary for a submitted run.
 
 ```text
 run_result(run_id="...", max_summary_lines=80)
 ```
+
+Poll no faster than the returned `poll_after_ms`. Active responses intentionally defer log scanning and expose the
+full log paths. Stop polling when `terminal` is true. Terminal statuses are `passed`, `failed`, `timeout`,
+`interrupted`, and `internal_error`.
 
 ### `latest_artifact`
 
@@ -640,6 +672,7 @@ Useful endpoints:
 - `GET /api/commands`
 - `GET /api/commands/{command_ref}`
 - `POST /api/runs/profiled`
+- `GET /api/runs/queue`
 - `GET /api/runs/latest`
 - `GET /api/runs/{run_id}`
 - `GET /api/artifacts/latest`
@@ -670,11 +703,14 @@ Snapshots are immutable. Each ingest creates a new snapshot with:
 - normalized line records
 - line, branch, function, and region totals when supplied by the report format
 
-Registered commands and runs are immutable too. Changing a command means registering a new approved command record. Run stdout/stderr are written under the database directory's `runs/` folder, and the database stores the paths plus bounded parsed summaries.
+Registered commands and completed runs are immutable too. Changing a command means registering a new approved command
+record. Mutable queue state is stored separately until a run reaches a terminal state. Run stdout/stderr are written
+under the database directory's `runs/` folder, and the database stores the paths plus bounded parsed summaries.
 
 Topology is derived, not separately stored. The same immutable rows power both direct object responses and `object_topology`.
 
-DuckDB is used because this is local-first and query-heavy. There is no background daemon or external time-series database.
+DuckDB is used because this is local-first and query-heavy. A lightweight in-process worker drains the durable command
+queue; there is no broker or external time-series database.
 
 ## Test Coverage
 

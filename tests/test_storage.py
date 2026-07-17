@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -229,6 +230,11 @@ sys.exit(2)
         assert run["parsed_summary"]["stderr_line_count"] == 1
         assert len(run["parsed_summary"]["excerpts"]) <= 3
         assert any("FAILED" in item["text"] for item in run["parsed_summary"]["excerpts"])
+        Path(run["stdout_path"]).unlink()
+        Path(run["stderr_path"]).unlink()
+        bounded = store.run_result(run["id"], max_summary_lines=1)
+        assert bounded["parsed_summary"]["stdout_line_count"] == 30
+        assert len(bounded["parsed_summary"]["excerpts"]) == 1
     finally:
         store.close()
 
