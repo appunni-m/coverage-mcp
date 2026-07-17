@@ -15,7 +15,7 @@ It runs locally, stores coverage snapshots in DuckDB, exposes a dashboard, and p
 | Dashboard | `http://127.0.0.1:59471/` |
 | MCP endpoint | `http://127.0.0.1:59471/mcp/` |
 | Database | `<shared-git-root>/.coverage-mcp/coverage.duckdb` |
-| Run concurrency | One managed command at a time, FIFO |
+| Run concurrency | Four managed commands, FIFO assignment |
 | Run retention | Newest 100 terminal runs per registered command |
 
 ## What Problem It Solves
@@ -142,8 +142,13 @@ Override host, port, or DB:
 COVERAGE_MCP_HOST=127.0.0.1 \
 COVERAGE_MCP_PORT=8765 \
 COVERAGE_MCP_DB=/path/to/coverage.duckdb \
+COVERAGE_MCP_RUN_CONCURRENCY=4 \
 coverage-mcp
 ```
+
+`COVERAGE_MCP_RUN_CONCURRENCY` accepts 1-32 workers and defaults to `4`. Use
+`1` for suites that share non-isolated build outputs and cannot safely overlap.
+The active value is returned by `/health`.
 
 Retain more or fewer terminal test runs per approved command:
 
@@ -160,7 +165,7 @@ The `testing` plugin in
 agent instructions for approved test runs, bounded summaries, artifact ingestion, and worktree comparisons.
 
 The plugin expects Coverage MCP at `http://127.0.0.1:59471/mcp/`. Start the server before opening a new agent session.
-The current plugin compatibility declaration requires Coverage MCP `>=0.3.3,<0.4.0`.
+The current plugin compatibility declaration requires Coverage MCP `>=0.3.4,<0.4.0`.
 
 The plugin installs only:
 
@@ -413,11 +418,12 @@ Each completed run is stored as an immutable ledger record:
 The MCP response does not return full raw logs by default. It returns a bounded summary and tells you where the full
 logs are stored. While a run is active, polling is constant-time and defers log parsing until completion.
 
-Managed commands run outside the MCP event loop. One local worker executes them in FIFO order, so dashboards, health
-checks, coverage insights, and other agents remain responsive without running several expensive suites concurrently.
-A graceful shutdown waits for work already accepted by the worker; check `run_queue` before restarting when a prompt
-restart matters. After an unexpected process exit, the active run is preserved as `interrupted` and queued runs
-resume from the same DuckDB rather than being submitted again.
+Managed commands run outside the MCP event loop. Four local workers claim jobs in FIFO order by default, so dashboards,
+health checks, coverage insights, and other agents remain responsive while independent suites run concurrently. Queue
+ETA models the worker lanes instead of summing every earlier job as serial work. DuckDB operations remain internally
+serialized. A graceful shutdown waits for accepted work; check `run_queue` before restarting when a prompt restart
+matters. After an unexpected process exit, active runs are preserved as `interrupted` and queued runs resume from the
+same DuckDB rather than being submitted again.
 
 Every command starts in its own process group. `cancel_run` and command timeouts signal the entire group, then escalate
 from `SIGTERM` to `SIGKILL` after two seconds if processes remain. This prevents child test processes from continuing
@@ -538,7 +544,7 @@ register_test_command(
 
 ### `run_command_profiled`
 
-`run_command_profiled(command_ref, max_summary_lines = 80, timeout_seconds = null, idempotency_key = null, wait = false)` submits an approved command to the single FIFO worker.
+`run_command_profiled(command_ref, max_summary_lines = 80, timeout_seconds = null, idempotency_key = null, wait = false)` submits an approved command to the bounded FIFO worker pool.
 
 **Inputs:** `command_ref` is a registration ID or name; `max_summary_lines` is 1-500; `timeout_seconds` is null or 1-86400; `idempotency_key` is null or a 1-200 character key scoped to that command; `wait` blocks until terminal only when true.
 
@@ -552,7 +558,7 @@ register_test_command(
 
 **Inputs:** `limit` is 1-1000.
 
-**Returns:** The running run first with `queue_position: 0`, followed by queued runs with positive positions, polling guidance, and ETA. If history is insufficient, `eta_unavailable_reason` explains why.
+**Returns:** Running runs first with `queue_position: 0`, followed by queued runs with positive positions, polling guidance, and lane-aware ETA. If history is insufficient, `eta_unavailable_reason` explains why.
 
 **Errors:** Schema validation errors only; an idle worker returns an empty list.
 
@@ -868,7 +874,7 @@ run retention can remove the run linkage but does not delete coverage history.
 
 Topology is derived, not separately stored. The same immutable rows power both direct object responses and `object_topology`.
 
-DuckDB is used because this is local-first and query-heavy. A lightweight in-process worker drains the durable command
+DuckDB is used because this is local-first and query-heavy. A bounded in-process worker pool drains the durable command
 queue; there is no broker or external time-series database.
 
 ## Test Coverage

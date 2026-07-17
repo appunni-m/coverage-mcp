@@ -89,7 +89,7 @@ from coverage_mcp.contracts import (
     WorktreeResult,
 )
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.storage import DEFAULT_RUN_RETENTION, CoverageStore
+from coverage_mcp.storage import DEFAULT_RUN_CONCURRENCY, DEFAULT_RUN_RETENTION, CoverageStore
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
@@ -151,9 +151,11 @@ class RunCommandRequest(BaseModel):
 
 def create_app(db_path: str | None = None) -> FastAPI:
     run_retention = int(os.environ.get("COVERAGE_MCP_RUN_RETENTION", DEFAULT_RUN_RETENTION))
+    run_concurrency = int(os.environ.get("COVERAGE_MCP_RUN_CONCURRENCY", DEFAULT_RUN_CONCURRENCY))
     store = CoverageStore(
         db_path or os.environ.get("COVERAGE_MCP_DB", default_db_path()),
         run_retention=run_retention,
+        run_concurrency=run_concurrency,
     )
     mcp = create_mcp(store)
     mcp_app = mcp.streamable_http_app()
@@ -185,6 +187,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "version": __version__,
             "db_path": store.db_path.as_posix(),
             "run_retention": store.run_retention,
+            "run_concurrency": store.run_concurrency,
         }
 
     @app.post("/api/ingest")
@@ -562,7 +565,7 @@ def create_mcp(store: CoverageStore) -> FastMCP:
 
     @mcp.tool()
     async def run_queue(limit: ResultLimit = 100) -> RunQueueResults:
-        """List the running job followed by queued jobs with position and historical ETA."""
+        """List running jobs followed by queued jobs with position and lane-aware historical ETA."""
         runs = await asyncio.to_thread(store.list_run_queue, limit=limit)
         return validated_outputs(RunResult, runs)
 

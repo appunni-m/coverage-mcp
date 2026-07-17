@@ -554,9 +554,13 @@ def test_mcp_remains_responsive_while_registered_command_runs(tmp_path):
             assert asyncio.get_running_loop().time() - started < 0.3
             assert first["terminal"] is False
             assert second["terminal"] is False
-            queue = structured(await mcp.call_tool("run_queue", {"limit": 5}))
+            for _ in range(100):
+                queue = structured(await mcp.call_tool("run_queue", {"limit": 5}))
+                if sum(item["status"] == "running" for item in queue) == 2:
+                    break
+                await asyncio.sleep(0.01)
             assert {item["id"] for item in queue} == {first["id"], second["id"]}
-            assert sum(item["status"] == "running" for item in queue) <= 1
+            assert sum(item["status"] == "running" for item in queue) == 2
             commands = structured(
                 await asyncio.wait_for(
                     mcp.call_tool("list_registered_commands", {"limit": 1}),
@@ -570,7 +574,9 @@ def test_mcp_remains_responsive_while_registered_command_runs(tmp_path):
             )
             assert first_result["status"] == "passed"
             assert second_result["status"] == "passed"
-            assert first_result["ended_at"] <= second_result["started_at"]
+            assert max(first_result["started_at"], second_result["started_at"]) < min(
+                first_result["ended_at"], second_result["ended_at"]
+            )
 
         run(scenario())
     finally:

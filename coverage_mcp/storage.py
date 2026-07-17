@@ -25,6 +25,8 @@ from coverage_mcp.models import CoverageReport
 from coverage_mcp.parsers import parse_coverage_report
 
 DEFAULT_RUN_RETENTION = 100
+DEFAULT_RUN_CONCURRENCY = 4
+MAX_RUN_CONCURRENCY = 32
 COMMAND_DURATION_SAMPLE_LIMIT = 20
 
 
@@ -41,16 +43,25 @@ def minute_bucket(value: datetime) -> datetime:
 
 
 class CoverageStore:
-    def __init__(self, db_path: str | Path, *, run_retention: int = DEFAULT_RUN_RETENTION) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        run_retention: int = DEFAULT_RUN_RETENTION,
+        run_concurrency: int = DEFAULT_RUN_CONCURRENCY,
+    ) -> None:
         if run_retention < 1:
             raise ValueError("run_retention must be at least 1")
+        if not 1 <= run_concurrency <= MAX_RUN_CONCURRENCY:
+            raise ValueError(f"run_concurrency must be between 1 and {MAX_RUN_CONCURRENCY}")
         self.db_path = Path(db_path).expanduser()
         self.run_retention = run_retention
+        self.run_concurrency = run_concurrency
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.run_dir = self.db_path.parent / "runs"
         self._conn = duckdb.connect(self.db_path.as_posix())
         self._lock = threading.RLock()
-        self._run_lock = threading.Lock()
+        self._run_slots = threading.BoundedSemaphore(run_concurrency)
         self._process_lock = threading.RLock()
         self._active_processes: dict[str, subprocess.Popen[str]] = {}
         self._cancel_events: dict[str, threading.Event] = {}
@@ -60,20 +71,26 @@ class CoverageStore:
         queued_jobs = self._recover_run_jobs()
         self._prune_run_history()
         self._refresh_all_command_duration_stats()
-        self._worker = threading.Thread(
-            target=self._run_worker,
-            name="coverage-mcp-runner",
-            daemon=True,
-        )
-        self._worker.start()
+        self._workers = [
+            threading.Thread(
+                target=self._run_worker,
+                name=f"coverage-mcp-runner-{index + 1}",
+                daemon=True,
+            )
+            for index in range(run_concurrency)
+        ]
+        for worker in self._workers:
+            worker.start()
         for run_id in queued_jobs:
             self._cancel_event(run_id)
             self._job_queue.put(run_id)
 
     def close(self) -> None:
         self._closing.set()
-        self._job_queue.put(None)
-        self._worker.join()
+        for _worker in self._workers:
+            self._job_queue.put(None)
+        for worker in self._workers:
+            worker.join()
         with self._lock:
             self._conn.close()
 
@@ -641,7 +658,7 @@ class CoverageStore:
                 self._job_queue.task_done()
 
     def _execute_run_job(self, run_id: str) -> None:
-        with self._run_lock:
+        with self._run_slots:
             job = self._run_job(run_id)
             if job is None or job["status"] != "queued":
                 return
@@ -1210,22 +1227,47 @@ class CoverageStore:
                          j.queued_at, j.id
                 """
             ).fetchall()
-        wait_ms = 0
-        history_missing = False
+
+        lanes: list[int | None] = [0] * self.run_concurrency
+        running_lane = 0
+        schedule_uncertain = False
         for queued_id, status, started_at, estimate_ms in rows:
-            if str(queued_id) == run_id:
-                if history_missing:
-                    return None, "queue_history_incomplete"
-                return wait_ms, None
-            if estimate_ms is None:
-                history_missing = True
-                continue
-            remaining_ms = int(estimate_ms)
+            status = str(status)
             if status == "running":
-                started = parse_datetime(started_at)
-                elapsed_ms = int((now - (started or now)).total_seconds() * 1000)
-                remaining_ms = max(remaining_ms - elapsed_ms, 0)
-            wait_ms += remaining_ms
+                if running_lane >= len(lanes):
+                    schedule_uncertain = True
+                    continue
+                if estimate_ms is None:
+                    lanes[running_lane] = None
+                else:
+                    started = parse_datetime(started_at)
+                    elapsed_ms = int((now - (started or now)).total_seconds() * 1000)
+                    lanes[running_lane] = max(int(estimate_ms) - elapsed_ms, 0)
+                running_lane += 1
+                continue
+
+            if str(queued_id) == run_id:
+                if 0 in lanes:
+                    return 0, None
+                if schedule_uncertain or any(value is None for value in lanes):
+                    return None, "queue_history_incomplete"
+                return min(value for value in lanes if value is not None), None
+
+            if schedule_uncertain:
+                continue
+            idle_lane = next((index for index, value in enumerate(lanes) if value == 0), None)
+            if idle_lane is not None:
+                selected_lane = idle_lane
+            elif any(value is None for value in lanes):
+                schedule_uncertain = True
+                continue
+            else:
+                selected_lane = min((value, index) for index, value in enumerate(lanes) if value is not None)[1]
+            if estimate_ms is None:
+                lanes[selected_lane] = None
+            else:
+                current_wait = lanes[selected_lane]
+                lanes[selected_lane] = (current_wait or 0) + int(estimate_ms)
         return None, "run_state_changed"
 
     def _job_eta_fields(

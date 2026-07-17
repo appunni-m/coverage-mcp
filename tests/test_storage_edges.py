@@ -492,10 +492,10 @@ def test_managed_run_reports_stale_missing_and_invalid_coverage_artifacts(tmp_pa
 
 def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_path):
     db_path = tmp_path / "coverage.duckdb"
-    store = CoverageStore(db_path)
+    store = CoverageStore(db_path, run_concurrency=1)
     command = store.register_command(
         name="recoverable-suite",
-        command=f"{sys.executable} -c 'import time; time.sleep(0.1); print(\"1 passed\")'",
+        command=f"{sys.executable} -c 'import time; time.sleep(1); print(\"1 passed\")'",
         cwd=tmp_path.as_posix(),
         human_approved=True,
         approved_by="tester",
@@ -531,7 +531,7 @@ def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_pa
     )
     conn.close()
 
-    recovered = CoverageStore(db_path, run_retention=3)
+    recovered = CoverageStore(db_path, run_retention=3, run_concurrency=1)
     try:
         interrupted_result = recovered.run_result(interrupted["id"])
         pending_result = recovered.wait_for_run(pending["id"])
@@ -600,6 +600,10 @@ def test_run_retention_is_count_based_and_isolated_per_command(monkeypatch, tmp_
     db_path = tmp_path / "coverage.duckdb"
     with pytest.raises(ValueError, match="at least 1"):
         CoverageStore(db_path, run_retention=0)
+    with pytest.raises(ValueError, match="between 1 and 32"):
+        CoverageStore(db_path, run_concurrency=0)
+    with pytest.raises(ValueError, match="between 1 and 32"):
+        CoverageStore(db_path, run_concurrency=33)
 
     script = tmp_path / "run.py"
     script.write_text(
@@ -705,7 +709,7 @@ print("1 passed")
     for path in (primary_delay, secondary_delay, unknown_delay):
         path.write_text("0.001", encoding="utf-8")
 
-    store = CoverageStore(tmp_path / "coverage.duckdb")
+    store = CoverageStore(tmp_path / "coverage.duckdb", run_concurrency=1)
     try:
         primary = store.register_command(
             name="timed-primary",
@@ -810,6 +814,107 @@ print("1 passed")
         store.cancel_run(no_history["id"])
         store.wait_for_run(no_history["id"])
         assert store.registered_command(unknown["id"])["duration_sample_count"] == 0
+    finally:
+        store.close()
+
+
+def test_four_worker_pool_runs_in_parallel_and_estimates_by_lane(tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        command = store.register_command(
+            name="parallel-suite",
+            command=f"{sys.executable} -c 'import time; time.sleep(2)'",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved four-worker concurrency test",
+        )
+        store._conn.execute(
+            """
+            UPDATE registered_commands
+            SET duration_estimate_ms = 2000, duration_p90_ms = 2000,
+                duration_sample_count = 3, duration_stats_updated_at = ?
+            WHERE id = ?
+            """,
+            [datetime.now(UTC), command["id"]],
+        )
+
+        runs = [store.submit_command_profiled(command["id"], idempotency_key=f"parallel-{index}") for index in range(5)]
+        for _ in range(200):
+            queue = store.list_run_queue(limit=10)
+            if sum(item["status"] == "running" for item in queue) == 4:
+                break
+            time.sleep(0.01)
+
+        running = [item for item in queue if item["status"] == "running"]
+        queued = [item for item in queue if item["status"] == "queued"]
+        assert store.run_concurrency == 4
+        assert len(store._workers) == 4
+        assert len(running) == 4
+        assert len(queued) == 1
+        assert queued[0]["queue_position"] == 1
+        assert 0 <= queued[0]["queue_wait_estimate_seconds"] <= 2
+        assert queued[0]["eta_seconds"] <= 4
+
+        store.cancel_run(queued[0]["id"])
+        for item in running:
+            store.cancel_run(item["id"])
+        assert {store.wait_for_run(run["id"])["status"] for run in runs} == {"cancelled"}
+    finally:
+        store.close()
+
+
+def test_parallel_queue_eta_handles_lane_scheduling_edges(monkeypatch, tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb", run_concurrency=2)
+    now = datetime.now(UTC).replace(tzinfo=None)
+
+    class QueueRowsConnection:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def execute(self, _query):
+            return self
+
+        def fetchall(self):
+            return self.rows
+
+    def estimate(rows):
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_conn", QueueRowsConnection(rows))
+            return store._queue_wait_estimate_ms("target", now)
+
+    try:
+        assert estimate(
+            [
+                ("running-1", "running", now, 1000),
+                ("running-2", "running", now, 1000),
+                ("running-3", "running", now, 1000),
+                ("target", "queued", None, 500),
+            ]
+        ) == (None, "queue_history_incomplete")
+        assert estimate(
+            [
+                ("running", "running", now, 1000),
+                ("predecessor", "queued", None, 500),
+                ("target", "queued", None, 500),
+            ]
+        ) == (500, None)
+        assert estimate(
+            [
+                ("running-1", "running", now, 1000),
+                ("running-2", "running", now, 2000),
+                ("predecessor", "queued", None, 500),
+                ("target", "queued", None, 500),
+            ]
+        ) == (1500, None)
+        assert estimate(
+            [
+                ("running-1", "running", now, 1000),
+                ("running-2", "running", now, 2000),
+                ("predecessor", "queued", None, None),
+                ("target", "queued", None, 500),
+            ]
+        ) == (None, "queue_history_incomplete")
     finally:
         store.close()
 
@@ -929,7 +1034,7 @@ while True:
 """,
         encoding="utf-8",
     )
-    store = CoverageStore(tmp_path / "coverage.duckdb")
+    store = CoverageStore(tmp_path / "coverage.duckdb", run_concurrency=1)
     try:
         command = store.register_command(
             name="cancellable",

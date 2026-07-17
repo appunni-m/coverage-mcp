@@ -796,7 +796,7 @@ RegisteredCommandResults = Annotated[
 ]
 RunQueueResults = Annotated[
     list[RunResult],
-    Field(description="Running job followed by queued jobs in FIFO order."),
+    Field(description="Running jobs followed by queued jobs in FIFO order."),
 ]
 CoverageFileResults = Annotated[
     list[CoverageFileResult],
