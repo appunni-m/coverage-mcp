@@ -57,6 +57,7 @@ end_of_record
                 "list_registered_commands",
                 "run_command_profiled",
                 "run_queue",
+                "cancel_run",
                 "run_result",
                 "latest_run",
                 "object_topology",
@@ -147,7 +148,11 @@ sys.exit(1)
             run = structured(
                 await mcp.call_tool(
                     "run_command_profiled",
-                    {"command_ref": command["id"], "max_summary_lines": 2},
+                    {
+                        "command_ref": command["id"],
+                        "max_summary_lines": 2,
+                        "idempotency_key": "failing-run",
+                    },
                 )
             )
             assert run["status"] in {"queued", "running"}
@@ -190,6 +195,16 @@ sys.exit(1)
             assert artifact["exists"] is True
             assert projects[0]["latest_run_age_seconds"] >= 0
             assert projects[0]["latest_run_age"].endswith(" ago")
+            repeated = structured(
+                await mcp.call_tool(
+                    "run_command_profiled",
+                    {"command_ref": command["id"], "idempotency_key": "failing-run"},
+                )
+            )
+            assert repeated["id"] == run["id"]
+            assert repeated["submission_reused"] is True
+            with pytest.raises(ToolError, match="already terminal"):
+                await mcp.call_tool("cancel_run", {"run_id": run["id"]})
 
         run(scenario())
     finally:

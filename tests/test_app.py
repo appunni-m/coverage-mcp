@@ -110,7 +110,7 @@ print("1 passed")
 
         response = client.post(
             "/api/runs/profiled",
-            json={"command_ref": command["id"], "max_summary_lines": 5},
+            json={"command_ref": command["id"], "max_summary_lines": 5, "idempotency_key": "api-unit"},
         )
         assert response.status_code == 200
         run = response.json()
@@ -125,6 +125,13 @@ print("1 passed")
         assert run["status"] == "passed"
         assert run["topology"]["command"]["id"] == command["id"]
         assert run["parsed_summary"]["counters"]["passed"] == 1
+        repeated = client.post(
+            "/api/runs/profiled",
+            json={"command_ref": command["id"], "idempotency_key": "api-unit"},
+        ).json()
+        assert repeated["id"] == run["id"]
+        assert repeated["submission_reused"] is True
+        assert client.post(f"/api/runs/{run['id']}/cancel").status_code == 400
         assert client.get("/api/runs/latest").json()["id"] == run["id"]
         assert client.get(f"/api/runs/latest?command_ref={command['id']}").json()["id"] == run["id"]
 

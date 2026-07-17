@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import signal
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
 import pytest
 
+from coverage_mcp import storage as storage_module
 from coverage_mcp.models import CoverageReport, FileCoverage, LineCoverage
 from coverage_mcp.storage import (
     CoverageStore,
@@ -479,6 +482,8 @@ def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_pa
         assert interrupted_result["terminal"] is True
         assert interrupted_result["queue_position"] is None
         assert "restarted" in interrupted_result["error"]
+        with pytest.raises(ValueError, match="already terminal"):
+            recovered.cancel_run(interrupted["id"])
         assert pending_result["status"] == "passed"
         assert pending_result["terminal"] is True
         assert pending_result["queue_duration_ms"] >= 0
@@ -491,7 +496,7 @@ def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_pa
         recovered.close()
 
 
-def test_run_execution_error_is_recorded_without_killing_worker(tmp_path):
+def test_run_execution_error_is_recorded_without_killing_worker(monkeypatch, tmp_path):
     store = CoverageStore(tmp_path / "coverage.duckdb")
     try:
         command = store.register_command(
@@ -509,6 +514,25 @@ def test_run_execution_error_is_recorded_without_killing_worker(tmp_path):
         assert result["status"] == "failed"
         assert result["exit_code"] is None
         assert "FileNotFoundError" in result["parsed_summary"]["execution_error"]
+
+        started = store.register_command(
+            name="failed-after-start",
+            command=f"{sys.executable} -c 'import time; time.sleep(30)'",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved post-start cleanup test",
+        )
+
+        def fail_wait(*_args, **_kwargs):
+            raise RuntimeError("wait failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_wait_for_process", fail_wait)
+            failed_after_start = store.run_command_profiled(started["id"])
+        assert failed_after_start["status"] == "failed"
+        assert "wait failed" in failed_after_start["parsed_summary"]["execution_error"]
+        assert store._active_processes == {}
     finally:
         store.close()
 
@@ -602,6 +626,214 @@ def test_run_retention_is_count_based_and_isolated_per_command(monkeypatch, tmp_
         assert (outside / "stdout.log").exists()
     finally:
         retained.close()
+
+
+def test_run_submission_idempotency_is_atomic_and_command_scoped(monkeypatch, tmp_path):
+    script = tmp_path / "run.py"
+    script.write_text(
+        """from pathlib import Path
+import time
+path = Path("executions.txt")
+path.write_text(path.read_text() + "run\\n" if path.exists() else "run\\n")
+time.sleep(0.1)
+print("1 passed")
+""",
+        encoding="utf-8",
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        primary = store.register_command(
+            name="idempotent-primary",
+            command=f"{sys.executable} {script.name}",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved idempotency concurrency test",
+        )
+        secondary = store.register_command(
+            name="idempotent-secondary",
+            command=f"{sys.executable} {script.name}",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved command-scoped idempotency test",
+        )
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            submissions = list(
+                executor.map(
+                    lambda _index: store.submit_command_profiled(
+                        primary["id"],
+                        idempotency_key="  task-42  ",
+                    ),
+                    range(5),
+                )
+            )
+
+        assert len({item["id"] for item in submissions}) == 1
+        assert sum(not item["submission_reused"] for item in submissions) == 1
+        primary_result = store.wait_for_run(submissions[0]["id"])
+        assert primary_result["idempotency_key"] == "task-42"
+        repeated = store.submit_command_profiled(primary["id"], idempotency_key="task-42")
+        assert repeated["id"] == primary_result["id"]
+        assert repeated["terminal"] is True
+        assert repeated["submission_reused"] is True
+
+        existing_dirs = set((tmp_path / "runs").iterdir())
+        lookups = iter([None, primary_result["id"]])
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_idempotent_run_id", lambda _command_id, _key: next(lookups))
+            raced = store.submit_command_profiled(primary["id"], idempotency_key="simulated-race")
+        assert raced["id"] == primary_result["id"]
+        assert raced["submission_reused"] is True
+        assert set((tmp_path / "runs").iterdir()) == existing_dirs
+
+        secondary_result = store.run_command_profiled(secondary["id"], idempotency_key="task-42")
+        assert secondary_result["id"] != primary_result["id"]
+        assert (tmp_path / "executions.txt").read_text(encoding="utf-8").splitlines() == ["run", "run"]
+
+        with pytest.raises(ValueError, match="blank"):
+            store.submit_command_profiled(primary["id"], idempotency_key=" ")
+        with pytest.raises(ValueError, match="200"):
+            store.submit_command_profiled(primary["id"], idempotency_key="x" * 201)
+    finally:
+        store.close()
+
+
+def test_cancel_run_handles_queued_running_and_terminal_states(monkeypatch, tmp_path):
+    child_script = tmp_path / "child.py"
+    child_script.write_text(
+        """import signal
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+
+def stop(_signal, _frame):
+    marker.write_text("terminated")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+Path(sys.argv[2]).write_text(str(__import__("os").getpid()))
+while True:
+    time.sleep(0.1)
+""",
+        encoding="utf-8",
+    )
+    parent_script = tmp_path / "parent.py"
+    parent_script.write_text(
+        """import subprocess
+import sys
+import time
+from pathlib import Path
+
+subprocess.Popen([sys.executable, "child.py", "child-terminated.txt", "child.pid"])
+Path("parent-ready.txt").write_text("ready")
+while True:
+    time.sleep(0.1)
+""",
+        encoding="utf-8",
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        command = store.register_command(
+            name="cancellable",
+            command=f"{sys.executable} {parent_script.name}",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved cancellation process-group test",
+        )
+        running = store.submit_command_profiled(command["id"], idempotency_key="running")
+        for _ in range(200):
+            running = store.run_result(running["id"])
+            if running["status"] == "running" and (tmp_path / "child.pid").exists():
+                break
+            time.sleep(0.01)
+        assert running["status"] == "running"
+
+        queued = store.submit_command_profiled(command["id"], idempotency_key="queued")
+        queued_before_cancel = store._run_job(queued["id"])
+        assert queued_before_cancel is not None
+        queued_cancelled = store.cancel_run(queued["id"])
+        assert queued_cancelled["status"] == "cancelled"
+        assert queued_cancelled["terminal"] is True
+        assert queued_cancelled["cancellation_requested"] is True
+        assert queued_cancelled["cancellation_requested_at"]
+        assert store.cancel_run(queued["id"])["status"] == "cancelled"
+
+        cancellation = store.cancel_run(running["id"])
+        assert cancellation["status"] in {"running", "cancelled"}
+        assert cancellation["cancellation_requested"] is True
+        assert cancellation["cancellation_requested_at"]
+        cancelled = store.wait_for_run(running["id"])
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["parsed_summary"]["execution_error"] == "Run cancelled by request."
+        assert store.cancel_run(running["id"])["status"] == "cancelled"
+        for _ in range(100):
+            if queued["id"] not in store._cancel_events:
+                break
+            time.sleep(0.01)
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_run_job", lambda _run_id: queued_before_cancel)
+            store._execute_run_job(queued["id"])
+        for _ in range(100):
+            if (tmp_path / "child-terminated.txt").exists():
+                break
+            time.sleep(0.01)
+        assert (tmp_path / "child-terminated.txt").read_text(encoding="utf-8") == "terminated"
+
+        passed = store.run_command_profiled(
+            store.register_command(
+                name="short",
+                command="echo passed",
+                cwd=tmp_path.as_posix(),
+                human_approved=True,
+                approved_by="tester",
+                approval_note="approved terminal cancellation test",
+            )["id"]
+        )
+        with pytest.raises(ValueError, match="already terminal"):
+            store.cancel_run(passed["id"])
+        with pytest.raises(KeyError, match="run not found"):
+            store.cancel_run("missing")
+    finally:
+        store.close()
+
+
+def test_process_wait_escalates_cancellation(monkeypatch, tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+
+        class FakeProcess:
+            pid = 123
+
+            def __init__(self):
+                self.results = iter([None, None, 0])
+
+            def poll(self):
+                return next(self.results)
+
+        moments = iter([0.0, 0.0, 3.0])
+        signals = []
+        event = threading.Event()
+        event.set()
+        monkeypatch.setattr(storage_module.time, "monotonic", lambda: next(moments))
+        monkeypatch.setattr(storage_module.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(store, "_signal_process_group", lambda _process, selected: signals.append(selected))
+
+        return_code, timed_out = store._wait_for_process(
+            FakeProcess(),
+            cancel_event=event,
+            timeout_seconds=None,
+        )
+
+        assert return_code == 0
+        assert timed_out is False
+        assert signals == [signal.SIGTERM, signal.SIGKILL, signal.SIGKILL]
+    finally:
+        store.close()
 
 
 def test_log_summary_and_topology_helpers(tmp_path):
@@ -793,6 +1025,30 @@ def test_existing_schema_migration(tmp_path):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE run_jobs (
+            id VARCHAR PRIMARY KEY,
+            command_id VARCHAR NOT NULL,
+            command_name VARCHAR NOT NULL,
+            command VARCHAR NOT NULL,
+            cwd VARCHAR NOT NULL,
+            repo_path VARCHAR NOT NULL,
+            repo_key VARCHAR NOT NULL,
+            branch VARCHAR,
+            commit_sha VARCHAR,
+            queued_at TIMESTAMP NOT NULL,
+            started_at TIMESTAMP,
+            ended_at TIMESTAMP,
+            timeout_seconds INTEGER,
+            max_summary_lines INTEGER NOT NULL,
+            status VARCHAR NOT NULL,
+            stdout_path VARCHAR NOT NULL,
+            stderr_path VARCHAR NOT NULL,
+            error VARCHAR NOT NULL
+        )
+        """
+    )
     conn.close()
     store = CoverageStore(db)
     try:
@@ -803,7 +1059,9 @@ def test_existing_schema_migration(tmp_path):
         assert {"total_regions", "covered_regions", "region_rate"} <= snapshot_columns
         assert {"total_regions", "covered_regions", "region_rate"} <= file_columns
         run_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('runs')").fetchall()}
-        assert {"queued_at", "queue_duration_ms"} <= run_columns
+        assert {"queued_at", "queue_duration_ms", "idempotency_key", "cancellation_requested_at"} <= run_columns
+        job_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('run_jobs')").fetchall()}
+        assert {"idempotency_key", "cancellation_requested_at"} <= job_columns
         assert store._conn.execute("SELECT count(*) FROM run_jobs").fetchone() == (0,)
     finally:
         store.close()
@@ -831,7 +1089,7 @@ def test_index_creation_failures_do_not_block_schema_init():
 
     CoverageStore._init_schema(store)
 
-    assert store._conn.index_failures == 9
+    assert store._conn.index_failures == 11
 
 
 def test_git_metadata_is_captured_for_registered_commands(tmp_path):

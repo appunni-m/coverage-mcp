@@ -60,6 +60,7 @@ class RunCommandRequest(BaseModel):
     command_ref: str
     max_summary_lines: int = Field(default=80, ge=1, le=500)
     timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
+    idempotency_key: str | None = Field(default=None, max_length=200)
     wait: bool = False
 
 
@@ -184,6 +185,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 request.command_ref,
                 max_summary_lines=request.max_summary_lines,
                 timeout_seconds=request.timeout_seconds,
+                idempotency_key=request.idempotency_key,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
@@ -191,6 +193,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/api/runs/queue")
     def run_queue(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
         return store.list_run_queue(limit=limit)
+
+    @app.post("/api/runs/{run_id}/cancel")
+    def cancel_run(run_id: str, max_summary_lines: int = Query(default=80, ge=1, le=500)) -> dict[str, Any]:
+        try:
+            return store.cancel_run(run_id, max_summary_lines=max_summary_lines)
+        except Exception as exc:
+            raise _http_error(exc) from exc
 
     @app.get("/api/runs/latest")
     def latest_run(command_ref: str | None = None) -> dict[str, Any]:
@@ -438,21 +447,28 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         command_ref: str,
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
+        idempotency_key: str | None = None,
         wait: bool = False,
     ) -> dict[str, Any]:
-        """Queue an approved command and return immediately; set wait=true for the final result."""
+        """Queue an approved command, reusing an existing run when its idempotency key matches."""
         runner = store.run_command_profiled if wait else store.submit_command_profiled
         return await asyncio.to_thread(
             runner,
             command_ref,
             max_summary_lines=max_summary_lines,
             timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
         )
 
     @mcp.tool()
     async def run_queue(limit: int = 100) -> list[dict[str, Any]]:
         """List running and queued approved commands in FIFO execution order."""
         return await asyncio.to_thread(store.list_run_queue, limit=limit)
+
+    @mcp.tool()
+    async def cancel_run(run_id: str, max_summary_lines: int = 80) -> dict[str, Any]:
+        """Cancel a queued or running command and return its current bounded state."""
+        return await asyncio.to_thread(store.cancel_run, run_id, max_summary_lines=max_summary_lines)
 
     @mcp.tool()
     async def run_result(run_id: str, max_summary_lines: int = 80) -> dict[str, Any]:

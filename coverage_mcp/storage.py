@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -47,6 +49,9 @@ class CoverageStore:
         self._conn = duckdb.connect(self.db_path.as_posix())
         self._lock = threading.RLock()
         self._run_lock = threading.Lock()
+        self._process_lock = threading.RLock()
+        self._active_processes: dict[str, subprocess.Popen[str]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         self._job_queue: Queue[str | None] = Queue()
         self._closing = threading.Event()
         self._init_schema()
@@ -59,6 +64,7 @@ class CoverageStore:
         )
         self._worker.start()
         for run_id in queued_jobs:
+            self._cancel_event(run_id)
             self._job_queue.put(run_id)
 
     def close(self) -> None:
@@ -183,6 +189,7 @@ class CoverageStore:
                     command_id VARCHAR NOT NULL,
                     command_name VARCHAR NOT NULL,
                     command VARCHAR NOT NULL,
+                    idempotency_key VARCHAR,
                     cwd VARCHAR NOT NULL,
                     repo_path VARCHAR NOT NULL,
                     repo_key VARCHAR NOT NULL,
@@ -198,7 +205,8 @@ class CoverageStore:
                     parsed_summary VARCHAR NOT NULL,
                     artifact_paths VARCHAR NOT NULL,
                     queued_at TIMESTAMP,
-                    queue_duration_ms INTEGER
+                    queue_duration_ms INTEGER,
+                    cancellation_requested_at TIMESTAMP
                 )
                 """
             )
@@ -220,6 +228,7 @@ class CoverageStore:
                     command_id VARCHAR NOT NULL,
                     command_name VARCHAR NOT NULL,
                     command VARCHAR NOT NULL,
+                    idempotency_key VARCHAR,
                     cwd VARCHAR NOT NULL,
                     repo_path VARCHAR NOT NULL,
                     repo_key VARCHAR NOT NULL,
@@ -233,10 +242,12 @@ class CoverageStore:
                     status VARCHAR NOT NULL,
                     stdout_path VARCHAR NOT NULL,
                     stderr_path VARCHAR NOT NULL,
-                    error VARCHAR NOT NULL
+                    error VARCHAR NOT NULL,
+                    cancellation_requested_at TIMESTAMP
                 )
                 """
             )
+            self._migrate_schema()
             for statement in [
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_repo_time ON snapshots(repo_key, created_at)",
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_commit ON snapshots(repo_key, commit_sha)",
@@ -247,10 +258,11 @@ class CoverageStore:
                 "CREATE INDEX IF NOT EXISTS idx_runs_command_time ON runs(command_id, started_at)",
                 "CREATE INDEX IF NOT EXISTS idx_run_artifacts_kind ON run_artifacts(kind)",
                 "CREATE INDEX IF NOT EXISTS idx_run_jobs_status_time ON run_jobs(status, queued_at)",
+                "CREATE INDEX IF NOT EXISTS idx_runs_idempotency ON runs(command_id, idempotency_key)",
+                "CREATE INDEX IF NOT EXISTS idx_run_jobs_idempotency ON run_jobs(command_id, idempotency_key)",
             ]:
                 with suppress(duckdb.Error):
                     self._conn.execute(statement)
-            self._migrate_schema()
 
     def _migrate_schema(self) -> None:
         line_columns = {row[1] for row in self._conn.execute("PRAGMA table_info('lines')").fetchall()}
@@ -265,10 +277,28 @@ class CoverageStore:
             ):
                 if name not in columns:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-        run_columns = {row[1] for row in self._conn.execute("PRAGMA table_info('runs')").fetchall()}
-        for name, definition in (("queued_at", "TIMESTAMP"), ("queue_duration_ms", "INTEGER")):
-            if name not in run_columns:
-                self._conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+        for table, additions in (
+            (
+                "runs",
+                (
+                    ("queued_at", "TIMESTAMP"),
+                    ("queue_duration_ms", "INTEGER"),
+                    ("idempotency_key", "VARCHAR"),
+                    ("cancellation_requested_at", "TIMESTAMP"),
+                ),
+            ),
+            (
+                "run_jobs",
+                (
+                    ("idempotency_key", "VARCHAR"),
+                    ("cancellation_requested_at", "TIMESTAMP"),
+                ),
+            ),
+        ):
+            columns = {row[1] for row in self._conn.execute(f"PRAGMA table_info('{table}')").fetchall()}
+            for name, definition in additions:
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def register_command(
         self,
@@ -369,13 +399,17 @@ class CoverageStore:
         *,
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         job = self.submit_command_profiled(
             command_ref,
             max_summary_lines=max_summary_lines,
             timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
         )
-        return self.wait_for_run(job["id"], max_summary_lines=max_summary_lines)
+        result = self.wait_for_run(job["id"], max_summary_lines=max_summary_lines)
+        result["submission_reused"] = job["submission_reused"]
+        return result
 
     def submit_command_profiled(
         self,
@@ -383,12 +417,24 @@ class CoverageStore:
         *,
         max_summary_lines: int = 80,
         timeout_seconds: int | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         if self._closing.is_set():
             raise RuntimeError("coverage store is shutting down")
         registered = self.registered_command(command_ref)
         if not registered.get("enabled", True):
             raise ValueError(f"registered command is disabled: {command_ref}")
+        if idempotency_key is not None:
+            idempotency_key = idempotency_key.strip()
+            if not idempotency_key:
+                raise ValueError("idempotency_key must not be blank")
+            if len(idempotency_key) > 200:
+                raise ValueError("idempotency_key must not exceed 200 characters")
+            existing_run_id = self._idempotent_run_id(registered["id"], idempotency_key)
+            if existing_run_id is not None:
+                result = self.run_result(existing_run_id, max_summary_lines=max_summary_lines)
+                result["submission_reused"] = True
+                return result
 
         run_id = str(uuid.uuid4())
         run_path = self.run_dir / run_id
@@ -401,19 +447,27 @@ class CoverageStore:
         stdout_path.touch()
         stderr_path.touch()
         with self._lock:
+            existing_run_id = self._idempotent_run_id(registered["id"], idempotency_key)
+            if existing_run_id is not None:
+                self._remove_managed_run_logs([run_id])
+                result = self.run_result(existing_run_id, max_summary_lines=max_summary_lines)
+                result["submission_reused"] = True
+                return result
             self._conn.execute(
                 """
                 INSERT INTO run_jobs (
-                    id, command_id, command_name, command, cwd, repo_path, repo_key,
+                    id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key,
                     branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds,
-                    max_summary_lines, status, stdout_path, stderr_path, error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    max_summary_lines, status, stdout_path, stderr_path, error,
+                    cancellation_requested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     run_id,
                     registered["id"],
                     registered["name"],
                     registered["command"],
+                    idempotency_key,
                     cwd,
                     git.repo_path,
                     git.repo_key,
@@ -428,10 +482,31 @@ class CoverageStore:
                     stdout_path.as_posix(),
                     stderr_path.as_posix(),
                     "",
+                    None,
                 ],
             )
+        self._cancel_event(run_id)
         self._job_queue.put(run_id)
-        return self.run_result(run_id, max_summary_lines=max_summary_lines)
+        result = self.run_result(run_id, max_summary_lines=max_summary_lines)
+        result["submission_reused"] = False
+        return result
+
+    def _idempotent_run_id(self, command_id: str, idempotency_key: str | None) -> str | None:
+        if idempotency_key is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id FROM run_jobs
+                WHERE command_id = ? AND idempotency_key = ?
+                UNION ALL
+                SELECT id FROM runs
+                WHERE command_id = ? AND idempotency_key = ?
+                LIMIT 1
+                """,
+                [command_id, idempotency_key, command_id, idempotency_key],
+            ).fetchone()
+        return str(row[0]) if row is not None else None
 
     def wait_for_run(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
         while True:
@@ -441,6 +516,54 @@ class CoverageStore:
                     raise RuntimeError(result.get("error") or "run worker failed")
                 return result
             time.sleep(0.02)
+
+    def cancel_run(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
+        requested_at = utcnow()
+        command_id: str | None = None
+        with self._lock:
+            row = self._conn.execute("SELECT status, command_id FROM run_jobs WHERE id = ?", [run_id]).fetchone()
+            if row is None:
+                completed = self._conn.execute("SELECT status FROM runs WHERE id = ?", [run_id]).fetchone()
+                if completed is None:
+                    raise KeyError(f"run not found: {run_id}")
+                if completed[0] == "cancelled":
+                    return self.run_result(run_id, max_summary_lines=max_summary_lines)
+                raise ValueError(f"run is already terminal: {completed[0]}")
+
+            status, command_id = str(row[0]), str(row[1])
+            if status == "cancelled":
+                return self.run_result(run_id, max_summary_lines=max_summary_lines)
+            if status not in {"queued", "running"}:
+                raise ValueError(f"run is already terminal: {status}")
+            if status == "queued":
+                self._conn.execute(
+                    """
+                    UPDATE run_jobs
+                    SET status = 'cancelled', ended_at = ?, cancellation_requested_at = ?,
+                        error = 'Run cancelled before execution.'
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    [requested_at, requested_at, run_id],
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE run_jobs
+                    SET cancellation_requested_at = ?, error = 'Cancellation requested.'
+                    WHERE id = ? AND status = 'running'
+                    """,
+                    [requested_at, run_id],
+                )
+
+        cancel_event = self._cancel_event(run_id)
+        cancel_event.set()
+        with self._process_lock:
+            process = self._active_processes.get(run_id)
+        if process is not None:
+            self._signal_process_group(process, signal.SIGTERM)
+        if status == "queued" and command_id is not None:
+            self._prune_run_history(command_id)
+        return self.run_result(run_id, max_summary_lines=max_summary_lines)
 
     def list_run_queue(self, *, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
@@ -469,6 +592,8 @@ class CoverageStore:
                 except Exception as exc:
                     self._mark_job_error(run_id, exc)
             finally:
+                if run_id is not None:
+                    self._forget_runtime_state(run_id)
                 self._job_queue.task_done()
 
     def _execute_run_job(self, run_id: str) -> None:
@@ -479,6 +604,9 @@ class CoverageStore:
             registered = self.registered_command(job["command_id"])
             started_at = utcnow()
             with self._lock:
+                current = self._conn.execute("SELECT status FROM run_jobs WHERE id = ?", [run_id]).fetchone()
+                if current is None or current[0] != "queued":
+                    return
                 self._conn.execute(
                     "UPDATE run_jobs SET status = 'running', started_at = ?, error = '' WHERE id = ?",
                     [started_at, run_id],
@@ -488,14 +616,17 @@ class CoverageStore:
             exit_code: int | None = None
             status = "failed"
             error = ""
+            timed_out = False
             stdout_path = Path(job["stdout_path"])
             stderr_path = Path(job["stderr_path"])
+            cancel_event = self._cancel_event(run_id)
+            process: subprocess.Popen[str] | None = None
             try:
                 with (
                     stdout_path.open("w", encoding="utf-8", errors="replace") as stdout,
                     stderr_path.open("w", encoding="utf-8", errors="replace") as stderr,
                 ):
-                    completed = subprocess.run(
+                    process = subprocess.Popen(
                         job["command"],
                         shell=True,
                         cwd=job["cwd"],
@@ -503,23 +634,43 @@ class CoverageStore:
                         stdout=stdout,
                         stderr=stderr,
                         text=True,
-                        timeout=job["timeout_seconds"],
-                        check=False,
+                        start_new_session=True,
                     )
-                exit_code = completed.returncode
-                status = "passed" if exit_code == 0 else "failed"
-            except subprocess.TimeoutExpired:
-                status = "timeout"
-                with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
-                    stderr.write(f"\nCommand timed out after {job['timeout_seconds']} seconds.\n")
+                    self._register_process(run_id, process)
+                    exit_code, timed_out = self._wait_for_process(
+                        process,
+                        cancel_event=cancel_event,
+                        timeout_seconds=job["timeout_seconds"],
+                    )
+                if timed_out:
+                    status = "timeout"
+                    with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
+                        stderr.write(f"\nCommand timed out after {job['timeout_seconds']} seconds.\n")
+                elif cancel_event.is_set():
+                    status = "cancelled"
+                    error = "Run cancelled by request."
+                    with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
+                        stderr.write("\nRun cancelled by request.\n")
+                else:
+                    status = "passed" if exit_code == 0 else "failed"
             except Exception as exc:
                 status = "failed"
                 error = f"{type(exc).__name__}: {exc}"
                 with stderr_path.open("a", encoding="utf-8", errors="replace") as stderr:
                     stderr.write(f"\nCommand execution failed: {error}\n")
+            finally:
+                if process is not None and process.poll() is None:
+                    with suppress(OSError):
+                        self._signal_process_group(process, signal.SIGKILL)
+                    with suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=0.5)
+                self._unregister_process(run_id, process)
 
             ended_at = utcnow()
             duration_ms = int((time.monotonic() - start) * 1000)
+            latest_job = self._run_job(run_id)
+            if latest_job is not None:
+                job = latest_job
             self._finalize_run_job(
                 job=job,
                 registered=registered,
@@ -530,6 +681,57 @@ class CoverageStore:
                 status=status,
                 error=error,
             )
+
+    def _cancel_event(self, run_id: str) -> threading.Event:
+        with self._process_lock:
+            return self._cancel_events.setdefault(run_id, threading.Event())
+
+    def _register_process(self, run_id: str, process: subprocess.Popen[str]) -> None:
+        with self._process_lock:
+            self._active_processes[run_id] = process
+
+    def _unregister_process(self, run_id: str, process: subprocess.Popen[str] | None) -> None:
+        with self._process_lock:
+            if process is not None and self._active_processes.get(run_id) is process:
+                self._active_processes.pop(run_id, None)
+
+    def _forget_runtime_state(self, run_id: str) -> None:
+        with self._process_lock:
+            self._active_processes.pop(run_id, None)
+            self._cancel_events.pop(run_id, None)
+
+    def _wait_for_process(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        cancel_event: threading.Event,
+        timeout_seconds: int | None,
+    ) -> tuple[int | None, bool]:
+        started = time.monotonic()
+        termination_started: float | None = None
+        timed_out = False
+        while True:
+            return_code = process.poll()
+            if return_code is not None:
+                if termination_started is not None:
+                    self._signal_process_group(process, signal.SIGKILL)
+                return return_code, timed_out
+
+            now = time.monotonic()
+            if termination_started is None and cancel_event.is_set():
+                self._signal_process_group(process, signal.SIGTERM)
+                termination_started = now
+            elif termination_started is None and timeout_seconds is not None and now - started >= timeout_seconds:
+                timed_out = True
+                self._signal_process_group(process, signal.SIGTERM)
+                termination_started = now
+            elif termination_started is not None and now - termination_started >= 2:
+                self._signal_process_group(process, signal.SIGKILL)
+            time.sleep(0.02)
+
+    def _signal_process_group(self, process: subprocess.Popen[str], selected_signal: signal.Signals) -> None:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, selected_signal)
 
     def _finalize_run_job(
         self,
@@ -565,17 +767,18 @@ class CoverageStore:
                 self._conn.execute(
                     """
                     INSERT INTO runs (
-                        id, command_id, command_name, command, cwd, repo_path, repo_key,
+                        id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key,
                         branch, commit_sha, started_at, ended_at, duration_ms, exit_code,
                         status, stdout_path, stderr_path, parsed_summary, artifact_paths,
-                        queued_at, queue_duration_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        queued_at, queue_duration_ms, cancellation_requested_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         job["id"],
                         job["command_id"],
                         job["command_name"],
                         job["command"],
+                        job["idempotency_key"],
                         job["cwd"],
                         job["repo_path"],
                         job["repo_key"],
@@ -592,6 +795,7 @@ class CoverageStore:
                         json.dumps(artifact_paths),
                         queued_at,
                         max(queue_duration_ms, 0),
+                        parse_datetime(job.get("cancellation_requested_at")),
                     ],
                 )
                 if artifact_paths:
@@ -839,6 +1043,7 @@ class CoverageStore:
             "terminal": terminal,
             "poll_after_ms": None if terminal else 1000,
             "execution_mode": "background",
+            "cancellation_requested": job.get("cancellation_requested_at") is not None,
         }
         if terminal:
             result["parsed_summary"] = summarize_run_logs(
@@ -1981,6 +2186,7 @@ class CoverageStore:
         run["poll_after_ms"] = None
         run["queue_position"] = None
         run["execution_mode"] = "background"
+        run["cancellation_requested"] = run.get("cancellation_requested_at") is not None
         return self._with_relative_age(run, "ended_at")
 
     def _worktree_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:

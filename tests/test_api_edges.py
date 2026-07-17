@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import runpy
 import sys
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -22,7 +23,7 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     with TestClient(app) as client:
         health = client.get("/health").json()
-        assert health["version"] == "0.2.1"
+        assert health["version"] == "0.3.0"
         assert health["run_retention"] == 100
         assert client.get("/api/snapshots/latest").status_code == 404
         assert client.get("/api/artifacts/latest?kind=missing").status_code == 404
@@ -148,6 +149,19 @@ def test_rest_run_errors_and_timeout(tmp_path):
                 "approval_note": "approved slow command",
             },
         ).json()
+        cancellable = client.post(
+            "/api/runs/profiled",
+            json={"command_ref": command["id"], "idempotency_key": "cancel-via-rest"},
+        ).json()
+        cancellation = client.post(f"/api/runs/{cancellable['id']}/cancel").json()
+        assert cancellation["status"] in {"running", "cancelled"}
+        for _ in range(100):
+            cancellation = client.get(f"/api/runs/{cancellable['id']}").json()
+            if cancellation["terminal"]:
+                break
+            time.sleep(0.02)
+        assert cancellation["status"] == "cancelled"
+        assert client.post(f"/api/runs/{cancellable['id']}/cancel").json()["status"] == "cancelled"
         run = client.post(
             "/api/runs/profiled",
             json={"command_ref": command["id"], "timeout_seconds": 1, "max_summary_lines": 5, "wait": True},
@@ -155,6 +169,7 @@ def test_rest_run_errors_and_timeout(tmp_path):
         assert run["status"] == "timeout"
         assert client.get(f"/api/runs/{run['id']}?max_summary_lines=1").json()["id"] == run["id"]
         assert client.get("/api/runs/missing").status_code == 404
+        assert client.post("/api/runs/missing/cancel").status_code == 404
 
 
 def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):

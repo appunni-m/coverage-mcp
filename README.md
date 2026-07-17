@@ -248,8 +248,8 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
 - Register a new worktree once with `register_worktree(path, base_ref, name)` before its first coverage run. Keep the
   returned `worktree_id`; its frozen baseline defines the lineage for that worktree.
 - Run tests through an existing human-approved command with `run_command_profiled`. Record the returned run id and
-  poll `run_result` no faster than `poll_after_ms`; never submit a second run because the first is still queued or
-  running. If no approved command exists, ask for explicit approval before registering one.
+  use one stable `idempotency_key` for that intended run. Poll `run_result` no faster than `poll_after_ms`; retries
+  must reuse the same key. If no approved command exists, ask for explicit approval before registering one.
 - Ingest generated coverage with the actual worktree path as `repo_path`, its branch/commit, and a stable suite name.
 - Use `worktree_progress(worktree_id, suite)` or `compare_to_baseline(worktree_id=...)` to report whether line, branch,
   function, and region coverage improved. Do not compare one worktree's snapshots to another worktree.
@@ -297,7 +297,11 @@ register_test_command(
 After that, agents run only the registered command id or name:
 
 ```text
-run_command_profiled(command_ref="condition", max_summary_lines=80)
+run_command_profiled(
+  command_ref="condition",
+  max_summary_lines=80,
+  idempotency_key="condition:<commit-sha>:coverage"
+)
 ```
 
 Submission returns immediately with a durable run id and `status` set to `queued` or `running`. Poll that id until
@@ -309,6 +313,10 @@ run_result(run_id="returned-run-id", max_summary_lines=80)
 
 Use `run_queue()` to inspect FIFO position. Set `wait=true` only for a command known to finish quickly; the default
 background mode keeps the MCP call responsive during long suites.
+
+An idempotency key identifies one intended run and is scoped to the registered command. Repeating the same key returns
+the existing queued, running, or terminal run with `submission_reused: true`. Use a new key only when a genuinely new
+execution is intended. A key remains effective while its run is retained.
 
 Each completed run is stored as an immutable ledger record:
 
@@ -331,12 +339,16 @@ Queued jobs survive a clean restart and resume from the same DuckDB. Graceful sh
 finish. If the server exits unexpectedly during a command, restart recovery preserves that run as `interrupted`
 instead of rerunning it automatically.
 
+Every command starts in its own process group. `cancel_run` and command timeouts signal the entire group, then escalate
+from `SIGTERM` to `SIGKILL` after two seconds if processes remain. This prevents child test processes from continuing
+after the managed run has ended.
+
 ## Run Retention
 
 Coverage MCP keeps the newest 100 terminal run records for each registered command. Retention is count-based, never
 time-based, so an older but low-volume suite keeps its own history even when another suite runs frequently.
 
-The count includes `passed`, `failed`, `timeout`, `interrupted`, and `internal_error` records. Queued and running jobs
+The count includes `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, and `internal_error` records. Queued and running jobs
 are never retention candidates. When a record expires, Coverage MCP removes its run row, artifact-registry rows, and
 managed stdout/stderr files. It does not delete registered artifact files or coverage snapshots.
 
@@ -422,12 +434,17 @@ list_registered_commands(limit=50)
 Queues a registered command and immediately returns its durable run id.
 
 ```text
-run_command_profiled(command_ref="unit", max_summary_lines=80)
+run_command_profiled(
+  command_ref="unit",
+  max_summary_lines=80,
+  idempotency_key="unit:<commit-sha>:requested-check"
+)
 ```
 
 The normal response has `status: "queued"` or `status: "running"`, `terminal: false`, `queue_position`, and
 `poll_after_ms`. Save the run id and poll `run_result`; do not call `run_command_profiled` again for the same intended
-run. Use `wait=true` only for a command known to be short when a single blocking call is explicitly useful.
+run. Retrying with the same `idempotency_key` reuses that run instead of creating a duplicate. Use `wait=true` only for
+a command known to be short when a single blocking call is explicitly useful.
 
 Once complete, the response includes pass/fail, exit code, execution and queue duration, key counters, selected
 error/tail excerpts, full log paths, and artifact paths. It also includes the exact completion time plus freshness
@@ -442,6 +459,18 @@ run_queue(limit=50)
 ```
 
 There is at most one running command per server. `queue_position: 0` means running; positive positions are waiting.
+
+### `cancel_run`
+
+Cancels a queued or running command by run id.
+
+```text
+cancel_run(run_id="...")
+```
+
+Queued runs become terminal immediately. Running runs expose `cancellation_requested: true`; poll `run_result` until
+their status becomes `cancelled`. Repeating cancellation for an already cancelled run is safe. Other terminal runs
+cannot be cancelled.
 
 ### `latest_run`
 
@@ -463,7 +492,7 @@ run_result(run_id="...", max_summary_lines=80)
 ```
 
 Poll no faster than the returned `poll_after_ms`. Active responses intentionally defer log scanning and expose the
-full log paths. Stop polling when `terminal` is true. Terminal statuses are `passed`, `failed`, `timeout`,
+full log paths. Stop polling when `terminal` is true. Terminal statuses are `passed`, `failed`, `cancelled`, `timeout`,
 `interrupted`, and `internal_error`.
 
 ### `latest_artifact`
@@ -693,6 +722,7 @@ Useful endpoints:
 - `GET /api/commands/{command_ref}`
 - `POST /api/runs/profiled`
 - `GET /api/runs/queue`
+- `POST /api/runs/{run_id}/cancel`
 - `GET /api/runs/latest`
 - `GET /api/runs/{run_id}`
 - `GET /api/artifacts/latest`
