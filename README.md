@@ -132,6 +132,14 @@ COVERAGE_MCP_DB=/path/to/coverage.duckdb \
 coverage-mcp
 ```
 
+Retain more or fewer terminal test runs per approved command:
+
+```bash
+COVERAGE_MCP_RUN_RETENTION=250 coverage-mcp
+```
+
+The default is `100`. The active value is returned by `/health`.
+
 ## Install In An Agent
 
 The `testing` plugin in
@@ -322,6 +330,18 @@ checks, coverage insights, and other agents remain responsive without running se
 Queued jobs survive a clean restart and resume from the same DuckDB. Graceful shutdown lets the current command
 finish. If the server exits unexpectedly during a command, restart recovery preserves that run as `interrupted`
 instead of rerunning it automatically.
+
+## Run Retention
+
+Coverage MCP keeps the newest 100 terminal run records for each registered command. Retention is count-based, never
+time-based, so an older but low-volume suite keeps its own history even when another suite runs frequently.
+
+The count includes `passed`, `failed`, `timeout`, `interrupted`, and `internal_error` records. Queued and running jobs
+are never retention candidates. When a record expires, Coverage MCP removes its run row, artifact-registry rows, and
+managed stdout/stderr files. It does not delete registered artifact files or coverage snapshots.
+
+Set `COVERAGE_MCP_RUN_RETENTION` before starting the server to change the per-command limit. Lowering the value prunes
+existing history during startup; no scheduler or time-based cleanup task is involved.
 
 ## Object Topology
 

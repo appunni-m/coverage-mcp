@@ -447,6 +447,7 @@ def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_pa
         time.sleep(0.01)
     assert active["status"] == "running"
     interrupted = store.submit_command_profiled(command["id"])
+    stale_interrupted = store.submit_command_profiled(command["id"])
     pending = store.submit_command_profiled(command["id"])
     store.close()
 
@@ -458,9 +459,17 @@ def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_pa
         "UPDATE run_jobs SET status = 'running', started_at = ? WHERE id = ?",
         [datetime.now(UTC), interrupted["id"]],
     )
+    conn.execute(
+        """
+        UPDATE run_jobs
+        SET status = 'interrupted', ended_at = ?, error = 'older interruption'
+        WHERE id = ?
+        """,
+        [datetime.now(UTC) - timedelta(days=1), stale_interrupted["id"]],
+    )
     conn.close()
 
-    recovered = CoverageStore(db_path)
+    recovered = CoverageStore(db_path, run_retention=3)
     try:
         interrupted_result = recovered.run_result(interrupted["id"])
         pending_result = recovered.wait_for_run(pending["id"])
@@ -474,6 +483,9 @@ def test_run_queue_recovers_pending_jobs_and_marks_active_job_interrupted(tmp_pa
         assert pending_result["terminal"] is True
         assert pending_result["queue_duration_ms"] >= 0
         assert active_result["status"] == "passed"
+        with pytest.raises(KeyError, match="run not found"):
+            recovered.run_result(stale_interrupted["id"])
+        assert not (tmp_path / "runs" / stale_interrupted["id"]).exists()
         assert recovered.list_run_queue() == []
     finally:
         recovered.close()
@@ -499,6 +511,97 @@ def test_run_execution_error_is_recorded_without_killing_worker(tmp_path):
         assert "FileNotFoundError" in result["parsed_summary"]["execution_error"]
     finally:
         store.close()
+
+
+def test_run_retention_is_count_based_and_isolated_per_command(monkeypatch, tmp_path):
+    db_path = tmp_path / "coverage.duckdb"
+    with pytest.raises(ValueError, match="at least 1"):
+        CoverageStore(db_path, run_retention=0)
+
+    script = tmp_path / "run.py"
+    script.write_text(
+        "from pathlib import Path\nPath('artifact.txt').write_text('ok')\nprint('1 passed')\n",
+        encoding="utf-8",
+    )
+    store = CoverageStore(db_path, run_retention=10)
+    primary = store.register_command(
+        name="primary",
+        command=f"{sys.executable} {script.name}",
+        cwd=tmp_path.as_posix(),
+        artifact_paths={"text": "artifact.txt"},
+        human_approved=True,
+        approved_by="tester",
+        approval_note="approved retention test",
+    )
+    secondary = store.register_command(
+        name="secondary",
+        command=f"{sys.executable} {script.name}",
+        cwd=tmp_path.as_posix(),
+        artifact_paths={"text": "artifact.txt"},
+        human_approved=True,
+        approved_by="tester",
+        approval_note="approved command isolation test",
+    )
+    primary_runs = [store.run_command_profiled(primary["id"]) for _ in range(3)]
+    secondary_run = store.run_command_profiled(secondary["id"])
+    oldest_log_dir = Path(primary_runs[0]["stdout_path"]).parent
+    assert oldest_log_dir.exists()
+    original_conn = store._conn
+
+    class FailingRetentionConnection:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        @property
+        def description(self):
+            return self.wrapped.description
+
+        def execute(self, query, *args, **kwargs):
+            return self.wrapped.execute(query, *args, **kwargs)
+
+        def executemany(self, query, *args, **kwargs):
+            if "DELETE FROM runs" in str(query):
+                raise RuntimeError("retention delete failed")
+            return self.wrapped.executemany(query, *args, **kwargs)
+
+        def close(self):
+            return self.wrapped.close()
+
+    store.run_retention = 2
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_conn", FailingRetentionConnection(original_conn))
+        with pytest.raises(RuntimeError, match="retention delete failed"):
+            store._prune_run_history(primary["id"])
+        assert store.run_result(primary_runs[0]["id"])["status"] == "passed"
+        assert store._conn.execute(
+            "SELECT count(*) FROM run_artifacts WHERE run_id = ?",
+            [primary_runs[0]["id"]],
+        ).fetchone() == (1,)
+    store.run_retention = 10
+    store.close()
+
+    retained = CoverageStore(db_path, run_retention=2)
+    try:
+        with pytest.raises(KeyError, match="run not found"):
+            retained.run_result(primary_runs[0]["id"])
+        assert retained.run_result(primary_runs[1]["id"])["status"] == "passed"
+        assert retained.run_result(primary_runs[2]["id"])["status"] == "passed"
+        assert retained.run_result(secondary_run["id"])["status"] == "passed"
+        assert not oldest_log_dir.exists()
+        assert retained._conn.execute(
+            "SELECT count(*) FROM run_artifacts WHERE run_id = ?",
+            [primary_runs[0]["id"]],
+        ).fetchone() == (0,)
+        assert (tmp_path / "artifact.txt").exists()
+        assert retained._prune_run_history(primary["id"]) == 0
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "stdout.log").write_text("keep", encoding="utf-8")
+        retained._remove_managed_run_logs(["../outside"])
+        assert (outside / "stdout.log").exists()
+    finally:
+        retained.close()
 
 
 def test_log_summary_and_topology_helpers(tmp_path):

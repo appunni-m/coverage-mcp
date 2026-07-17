@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from coverage_mcp import __version__
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.storage import CoverageStore
+from coverage_mcp.storage import DEFAULT_RUN_RETENTION, CoverageStore
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
@@ -64,7 +64,11 @@ class RunCommandRequest(BaseModel):
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
-    store = CoverageStore(db_path or os.environ.get("COVERAGE_MCP_DB", default_db_path()))
+    run_retention = int(os.environ.get("COVERAGE_MCP_RUN_RETENTION", DEFAULT_RUN_RETENTION))
+    store = CoverageStore(
+        db_path or os.environ.get("COVERAGE_MCP_DB", default_db_path()),
+        run_retention=run_retention,
+    )
     mcp = create_mcp(store)
     mcp_app = mcp.streamable_http_app()
 
@@ -90,7 +94,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"ok": True, "version": __version__, "db_path": store.db_path.as_posix()}
+        return {
+            "ok": True,
+            "version": __version__,
+            "db_path": store.db_path.as_posix(),
+            "run_retention": store.run_retention,
+        }
 
     @app.post("/api/ingest")
     def ingest(request: IngestRequest) -> dict[str, Any]:

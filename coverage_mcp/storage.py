@@ -21,6 +21,8 @@ from coverage_mcp.git_utils import inspect_git, merge_base
 from coverage_mcp.models import CoverageReport
 from coverage_mcp.parsers import parse_coverage_report
 
+DEFAULT_RUN_RETENTION = 100
+
 
 def row_dict(columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
     return dict(zip(columns, row, strict=True))
@@ -35,8 +37,11 @@ def minute_bucket(value: datetime) -> datetime:
 
 
 class CoverageStore:
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(self, db_path: str | Path, *, run_retention: int = DEFAULT_RUN_RETENTION) -> None:
+        if run_retention < 1:
+            raise ValueError("run_retention must be at least 1")
         self.db_path = Path(db_path).expanduser()
+        self.run_retention = run_retention
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.run_dir = self.db_path.parent / "runs"
         self._conn = duckdb.connect(self.db_path.as_posix())
@@ -46,6 +51,7 @@ class CoverageStore:
         self._closing = threading.Event()
         self._init_schema()
         queued_jobs = self._recover_run_jobs()
+        self._prune_run_history()
         self._worker = threading.Thread(
             target=self._run_worker,
             name="coverage-mcp-runner",
@@ -609,10 +615,12 @@ class CoverageStore:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+        self._prune_run_history(job["command_id"])
 
     def _mark_job_error(self, run_id: str, exc: Exception) -> None:
         message = f"{type(exc).__name__}: {exc}"
         ended_at = utcnow()
+        job = None
         with suppress(OSError):
             job = self._run_job(run_id)
             if job is not None:
@@ -627,6 +635,8 @@ class CoverageStore:
                 """,
                 [ended_at, message, run_id],
             )
+        if job is not None:
+            self._prune_run_history(job["command_id"])
 
     def _recover_run_jobs(self) -> list[str]:
         recovered_at = utcnow()
@@ -642,6 +652,69 @@ class CoverageStore:
             )
             rows = self._conn.execute("SELECT id FROM run_jobs WHERE status = 'queued' ORDER BY queued_at").fetchall()
         return [str(row[0]) for row in rows]
+
+    def _prune_run_history(self, command_id: str | None = None) -> int:
+        if command_id is None:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT command_id FROM runs
+                    UNION
+                    SELECT command_id FROM run_jobs
+                    WHERE status NOT IN ('queued', 'running')
+                    """
+                ).fetchall()
+            return sum(self._prune_run_history(str(row[0])) for row in rows)
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, record_kind
+                FROM (
+                    SELECT id, 'run' AS record_kind, ended_at AS terminal_at
+                    FROM runs
+                    WHERE command_id = ?
+                    UNION ALL
+                    SELECT id, 'job' AS record_kind, COALESCE(ended_at, queued_at) AS terminal_at
+                    FROM run_jobs
+                    WHERE command_id = ? AND status NOT IN ('queued', 'running')
+                ) terminal_runs
+                ORDER BY terminal_at DESC, id DESC
+                """,
+                [command_id, command_id],
+            ).fetchall()
+            stale = [(str(row[0]), str(row[1])) for row in rows[self.run_retention :]]
+            if not stale:
+                return 0
+
+            run_ids = [[run_id] for run_id, kind in stale if kind == "run"]
+            job_ids = [[run_id] for run_id, kind in stale if kind == "job"]
+            self._conn.execute("BEGIN")
+            try:
+                if run_ids:
+                    self._conn.executemany("DELETE FROM run_artifacts WHERE run_id = ?", run_ids)
+                    self._conn.executemany("DELETE FROM runs WHERE id = ?", run_ids)
+                if job_ids:
+                    self._conn.executemany("DELETE FROM run_jobs WHERE id = ?", job_ids)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+        self._remove_managed_run_logs([run_id for run_id, _kind in stale])
+        return len(stale)
+
+    def _remove_managed_run_logs(self, run_ids: list[str]) -> None:
+        root = self.run_dir.resolve()
+        for run_id in run_ids:
+            run_path = (root / run_id).resolve()
+            if run_path.parent != root:
+                continue
+            for name in ("stdout.log", "stderr.log"):
+                with suppress(OSError):
+                    (run_path / name).unlink()
+            with suppress(OSError):
+                run_path.rmdir()
 
     def run_result(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
         with self._lock:
