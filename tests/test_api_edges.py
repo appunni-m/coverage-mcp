@@ -11,6 +11,28 @@ from coverage_mcp import app as app_module
 from coverage_mcp.app import create_app
 
 
+def test_readme_lists_every_rest_endpoint(tmp_path):
+    app = create_app((tmp_path / "coverage.duckdb").as_posix())
+    try:
+        readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+        documented = {
+            line.removeprefix("- `").removesuffix("`")
+            for line in readme.splitlines()
+            if line.startswith(("- `GET /api/", "- `POST /api/"))
+        }
+        exposed = {
+            f"{method} {route.path}"
+            for route in app.routes
+            if route.path.startswith("/api/")
+            for method in route.methods or set()
+            if method in {"GET", "POST"}
+        }
+
+        assert documented == exposed
+    finally:
+        app.state.coverage_store.close()
+
+
 def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
     source = tmp_path / "src"
     source.mkdir()
