@@ -239,6 +239,74 @@ sys.exit(2)
         store.close()
 
 
+def test_managed_run_auto_ingests_fresh_coverage_and_links_snapshot(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/a.py").write_text("covered\nmissed\n", encoding="utf-8")
+    script = tmp_path / "coverage_suite.py"
+    script.write_text(
+        """from pathlib import Path
+import sys
+Path("coverage.lcov").write_text("TN:\\nSF:src/a.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n")
+print("1 failed")
+sys.exit(2)
+""",
+        encoding="utf-8",
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        command = store.register_command(
+            name="unit",
+            command=f"{sys.executable} {script.name}",
+            cwd=tmp_path.as_posix(),
+            artifact_paths={
+                "coverage": {
+                    "path": "coverage.lcov",
+                    "coverage_format": "lcov",
+                    "suite": "unit-coverage",
+                }
+            },
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved automatic coverage ingestion test",
+        )
+        assert store._job_coverage_ingest({"command_id": command["id"]}, terminal=False)["status"] == "pending"
+        terminal_ingest = store._job_coverage_ingest({"command_id": command["id"]}, terminal=True)
+        assert terminal_ingest["status"] == "skipped_run_status"
+
+        run = store.run_command_profiled(command["id"], idempotency_key="auto-ingest")
+        artifact = run["artifact_paths"][0]
+        snapshot_id = artifact["snapshot_id"]
+
+        assert run["status"] == "failed"
+        assert artifact["modified_by_run"] is True
+        assert artifact["ingest_status"] == "ingested"
+        assert artifact["ingest_error"] is None
+        assert artifact["suite"] == "unit-coverage"
+        assert run["coverage_ingest"] == {
+            "status": "ingested",
+            "configured_artifacts": 1,
+            "ingested_artifacts": 1,
+            "failed_artifacts": 0,
+            "skipped_artifacts": 0,
+            "snapshot_ids": [snapshot_id],
+        }
+        snapshot = store.snapshot(snapshot_id)
+        assert snapshot["suite"] == "unit-coverage"
+        assert snapshot["covered_lines"] == 1
+        assert snapshot["total_lines"] == 2
+        latest = store.latest_artifact(command_ref=command["id"], kind="coverage")
+        assert latest is not None
+        assert latest["snapshot_id"] == snapshot_id
+        assert latest["ingest_status"] == "ingested"
+
+        repeated = store.submit_command_profiled(command["id"], idempotency_key="auto-ingest")
+        assert repeated["id"] == run["id"]
+        assert repeated["coverage_ingest"]["snapshot_ids"] == [snapshot_id]
+        assert len(store.list_snapshots(limit=10)) == 1
+    finally:
+        store.close()
+
+
 def test_topology_is_computed_for_commands_runs_projects_and_snapshots(tmp_path):
     report_path = tmp_path / "coverage.lcov"
     report_path.write_text(

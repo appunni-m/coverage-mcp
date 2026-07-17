@@ -224,7 +224,13 @@ class CoverageStore:
                     kind VARCHAR NOT NULL,
                     path VARCHAR NOT NULL,
                     exists BOOLEAN NOT NULL,
-                    size_bytes BIGINT
+                    size_bytes BIGINT,
+                    coverage_format VARCHAR,
+                    suite VARCHAR,
+                    modified_by_run BOOLEAN NOT NULL DEFAULT false,
+                    ingest_status VARCHAR,
+                    snapshot_id VARCHAR,
+                    ingest_error VARCHAR
                 )
                 """
             )
@@ -308,6 +314,17 @@ class CoverageStore:
                 (
                     ("idempotency_key", "VARCHAR"),
                     ("cancellation_requested_at", "TIMESTAMP"),
+                ),
+            ),
+            (
+                "run_artifacts",
+                (
+                    ("coverage_format", "VARCHAR"),
+                    ("suite", "VARCHAR"),
+                    ("modified_by_run", "BOOLEAN DEFAULT false"),
+                    ("ingest_status", "VARCHAR"),
+                    ("snapshot_id", "VARCHAR"),
+                    ("ingest_error", "VARCHAR"),
                 ),
             ),
         ):
@@ -648,6 +665,7 @@ class CoverageStore:
             stderr_path = Path(job["stderr_path"])
             cancel_event = self._cancel_event(run_id)
             process: subprocess.Popen[str] | None = None
+            artifact_states_before = self._artifact_file_states(registered["artifact_specs"], job["cwd"])
             try:
                 with (
                     stdout_path.open("w", encoding="utf-8", errors="replace") as stdout,
@@ -707,6 +725,7 @@ class CoverageStore:
                 exit_code=exit_code,
                 status=status,
                 error=error,
+                artifact_states_before=artifact_states_before,
             )
 
     def _cancel_event(self, run_id: str) -> threading.Event:
@@ -771,11 +790,22 @@ class CoverageStore:
         exit_code: int | None,
         status: str,
         error: str,
+        artifact_states_before: dict[str, tuple[Any, ...] | None],
     ) -> None:
         run_id = job["id"]
         stdout_path = Path(job["stdout_path"])
         stderr_path = Path(job["stderr_path"])
-        artifact_paths = self._collect_run_artifacts(registered["artifact_specs"], job["cwd"])
+        artifact_paths = self._collect_run_artifacts(
+            registered["artifact_specs"],
+            job["cwd"],
+            previous_states=artifact_states_before,
+        )
+        self._auto_ingest_run_artifacts(
+            artifact_paths,
+            job=job,
+            command_name=registered["name"],
+            eligible=status in {"passed", "failed"} and exit_code is not None,
+        )
         summary = summarize_run_logs(
             stdout_path=stdout_path,
             stderr_path=stderr_path,
@@ -828,7 +858,10 @@ class CoverageStore:
                 if artifact_paths:
                     self._conn.executemany(
                         """
-                        INSERT INTO run_artifacts VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO run_artifacts (
+                            run_id, kind, path, exists, size_bytes, coverage_format, suite,
+                            modified_by_run, ingest_status, snapshot_id, ingest_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
                             [
@@ -837,6 +870,12 @@ class CoverageStore:
                                 artifact["path"],
                                 artifact["exists"],
                                 artifact["size_bytes"],
+                                artifact["coverage_format"],
+                                artifact["suite"],
+                                artifact["modified_by_run"],
+                                artifact["ingest_status"],
+                                artifact["snapshot_id"],
+                                artifact["ingest_error"],
                             ]
                             for artifact in artifact_paths
                         ],
@@ -1278,6 +1317,7 @@ class CoverageStore:
             "duration_ms": max(duration_ms, 0),
             "exit_code": None,
             "artifact_paths": [],
+            "coverage_ingest": self._job_coverage_ingest(job, terminal=terminal),
             "terminal": terminal,
             "poll_after_ms": None if terminal else 1000,
             "execution_mode": "background",
@@ -1327,6 +1367,19 @@ class CoverageStore:
             self._with_relative_age(result, "ended_at")
         return self._with_topology(result)
 
+    def _job_coverage_ingest(self, job: dict[str, Any], *, terminal: bool) -> dict[str, Any]:
+        registered = self.registered_command(str(job["command_id"]))
+        artifacts = [
+            {
+                "coverage_format": spec.get("coverage_format"),
+                "ingest_status": "skipped_run_status" if terminal else None,
+                "snapshot_id": None,
+            }
+            for spec in registered["artifact_specs"]
+            if spec.get("coverage_format")
+        ]
+        return summarize_coverage_ingest(artifacts)
+
     def latest_artifact(self, *, command_ref: str | None = None, kind: str) -> dict[str, Any] | None:
         args: list[Any] = [kind]
         command_filter = ""
@@ -1345,6 +1398,8 @@ class CoverageStore:
             row = self._conn.execute(
                 f"""
                 SELECT a.run_id, a.kind, a.path, a.exists, a.size_bytes,
+                       a.coverage_format, a.suite, a.modified_by_run,
+                       a.ingest_status, a.snapshot_id, a.ingest_error,
                        r.command_id, r.command_name, r.repo_key, r.repo_path,
                        r.started_at, r.ended_at, r.status, r.exit_code
                 FROM run_artifacts a
@@ -1386,28 +1441,115 @@ class CoverageStore:
             return {"object_kind": "worktree", "object_ref": object_ref, "topology": worktree["topology"]}
         raise ValueError(f"unsupported topology object kind: {object_kind}")
 
-    def _collect_run_artifacts(self, artifact_specs: list[dict[str, Any]], cwd: str) -> list[dict[str, Any]]:
-        artifacts: list[dict[str, Any]] = []
-        cwd_path = Path(cwd)
+    def _artifact_file_states(
+        self,
+        artifact_specs: list[dict[str, Any]],
+        cwd: str,
+    ) -> dict[str, tuple[Any, ...] | None]:
+        states: dict[str, tuple[Any, ...] | None] = {}
         for spec in artifact_specs:
-            raw_path = str(spec.get("path", "")).strip()
-            if not raw_path:
+            path = self._artifact_path(spec, cwd)
+            if path is not None:
+                states[str(spec["kind"])] = self._artifact_file_state(path)
+        return states
+
+    @staticmethod
+    def _artifact_path(spec: dict[str, Any], cwd: str) -> Path | None:
+        raw_path = str(spec.get("path", "")).strip()
+        if not raw_path:
+            return None
+        path = Path(raw_path).expanduser()
+        return path if path.is_absolute() else Path(cwd) / path
+
+    @staticmethod
+    def _artifact_file_state(path: Path) -> tuple[Any, ...] | None:
+        try:
+            if not path.exists():
+                return None
+            if not path.is_file():
+                return ("not_file",)
+            metadata = path.stat()
+        except OSError:
+            return None
+        return ("file", metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns, metadata.st_ino)
+
+    def _collect_run_artifacts(
+        self,
+        artifact_specs: list[dict[str, Any]],
+        cwd: str,
+        *,
+        previous_states: dict[str, tuple[Any, ...] | None] | None = None,
+    ) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        for spec in artifact_specs:
+            path = self._artifact_path(spec, cwd)
+            if path is None:
                 continue
-            path = Path(raw_path).expanduser()
-            if not path.is_absolute():
-                path = cwd_path / path
-            exists = path.exists()
+            kind = str(spec["kind"])
+            state = self._artifact_file_state(path)
+            size_bytes = state[1] if state is not None and state[0] == "file" else None
+            modified_by_run = previous_states is not None and state is not None and state != previous_states.get(kind)
             artifacts.append(
                 {
-                    "kind": spec["kind"],
+                    "kind": kind,
                     "path": path.as_posix(),
-                    "exists": exists,
-                    "size_bytes": path.stat().st_size if exists and path.is_file() else None,
+                    "exists": state is not None,
+                    "size_bytes": size_bytes,
                     "required": bool(spec.get("required", False)),
                     "coverage_format": spec.get("coverage_format"),
+                    "suite": spec.get("suite"),
+                    "modified_by_run": modified_by_run,
+                    "ingest_status": None,
+                    "snapshot_id": None,
+                    "ingest_error": None,
                 }
             )
         return artifacts
+
+    def _auto_ingest_run_artifacts(
+        self,
+        artifacts: list[dict[str, Any]],
+        *,
+        job: dict[str, Any],
+        command_name: str,
+        eligible: bool,
+    ) -> None:
+        for artifact in artifacts:
+            coverage_format = artifact.get("coverage_format")
+            if not coverage_format:
+                continue
+            artifact["suite"] = artifact.get("suite") or command_name
+            if not eligible:
+                artifact["ingest_status"] = "skipped_run_status"
+                artifact["ingest_error"] = "run did not complete with a process exit code"
+                continue
+            if not artifact["exists"]:
+                artifact["ingest_status"] = "missing"
+                artifact["ingest_error"] = "coverage artifact does not exist"
+                continue
+            if artifact["size_bytes"] is None:
+                artifact["ingest_status"] = "failed"
+                artifact["ingest_error"] = "coverage artifact is not a regular file"
+                continue
+            if not artifact["modified_by_run"]:
+                artifact["ingest_status"] = "skipped_stale"
+                artifact["ingest_error"] = "coverage artifact was not created or modified by this run"
+                continue
+            try:
+                snapshot = self.ingest_report(
+                    artifact["path"],
+                    format=str(coverage_format),
+                    repo_path=job["repo_path"],
+                    branch=job.get("branch"),
+                    commit_sha=job.get("commit_sha"),
+                    suite=str(artifact["suite"]),
+                )
+            except Exception as exc:
+                artifact["ingest_status"] = "failed"
+                artifact["ingest_error"] = f"{type(exc).__name__}: {exc}"[:1000]
+            else:
+                artifact["ingest_status"] = "ingested"
+                artifact["snapshot_id"] = snapshot["id"]
 
     def ingest_report(
         self,
@@ -2454,6 +2596,7 @@ class CoverageStore:
         run = self._with_topology(
             self._decode_json_fields(row_dict(columns, row), ["parsed_summary", "artifact_paths"])
         )
+        run["coverage_ingest"] = summarize_coverage_ingest(run["artifact_paths"])
         run["terminal"] = True
         run["poll_after_ms"] = None
         run["queue_position"] = None
@@ -2620,6 +2763,10 @@ def infer_topology(value: dict[str, Any]) -> dict[str, Any] | None:
                     "kind": artifact.get("kind"),
                     "path": artifact.get("path"),
                     "exists": artifact.get("exists"),
+                    "coverage_format": artifact.get("coverage_format"),
+                    "suite": artifact.get("suite"),
+                    "ingest_status": artifact.get("ingest_status"),
+                    "snapshot_id": artifact.get("snapshot_id"),
                 }
                 for artifact in artifacts
                 if isinstance(artifact, dict)
@@ -2721,6 +2868,49 @@ def infer_topology(value: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def summarize_coverage_ingest(artifact_paths: list[dict[str, Any]]) -> dict[str, Any]:
+    coverage_artifacts = [artifact for artifact in artifact_paths if artifact.get("coverage_format")]
+    if not coverage_artifacts:
+        return {
+            "status": "not_configured",
+            "configured_artifacts": 0,
+            "ingested_artifacts": 0,
+            "failed_artifacts": 0,
+            "skipped_artifacts": 0,
+            "snapshot_ids": [],
+        }
+
+    statuses = [
+        "not_recorded" if "ingest_status" not in artifact else str(artifact.get("ingest_status") or "pending")
+        for artifact in coverage_artifacts
+    ]
+    ingested = statuses.count("ingested")
+    failed = sum(status in {"failed", "missing"} for status in statuses)
+    skipped = sum(status.startswith("skipped_") for status in statuses)
+    if ingested == len(statuses):
+        status = "ingested"
+    elif ingested:
+        status = "partial"
+    elif failed:
+        status = "failed"
+    elif statuses and all(item == "skipped_stale" for item in statuses):
+        status = "skipped_stale"
+    elif statuses and all(item == "skipped_run_status" for item in statuses):
+        status = "skipped_run_status"
+    elif statuses and all(item == "not_recorded" for item in statuses):
+        status = "not_recorded"
+    else:
+        status = "pending"
+    return {
+        "status": status,
+        "configured_artifacts": len(coverage_artifacts),
+        "ingested_artifacts": ingested,
+        "failed_artifacts": failed,
+        "skipped_artifacts": skipped,
+        "snapshot_ids": [artifact["snapshot_id"] for artifact in coverage_artifacts if artifact.get("snapshot_id")],
+    }
+
+
 def normalize_artifact_specs(artifact_paths: dict[str, Any]) -> list[dict[str, Any]]:
     specs: list[dict[str, Any]] = []
     for kind, value in artifact_paths.items():
@@ -2731,10 +2921,15 @@ def normalize_artifact_specs(artifact_paths: dict[str, Any]) -> list[dict[str, A
             path = value
             required = False
             coverage_format = None
+            suite = None
         elif isinstance(value, dict):
             path = str(value.get("path", "")).strip()
             required = bool(value.get("required", False))
             coverage_format = value.get("coverage_format") or value.get("format")
+            raw_suite = value.get("suite")
+            suite = str(raw_suite).strip() if raw_suite is not None else None
+            if raw_suite is not None and not suite:
+                raise ValueError(f"artifact spec for {kind} has a blank suite")
         else:
             raise ValueError(f"artifact spec for {kind} must be a path string or object")
         if not path:
@@ -2745,6 +2940,7 @@ def normalize_artifact_specs(artifact_paths: dict[str, Any]) -> list[dict[str, A
                 "path": path,
                 "required": required,
                 "coverage_format": coverage_format,
+                "suite": suite,
             }
         )
     return specs

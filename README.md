@@ -160,7 +160,7 @@ The `testing` plugin in
 agent instructions for approved test runs, bounded summaries, artifact ingestion, and worktree comparisons.
 
 The plugin expects Coverage MCP at `http://127.0.0.1:59471/mcp/`. Start the server before opening a new agent session.
-The current plugin compatibility declaration requires Coverage MCP `>=0.3.2,<0.4.0`.
+The current plugin compatibility declaration requires Coverage MCP `>=0.3.3,<0.4.0`.
 
 The plugin installs only:
 
@@ -226,8 +226,8 @@ If no command is registered, give the agent the complete test command, working d
 explicitly approve that exact registration. After a run, ask:
 
 ```text
-Run the approved test suite, ingest its coverage artifact, and tell me whether this worktree improved against its
-frozen baseline.
+Run the approved test suite, verify its declared coverage artifact was automatically ingested, and tell me whether
+this worktree improved against its frozen baseline.
 ```
 
 ## First Run
@@ -241,8 +241,10 @@ This is the preferred agent workflow:
    approval, then call `register_test_command`.
 3. Submit it with `run_command_profiled`, save the returned run ID, and poll `run_result` no faster than
    `poll_after_ms`. Reuse one `idempotency_key` for retries of the same intended run.
-4. Use the run's registered artifact path and call `ingest_coverage` when a valid report exists.
-5. Query `coverage_summary`, `coverage_insights`, and `compare_to_baseline`, or open the dashboard.
+4. When the run is terminal, inspect `coverage_ingest.status` and `coverage_ingest.snapshot_ids`. A declared artifact
+   with `coverage_format` is automatically ingested only when that run created or modified it.
+5. Query the returned snapshot with `coverage_summary`, `coverage_insights`, and `compare_to_baseline`, or open the
+   dashboard. Do not call `ingest_coverage` again for an automatically ingested artifact.
 
 ### Ingest An Existing Report
 
@@ -294,7 +296,9 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
 - Run tests through an existing human-approved command with `run_command_profiled`. Record the returned run id and
   use one stable `idempotency_key` for that intended run. Poll `run_result` no faster than `poll_after_ms`; retries
   must reuse the same key. If no approved command exists, ask for explicit approval before registering one.
-- Ingest generated coverage with the actual worktree path as `repo_path`, its branch/commit, and a stable suite name.
+- Declare managed coverage artifacts with `coverage_format` and a stable `suite`. On terminal runs, require
+  `coverage_ingest.status` to report `ingested` and use its `snapshot_ids`; never ingest that artifact a second time.
+- Use `ingest_coverage` only for reports produced outside the Coverage MCP managed runner.
 - Use `worktree_progress(worktree_id, suite)` or `compare_to_baseline(worktree_id=...)` to report whether line, branch,
   function, and region coverage improved. No current snapshot means "not measured", not "unchanged"; never compare
   unrelated worktrees.
@@ -312,7 +316,12 @@ register_test_command(
   command="make -C pillow-rs-freetype test-unified-condition-coverage",
   cwd="/path/to/repo",
   artifact_paths={
-    "llvm_json": "pillow-rs-freetype/target/coverage/unified-condition-summary.json",
+    "llvm_json": {
+      "path": "pillow-rs-freetype/target/coverage/unified-condition-summary.json",
+      "required": true,
+      "coverage_format": "llvm",
+      "suite": "unified-condition"
+    },
     "missing_lines": "pillow-rs-freetype/target/coverage/unified-condition-missing-lines.txt"
   },
   human_approved=true,
@@ -340,6 +349,43 @@ run_result(run_id="returned-run-id", max_summary_lines=80)
 
 Use `run_queue()` to inspect FIFO position. Set `wait=true` only for a command known to finish quickly; the default
 background mode keeps the MCP call responsive during long suites.
+
+Artifacts with a non-null `coverage_format` are automatically parsed after a managed process exits normally, whether
+the test status is `passed` or `failed`. The server compares file size, nanosecond modification/change times, and inode
+state captured immediately before and after the command. A pre-existing report that the command did not modify is
+reported as `skipped_stale` and is not ingested. Cancelled, timed-out, interrupted, or unlaunched commands do not
+auto-ingest potentially partial artifacts.
+
+A terminal run returns a top-level `coverage_ingest` summary and per-artifact results. `status: "ingested"` includes
+the immutable `snapshot_ids`. `failed`, `missing`, `skipped_stale`, and `skipped_run_status` leave the test process
+status unchanged and explain the ingestion outcome in each artifact's `ingest_error`. Parser failure is therefore
+visible without turning a successful test command into a failed command. Reusing an idempotency key returns the same
+run and snapshot links instead of creating duplicate snapshots.
+
+Runs completed before Coverage MCP `0.3.3` may report `coverage_ingest.status: "not_recorded"`. They are historical
+ledger entries with no automatic-ingestion decision; do not poll them for a snapshot or implicitly ingest their
+possibly stale artifact.
+
+```json
+{
+  "status": "passed",
+  "coverage_ingest": {
+    "status": "ingested",
+    "configured_artifacts": 1,
+    "ingested_artifacts": 1,
+    "failed_artifacts": 0,
+    "skipped_artifacts": 0,
+    "snapshot_ids": ["snapshot-uuid"]
+  },
+  "artifact_paths": [{
+    "kind": "llvm_json",
+    "modified_by_run": true,
+    "ingest_status": "ingested",
+    "snapshot_id": "snapshot-uuid",
+    "ingest_error": null
+  }]
+}
+```
 
 After a command has completed normally at least once, active polling also reports an ETA learned from that command's
 own history. The command record stores the median duration, p90 duration, sample count, and newest contributing run
@@ -425,10 +471,13 @@ Connect your MCP client to:
 http://127.0.0.1:59471/mcp/
 ```
 
-The current server exposes 21 tools. Their MCP JSON Schemas carry the same
-descriptions, required fields, enums, and bounds documented below. Invalid
-types, missing required inputs, out-of-range values, and unsupported enum
-values are returned as MCP tool errors before execution.
+The current server exposes 21 tools. `tools/list` returns concrete JSON Schemas
+for both inputs and outputs, including nested fields, required fields, nullability,
+status enums, descriptions, and bounds. An agent can therefore use the MCP
+contract without reading this repository or guessing response keys. Invalid
+types, missing required inputs, out-of-range values, and unsupported input enum
+values are returned as MCP tool errors before execution. Returned payloads are
+also validated against these contracts so implementation drift fails visibly.
 
 General conventions:
 
@@ -444,7 +493,7 @@ General conventions:
 
 **Inputs:** `limit` is the maximum records to return, from 1 through 1000.
 
-**Returns:** A list containing project identity, latest snapshot and run, counts, current rates, freshness, and inline topology.
+**Returns:** A list containing project identity, latest snapshot and run, counts, current rates, freshness, and inline topology. A project known only through an approved command has null coverage fields until its first snapshot; that means not measured, not zero coverage.
 
 **Errors:** Schema validation errors only; an empty server returns an empty list.
 
@@ -452,11 +501,11 @@ General conventions:
 
 `register_test_command(name, command, human_approved, approved_by, approval_note, cwd = null, shell = "/bin/bash", artifact_paths = null)` creates an immutable approved command definition.
 
-**Inputs:** `name` is a non-empty stable label; `command` is the complete shell command; `human_approved` must literally be `true`; `approved_by` identifies the approving human; `approval_note` records the exact approval; `cwd` is the project working directory or null for the server cwd; `shell` is the executable shell; `artifact_paths` maps artifact kind to either a path string or `{path, required, coverage_format}`. Relative artifact paths resolve from `cwd`; `required` defaults to false and `coverage_format` defaults to null. When present, `coverage_format` accepts the formats listed under `ingest_coverage`.
+**Inputs:** `name` is a non-empty stable label; `command` is the complete shell command; `human_approved` must literally be `true`; `approved_by` identifies the approving human; `approval_note` records the exact approval; `cwd` is the project working directory or null for the server cwd; `shell` is the executable shell; `artifact_paths` maps artifact kind to either a path string or `{path, required, coverage_format, suite}`. Relative artifact paths resolve from `cwd`; `required` defaults to false and `coverage_format` defaults to null. A non-null `coverage_format` accepts the formats listed under `ingest_coverage` and enables freshness-guarded automatic ingestion. `suite` is a non-empty stable trend name and defaults to the registered command name. Give each of multiple coverage artifacts an explicit suite.
 
 **Returns:** The registration ID, exact execution details, approval audit fields, project topology, enabled state, and learned duration fields.
 
-**Errors:** Missing or false approval, blank required text, or invalid cwd/artifact configuration produces a tool error. Duplicate definitions are allowed as separate immutable registrations; changing an approved command requires a new registration.
+**Errors:** Missing or false approval, blank required text (including an explicitly supplied blank artifact suite), or invalid cwd/artifact configuration produces a tool error. Duplicate definitions are allowed as separate immutable registrations; changing an approved command requires a new registration.
 
 ```text
 register_test_command(
@@ -467,7 +516,8 @@ register_test_command(
     "coverage_json": {
       "path": ".coverage-mcp/coverage.json",
       "required": true,
-      "coverage_format": "coveragepy"
+      "coverage_format": "coveragepy",
+      "suite": "unit"
     }
   },
   human_approved=true,
@@ -492,9 +542,9 @@ register_test_command(
 
 **Inputs:** `command_ref` is a registration ID or name; `max_summary_lines` is 1-500; `timeout_seconds` is null or 1-86400; `idempotency_key` is null or a 1-200 character key scoped to that command; `wait` blocks until terminal only when true.
 
-**Returns:** Normally a durable run with `status` queued/running, `terminal: false`, `poll_after_ms`, queue position, log paths, and historical ETA fields. A terminal result also contains exit code, timing, bounded excerpts/counters, artifacts, freshness, and status `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, or `internal_error`. Reusing the same idempotency key returns the original run with `submission_reused: true`.
+**Returns:** Normally a durable run with `status` queued/running, `terminal: false`, `poll_after_ms`, queue position, log paths, historical ETA fields, and `coverage_ingest.status` set to `pending` or `not_configured`. A terminal result also contains exit code, timing, bounded excerpts/counters, artifacts, freshness, and status `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, or `internal_error`. `coverage_ingest` then summarizes configured/ingested/failed/skipped artifacts and returns immutable `snapshot_ids`; each finalized coverage artifact reports `modified_by_run`, `ingest_status`, `snapshot_id`, and bounded `ingest_error`. Reusing the same idempotency key returns the original run and snapshot links with `submission_reused: true`.
 
-**Errors:** Unknown/disabled commands, invalid limits/timeouts, or reusing one idempotency key with different submission parameters produces a tool error. A test failure is a successful tool response with `status: "failed"`, not an MCP protocol error.
+**Errors:** Unknown/disabled commands, invalid limits/timeouts, or reusing one idempotency key with different submission parameters produces a tool error. A test failure is a successful tool response with `status: "failed"`, not an MCP protocol error. Missing, stale, or malformed coverage is likewise terminal response data under `coverage_ingest`, not a transport error.
 
 ### `run_queue`
 
@@ -522,7 +572,7 @@ register_test_command(
 
 **Inputs:** `run_id` is required; `max_summary_lines` is 1-500.
 
-**Returns:** Active state avoids reading full logs and includes `poll_after_ms`, queue/ETA details, and log paths. Terminal state includes bounded output summaries, counters, artifacts, exact timing, and freshness. Poll no faster than `poll_after_ms`; ETA is historical, while timeout is an execution limit.
+**Returns:** Active state avoids reading full logs and includes `poll_after_ms`, queue/ETA details, and log paths. Terminal state includes bounded output summaries, counters, artifact-level automatic ingestion outcomes, linked snapshot IDs, exact timing, and freshness. Poll no faster than `poll_after_ms`; ETA is historical, while timeout is an execution limit.
 
 **Errors:** Unknown run IDs or invalid limits produce a tool error.
 
@@ -532,7 +582,7 @@ register_test_command(
 
 **Inputs:** `command_ref` optionally restricts lookup to a command ID/name; `max_summary_lines` is 1-500.
 
-**Returns:** The same bounded state as `run_result`, including `age` and `age_seconds` so callers can decide whether it is stale.
+**Returns:** The same bounded state as `run_result`, including automatic ingestion outcomes plus `age` and `age_seconds` so callers can decide whether it is stale.
 
 **Errors:** Unknown command references, no matching runs, or invalid limits produce a tool error.
 
@@ -542,7 +592,7 @@ register_test_command(
 
 **Inputs:** `kind` is the non-empty artifact key from registration; `command_ref` optionally restricts lookup to one command ID/name.
 
-**Returns:** Artifact kind/path, existence and size, run/command identity, project identity, run status/timing, freshness, and topology for the newest match.
+**Returns:** Artifact kind/path, existence and size, run/command identity, project identity, run status/timing, freshness, `coverage_format`, suite, freshness decision, ingestion status/error, linked snapshot ID, and topology for the newest match.
 
 **Errors:** Unknown command references or no matching artifact produces a tool error. A registered artifact that was not generated is still returned with `exists: false` when it is the latest match.
 
@@ -558,9 +608,9 @@ register_test_command(
 
 ### `ingest_coverage`
 
-`ingest_coverage(report_path, format = "auto", repo_path = null, suite = "default", branch = null, commit_sha = null, base_ref = null)` parses and stores one immutable snapshot.
+`ingest_coverage(report_path, format = "auto", repo_path = null, suite = "default", branch = null, commit_sha = null, base_ref = null)` parses and stores one external immutable snapshot.
 
-**Inputs:** `report_path` is a local server-readable artifact; `format` accepts `auto`, `lcov`, `coverage.py`, `coveragepy`, `coverage-json`, `coveragepy-json`, `cobertura`, `jacoco`, `istanbul`, `nyc`, `go`, `go-cover`, `go-coverprofile`, `coverprofile`, `llvm`, or `llvm-json`; `repo_path` identifies the checkout/shared repository; `suite` is a non-empty stable trend name; `branch`, `commit_sha`, and `base_ref` override or add Git metadata when provided.
+**Inputs:** `report_path` is a local server-readable artifact produced outside the managed runner; `format` accepts `auto`, `lcov`, `coverage.py`, `coveragepy`, `coverage-json`, `coveragepy-json`, `cobertura`, `jacoco`, `istanbul`, `nyc`, `go`, `go-cover`, `go-coverprofile`, `coverprofile`, `llvm`, or `llvm-json`; `repo_path` identifies the checkout/shared repository; `suite` is a non-empty stable trend name; `branch`, `commit_sha`, and `base_ref` override or add Git metadata when provided. Managed artifacts declaring `coverage_format` must use their run's automatic snapshot instead of this tool.
 
 **Returns:** Snapshot identity and topology, normalized line/branch/function/region totals and rates, report metadata, parser warnings, timestamp, and freshness.
 
@@ -619,7 +669,7 @@ returns an empty list; use `coverage_summary` first when snapshot existence must
 
 **Inputs:** `snapshot_id` and exact `file_path` are required; `include_lines` controls whether exact line records are included.
 
-**Returns:** A `file` object with totals/rates and, by default, a `lines` array capped at 5000 records containing line number, hits, covered state, and branch/function counters when available.
+**Returns:** A `file` object with totals/rates and, by default, a `lines` array capped at 5000 records containing line number, hits, covered state, and branch/function counters when available. With `include_lines=false`, the `lines` field is omitted.
 
 **Errors:** Unknown snapshots or paths produce a tool error.
 
@@ -813,6 +863,8 @@ Snapshots are immutable. Each ingest creates a new snapshot with:
 Registered commands and completed runs are immutable too. Changing a command means registering a new approved command
 record. Mutable queue state is stored separately until a run reaches a terminal state. Run stdout/stderr are written
 under the database directory's `runs/` folder, and the database stores the paths plus bounded parsed summaries.
+Fresh managed coverage artifacts create immutable snapshots and store their snapshot IDs on the run artifact registry;
+run retention can remove the run linkage but does not delete coverage history.
 
 Topology is derived, not separately stored. The same immutable rows power both direct object responses and `object_topology`.
 
@@ -832,6 +884,7 @@ The test suite covers:
 - approved command registration and run ledger storage
 - bounded profiled command summaries
 - artifact registration and lookup
+- freshness-guarded managed artifact auto-ingestion and run-to-snapshot linkage
 - computed topology for projects, commands, runs, snapshots, and artifacts
 - FastAPI ingest/list endpoints
 - project summaries and coverage insights

@@ -58,6 +58,30 @@ EXPECTED_MCP_INPUTS = {
     "source_context": {"snapshot_id", "file_path", "start", "end"},
 }
 
+EXPECTED_MCP_OUTPUTS = {
+    "project_summaries": {"repo_key", "latest_snapshot_id", "latest_run_age", "topology"},
+    "register_test_command": {"id", "command", "artifact_specs", "approved_by", "topology"},
+    "list_registered_commands": {"id", "name", "duration_estimate_ms", "artifact_specs"},
+    "run_command_profiled": {"id", "status", "terminal", "poll_after_ms", "coverage_ingest", "artifact_paths"},
+    "run_queue": {"id", "status", "queue_position", "eta_seconds"},
+    "cancel_run": {"id", "status", "cancellation_requested", "terminal"},
+    "run_result": {"id", "status", "parsed_summary", "coverage_ingest", "age"},
+    "latest_run": {"id", "status", "age", "age_seconds", "topology"},
+    "latest_artifact": {"run_id", "kind", "ingest_status", "snapshot_id", "run_age"},
+    "object_topology": {"object_kind", "object_ref", "topology"},
+    "ingest_coverage": {"id", "suite", "format", "line_rate", "age", "topology"},
+    "register_worktree": {"id", "path", "base_ref", "baseline_snapshot_id", "topology"},
+    "worktree_progress": {"worktree", "suite", "baseline", "current", "deltas", "points"},
+    "coverage_summary": {"id", "suite", "total_lines", "line_rate", "warnings", "age"},
+    "coverage_files": {"snapshot_id", "file_path", "total_lines", "line_rate", "raw_metrics"},
+    "coverage_file": {"file", "lines"},
+    "coverage_insights": {"snapshot", "baseline", "summary", "items"},
+    "compare_to_baseline": {"baseline", "current", "overall", "files", "changed_lines", "worktree"},
+    "changed_lines": {"file_path", "line_number", "status", "baseline_covered", "current_covered"},
+    "line_history": {"snapshot_id", "created_at", "file_path", "line_number", "hits", "covered"},
+    "source_context": {"line_number", "text"},
+}
+
 EXPECTED_MCP_RESOURCES = {"coverage://snapshots/latest", "coverage://projects"}
 EXPECTED_MCP_RESOURCE_TEMPLATES = {
     "coverage://snapshot/{snapshot_id}/summary",
@@ -75,6 +99,28 @@ def structured(payload):
     return value["result"] if isinstance(value, dict) and set(value) == {"result"} else value
 
 
+def resolved_schema(schema, root):
+    if "$ref" in schema:
+        return root["$defs"][schema["$ref"].rsplit("/", 1)[1]]
+    return schema
+
+
+def output_item_properties(schema):
+    node = schema
+    properties = node.get("properties", {})
+    if set(properties) == {"result"}:
+        node = resolved_schema(properties["result"], schema)
+        if node.get("type") == "array":
+            node = resolved_schema(node["items"], schema)
+    variants = node.get("anyOf", [])
+    if variants:
+        merged = {}
+        for variant in variants:
+            merged.update(resolved_schema(variant, schema).get("properties", {}))
+        return merged
+    return node.get("properties", {})
+
+
 def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
     store = CoverageStore(tmp_path / "coverage.duckdb")
     try:
@@ -89,6 +135,18 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
                 properties = tool.inputSchema["properties"]
                 assert set(properties) == expected_inputs
                 assert all(properties[input_name].get("description") for input_name in expected_inputs)
+
+                output_properties = output_item_properties(tool.outputSchema)
+                assert EXPECTED_MCP_OUTPUTS[name] <= set(output_properties)
+                assert output_properties, f"{name} has a generic output schema"
+                for model_name, model_schema in {
+                    "root": tool.outputSchema,
+                    **tool.outputSchema.get("$defs", {}),
+                }.items():
+                    for field_name, field_schema in model_schema.get("properties", {}).items():
+                        assert field_schema.get("description"), (
+                            f"{name} output {model_name}.{field_name} has no description"
+                        )
 
             run_schema = tools["run_command_profiled"].inputSchema["properties"]
             assert run_schema["max_summary_lines"]["minimum"] == 1
@@ -112,6 +170,8 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
             artifact = registration["$defs"]["ArtifactSpec"]
             assert set(artifact["required"]) == {"path"}
             assert all(field.get("description") for field in artifact["properties"].values())
+            assert "automatic ingestion" in artifact["properties"]["coverage_format"]["description"]
+            assert artifact["properties"]["suite"]["anyOf"][0]["minLength"] == 1
             artifact_formats = artifact["properties"]["coverage_format"]["anyOf"][0]["enum"]
             assert {"auto", "lcov", "coveragepy", "cobertura", "jacoco", "istanbul", "go", "llvm"} <= set(
                 artifact_formats
@@ -123,6 +183,46 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
             )
             topology_kinds = tools["object_topology"].inputSchema["properties"]["object_kind"]["enum"]
             assert {"project", "command", "run", "snapshot", "worktree"} <= set(topology_kinds)
+
+            run_output = tools["run_command_profiled"].outputSchema
+            run_properties = output_item_properties(run_output)
+            assert set(run_properties["status"]["enum"]) == {
+                "queued",
+                "running",
+                "passed",
+                "failed",
+                "cancelled",
+                "timeout",
+                "interrupted",
+                "internal_error",
+            }
+            ingest_output = resolved_schema(run_properties["coverage_ingest"], run_output)
+            assert set(ingest_output["properties"]["status"]["enum"]) == {
+                "not_configured",
+                "pending",
+                "ingested",
+                "partial",
+                "failed",
+                "skipped_stale",
+                "skipped_run_status",
+                "not_recorded",
+            }
+            run_artifact = resolved_schema(run_properties["artifact_paths"]["items"], run_output)
+            assert set(run_artifact["properties"]["ingest_status"]["anyOf"][0]["enum"]) == {
+                "ingested",
+                "failed",
+                "missing",
+                "skipped_stale",
+                "skipped_run_status",
+            }
+            changed_output = output_item_properties(tools["changed_lines"].outputSchema)
+            assert set(changed_output["status"]["enum"]) == {
+                "new",
+                "removed",
+                "regressed",
+                "improved",
+                "changed",
+            }
 
             resources = {str(resource.uri) for resource in await mcp.list_resources()}
             templates = {str(template.uriTemplate) for template in await mcp.list_resource_templates()}
@@ -139,6 +239,60 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
             ):
                 with pytest.raises(ToolError):
                     await mcp.call_tool(tool_name, arguments)
+
+        run(scenario())
+    finally:
+        store.close()
+
+
+def test_mcp_managed_command_auto_ingests_declared_coverage(tmp_path):
+    script = tmp_path / "managed_coverage.py"
+    script.write_text(
+        """from pathlib import Path
+Path("coverage.lcov").write_text("TN:\\nSF:src/a.py\\nDA:1,1\\nend_of_record\\n")
+print("1 passed")
+""",
+        encoding="utf-8",
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        mcp = create_mcp(store)
+
+        async def scenario():
+            command = structured(
+                await mcp.call_tool(
+                    "register_test_command",
+                    {
+                        "name": "managed-unit",
+                        "command": f"{sys.executable} {script.name}",
+                        "cwd": tmp_path.as_posix(),
+                        "artifact_paths": {
+                            "coverage": {
+                                "path": "coverage.lcov",
+                                "coverage_format": "lcov",
+                                "suite": "unit",
+                            }
+                        },
+                        "human_approved": True,
+                        "approved_by": "tester",
+                        "approval_note": "approved MCP auto-ingestion test",
+                    },
+                )
+            )
+            result = structured(
+                await mcp.call_tool(
+                    "run_command_profiled",
+                    {"command_ref": command["id"], "wait": True, "idempotency_key": "managed-coverage"},
+                )
+            )
+            snapshot_id = result["coverage_ingest"]["snapshot_ids"][0]
+            summary = structured(await mcp.call_tool("coverage_summary", {"snapshot_id": snapshot_id}))
+
+            assert result["status"] == "passed"
+            assert result["coverage_ingest"]["status"] == "ingested"
+            assert result["artifact_paths"][0]["ingest_status"] == "ingested"
+            assert summary["suite"] == "unit"
+            assert summary["covered_lines"] == 1
 
         run(scenario())
     finally:
@@ -177,6 +331,9 @@ def test_streamable_http_protocol_with_official_client(tmp_path):
                 assert tool.description
                 assert set(tool.inputSchema["properties"]) == EXPECTED_MCP_INPUTS[tool.name]
                 assert all(field.get("description") for field in tool.inputSchema["properties"].values())
+                output_properties = output_item_properties(tool.outputSchema)
+                assert EXPECTED_MCP_OUTPUTS[tool.name] <= set(output_properties)
+                assert all(field.get("description") for field in output_properties.values())
             result = await session.call_tool("project_summaries", {"limit": 1})
             assert result.isError is False
             assert result.structuredContent == {"result": []}

@@ -25,6 +25,7 @@ from coverage_mcp.storage import (
     percent_delta,
     profile_log,
     relative_age,
+    summarize_coverage_ingest,
     summarize_run_logs,
     update_log_counters,
 )
@@ -427,6 +428,64 @@ def test_run_latest_fallbacks_and_missing_artifacts(tmp_path):
         assert artifact is not None
         assert artifact["exists"] is False
         assert store.latest_artifact(command_ref="unknown", kind="missing") is None
+    finally:
+        store.close()
+
+
+def test_managed_run_reports_stale_missing_and_invalid_coverage_artifacts(tmp_path):
+    make_lcov(tmp_path / "stale.lcov")
+    (tmp_path / "coverage-dir").mkdir()
+    script = tmp_path / "artifacts.py"
+    script.write_text(
+        "from pathlib import Path\nPath('invalid.xml').write_text('<coverage>')\nprint('1 passed')\n",
+        encoding="utf-8",
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        command = store.register_command(
+            name="artifact-check",
+            command=f"{sys.executable} {script.name}",
+            cwd=tmp_path.as_posix(),
+            artifact_paths={
+                "stale": {"path": "stale.lcov", "coverage_format": "lcov"},
+                "invalid": {"path": "invalid.xml", "coverage_format": "cobertura"},
+                "missing": {"path": "missing.lcov", "coverage_format": "lcov", "required": True},
+                "directory": {"path": "coverage-dir", "coverage_format": "lcov"},
+            },
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved coverage artifact state test",
+        )
+
+        run = store.run_command_profiled(command["id"])
+        artifacts = {artifact["kind"]: artifact for artifact in run["artifact_paths"]}
+
+        assert run["status"] == "passed"
+        assert run["coverage_ingest"]["status"] == "failed"
+        assert run["coverage_ingest"]["failed_artifacts"] == 3
+        assert run["coverage_ingest"]["skipped_artifacts"] == 1
+        assert artifacts["stale"]["ingest_status"] == "skipped_stale"
+        assert artifacts["invalid"]["modified_by_run"] is True
+        assert artifacts["invalid"]["ingest_status"] == "failed"
+        assert "ParseError" in artifacts["invalid"]["ingest_error"]
+        assert artifacts["invalid"]["suite"] == "artifact-check"
+        assert artifacts["missing"]["ingest_status"] == "missing"
+        assert artifacts["directory"]["ingest_status"] == "failed"
+        assert store.list_snapshots(limit=10) == []
+
+        pending = store._collect_run_artifacts(
+            [{"kind": "coverage", "path": "stale.lcov", "coverage_format": "lcov"}],
+            tmp_path.as_posix(),
+            previous_states={"coverage": None},
+        )
+        store._auto_ingest_run_artifacts(
+            pending,
+            job={"repo_path": tmp_path.as_posix(), "branch": None, "commit_sha": None},
+            command_name="cancelled-suite",
+            eligible=False,
+        )
+        assert pending[0]["ingest_status"] == "skipped_run_status"
+        assert summarize_coverage_ingest(pending)["status"] == "skipped_run_status"
     finally:
         store.close()
 
@@ -1017,12 +1076,44 @@ def test_log_summary_and_topology_helpers(tmp_path):
 
 
 def test_normalize_artifact_specs_edges():
-    specs = normalize_artifact_specs({"": "ignored", "json": {"path": "a.json", "format": "custom"}, "txt": "a.txt"})
+    specs = normalize_artifact_specs(
+        {"": "ignored", "json": {"path": "a.json", "format": "custom", "suite": "unit"}, "txt": "a.txt"}
+    )
     assert [spec["kind"] for spec in specs] == ["json", "txt"]
+    assert specs[0]["suite"] == "unit"
+    assert specs[1]["suite"] is None
     with pytest.raises(ValueError, match="must be"):
         normalize_artifact_specs({"bad": 1})
     with pytest.raises(ValueError, match="missing path"):
         normalize_artifact_specs({"bad": {"path": ""}})
+    with pytest.raises(ValueError, match="blank suite"):
+        normalize_artifact_specs({"bad": {"path": "coverage.json", "suite": " "}})
+
+    class UnreadablePath:
+        def exists(self):
+            raise OSError("unreadable")
+
+    assert CoverageStore._artifact_file_state(UnreadablePath()) is None
+    assert (
+        summarize_coverage_ingest(
+            [
+                {"coverage_format": "lcov", "ingest_status": "ingested", "snapshot_id": "snapshot"},
+                {"coverage_format": "lcov", "ingest_status": "failed", "snapshot_id": None},
+            ]
+        )["status"]
+        == "partial"
+    )
+    assert (
+        summarize_coverage_ingest([{"coverage_format": "lcov", "ingest_status": "skipped_stale", "snapshot_id": None}])[
+            "status"
+        ]
+        == "skipped_stale"
+    )
+    assert (
+        summarize_coverage_ingest([{"coverage_format": "lcov", "ingest_status": None, "snapshot_id": None}])["status"]
+        == "pending"
+    )
+    assert summarize_coverage_ingest([{"coverage_format": "lcov", "snapshot_id": None}])["status"] == "not_recorded"
 
 
 def test_storage_rollbacks_are_triggered(monkeypatch, tmp_path):
@@ -1223,6 +1314,17 @@ def test_existing_schema_migration(tmp_path):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE run_artifacts (
+            run_id VARCHAR NOT NULL,
+            kind VARCHAR NOT NULL,
+            path VARCHAR NOT NULL,
+            exists BOOLEAN NOT NULL,
+            size_bytes BIGINT
+        )
+        """
+    )
     conn.close()
     store = CoverageStore(db)
     try:
@@ -1236,6 +1338,15 @@ def test_existing_schema_migration(tmp_path):
         assert {"queued_at", "queue_duration_ms", "idempotency_key", "cancellation_requested_at"} <= run_columns
         job_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('run_jobs')").fetchall()}
         assert {"idempotency_key", "cancellation_requested_at"} <= job_columns
+        artifact_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('run_artifacts')").fetchall()}
+        assert {
+            "coverage_format",
+            "suite",
+            "modified_by_run",
+            "ingest_status",
+            "snapshot_id",
+            "ingest_error",
+        } <= artifact_columns
         command_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('registered_commands')").fetchall()}
         assert {
             "duration_estimate_ms",

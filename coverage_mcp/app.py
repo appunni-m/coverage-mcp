@@ -22,13 +22,22 @@ from coverage_mcp.contracts import (
     BaseRef,
     Branch,
     ChangedLineLimit,
+    ChangedLineResult,
+    ChangedLineResults,
     CommandCwd,
     CommandReference,
     CommandText,
     CommitSha,
     ComparisonFileLimit,
     ComparisonLineLimit,
+    ComparisonResult,
+    CoverageFileDetailResult,
+    CoverageFileResponse,
+    CoverageFileResult,
+    CoverageFileResults,
+    CoverageFileSummaryResult,
     CoverageFormat,
+    CoverageInsightsResult,
     FileLimit,
     FilePath,
     HistoryLimit,
@@ -36,6 +45,9 @@ from coverage_mcp.contracts import (
     IdempotencyKey,
     IncludeLines,
     InsightLimit,
+    LatestArtifactResult,
+    LineHistoryResult,
+    LineHistoryResults,
     NonEmptyName,
     ObjectReference,
     OnlyRegressions,
@@ -46,28 +58,52 @@ from coverage_mcp.contracts import (
     OptionalSnapshotId,
     OptionalSuite,
     OptionalWorktreeId,
+    OutputModel,
     PositiveLineNumber,
+    ProjectSummaryResult,
+    ProjectSummaryResults,
+    RegisteredCommandResult,
+    RegisteredCommandResults,
     RepoPath,
     ReportPath,
     ResultLimit,
     RunId,
+    RunQueueResults,
+    RunResult,
     ShellPath,
     SnapshotId,
+    SnapshotResult,
     SourceBoundary,
+    SourceLineResult,
+    SourceLineResults,
     Suite,
     SummaryLineLimit,
     TimeoutSeconds,
     TopologyKind,
+    TopologyResult,
     TrendLimit,
     WaitForCompletion,
     WorktreeId,
     WorktreePath,
+    WorktreeProgressResult,
+    WorktreeResult,
 )
 from coverage_mcp.git_utils import inspect_git
 from coverage_mcp.storage import DEFAULT_RUN_RETENTION, CoverageStore
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
+
+
+def validated_output[OutputT: OutputModel](model: type[OutputT], value: Any) -> OutputT:
+    return model.model_validate(value)
+
+
+def validated_outputs[OutputT: OutputModel](
+    model: type[OutputT],
+    values: list[dict[str, Any]],
+) -> list[OutputT]:
+    return [model.model_validate(value) for value in values]
 
 
 class IngestRequest(BaseModel):
@@ -451,20 +487,24 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         "coverage-mcp",
         instructions=(
             f"Coverage MCP {__version__} is the local system of record for approved test runs and coverage history. "
-            "Discover the project and approved commands first; reuse a fresh run when possible. Execute only an "
-            "exact human-approved registered command, save its durable run id, and poll run_result no faster than "
-            "poll_after_ms. Ingest generated coverage with the actual checkout path and stable suite name. Query "
-            "summary, insights, files, changed lines, and bounded source context instead of reading full logs or "
-            "coverage artifacts. Every linked worktree must reuse the one shared server and DuckDB."
+            "Use each tool's input and output schema as the source of truth for fields, enums, bounds, and nullability. "
+            "Discover the project and approved commands first; reuse a fresh run when possible. Execute only an exact "
+            "human-approved registered command, save its durable run id, and poll run_result no faster than "
+            "poll_after_ms. Declared artifacts with coverage_format are freshness-checked and automatically ingested; "
+            "read terminal coverage_ingest and snapshot_ids before querying coverage. Use ingest_coverage only for "
+            "reports produced outside the managed runner. Query summary, insights, files, changed lines, and bounded "
+            "source context instead of reading full logs or coverage artifacts. Every linked worktree must reuse the "
+            "one shared server and DuckDB."
         ),
         stateless_http=True,
         streamable_http_path="/",
     )
 
     @mcp.tool()
-    async def project_summaries(limit: ResultLimit = 100) -> list[dict[str, Any]]:
+    async def project_summaries(limit: ResultLimit = 100) -> ProjectSummaryResults:
         """Discover known projects and their latest coverage, run freshness, and topology."""
-        return await asyncio.to_thread(store.projects, limit=limit)
+        projects = await asyncio.to_thread(store.projects, limit=limit)
+        return validated_outputs(ProjectSummaryResult, projects)
 
     @mcp.tool()
     async def register_test_command(
@@ -476,24 +516,28 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         cwd: CommandCwd = None,
         shell: ShellPath = "/bin/bash",
         artifact_paths: ArtifactPaths = None,
-    ) -> dict[str, Any]:
-        """Create an immutable command registration after explicit approval of every execution detail."""
-        return await asyncio.to_thread(
-            store.register_command,
-            name=name,
-            command=command,
-            cwd=cwd,
-            shell=shell,
-            artifact_paths=artifact_paths,
-            human_approved=human_approved,
-            approved_by=approved_by,
-            approval_note=approval_note,
+    ) -> RegisteredCommandResult:
+        """Register an approved command; coverage_format artifacts auto-ingest when freshly produced."""
+        return validated_output(
+            RegisteredCommandResult,
+            await asyncio.to_thread(
+                store.register_command,
+                name=name,
+                command=command,
+                cwd=cwd,
+                shell=shell,
+                artifact_paths=artifact_paths,
+                human_approved=human_approved,
+                approved_by=approved_by,
+                approval_note=approval_note,
+            ),
         )
 
     @mcp.tool()
-    async def list_registered_commands(limit: ResultLimit = 100) -> list[dict[str, Any]]:
+    async def list_registered_commands(limit: ResultLimit = 100) -> RegisteredCommandResults:
         """List immutable approved command definitions and learned duration statistics, newest first."""
-        return await asyncio.to_thread(store.list_registered_commands, limit=limit)
+        commands = await asyncio.to_thread(store.list_registered_commands, limit=limit)
+        return validated_outputs(RegisteredCommandResult, commands)
 
     @mcp.tool()
     async def run_command_profiled(
@@ -502,59 +546,78 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         timeout_seconds: TimeoutSeconds = None,
         idempotency_key: IdempotencyKey = None,
         wait: WaitForCompletion = False,
-    ) -> dict[str, Any]:
-        """Submit an approved command to the durable FIFO worker and return bounded run state."""
+    ) -> RunResult:
+        """Submit approved work; terminal state links freshly auto-ingested coverage snapshots."""
         runner = store.run_command_profiled if wait else store.submit_command_profiled
-        return await asyncio.to_thread(
-            runner,
-            command_ref,
-            max_summary_lines=max_summary_lines,
-            timeout_seconds=timeout_seconds,
-            idempotency_key=idempotency_key,
+        return validated_output(
+            RunResult,
+            await asyncio.to_thread(
+                runner,
+                command_ref,
+                max_summary_lines=max_summary_lines,
+                timeout_seconds=timeout_seconds,
+                idempotency_key=idempotency_key,
+            ),
         )
 
     @mcp.tool()
-    async def run_queue(limit: ResultLimit = 100) -> list[dict[str, Any]]:
+    async def run_queue(limit: ResultLimit = 100) -> RunQueueResults:
         """List the running job followed by queued jobs with position and historical ETA."""
-        return await asyncio.to_thread(store.list_run_queue, limit=limit)
+        runs = await asyncio.to_thread(store.list_run_queue, limit=limit)
+        return validated_outputs(RunResult, runs)
 
     @mcp.tool()
-    async def cancel_run(run_id: RunId, max_summary_lines: SummaryLineLimit = 80) -> dict[str, Any]:
+    async def cancel_run(run_id: RunId, max_summary_lines: SummaryLineLimit = 80) -> RunResult:
         """Request process-group cancellation for queued/running work and return bounded state."""
-        return await asyncio.to_thread(store.cancel_run, run_id, max_summary_lines=max_summary_lines)
+        return validated_output(
+            RunResult,
+            await asyncio.to_thread(store.cancel_run, run_id, max_summary_lines=max_summary_lines),
+        )
 
     @mcp.tool()
-    async def run_result(run_id: RunId, max_summary_lines: SummaryLineLimit = 80) -> dict[str, Any]:
-        """Poll durable run state; active responses avoid log scans and terminal responses are bounded."""
-        return await asyncio.to_thread(store.run_result, run_id, max_summary_lines=max_summary_lines)
+    async def run_result(run_id: RunId, max_summary_lines: SummaryLineLimit = 80) -> RunResult:
+        """Poll bounded run state; terminal coverage_ingest reports automatic snapshot results."""
+        return validated_output(
+            RunResult,
+            await asyncio.to_thread(store.run_result, run_id, max_summary_lines=max_summary_lines),
+        )
 
     @mcp.tool()
     async def latest_run(
         command_ref: OptionalCommandReference = None,
         max_summary_lines: SummaryLineLimit = 80,
-    ) -> dict[str, Any]:
-        """Return the newest active or terminal run with relative freshness, optionally by command."""
+    ) -> RunResult:
+        """Return the newest run with freshness and terminal automatic-ingestion results."""
         latest = await asyncio.to_thread(store.latest_run, command_ref=command_ref)
         if latest is None:
             raise KeyError("no runs found")
-        return await asyncio.to_thread(
-            store.run_result,
-            latest["id"],
-            max_summary_lines=max_summary_lines,
+        return validated_output(
+            RunResult,
+            await asyncio.to_thread(
+                store.run_result,
+                latest["id"],
+                max_summary_lines=max_summary_lines,
+            ),
         )
 
     @mcp.tool()
-    async def latest_artifact(kind: ArtifactKind, command_ref: OptionalCommandReference = None) -> dict[str, Any]:
-        """Locate the newest run artifact by registration key without searching the filesystem."""
+    async def latest_artifact(
+        kind: ArtifactKind,
+        command_ref: OptionalCommandReference = None,
+    ) -> LatestArtifactResult:
+        """Locate an artifact with freshness, coverage ingestion status, and linked snapshot."""
         artifact = await asyncio.to_thread(store.latest_artifact, command_ref=command_ref, kind=kind)
         if artifact is None:
             raise KeyError("artifact not found")
-        return artifact
+        return validated_output(LatestArtifactResult, artifact)
 
     @mcp.tool()
-    async def object_topology(object_kind: TopologyKind, object_ref: ObjectReference) -> dict[str, Any]:
+    async def object_topology(object_kind: TopologyKind, object_ref: ObjectReference) -> TopologyResult:
         """Resolve an object's computed project, Git, command, run, artifact, or baseline relationships."""
-        return await asyncio.to_thread(store.object_topology, object_kind, object_ref)
+        return validated_output(
+            TopologyResult,
+            await asyncio.to_thread(store.object_topology, object_kind, object_ref),
+        )
 
     @mcp.tool()
     async def ingest_coverage(
@@ -565,17 +628,20 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         branch: Branch = None,
         commit_sha: CommitSha = None,
         base_ref: OptionalBaseRef = None,
-    ) -> dict[str, Any]:
-        """Parse a local coverage artifact and store one normalized immutable snapshot."""
-        return await asyncio.to_thread(
-            store.ingest_report,
-            report_path,
-            format=format,
-            repo_path=repo_path,
-            branch=branch,
-            commit_sha=commit_sha,
-            base_ref=base_ref,
-            suite=suite,
+    ) -> SnapshotResult:
+        """Ingest an external coverage report not produced by a managed registered command."""
+        return validated_output(
+            SnapshotResult,
+            await asyncio.to_thread(
+                store.ingest_report,
+                report_path,
+                format=format,
+                repo_path=repo_path,
+                branch=branch,
+                commit_sha=commit_sha,
+                base_ref=base_ref,
+                suite=suite,
+            ),
         )
 
     @mcp.tool()
@@ -583,9 +649,12 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         path: WorktreePath,
         base_ref: BaseRef,
         name: OptionalLabel = None,
-    ) -> dict[str, Any]:
+    ) -> WorktreeResult:
         """Register one linked checkout and freeze the reference coverage available at that moment."""
-        return await asyncio.to_thread(store.register_worktree, path, base_ref=base_ref, name=name)
+        return validated_output(
+            WorktreeResult,
+            await asyncio.to_thread(store.register_worktree, path, base_ref=base_ref, name=name),
+        )
 
     @mcp.tool()
     async def worktree_progress(
@@ -593,14 +662,17 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         suite: OptionalSuite = None,
         file_path: OptionalFilePath = None,
         limit: TrendLimit = 200,
-    ) -> dict[str, Any]:
+    ) -> WorktreeProgressResult:
         """Return a worktree-only trend and deltas from its frozen suite-specific baseline."""
-        return await asyncio.to_thread(
-            store.worktree_progress,
-            worktree_id,
-            suite=suite,
-            file_path=file_path,
-            limit=limit,
+        return validated_output(
+            WorktreeProgressResult,
+            await asyncio.to_thread(
+                store.worktree_progress,
+                worktree_id,
+                suite=suite,
+                file_path=file_path,
+                limit=limit,
+            ),
         )
 
     @mcp.tool()
@@ -609,44 +681,49 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         repo_path: RepoPath = None,
         branch: Branch = None,
         suite: OptionalSuite = None,
-    ) -> dict[str, Any]:
+    ) -> SnapshotResult:
         """Return one snapshot summary; snapshot_id takes precedence over latest-snapshot filters."""
         if snapshot_id:
-            return await asyncio.to_thread(store.snapshot, snapshot_id)
+            return validated_output(SnapshotResult, await asyncio.to_thread(store.snapshot, snapshot_id))
         snapshot = await asyncio.to_thread(store.latest_snapshot, repo_path=repo_path, branch=branch, suite=suite)
         if snapshot is None:
             raise KeyError("no snapshots found")
-        return snapshot
+        return validated_output(SnapshotResult, snapshot)
 
     @mcp.tool()
-    async def coverage_files(snapshot_id: SnapshotId, limit: FileLimit = 100) -> list[dict[str, Any]]:
+    async def coverage_files(snapshot_id: SnapshotId, limit: FileLimit = 100) -> CoverageFileResults:
         """List bounded per-file counters ordered by lowest line coverage and largest files."""
-        return await asyncio.to_thread(store.files, snapshot_id, limit=limit)
+        files = await asyncio.to_thread(store.files, snapshot_id, limit=limit)
+        return validated_outputs(CoverageFileResult, files)
 
     @mcp.tool()
     async def coverage_file(
         snapshot_id: SnapshotId,
         file_path: FilePath,
         include_lines: IncludeLines = True,
-    ) -> dict[str, Any]:
+    ) -> CoverageFileResponse:
         """Inspect one exact path's totals and optionally up to 5,000 line records."""
         result: dict[str, Any] = {"file": await asyncio.to_thread(store.file_coverage, snapshot_id, file_path)}
         if include_lines:
             result["lines"] = await asyncio.to_thread(store.lines, snapshot_id, file_path)
-        return result
+            return validated_output(CoverageFileDetailResult, result)
+        return validated_output(CoverageFileSummaryResult, result)
 
     @mcp.tool()
     async def coverage_insights(
         snapshot_id: SnapshotId,
         baseline_snapshot_id: OptionalSnapshotId = None,
         limit: InsightLimit = 10,
-    ) -> dict[str, Any]:
+    ) -> CoverageInsightsResult:
         """Return deterministic investigation priorities, optionally including baseline regressions."""
-        return await asyncio.to_thread(
-            store.insights,
-            snapshot_id=snapshot_id,
-            baseline_snapshot_id=baseline_snapshot_id,
-            limit=limit,
+        return validated_output(
+            CoverageInsightsResult,
+            await asyncio.to_thread(
+                store.insights,
+                snapshot_id=snapshot_id,
+                baseline_snapshot_id=baseline_snapshot_id,
+                limit=limit,
+            ),
         )
 
     @mcp.tool()
@@ -656,26 +733,32 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         worktree_id: OptionalWorktreeId = None,
         file_limit: ComparisonFileLimit = 100,
         line_limit: ComparisonLineLimit = 500,
-    ) -> dict[str, Any]:
+    ) -> ComparisonResult:
         """Compare two explicit snapshots, or use worktree_id to select its frozen baseline."""
         if worktree_id:
             if baseline_snapshot_id:
                 raise ValueError("baseline_snapshot_id cannot be used with worktree_id")
-            return await asyncio.to_thread(
-                store.compare_worktree,
-                worktree_id,
-                snapshot_id=snapshot_id,
-                file_limit=file_limit,
-                line_limit=line_limit,
+            return validated_output(
+                ComparisonResult,
+                await asyncio.to_thread(
+                    store.compare_worktree,
+                    worktree_id,
+                    snapshot_id=snapshot_id,
+                    file_limit=file_limit,
+                    line_limit=line_limit,
+                ),
             )
         if not snapshot_id or not baseline_snapshot_id:
             raise ValueError("snapshot_id and baseline_snapshot_id are required without worktree_id")
-        return await asyncio.to_thread(
-            store.compare,
-            snapshot_id=snapshot_id,
-            baseline_snapshot_id=baseline_snapshot_id,
-            file_limit=file_limit,
-            line_limit=line_limit,
+        return validated_output(
+            ComparisonResult,
+            await asyncio.to_thread(
+                store.compare,
+                snapshot_id=snapshot_id,
+                baseline_snapshot_id=baseline_snapshot_id,
+                file_limit=file_limit,
+                line_limit=line_limit,
+            ),
         )
 
     @mcp.tool()
@@ -685,9 +768,9 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         file_path: OptionalFilePath = None,
         only_regressions: OnlyRegressions = False,
         limit: ChangedLineLimit = 500,
-    ) -> list[dict[str, Any]]:
+    ) -> ChangedLineResults:
         """Return bounded exact line/hit/branch changes, optionally only newly uncovered lines."""
-        return await asyncio.to_thread(
+        lines = await asyncio.to_thread(
             store.changed_lines,
             snapshot_id=snapshot_id,
             baseline_snapshot_id=baseline_snapshot_id,
@@ -695,6 +778,7 @@ def create_mcp(store: CoverageStore) -> FastMCP:
             only_regressions=only_regressions,
             limit=limit,
         )
+        return validated_outputs(ChangedLineResult, lines)
 
     @mcp.tool()
     async def line_history(
@@ -703,9 +787,9 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         repo_path: RepoPath = None,
         branch: Branch = None,
         limit: HistoryLimit = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> LineHistoryResults:
         """Return chronological coverage state for one path and one-based line number."""
-        return await asyncio.to_thread(
+        history = await asyncio.to_thread(
             store.line_history,
             file_path=file_path,
             line_number=line_number,
@@ -713,6 +797,7 @@ def create_mcp(store: CoverageStore) -> FastMCP:
             branch=branch,
             limit=limit,
         )
+        return validated_outputs(LineHistoryResult, history)
 
     @mcp.tool()
     async def source_context(
@@ -720,15 +805,16 @@ def create_mcp(store: CoverageStore) -> FastMCP:
         file_path: FilePath,
         start: SourceBoundary,
         end: SourceBoundary,
-    ) -> list[dict[str, Any]]:
+    ) -> SourceLineResults:
         """Read at most 200 repository-contained source lines identified by coverage metadata."""
-        return await asyncio.to_thread(
+        lines = await asyncio.to_thread(
             store.source_lines,
             snapshot_id=snapshot_id,
             file_path=file_path,
             start=start,
             end=end,
         )
+        return validated_outputs(SourceLineResult, lines)
 
     @mcp.resource("coverage://snapshots/latest", mime_type="application/json")
     async def latest_snapshot_resource() -> dict[str, Any]:
@@ -1644,7 +1730,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="toolbar">
       <select id="projectSelect" title="Project"></select>
       <select id="snapshotSelect" title="Snapshot"></select>
-      <input id="reportPath" placeholder="coverage report path">
+      <input id="reportPath" placeholder="external coverage report path">
       <select id="format">
         <option value="auto">auto</option>
         <option value="lcov">lcov</option>
@@ -1655,7 +1741,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <option value="go">Go coverprofile</option>
         <option value="llvm">LLVM JSON</option>
       </select>
-      <button class="primary" id="ingestBtn" title="Ingest report">Ingest</button>
+      <button class="primary" id="ingestBtn" title="Ingest external report">Ingest external</button>
       <button id="refreshBtn" title="Refresh">Refresh</button>
     </div>
   </header>
