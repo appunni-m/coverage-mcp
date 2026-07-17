@@ -159,6 +159,9 @@ sys.exit(1)
             assert run["terminal"] is False
             assert run["poll_after_ms"] == 1000
             assert run["parsed_summary"]["summary_deferred"] is True
+            assert run["duration_sample_count"] == 0
+            assert run["eta_seconds"] is None
+            assert run["eta_unavailable_reason"] == "no_command_history"
             run = await completed_run(mcp, run["id"], max_summary_lines=2)
             result = structured(await mcp.call_tool("run_result", {"run_id": run["id"], "max_summary_lines": 1}))
             latest_run = structured(
@@ -183,11 +186,14 @@ sys.exit(1)
             projects = structured(await mcp.call_tool("project_summaries", {"limit": 5}))
 
             assert run["status"] == "failed"
+            assert run["eta_seconds"] == 0
             assert result["id"] == run["id"]
             assert latest_run["id"] == run["id"]
             assert latest_run["age_seconds"] >= 0
             assert latest_run["age"].endswith(" ago")
             assert commands[0]["id"] == command["id"]
+            assert commands[0]["duration_sample_count"] == 1
+            assert commands[0]["duration_estimate_ms"] >= 0
             assert run["topology"]["command"]["id"] == command["id"]
             assert topology["topology"]["kind"] == "run"
             assert run["parsed_summary"]["stdout_line_count"] == 20

@@ -250,6 +250,8 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
 - Run tests through an existing human-approved command with `run_command_profiled`. Record the returned run id and
   use one stable `idempotency_key` for that intended run. Poll `run_result` no faster than `poll_after_ms`; retries
   must reuse the same key. If no approved command exists, ask for explicit approval before registering one.
+- Use `eta_seconds` to schedule the next status check when available. Treat it as a median-based estimate, use
+  `duration_p90_ms` as the conservative reference, and keep polling normally when the estimate is exceeded or absent.
 - Ingest generated coverage with the actual worktree path as `repo_path`, its branch/commit, and a stable suite name.
 - Use `worktree_progress(worktree_id, suite)` or `compare_to_baseline(worktree_id=...)` to report whether line, branch,
   function, and region coverage improved. Do not compare one worktree's snapshots to another worktree.
@@ -313,6 +315,13 @@ run_result(run_id="returned-run-id", max_summary_lines=80)
 
 Use `run_queue()` to inspect FIFO position. Set `wait=true` only for a command known to finish quickly; the default
 background mode keeps the MCP call responsive during long suites.
+
+After a command has completed normally at least once, active polling also reports an ETA learned from that command's
+own history. The command record stores the median duration, p90 duration, sample count, and newest contributing run
+time for its latest 20 natural completions. Passed and failed test processes contribute; cancellations, timeouts,
+interruptions, and launch failures do not. Queued ETA includes the estimated remaining time of FIFO jobs ahead plus
+the current command's median. When required history is missing, `eta_seconds` is `null` and
+`eta_unavailable_reason` explains why.
 
 An idempotency key identifies one intended run and is scoped to the registered command. Repeating the same key returns
 the existing queued, running, or terminal run with `submission_reused: true`. Use a new key only when a genuinely new
@@ -442,9 +451,12 @@ run_command_profiled(
 ```
 
 The normal response has `status: "queued"` or `status: "running"`, `terminal: false`, `queue_position`, and
-`poll_after_ms`. Save the run id and poll `run_result`; do not call `run_command_profiled` again for the same intended
-run. Retrying with the same `idempotency_key` reuses that run instead of creating a duplicate. Use `wait=true` only for
-a command known to be short when a single blocking call is explicitly useful.
+`poll_after_ms`. With sufficient command history it also has `eta_seconds`, a human-readable `eta`,
+`estimated_completion_at`, `duration_estimate_ms`, `duration_p90_ms`, and `duration_sample_count`. Queued runs add
+`estimated_start_at` and `queue_wait_estimate_seconds`; running jobs report `estimate_overrun_seconds` after exceeding
+their historical median. Save the run id and poll `run_result`; do not call `run_command_profiled` again for the same
+intended run. Retrying with the same `idempotency_key` reuses that run instead of creating a duplicate. Use `wait=true`
+only for a command known to be short when a single blocking call is explicitly useful.
 
 Once complete, the response includes pass/fail, exit code, execution and queue duration, key counters, selected
 error/tail excerpts, full log paths, and artifact paths. It also includes the exact completion time plus freshness
@@ -459,6 +471,8 @@ run_queue(limit=50)
 ```
 
 There is at most one running command per server. `queue_position: 0` means running; positive positions are waiting.
+Queue ETAs are composed from the stored median duration of each command in FIFO order. A missing estimate anywhere
+ahead produces `eta_unavailable_reason: "queue_history_incomplete"` rather than an unreliable ETA.
 
 ### `cancel_run`
 
@@ -492,8 +506,9 @@ run_result(run_id="...", max_summary_lines=80)
 ```
 
 Poll no faster than the returned `poll_after_ms`. Active responses intentionally defer log scanning and expose the
-full log paths. Stop polling when `terminal` is true. Terminal statuses are `passed`, `failed`, `cancelled`, `timeout`,
-`interrupted`, and `internal_error`.
+full log paths. Treat ETA as a historical estimate, not a timeout: p90 is the conservative reference, and
+`estimate_overrun_seconds` shows when a running command has exceeded its median. Stop polling when `terminal` is true.
+Terminal statuses are `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, and `internal_error`.
 
 ### `latest_artifact`
 

@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Queue
 from typing import Any
@@ -24,6 +24,7 @@ from coverage_mcp.models import CoverageReport
 from coverage_mcp.parsers import parse_coverage_report
 
 DEFAULT_RUN_RETENTION = 100
+COMMAND_DURATION_SAMPLE_LIMIT = 20
 
 
 def row_dict(columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
@@ -57,6 +58,7 @@ class CoverageStore:
         self._init_schema()
         queued_jobs = self._recover_run_jobs()
         self._prune_run_history()
+        self._refresh_all_command_duration_stats()
         self._worker = threading.Thread(
             target=self._run_worker,
             name="coverage-mcp-runner",
@@ -178,7 +180,11 @@ class CoverageStore:
                     approved_by VARCHAR NOT NULL,
                     approval_note VARCHAR NOT NULL,
                     artifact_specs VARCHAR NOT NULL,
-                    enabled BOOLEAN NOT NULL
+                    enabled BOOLEAN NOT NULL,
+                    duration_estimate_ms INTEGER,
+                    duration_p90_ms INTEGER,
+                    duration_sample_count INTEGER NOT NULL DEFAULT 0,
+                    duration_stats_updated_at TIMESTAMP
                 )
                 """
             )
@@ -279,6 +285,15 @@ class CoverageStore:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
         for table, additions in (
             (
+                "registered_commands",
+                (
+                    ("duration_estimate_ms", "INTEGER"),
+                    ("duration_p90_ms", "INTEGER"),
+                    ("duration_sample_count", "INTEGER DEFAULT 0"),
+                    ("duration_stats_updated_at", "TIMESTAMP"),
+                ),
+            ),
+            (
                 "runs",
                 (
                     ("queued_at", "TIMESTAMP"),
@@ -336,7 +351,12 @@ class CoverageStore:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO registered_commands VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO registered_commands (
+                    id, created_at, name, command, cwd, repo_path, repo_key, branch,
+                    commit_sha, shell, approved_by, approval_note, artifact_specs, enabled,
+                    duration_estimate_ms, duration_p90_ms, duration_sample_count,
+                    duration_stats_updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     command_id,
@@ -353,6 +373,10 @@ class CoverageStore:
                     approval_note,
                     json.dumps(specs),
                     enabled,
+                    None,
+                    None,
+                    0,
+                    None,
                 ],
             )
         return self.registered_command(command_id)
@@ -815,11 +839,88 @@ class CoverageStore:
                         ],
                     )
                 self._conn.execute("DELETE FROM run_jobs WHERE id = ?", [run_id])
+                if status in {"passed", "failed"} and exit_code is not None:
+                    self._refresh_command_duration_stats(job["command_id"])
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
         self._prune_run_history(job["command_id"])
+
+    def _refresh_all_command_duration_stats(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                WITH ranked_runs AS (
+                    SELECT command_id, duration_ms, ended_at,
+                           row_number() OVER (
+                               PARTITION BY command_id
+                               ORDER BY ended_at DESC, id DESC
+                           ) AS recency
+                    FROM runs
+                    WHERE status IN ('passed', 'failed')
+                      AND exit_code IS NOT NULL
+                ), duration_stats AS (
+                    SELECT command_id, median(duration_ms) AS estimate_ms,
+                           quantile_cont(duration_ms, 0.9) AS p90_ms,
+                           count(*) AS sample_count, max(ended_at) AS stats_updated_at
+                    FROM ranked_runs
+                    WHERE recency <= ?
+                    GROUP BY command_id
+                )
+                UPDATE registered_commands AS commands
+                SET duration_estimate_ms = round(stats.estimate_ms),
+                    duration_p90_ms = round(stats.p90_ms),
+                    duration_sample_count = stats.sample_count,
+                    duration_stats_updated_at = stats.stats_updated_at
+                FROM duration_stats AS stats
+                WHERE commands.id = stats.command_id
+                """,
+                [COMMAND_DURATION_SAMPLE_LIMIT],
+            )
+
+    def _refresh_command_duration_stats(self, command_id: str) -> None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT median(duration_ms), quantile_cont(duration_ms, 0.9), count(*), max(ended_at)
+                FROM (
+                    SELECT duration_ms, ended_at
+                    FROM runs
+                    WHERE command_id = ?
+                      AND status IN ('passed', 'failed')
+                      AND exit_code IS NOT NULL
+                    ORDER BY ended_at DESC, id DESC
+                    LIMIT ?
+                ) recent_runs
+                """,
+                [command_id, COMMAND_DURATION_SAMPLE_LIMIT],
+            ).fetchone()
+            if row is None or not row[2]:
+                estimate_ms = None
+                p90_ms = None
+                sample_count = 0
+                stats_updated_at = None
+            else:
+                estimate_ms = round(float(row[0]))
+                p90_ms = round(float(row[1]))
+                sample_count = int(row[2])
+                stats_updated_at = row[3]
+            self._conn.execute(
+                """
+                UPDATE registered_commands
+                SET duration_estimate_ms = ?, duration_p90_ms = ?,
+                    duration_sample_count = ?, duration_stats_updated_at = ?
+                WHERE id = ?
+                """,
+                [
+                    estimate_ms,
+                    p90_ms,
+                    sample_count,
+                    stats_updated_at,
+                    command_id,
+                ],
+            )
 
     def _mark_job_error(self, run_id: str, exc: Exception) -> None:
         message = f"{type(exc).__name__}: {exc}"
@@ -1027,6 +1128,139 @@ class CoverageStore:
     def _job_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
         return self._job_response(self._serialize(row_dict(columns, row)))
 
+    def _command_duration_stats(self, command_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT duration_estimate_ms, duration_p90_ms, duration_sample_count,
+                       duration_stats_updated_at
+                FROM registered_commands
+                WHERE id = ?
+                """,
+                [command_id],
+            ).fetchone()
+        if row is None:
+            return {
+                "duration_estimate_ms": None,
+                "duration_p90_ms": None,
+                "duration_sample_count": 0,
+                "duration_stats_updated_at": None,
+            }
+        return self._serialize(
+            {
+                "duration_estimate_ms": row[0],
+                "duration_p90_ms": row[1],
+                "duration_sample_count": row[2],
+                "duration_stats_updated_at": row[3],
+            }
+        )
+
+    def _queue_wait_estimate_ms(self, run_id: str, now: datetime) -> tuple[int | None, str | None]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT j.id, j.status, j.started_at, c.duration_estimate_ms
+                FROM run_jobs j
+                JOIN registered_commands c ON c.id = j.command_id
+                WHERE j.status IN ('running', 'queued')
+                ORDER BY CASE j.status WHEN 'running' THEN 0 ELSE 1 END,
+                         j.queued_at, j.id
+                """
+            ).fetchall()
+        wait_ms = 0
+        history_missing = False
+        for queued_id, status, started_at, estimate_ms in rows:
+            if str(queued_id) == run_id:
+                if history_missing:
+                    return None, "queue_history_incomplete"
+                return wait_ms, None
+            if estimate_ms is None:
+                history_missing = True
+                continue
+            remaining_ms = int(estimate_ms)
+            if status == "running":
+                started = parse_datetime(started_at)
+                elapsed_ms = int((now - (started or now)).total_seconds() * 1000)
+                remaining_ms = max(remaining_ms - elapsed_ms, 0)
+            wait_ms += remaining_ms
+        return None, "run_state_changed"
+
+    def _job_eta_fields(
+        self,
+        job: dict[str, Any],
+        *,
+        status: str,
+        now: datetime,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        stats = self._command_duration_stats(str(job["command_id"]))
+        fields: dict[str, Any] = {
+            **stats,
+            "duration_estimate_window": COMMAND_DURATION_SAMPLE_LIMIT,
+            "eta_seconds": None,
+            "eta": None,
+            "estimated_start_at": None,
+            "estimated_completion_at": None,
+            "queue_wait_estimate_seconds": None,
+            "estimate_overrun_seconds": 0,
+            "eta_unavailable_reason": None,
+        }
+        if status not in {"queued", "running"}:
+            fields.update(
+                {
+                    "eta_seconds": 0,
+                    "eta": format_duration(0),
+                    "estimated_start_at": job.get("started_at"),
+                    "estimated_completion_at": job.get("ended_at"),
+                    "queue_wait_estimate_seconds": 0,
+                }
+            )
+            return fields
+
+        estimate_ms = stats["duration_estimate_ms"]
+        if status == "running":
+            fields["estimated_start_at"] = job.get("started_at")
+            fields["queue_wait_estimate_seconds"] = 0
+            if estimate_ms is None:
+                fields["eta_unavailable_reason"] = "no_command_history"
+                return fields
+            remaining_ms = max(int(estimate_ms) - duration_ms, 0)
+            eta_seconds = milliseconds_to_seconds(remaining_ms)
+            started_at = parse_datetime(job.get("started_at")) or now
+            fields.update(
+                {
+                    "eta_seconds": eta_seconds,
+                    "eta": format_duration(eta_seconds),
+                    "estimated_completion_at": serialize_datetime(
+                        started_at + timedelta(milliseconds=int(estimate_ms))
+                    ),
+                    "estimate_overrun_seconds": milliseconds_to_seconds(max(duration_ms - int(estimate_ms), 0)),
+                }
+            )
+            return fields
+
+        queue_wait_ms, queue_error = self._queue_wait_estimate_ms(str(job["id"]), now)
+        if queue_wait_ms is not None:
+            fields["queue_wait_estimate_seconds"] = milliseconds_to_seconds(queue_wait_ms)
+            estimated_start = now + timedelta(milliseconds=queue_wait_ms)
+            fields["estimated_start_at"] = serialize_datetime(estimated_start)
+        if estimate_ms is None:
+            fields["eta_unavailable_reason"] = "no_command_history"
+            return fields
+        if queue_wait_ms is None:
+            fields["eta_unavailable_reason"] = queue_error
+            return fields
+        eta_ms = queue_wait_ms + int(estimate_ms)
+        eta_seconds = milliseconds_to_seconds(eta_ms)
+        fields.update(
+            {
+                "eta_seconds": eta_seconds,
+                "eta": format_duration(eta_seconds),
+                "estimated_completion_at": serialize_datetime(now + timedelta(milliseconds=eta_ms)),
+            }
+        )
+        return fields
+
     def _job_response(self, job: dict[str, Any], *, max_summary_lines: int | None = None) -> dict[str, Any]:
         status = str(job["status"])
         terminal = status not in {"queued", "running"}
@@ -1045,6 +1279,7 @@ class CoverageStore:
             "execution_mode": "background",
             "cancellation_requested": job.get("cancellation_requested_at") is not None,
         }
+        result.update(self._job_eta_fields(job, status=status, now=now, duration_ms=result["duration_ms"]))
         if terminal:
             result["parsed_summary"] = summarize_run_logs(
                 stdout_path=Path(job["stdout_path"]),
@@ -1073,9 +1308,10 @@ class CoverageStore:
                 position = self._conn.execute(
                     """
                     SELECT count(*) FROM run_jobs
-                    WHERE status = 'queued' AND queued_at <= ?
+                    WHERE status = 'queued'
+                      AND (queued_at < ? OR (queued_at = ? AND id <= ?))
                     """,
-                    [job["queued_at"]],
+                    [job["queued_at"], job["queued_at"], job["id"]],
                 ).fetchone()
             result["queue_position"] = int(position[0]) if position else 1
             self._with_relative_age(result, "queued_at", prefix="queued")
@@ -2187,6 +2423,14 @@ class CoverageStore:
         run["queue_position"] = None
         run["execution_mode"] = "background"
         run["cancellation_requested"] = run.get("cancellation_requested_at") is not None
+        run.update(
+            self._job_eta_fields(
+                run,
+                status=str(run["status"]),
+                now=utcnow(),
+                duration_ms=int(run["duration_ms"]),
+            )
+        )
         return self._with_relative_age(run, "ended_at")
 
     def _worktree_from_row(self, columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:
@@ -2283,6 +2527,18 @@ def format_age(seconds: int) -> str:
     if not parts:
         parts.append("0 seconds")
     return " ".join(parts) + " ago"
+
+
+def format_duration(seconds: int) -> str:
+    return format_age(seconds).removesuffix(" ago")
+
+
+def milliseconds_to_seconds(milliseconds: int) -> int:
+    return (max(milliseconds, 0) + 999) // 1000
+
+
+def serialize_datetime(value: datetime) -> str:
+    return value.isoformat() + "Z"
 
 
 def infer_topology(value: dict[str, Any]) -> dict[str, Any] | None:

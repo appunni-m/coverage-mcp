@@ -628,6 +628,131 @@ def test_run_retention_is_count_based_and_isolated_per_command(monkeypatch, tmp_
         retained.close()
 
 
+def test_command_duration_history_drives_running_and_queued_eta(tmp_path):
+    script = tmp_path / "timed.py"
+    script.write_text(
+        """import sys
+import time
+from pathlib import Path
+
+time.sleep(float(Path(sys.argv[1]).read_text()))
+print("1 passed")
+""",
+        encoding="utf-8",
+    )
+    primary_delay = tmp_path / "primary-delay.txt"
+    secondary_delay = tmp_path / "secondary-delay.txt"
+    unknown_delay = tmp_path / "unknown-delay.txt"
+    for path in (primary_delay, secondary_delay, unknown_delay):
+        path.write_text("0.001", encoding="utf-8")
+
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        primary = store.register_command(
+            name="timed-primary",
+            command=f"{sys.executable} {script.name} {primary_delay.name}",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved primary ETA test command",
+        )
+        secondary = store.register_command(
+            name="timed-secondary",
+            command=f"{sys.executable} {script.name} {secondary_delay.name}",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved secondary ETA test command",
+        )
+        unknown = store.register_command(
+            name="timed-unknown",
+            command=f"{sys.executable} {script.name} {unknown_delay.name}",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved no-history ETA test command",
+        )
+        assert primary["duration_estimate_ms"] is None
+        assert primary["duration_sample_count"] == 0
+        assert store._command_duration_stats("missing")["duration_sample_count"] == 0
+
+        primary_runs = [store.run_command_profiled(primary["id"]) for _ in range(3)]
+        secondary_run = store.run_command_profiled(secondary["id"])
+        for run, duration_ms in zip(primary_runs, (100, 200, 1000), strict=True):
+            store._conn.execute("UPDATE runs SET duration_ms = ? WHERE id = ?", [duration_ms, run["id"]])
+        store._conn.execute("UPDATE runs SET duration_ms = 400 WHERE id = ?", [secondary_run["id"]])
+        store._refresh_command_duration_stats(primary["id"])
+        store._refresh_command_duration_stats(secondary["id"])
+
+        learned = store.registered_command(primary["id"])
+        assert learned["duration_estimate_ms"] == 200
+        assert learned["duration_p90_ms"] == 840
+        assert learned["duration_sample_count"] == 3
+        assert learned["duration_stats_updated_at"]
+
+        primary_delay.write_text("0.8", encoding="utf-8")
+        secondary_delay.write_text("0.8", encoding="utf-8")
+        running = store.submit_command_profiled(primary["id"])
+        for _ in range(100):
+            running = store.run_result(running["id"])
+            if running["status"] == "running":
+                break
+            time.sleep(0.01)
+        queued = store.submit_command_profiled(secondary["id"])
+        queued = store.run_result(queued["id"])
+
+        assert running["duration_estimate_ms"] == 200
+        assert running["duration_p90_ms"] == 840
+        assert running["eta_seconds"] is not None
+        assert not running["eta"].endswith("ago")
+        assert running["estimated_completion_at"].endswith("Z")
+        assert queued["queue_position"] == 1
+        assert queued["duration_estimate_ms"] == 400
+        assert queued["queue_wait_estimate_seconds"] is not None
+        assert queued["eta_seconds"] >= queued["queue_wait_estimate_seconds"]
+        assert queued["estimated_start_at"].endswith("Z")
+        assert queued["estimated_completion_at"].endswith("Z")
+
+        time.sleep(0.25)
+        overrun = store.run_result(running["id"])
+        assert overrun["status"] == "running"
+        assert overrun["eta_seconds"] == 0
+        assert overrun["estimate_overrun_seconds"] >= 1
+        store.cancel_run(queued["id"])
+        cancelled = store.cancel_run(running["id"])
+        if not cancelled["terminal"]:
+            cancelled = store.wait_for_run(running["id"])
+        assert cancelled["eta_seconds"] == 0
+        assert cancelled["eta"] == "0 seconds"
+        assert store.registered_command(primary["id"])["duration_sample_count"] == 3
+
+        unknown_delay.write_text("0.8", encoding="utf-8")
+        no_history = store.submit_command_profiled(unknown["id"])
+        for _ in range(100):
+            no_history = store.run_result(no_history["id"])
+            if no_history["status"] == "running":
+                break
+            time.sleep(0.01)
+        assert no_history["eta_seconds"] is None
+        assert no_history["eta_unavailable_reason"] == "no_command_history"
+
+        blocked_eta = store.submit_command_profiled(secondary["id"])
+        blocked_eta = store.run_result(blocked_eta["id"])
+        assert blocked_eta["eta_seconds"] is None
+        assert blocked_eta["queue_wait_estimate_seconds"] is None
+        assert blocked_eta["eta_unavailable_reason"] == "queue_history_incomplete"
+        assert store._queue_wait_estimate_ms("missing", datetime.now(UTC).replace(tzinfo=None)) == (
+            None,
+            "run_state_changed",
+        )
+        store.cancel_run(blocked_eta["id"])
+        store.cancel_run(no_history["id"])
+        store.wait_for_run(no_history["id"])
+        assert store.registered_command(unknown["id"])["duration_sample_count"] == 0
+    finally:
+        store.close()
+
+
 def test_run_submission_idempotency_is_atomic_and_command_scoped(monkeypatch, tmp_path):
     script = tmp_path / "run.py"
     script.write_text(
@@ -1003,6 +1128,26 @@ def test_existing_schema_migration(tmp_path):
     )
     conn.execute(
         """
+        CREATE TABLE registered_commands (
+            id VARCHAR PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL,
+            name VARCHAR NOT NULL,
+            command VARCHAR NOT NULL,
+            cwd VARCHAR NOT NULL,
+            repo_path VARCHAR NOT NULL,
+            repo_key VARCHAR NOT NULL,
+            branch VARCHAR,
+            commit_sha VARCHAR,
+            shell VARCHAR NOT NULL,
+            approved_by VARCHAR NOT NULL,
+            approval_note VARCHAR NOT NULL,
+            artifact_specs VARCHAR NOT NULL,
+            enabled BOOLEAN NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE runs (
             id VARCHAR PRIMARY KEY,
             command_id VARCHAR NOT NULL,
@@ -1024,6 +1169,25 @@ def test_existing_schema_migration(tmp_path):
             artifact_paths VARCHAR NOT NULL
         )
         """
+    )
+    recorded_at = datetime.now(UTC)
+    conn.execute(
+        """
+        INSERT INTO registered_commands VALUES (
+            'legacy-command', ?, 'legacy', 'echo ok', ?, ?, ?, 'main', 'abc',
+            '/bin/bash', 'tester', 'legacy approval', '[]', true
+        )
+        """,
+        [recorded_at, tmp_path.as_posix(), tmp_path.as_posix(), tmp_path.as_posix()],
+    )
+    conn.execute(
+        """
+        INSERT INTO runs VALUES (
+            'legacy-run', 'legacy-command', 'legacy', 'echo ok', ?, ?, ?, 'main', 'abc',
+            ?, ?, 1234, 0, 'passed', 'stdout.log', 'stderr.log', '{}', '[]'
+        )
+        """,
+        [tmp_path.as_posix(), tmp_path.as_posix(), tmp_path.as_posix(), recorded_at, recorded_at],
     )
     conn.execute(
         """
@@ -1062,6 +1226,17 @@ def test_existing_schema_migration(tmp_path):
         assert {"queued_at", "queue_duration_ms", "idempotency_key", "cancellation_requested_at"} <= run_columns
         job_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('run_jobs')").fetchall()}
         assert {"idempotency_key", "cancellation_requested_at"} <= job_columns
+        command_columns = {row[1] for row in store._conn.execute("PRAGMA table_info('registered_commands')").fetchall()}
+        assert {
+            "duration_estimate_ms",
+            "duration_p90_ms",
+            "duration_sample_count",
+            "duration_stats_updated_at",
+        } <= command_columns
+        legacy = store.registered_command("legacy-command")
+        assert legacy["duration_estimate_ms"] == 1234
+        assert legacy["duration_p90_ms"] == 1234
+        assert legacy["duration_sample_count"] == 1
         assert store._conn.execute("SELECT count(*) FROM run_jobs").fetchone() == (0,)
     finally:
         store.close()
