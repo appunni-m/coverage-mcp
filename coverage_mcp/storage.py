@@ -19,6 +19,7 @@ from typing import Any
 
 import duckdb
 
+from coverage_mcp.contracts import MAX_SUMMARY_LINES, MAX_TIMEOUT_SECONDS, MIN_SUMMARY_LINES, MIN_TIMEOUT_SECONDS
 from coverage_mcp.git_utils import inspect_git, merge_base
 from coverage_mcp.models import CoverageReport
 from coverage_mcp.parsers import parse_coverage_report
@@ -443,6 +444,7 @@ class CoverageStore:
         timeout_seconds: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        validate_run_limits(max_summary_lines=max_summary_lines, timeout_seconds=timeout_seconds)
         if self._closing.is_set():
             raise RuntimeError("coverage store is shutting down")
         registered = self.registered_command(command_ref)
@@ -542,6 +544,7 @@ class CoverageStore:
             time.sleep(0.02)
 
     def cancel_run(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
+        validate_run_limits(max_summary_lines=max_summary_lines)
         requested_at = utcnow()
         command_id: str | None = None
         with self._lock:
@@ -1022,6 +1025,7 @@ class CoverageStore:
                 run_path.rmdir()
 
     def run_result(self, run_id: str, *, max_summary_lines: int = 80) -> dict[str, Any]:
+        validate_run_limits(max_summary_lines=max_summary_lines)
         with self._lock:
             row = self._conn.execute("SELECT * FROM runs WHERE id = ?", [run_id]).fetchone()
             if row is not None:
@@ -2067,7 +2071,21 @@ class CoverageStore:
                     c.covered_branches AS current_covered_branches,
                     b.branch_rate AS baseline_branch_rate,
                     c.branch_rate AS current_branch_rate,
-                    COALESCE(c.branch_rate, 0) - COALESCE(b.branch_rate, 0) AS branch_rate_delta
+                    COALESCE(c.branch_rate, 0) - COALESCE(b.branch_rate, 0) AS branch_rate_delta,
+                    b.total_functions AS baseline_total_functions,
+                    c.total_functions AS current_total_functions,
+                    b.covered_functions AS baseline_covered_functions,
+                    c.covered_functions AS current_covered_functions,
+                    b.function_rate AS baseline_function_rate,
+                    c.function_rate AS current_function_rate,
+                    COALESCE(c.function_rate, 0) - COALESCE(b.function_rate, 0) AS function_rate_delta,
+                    b.total_regions AS baseline_total_regions,
+                    c.total_regions AS current_total_regions,
+                    b.covered_regions AS baseline_covered_regions,
+                    c.covered_regions AS current_covered_regions,
+                    b.region_rate AS baseline_region_rate,
+                    c.region_rate AS current_region_rate,
+                    COALESCE(c.region_rate, 0) - COALESCE(b.region_rate, 0) AS region_rate_delta
                 FROM b
                 FULL OUTER JOIN c
                   ON c.file_path = b.file_path
@@ -2093,6 +2111,12 @@ class CoverageStore:
                 "branch_rate_delta": _delta(current.get("branch_rate"), baseline.get("branch_rate")),
                 "covered_branches_delta": current["covered_branches"] - baseline["covered_branches"],
                 "total_branches_delta": current["total_branches"] - baseline["total_branches"],
+                "function_rate_delta": _delta(current.get("function_rate"), baseline.get("function_rate")),
+                "covered_functions_delta": current["covered_functions"] - baseline["covered_functions"],
+                "total_functions_delta": current["total_functions"] - baseline["total_functions"],
+                "region_rate_delta": _delta(current.get("region_rate"), baseline.get("region_rate")),
+                "covered_regions_delta": current["covered_regions"] - baseline["covered_regions"],
+                "total_regions_delta": current["total_regions"] - baseline["total_regions"],
             },
             "files": [self._serialize(row_dict(file_columns, row)) for row in rows],
             "changed_lines": changed_lines,
@@ -2263,7 +2287,14 @@ class CoverageStore:
             "items": items[: limit * 4],
         }
 
-    def compare_worktree(self, worktree_id: str, *, snapshot_id: str | None = None) -> dict[str, Any]:
+    def compare_worktree(
+        self,
+        worktree_id: str,
+        *,
+        snapshot_id: str | None = None,
+        file_limit: int = 100,
+        line_limit: int = 500,
+    ) -> dict[str, Any]:
         worktree = self.worktree(worktree_id)
         current_id = snapshot_id
         if current_id is None:
@@ -2273,7 +2304,12 @@ class CoverageStore:
             current_id = points[-1]["id"]
         current = self.snapshot(current_id)
         baseline_snapshot_id = self._worktree_baseline_snapshot_id(worktree, current["suite"])
-        comparison = self.compare(snapshot_id=current_id, baseline_snapshot_id=baseline_snapshot_id)
+        comparison = self.compare(
+            snapshot_id=current_id,
+            baseline_snapshot_id=baseline_snapshot_id,
+            file_limit=file_limit,
+            line_limit=line_limit,
+        )
         comparison["worktree"] = worktree
         return comparison
 
@@ -2483,6 +2519,13 @@ def _delta(current: float | None, baseline: float | None) -> float | None:
     if current is None or baseline is None:
         return None
     return current - baseline
+
+
+def validate_run_limits(*, max_summary_lines: int, timeout_seconds: int | None = None) -> None:
+    if not MIN_SUMMARY_LINES <= max_summary_lines <= MAX_SUMMARY_LINES:
+        raise ValueError(f"max_summary_lines must be between {MIN_SUMMARY_LINES} and {MAX_SUMMARY_LINES}")
+    if timeout_seconds is not None and not MIN_TIMEOUT_SECONDS <= timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"timeout_seconds must be between {MIN_TIMEOUT_SECONDS} and {MAX_TIMEOUT_SECONDS}")
 
 
 def relative_age(

@@ -675,6 +675,8 @@ print("1 passed")
         assert primary["duration_estimate_ms"] is None
         assert primary["duration_sample_count"] == 0
         assert store._command_duration_stats("missing")["duration_sample_count"] == 0
+        store._refresh_command_duration_stats(unknown["id"])
+        assert store.registered_command(unknown["id"])["duration_estimate_ms"] is None
 
         primary_runs = [store.run_command_profiled(primary["id"]) for _ in range(3)]
         secondary_run = store.run_command_profiled(secondary["id"])
@@ -821,6 +823,14 @@ print("1 passed")
             store.submit_command_profiled(primary["id"], idempotency_key=" ")
         with pytest.raises(ValueError, match="200"):
             store.submit_command_profiled(primary["id"], idempotency_key="x" * 201)
+        with pytest.raises(ValueError, match="max_summary_lines"):
+            store.submit_command_profiled(primary["id"], max_summary_lines=501)
+        with pytest.raises(ValueError, match="timeout_seconds"):
+            store.submit_command_profiled(primary["id"], timeout_seconds=0)
+        with pytest.raises(ValueError, match="max_summary_lines"):
+            store.run_result(primary_result["id"], max_summary_lines=0)
+        with pytest.raises(ValueError, match="max_summary_lines"):
+            store.cancel_run(primary_result["id"], max_summary_lines=501)
     finally:
         store.close()
 

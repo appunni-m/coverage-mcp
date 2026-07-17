@@ -2,12 +2,68 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
+import time
+from pathlib import Path
 
 import pytest
+import uvicorn
+from mcp import ClientSession
 from mcp.server.fastmcp.exceptions import ToolError
 
-from coverage_mcp.app import create_mcp
+try:
+    from mcp.client.streamable_http import streamable_http_client
+except ImportError:  # MCP 1.23 compatibility
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
+
+from coverage_mcp.app import create_app, create_mcp
 from coverage_mcp.storage import CoverageStore
+
+EXPECTED_MCP_INPUTS = {
+    "project_summaries": {"limit"},
+    "register_test_command": {
+        "name",
+        "command",
+        "human_approved",
+        "approved_by",
+        "approval_note",
+        "cwd",
+        "shell",
+        "artifact_paths",
+    },
+    "list_registered_commands": {"limit"},
+    "run_command_profiled": {
+        "command_ref",
+        "max_summary_lines",
+        "timeout_seconds",
+        "idempotency_key",
+        "wait",
+    },
+    "run_queue": {"limit"},
+    "cancel_run": {"run_id", "max_summary_lines"},
+    "run_result": {"run_id", "max_summary_lines"},
+    "latest_run": {"command_ref", "max_summary_lines"},
+    "latest_artifact": {"kind", "command_ref"},
+    "object_topology": {"object_kind", "object_ref"},
+    "ingest_coverage": {"report_path", "format", "repo_path", "suite", "branch", "commit_sha", "base_ref"},
+    "register_worktree": {"path", "base_ref", "name"},
+    "worktree_progress": {"worktree_id", "suite", "file_path", "limit"},
+    "coverage_summary": {"snapshot_id", "repo_path", "branch", "suite"},
+    "coverage_files": {"snapshot_id", "limit"},
+    "coverage_file": {"snapshot_id", "file_path", "include_lines"},
+    "coverage_insights": {"snapshot_id", "baseline_snapshot_id", "limit"},
+    "compare_to_baseline": {"snapshot_id", "baseline_snapshot_id", "worktree_id", "file_limit", "line_limit"},
+    "changed_lines": {"snapshot_id", "baseline_snapshot_id", "file_path", "only_regressions", "limit"},
+    "line_history": {"file_path", "line_number", "repo_path", "branch", "limit"},
+    "source_context": {"snapshot_id", "file_path", "start", "end"},
+}
+
+EXPECTED_MCP_RESOURCES = {"coverage://snapshots/latest", "coverage://projects"}
+EXPECTED_MCP_RESOURCE_TEMPLATES = {
+    "coverage://snapshot/{snapshot_id}/summary",
+    "coverage://snapshot/{snapshot_id}/insights",
+    "coverage://snapshot/{snapshot_id}/files",
+}
 
 
 def run(coro):
@@ -17,6 +73,126 @@ def run(coro):
 def structured(payload):
     value = payload[1]
     return value["result"] if isinstance(value, dict) and set(value) == {"result"} else value
+
+
+def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        mcp = create_mcp(store)
+
+        async def scenario():
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
+            assert set(tools) == set(EXPECTED_MCP_INPUTS)
+            for name, expected_inputs in EXPECTED_MCP_INPUTS.items():
+                tool = tools[name]
+                assert tool.description
+                properties = tool.inputSchema["properties"]
+                assert set(properties) == expected_inputs
+                assert all(properties[input_name].get("description") for input_name in expected_inputs)
+
+            run_schema = tools["run_command_profiled"].inputSchema["properties"]
+            assert run_schema["max_summary_lines"]["minimum"] == 1
+            assert run_schema["max_summary_lines"]["maximum"] == 500
+            timeout_schema = run_schema["timeout_seconds"]["anyOf"][0]
+            assert timeout_schema["minimum"] == 1
+            assert timeout_schema["maximum"] == 86400
+            idempotency_schema = run_schema["idempotency_key"]["anyOf"][0]
+            assert idempotency_schema["minLength"] == 1
+            assert idempotency_schema["maxLength"] == 200
+
+            registration = tools["register_test_command"].inputSchema
+            assert set(registration["required"]) == {
+                "name",
+                "command",
+                "human_approved",
+                "approved_by",
+                "approval_note",
+            }
+            assert registration["properties"]["human_approved"]["const"] is True
+            artifact = registration["$defs"]["ArtifactSpec"]
+            assert set(artifact["required"]) == {"path"}
+            assert all(field.get("description") for field in artifact["properties"].values())
+            artifact_formats = artifact["properties"]["coverage_format"]["anyOf"][0]["enum"]
+            assert {"auto", "lcov", "coveragepy", "cobertura", "jacoco", "istanbul", "go", "llvm"} <= set(
+                artifact_formats
+            )
+
+            coverage_formats = tools["ingest_coverage"].inputSchema["properties"]["format"]["enum"]
+            assert {"auto", "lcov", "coveragepy", "cobertura", "jacoco", "istanbul", "go", "llvm"} <= set(
+                coverage_formats
+            )
+            topology_kinds = tools["object_topology"].inputSchema["properties"]["object_kind"]["enum"]
+            assert {"project", "command", "run", "snapshot", "worktree"} <= set(topology_kinds)
+
+            resources = {str(resource.uri) for resource in await mcp.list_resources()}
+            templates = {str(template.uriTemplate) for template in await mcp.list_resource_templates()}
+            assert resources == EXPECTED_MCP_RESOURCES
+            assert templates == EXPECTED_MCP_RESOURCE_TEMPLATES
+
+            for tool_name, arguments in (
+                ("run_command_profiled", {"command_ref": "unit", "max_summary_lines": 501}),
+                ("run_command_profiled", {"command_ref": "unit", "timeout_seconds": 0}),
+                ("run_command_profiled", {"command_ref": "unit", "idempotency_key": "x" * 201}),
+                ("register_test_command", {"name": "x", "command": "echo x", "human_approved": False}),
+                ("ingest_coverage", {"report_path": "coverage.out", "format": "unknown"}),
+                ("object_topology", {"object_kind": "unknown", "object_ref": "x"}),
+            ):
+                with pytest.raises(ToolError):
+                    await mcp.call_tool(tool_name, arguments)
+
+        run(scenario())
+    finally:
+        store.close()
+
+
+def test_streamable_http_protocol_with_official_client(tmp_path):
+    app = create_app((tmp_path / "coverage.duckdb").as_posix())
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=0,
+            log_level="critical",
+        )
+    )
+    thread = threading.Thread(target=server.run, name="coverage-mcp-http-test", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    async def scenario():
+        async with (
+            streamable_http_client(f"http://127.0.0.1:{port}/mcp/") as (read_stream, write_stream, _),
+            ClientSession(read_stream, write_stream) as session,
+        ):
+            initialized = await session.initialize()
+            assert initialized.serverInfo.name == "coverage-mcp"
+            assert "system of record" in (initialized.instructions or "")
+            tools = await session.list_tools()
+            assert {tool.name for tool in tools.tools} == set(EXPECTED_MCP_INPUTS)
+            for tool in tools.tools:
+                assert tool.description
+                assert set(tool.inputSchema["properties"]) == EXPECTED_MCP_INPUTS[tool.name]
+                assert all(field.get("description") for field in tool.inputSchema["properties"].values())
+            result = await session.call_tool("project_summaries", {"limit": 1})
+            assert result.isError is False
+            assert result.structuredContent == {"result": []}
+            resources = await session.list_resources()
+            assert {str(resource.uri) for resource in resources.resources} == EXPECTED_MCP_RESOURCES
+            templates = await session.list_resource_templates()
+            assert {
+                str(template.uriTemplate) for template in templates.resourceTemplates
+            } == EXPECTED_MCP_RESOURCE_TEMPLATES
+
+    try:
+        run(scenario())
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        assert not thread.is_alive()
 
 
 async def completed_run(mcp, run_id, max_summary_lines=80):
@@ -50,24 +226,7 @@ end_of_record
 
         async def scenario():
             tools = await mcp.list_tools()
-            assert {
-                "ingest_coverage",
-                "project_summaries",
-                "register_test_command",
-                "list_registered_commands",
-                "run_command_profiled",
-                "run_queue",
-                "cancel_run",
-                "run_result",
-                "latest_run",
-                "object_topology",
-                "coverage_summary",
-                "coverage_files",
-                "coverage_file",
-                "coverage_insights",
-                "changed_lines",
-                "worktree_progress",
-            }.issubset({tool.name for tool in tools})
+            assert {tool.name for tool in tools} == set(EXPECTED_MCP_INPUTS)
 
             snapshot = structured(
                 await mcp.call_tool(
@@ -318,6 +477,22 @@ def test_mcp_coverage_query_surface_and_resources(tmp_path):
                 )
             )
             assert comparison["overall"]["total_lines_delta"] == 1
+            assert set(comparison["overall"]) == {
+                "line_rate_delta",
+                "covered_lines_delta",
+                "total_lines_delta",
+                "branch_rate_delta",
+                "covered_branches_delta",
+                "total_branches_delta",
+                "function_rate_delta",
+                "covered_functions_delta",
+                "total_functions_delta",
+                "region_rate_delta",
+                "covered_regions_delta",
+                "total_regions_delta",
+            }
+            assert "function_rate_delta" in comparison["files"][0]
+            assert "region_rate_delta" in comparison["files"][0]
             changed = structured(
                 await mcp.call_tool(
                     "changed_lines",
@@ -352,10 +527,25 @@ def test_mcp_coverage_query_surface_and_resources(tmp_path):
             worktree_comparison = structured(
                 await mcp.call_tool(
                     "compare_to_baseline",
-                    {"worktree_id": worktree["id"], "snapshot_id": current_snapshot["id"]},
+                    {
+                        "worktree_id": worktree["id"],
+                        "snapshot_id": current_snapshot["id"],
+                        "file_limit": 1,
+                        "line_limit": 1,
+                    },
                 )
             )
             assert worktree_comparison["worktree"]["id"] == worktree["id"]
+            assert len(worktree_comparison["files"]) <= 1
+            assert len(worktree_comparison["changed_lines"]) <= 1
+            with pytest.raises(ToolError, match="cannot be used with worktree_id"):
+                await mcp.call_tool(
+                    "compare_to_baseline",
+                    {
+                        "worktree_id": worktree["id"],
+                        "baseline_snapshot_id": base_snapshot["id"],
+                    },
+                )
             progress = structured(
                 await mcp.call_tool(
                     "worktree_progress",
@@ -364,9 +554,9 @@ def test_mcp_coverage_query_surface_and_resources(tmp_path):
             )
             assert progress["baseline"]["id"] == base_snapshot["id"]
             resources = await mcp.list_resources()
-            assert "coverage://projects" in {str(resource.uri) for resource in resources}
+            assert {str(resource.uri) for resource in resources} == EXPECTED_MCP_RESOURCES
             templates = await mcp.list_resource_templates()
-            assert "coverage://snapshot/{snapshot_id}/files" in {str(template.uriTemplate) for template in templates}
+            assert {str(template.uriTemplate) for template in templates} == EXPECTED_MCP_RESOURCE_TEMPLATES
             latest = list(await mcp.read_resource("coverage://snapshots/latest"))
             assert latest
             projects = list(await mcp.read_resource("coverage://projects"))
@@ -389,3 +579,21 @@ def test_mcp_coverage_query_surface_and_resources(tmp_path):
         run(scenario())
     finally:
         store.close()
+
+
+def test_readme_documents_every_mcp_input_output_and_error():
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    guide = readme.split("## MCP Usage Guide", 1)[1].split("## Worktree Baselines", 1)[0]
+
+    for tool_name, inputs in EXPECTED_MCP_INPUTS.items():
+        marker = f"### `{tool_name}`"
+        assert guide.count(marker) == 1
+        section = guide.split(marker, 1)[1].split("\n### ", 1)[0]
+        assert "**Inputs:**" in section
+        assert "**Returns:**" in section
+        assert "**Errors:**" in section
+        for input_name in inputs:
+            assert f"`{input_name}`" in section, f"{tool_name} does not document {input_name}"
+
+    for uri in EXPECTED_MCP_RESOURCES | EXPECTED_MCP_RESOURCE_TEMPLATES:
+        assert f"`{uri}`" in guide

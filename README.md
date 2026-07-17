@@ -81,7 +81,7 @@ Confirm the new process loaded the expected release:
 curl http://127.0.0.1:59471/health
 ```
 
-The response includes the running `version` and active `db_path`.
+The response must report `version: "0.3.2"` and includes the active `db_path`.
 
 ## Start The Shared Server
 
@@ -400,259 +400,258 @@ Connect your MCP client to:
 http://127.0.0.1:59471/mcp/
 ```
 
-The most common tools are:
+Coverage MCP `0.3.2` exposes 21 tools. Their MCP JSON Schemas carry the same
+descriptions, required fields, enums, and bounds documented below. Invalid
+types, missing required inputs, out-of-range values, and unsupported enum
+values are returned as MCP tool errors before execution.
+
+General conventions:
+
+- IDs are durable UUID strings. A `command_ref` accepts either a registration ID or its latest matching name.
+- `file_path` is the exact repository-relative path stored by the report. Rename history is intentionally not inferred.
+- Result limits are inclusive. `limit` is tool-specific; `max_summary_lines` is always 1-500.
+- Times are returned as UTC timestamps plus `age_seconds` and a human-readable `age` such as `10 minutes 3 seconds ago`.
+- Missing IDs, files, reports, artifacts, or applicable baselines are MCP tool errors, not empty success objects unless stated otherwise.
 
 ### `project_summaries`
 
-Lists known projects with their latest coverage and snapshot counts.
+`project_summaries(limit: integer = 100)` discovers projects known through snapshots, commands, or runs.
 
-```text
-project_summaries(limit=100)
-```
+**Inputs:** `limit` is the maximum records to return, from 1 through 1000.
 
-Use this first when you want to know which project has what coverage.
+**Returns:** A list containing project identity, latest snapshot and run, counts, current rates, freshness, and inline topology.
+
+**Errors:** Schema validation errors only; an empty server returns an empty list.
 
 ### `register_test_command`
 
-Registers an approved command that can be run later by id or name.
+`register_test_command(name, command, human_approved, approved_by, approval_note, cwd = null, shell = "/bin/bash", artifact_paths = null)` creates an immutable approved command definition.
+
+**Inputs:** `name` is a non-empty stable label; `command` is the complete shell command; `human_approved` must literally be `true`; `approved_by` identifies the approving human; `approval_note` records the exact approval; `cwd` is the project working directory or null for the server cwd; `shell` is the executable shell; `artifact_paths` maps artifact kind to either a path string or `{path, required, coverage_format}`. Relative artifact paths resolve from `cwd`; `required` defaults to false and `coverage_format` defaults to null. When present, `coverage_format` accepts the formats listed under `ingest_coverage`.
+
+**Returns:** The registration ID, exact execution details, approval audit fields, project topology, enabled state, and learned duration fields.
+
+**Errors:** Missing or false approval, blank required text, or invalid cwd/artifact configuration produces a tool error. Duplicate definitions are allowed as separate immutable registrations; changing an approved command requires a new registration.
 
 ```text
 register_test_command(
-  name="unit",
-  command="pytest tests/unit",
+  name="unit-coverage",
+  command="pytest --cov=src --cov-report=json:.coverage-mcp/coverage.json",
   cwd="/path/to/repo",
-  artifact_paths={"lcov": "coverage/lcov.info"},
+  artifact_paths={
+    "coverage_json": {
+      "path": ".coverage-mcp/coverage.json",
+      "required": true,
+      "coverage_format": "coveragepy"
+    }
+  },
   human_approved=true,
-  approved_by="your-name",
-  approval_note="approved unit test command"
+  approved_by="person-or-auditable-label",
+  approval_note="Approved this exact command, cwd, shell, and artifact."
 )
 ```
-
-Registration fails unless `human_approved` is true and approval metadata is present.
 
 ### `list_registered_commands`
 
-Lists approved command records, newest first.
+`list_registered_commands(limit: integer = 100)` lists immutable command registrations newest first.
 
-```text
-list_registered_commands(limit=50)
-```
+**Inputs:** `limit` is 1-1000.
+
+**Returns:** Registrations with command, cwd, shell, artifacts, approval, topology, enabled state, and median/p90 duration statistics.
+
+**Errors:** Schema validation errors only; no registrations returns an empty list.
 
 ### `run_command_profiled`
 
-Queues a registered command and immediately returns its durable run id.
+`run_command_profiled(command_ref, max_summary_lines = 80, timeout_seconds = null, idempotency_key = null, wait = false)` submits an approved command to the single FIFO worker.
 
-```text
-run_command_profiled(
-  command_ref="unit",
-  max_summary_lines=80,
-  idempotency_key="unit:<commit-sha>:requested-check"
-)
-```
+**Inputs:** `command_ref` is a registration ID or name; `max_summary_lines` is 1-500; `timeout_seconds` is null or 1-86400; `idempotency_key` is null or a 1-200 character key scoped to that command; `wait` blocks until terminal only when true.
 
-The normal response has `status: "queued"` or `status: "running"`, `terminal: false`, `queue_position`, and
-`poll_after_ms`. With sufficient command history it also has `eta_seconds`, a human-readable `eta`,
-`estimated_completion_at`, `duration_estimate_ms`, `duration_p90_ms`, and `duration_sample_count`. Queued runs add
-`estimated_start_at` and `queue_wait_estimate_seconds`; running jobs report `estimate_overrun_seconds` after exceeding
-their historical median. Save the run id and poll `run_result`; do not call `run_command_profiled` again for the same
-intended run. Retrying with the same `idempotency_key` reuses that run instead of creating a duplicate. Use `wait=true`
-only for a command known to be short when a single blocking call is explicitly useful.
+**Returns:** Normally a durable run with `status` queued/running, `terminal: false`, `poll_after_ms`, queue position, log paths, and historical ETA fields. A terminal result also contains exit code, timing, bounded excerpts/counters, artifacts, freshness, and status `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, or `internal_error`. Reusing the same idempotency key returns the original run with `submission_reused: true`.
 
-Once complete, the response includes pass/fail, exit code, execution and queue duration, key counters, selected
-error/tail excerpts, full log paths, and artifact paths. It also includes the exact completion time plus freshness
-fields such as `age_seconds: 603` and `age: "10 minutes 3 seconds ago"`.
+**Errors:** Unknown/disabled commands, invalid limits/timeouts, or reusing one idempotency key with different submission parameters produces a tool error. A test failure is a successful tool response with `status: "failed"`, not an MCP protocol error.
 
 ### `run_queue`
 
-Lists the currently running command followed by queued commands in FIFO order.
+`run_queue(limit: integer = 100)` inspects active work in FIFO order.
 
-```text
-run_queue(limit=50)
-```
+**Inputs:** `limit` is 1-1000.
 
-There is at most one running command per server. `queue_position: 0` means running; positive positions are waiting.
-Queue ETAs are composed from the stored median duration of each command in FIFO order. A missing estimate anywhere
-ahead produces `eta_unavailable_reason: "queue_history_incomplete"` rather than an unreliable ETA.
+**Returns:** The running run first with `queue_position: 0`, followed by queued runs with positive positions, polling guidance, and ETA. If history is insufficient, `eta_unavailable_reason` explains why.
+
+**Errors:** Schema validation errors only; an idle worker returns an empty list.
 
 ### `cancel_run`
 
-Cancels a queued or running command by run id.
+`cancel_run(run_id, max_summary_lines = 80)` requests cancellation of queued or running work.
 
-```text
-cancel_run(run_id="...")
-```
+**Inputs:** `run_id` is the durable run UUID; `max_summary_lines` is 1-500.
 
-Queued runs become terminal immediately. Running runs expose `cancellation_requested: true`; poll `run_result` until
-their status becomes `cancelled`. Repeating cancellation for an already cancelled run is safe. Other terminal runs
-cannot be cancelled.
+**Returns:** A queued run becomes terminal immediately. A running run reports `cancellation_requested: true` while Coverage MCP terminates its process group; poll `run_result` until terminal. Repeating cancellation on an already cancelled run is idempotent.
 
-### `latest_run`
-
-Returns the latest bounded run result, optionally for one registered command.
-
-```text
-latest_run(command_ref="unit", max_summary_lines=80)
-```
-
-Use this before rerunning a suite. The `age` and `age_seconds` fields make it
-clear whether the previous result is fresh enough for the current task.
+**Errors:** Unknown runs and terminal runs other than `cancelled` cannot be cancelled.
 
 ### `run_result`
 
-Returns current status or a bounded final summary for a submitted run.
+`run_result(run_id, max_summary_lines = 80)` polls one submitted run.
 
-```text
-run_result(run_id="...", max_summary_lines=80)
-```
+**Inputs:** `run_id` is required; `max_summary_lines` is 1-500.
 
-Poll no faster than the returned `poll_after_ms`. Active responses intentionally defer log scanning and expose the
-full log paths. Treat ETA as a historical estimate, not a timeout: p90 is the conservative reference, and
-`estimate_overrun_seconds` shows when a running command has exceeded its median. Stop polling when `terminal` is true.
-Terminal statuses are `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, and `internal_error`.
+**Returns:** Active state avoids reading full logs and includes `poll_after_ms`, queue/ETA details, and log paths. Terminal state includes bounded output summaries, counters, artifacts, exact timing, and freshness. Poll no faster than `poll_after_ms`; ETA is historical, while timeout is an execution limit.
+
+**Errors:** Unknown run IDs or invalid limits produce a tool error.
+
+### `latest_run`
+
+`latest_run(command_ref = null, max_summary_lines = 80)` retrieves the newest active or terminal run.
+
+**Inputs:** `command_ref` optionally restricts lookup to a command ID/name; `max_summary_lines` is 1-500.
+
+**Returns:** The same bounded state as `run_result`, including `age` and `age_seconds` so callers can decide whether it is stale.
+
+**Errors:** Unknown command references, no matching runs, or invalid limits produce a tool error.
 
 ### `latest_artifact`
 
-Finds the latest artifact of a given kind for a command.
+`latest_artifact(kind, command_ref = null)` locates a run artifact without searching build directories.
 
-```text
-latest_artifact(command_ref="unit", kind="lcov")
-```
+**Inputs:** `kind` is the non-empty artifact key from registration; `command_ref` optionally restricts lookup to one command ID/name.
+
+**Returns:** Artifact kind/path, existence and size, run/command identity, project identity, run status/timing, freshness, and topology for the newest match.
+
+**Errors:** Unknown command references or no matching artifact produces a tool error. A registered artifact that was not generated is still returned with `exists: false` when it is the latest match.
 
 ### `object_topology`
 
-Returns the computed topology for an object.
+`object_topology(object_kind, object_ref)` resolves relationships without a separate topology object.
 
-```text
-object_topology(object_kind="command", object_ref="unit")
-object_topology(object_kind="run", object_ref="run-id")
-object_topology(object_kind="snapshot", object_ref="snapshot-id")
-object_topology(object_kind="project", object_ref="/path/to/repo")
-```
+**Inputs:** `object_kind` accepts `project`, `repo`, `repository`, `command`, `registered_command`, `test_command`, `run`, `snapshot`, `coverage_snapshot`, or `worktree`; `object_ref` is the corresponding UUID, command name, or repo path/key.
+
+**Returns:** Inline project identity plus the object's Git, command, run, artifact, snapshot, worktree, and baseline relationships as applicable.
+
+**Errors:** Unsupported kinds and unresolved references produce a tool error.
 
 ### `ingest_coverage`
 
-Stores a coverage report as an immutable snapshot.
+`ingest_coverage(report_path, format = "auto", repo_path = null, suite = "default", branch = null, commit_sha = null, base_ref = null)` parses and stores one immutable snapshot.
 
-```text
-ingest_coverage(report_path, format="auto", repo_path=None, suite="default")
-```
+**Inputs:** `report_path` is a local server-readable artifact; `format` accepts `auto`, `lcov`, `coverage.py`, `coveragepy`, `coverage-json`, `coveragepy-json`, `cobertura`, `jacoco`, `istanbul`, `nyc`, `go`, `go-cover`, `go-coverprofile`, `coverprofile`, `llvm`, or `llvm-json`; `repo_path` identifies the checkout/shared repository; `suite` is a non-empty stable trend name; `branch`, `commit_sha`, and `base_ref` override or add Git metadata when provided.
 
-Use this after every test run that produces a coverage artifact.
+**Returns:** Snapshot identity and topology, normalized line/branch/function/region totals and rates, report metadata, parser warnings, timestamp, and freshness.
 
-### `coverage_summary`
+**Errors:** Missing/unreadable artifacts, unsupported or misdetected formats, malformed reports, invalid repo paths, and empty suites produce a tool error.
 
-Gets a compact overall summary for a snapshot or the latest known snapshot.
+### `register_worktree`
 
-```text
-coverage_summary()
-coverage_summary(snapshot_id="...")
-coverage_summary(repo_path="/path/to/repo", branch="main")
-```
+`register_worktree(path, base_ref, name = null)` records a linked checkout and freezes available reference coverage.
 
-### `coverage_files`
+**Inputs:** `path` is the worktree checkout path; `base_ref` is the branch/revision whose latest suite snapshots become baseline references; `name` is an optional label.
 
-Lists files in a snapshot, lowest line coverage first.
+**Returns:** Worktree ID, path/head metadata, project identity, frozen suite-to-snapshot baseline map, and inline topology.
 
-```text
-coverage_files(snapshot_id="...", limit=50)
-```
-
-Use this when you want the LLM to find weak files without reading the whole report.
-
-### `coverage_file`
-
-Shows one file's coverage and, by default, its line records.
-
-```text
-coverage_file(snapshot_id="...", file_path="src/app.py")
-```
-
-### `coverage_insights`
-
-Returns prioritized investigation items for a snapshot.
-
-```text
-coverage_insights(snapshot_id="...")
-coverage_insights(
-  snapshot_id="current-snapshot-id",
-  baseline_snapshot_id="baseline-snapshot-id"
-)
-```
-
-The insight output is deterministic and data-driven. It can flag:
-
-- files with zero line coverage
-- files with low line coverage
-- files with low branch coverage
-- parser warnings from lossy formats
-- overall regressions against a baseline
-- files that regressed against a baseline
-- exact lines that became uncovered
-
-### `compare_to_baseline`
-
-Compares two snapshots or compares a worktree's current snapshot against its frozen baseline.
-
-```text
-compare_to_baseline(
-  snapshot_id="current-snapshot-id",
-  baseline_snapshot_id="baseline-snapshot-id"
-)
-```
-
-For a registered worktree:
-
-```text
-compare_to_baseline(worktree_id="...")
-```
+**Errors:** Invalid/non-Git paths produce a tool error. If no reference coverage exists, registration succeeds with a null baseline so lineage is preserved, but progress/comparison tools fail clearly until reference coverage is ingested. Registration never copies DuckDB into the worktree.
 
 ### `worktree_progress`
 
-Returns one registered worktree's frozen baseline, exact-path trend, latest point, and line/branch/function/region
-deltas. This is the preferred compact answer to "did this worktree improve coverage?"
+`worktree_progress(worktree_id, suite = null, file_path = null, limit = 200)` answers whether one worktree improved from its frozen baseline.
 
-```text
-worktree_progress(worktree_id="...", suite="unit")
-```
+**Inputs:** `worktree_id` is required; `suite` selects one coverage suite or the latest applicable suite; `file_path` optionally restricts the exact-path trend; `limit` is 1-2000 time-series points.
+
+**Returns:** Worktree and baseline metadata, chronological points, latest snapshot, and line/branch/function/region rate deltas. Each worktree progresses independently while its baseline still belongs to the common parent history.
+
+**Errors:** Unknown worktrees, absent suite baselines/current snapshots, or unknown exact file paths produce a tool error.
+
+### `coverage_summary`
+
+`coverage_summary(snapshot_id = null, repo_path = null, branch = null, suite = null)` returns one compact overall snapshot.
+
+**Inputs:** `snapshot_id` directly selects an immutable snapshot. Without it, `repo_path`, `branch`, and `suite` filter the latest snapshot. If `snapshot_id` is supplied, it takes precedence and all filters are ignored.
+
+**Returns:** Snapshot identity/topology, report metadata, line/branch/function/region totals and rates, warnings, timestamp, and freshness.
+
+**Errors:** Unknown snapshot IDs or no snapshot matching the filters produces a tool error.
+
+### `coverage_files`
+
+`coverage_files(snapshot_id, limit = 100)` finds weak files without returning raw report data.
+
+**Inputs:** `snapshot_id` is required; `limit` is 1-5000.
+
+**Returns:** Per-file line/branch/function totals and rates ordered by lowest line coverage and then largest files.
+
+**Errors:** Invalid inputs produce a tool error; a valid snapshot with no file records returns an empty list.
+
+### `coverage_file`
+
+`coverage_file(snapshot_id, file_path, include_lines = true)` drills into one exact path.
+
+**Inputs:** `snapshot_id` and exact `file_path` are required; `include_lines` controls whether exact line records are included.
+
+**Returns:** A `file` object with totals/rates and, by default, a `lines` array capped at 5000 records containing line number, hits, covered state, and branch/function counters when available.
+
+**Errors:** Unknown snapshots or paths produce a tool error.
+
+### `coverage_insights`
+
+`coverage_insights(snapshot_id, baseline_snapshot_id = null, limit = 10)` returns deterministic investigation priorities.
+
+**Inputs:** `snapshot_id` is current coverage; `baseline_snapshot_id` optionally enables regression analysis; `limit` is 1-50 primary items (the categorized response can contain up to four times this value).
+
+**Returns:** Current/baseline summaries, severity counts, and prioritized zero/low-covered files, weak branches, parser warnings, overall/file regressions, and newly uncovered lines.
+
+**Errors:** Unknown snapshots or invalid limits produce a tool error.
+
+### `compare_to_baseline`
+
+`compare_to_baseline(snapshot_id = null, baseline_snapshot_id = null, worktree_id = null, file_limit = 100, line_limit = 500)` supports two explicit modes.
+
+**Inputs:** Direct mode requires both `snapshot_id` and `baseline_snapshot_id`. Worktree mode requires `worktree_id`, optionally accepts `snapshot_id` as the current point, and resolves the frozen suite baseline itself. `baseline_snapshot_id` is forbidden in worktree mode. `file_limit` is 1-1000 and `line_limit` is 1-5000.
+
+**Returns:** Current and baseline summaries, overall line/branch/function/region deltas, bounded per-file comparison records in `files`, and bounded exact records in `changed_lines`. Worktree mode also returns `worktree` metadata.
+
+**Errors:** Mixing comparison modes, omitting required direct IDs, unknown snapshots/worktrees, or a missing frozen baseline produces a tool error.
 
 ### `changed_lines`
 
-Returns exact line-level coverage changes between two snapshots.
+`changed_lines(snapshot_id, baseline_snapshot_id, file_path = null, only_regressions = false, limit = 500)` answers exact line-change questions directly.
 
-```text
-changed_lines(
-  snapshot_id="current-snapshot-id",
-  baseline_snapshot_id="baseline-snapshot-id",
-  only_regressions=true
-)
-```
+**Inputs:** Current `snapshot_id` and `baseline_snapshot_id` are required; `file_path` optionally selects one exact path; `only_regressions` keeps only covered-to-uncovered changes; `limit` is 1-5000.
 
-Use this when you want the LLM to report only the lines that became uncovered.
+**Returns:** Line records with baseline/current covered state, hits, branch data, and status such as improved or regressed.
+
+**Errors:** Invalid inputs produce a tool error; no matching changes returns an empty list.
 
 ### `line_history`
 
-Shows coverage history for one file path and line number.
+`line_history(file_path, line_number, repo_path = null, branch = null, limit = 100)` follows one path and line over time.
 
-```text
-line_history(file_path="src/app.py", line_number=42)
-```
+**Inputs:** Exact `file_path` and one-based positive `line_number` are required; `repo_path` and `branch` optionally restrict project history; `limit` is 1-1000.
 
-History is path-based. Renames are not tracked.
+**Returns:** Chronological snapshot/time, Git, suite, hit, and covered-state points. History is path-based and does not follow renames.
+
+**Errors:** Invalid inputs produce a tool error; no recorded points returns an empty list.
 
 ### `source_context`
 
-Reads a bounded source range from the repository for a covered file.
+`source_context(snapshot_id, file_path, start, end)` reads only the source range needed to interpret coverage.
 
-```text
-source_context(
-  snapshot_id="...",
-  file_path="src/app.py",
-  start=35,
-  end=50
-)
-```
+**Inputs:** `snapshot_id` locates the repository, `file_path` is a repository-relative source path, and `start`/`end` are positive inclusive one-based boundaries. An `end` below `start` resolves to the single start line.
 
-Use this only when coverage metadata is not enough. The response is capped so an LLM does not pull a large source file by accident.
+**Returns:** Up to 200 `{line_number, text}` records. A larger requested range is bounded rather than returning the whole file.
+
+**Errors:** Unknown snapshots/files, paths escaping the repository, or unreadable source produces a tool error.
+
+### MCP Resources
+
+Read-only discovery is also available through two exact resources and three templates:
+
+| URI | Result |
+| --- | --- |
+| `coverage://projects` | Up to 100 project summaries |
+| `coverage://snapshots/latest` | Latest snapshot, or an error object when none exists |
+| `coverage://snapshot/{snapshot_id}/summary` | One snapshot summary |
+| `coverage://snapshot/{snapshot_id}/insights` | Deterministic insights for one snapshot |
+| `coverage://snapshot/{snapshot_id}/files` | Up to 500 per-file records |
 
 ## Worktree Baselines
 
@@ -793,7 +792,11 @@ The test suite covers:
 - computed topology for projects, commands, runs, snapshots, and artifacts
 - FastAPI ingest/list endpoints
 - project summaries and coverage insights
-- MCP tool calls for command registration/runs, ingest, summary, project listing, insights, file listing, and file drill-down
+- the exact 21-tool MCP inventory, every input description, enum, required field, and numeric/string bound
+- all five MCP resources and templates
+- in-process MCP execution for every workflow and validation failure
+- a real Streamable HTTP session through the official MCP client, including initialization, schemas, calls, and resources
+- README contract coverage that requires every MCP tool to document all inputs, outputs, and errors
 
 Local quality gates:
 
