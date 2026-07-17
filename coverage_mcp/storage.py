@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,53 @@ DEFAULT_RUN_RETENTION = 100
 DEFAULT_RUN_CONCURRENCY = 4
 MAX_RUN_CONCURRENCY = 32
 COMMAND_DURATION_SAMPLE_LIMIT = 20
+
+
+class CommonStore:
+    """Small daemon-wide registry; coverage data remains in repository databases."""
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path).expanduser()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = duckdb.connect(self.db_path.as_posix())
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS repositories (
+                    id VARCHAR PRIMARY KEY,
+                    repo_key VARCHAR UNIQUE NOT NULL,
+                    last_seen TIMESTAMP NOT NULL
+                )
+                """
+            )
+
+    def register_repository(self, repo_key: str) -> dict[str, str]:
+        repo_id = hashlib.sha256(repo_key.encode()).hexdigest()[:16]
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO repositories (id, repo_key, last_seen)
+                VALUES (?, ?, current_timestamp)
+                ON CONFLICT (repo_key) DO UPDATE SET last_seen = excluded.last_seen
+                """,
+                [repo_id, repo_key],
+            )
+        return {"id": repo_id, "repo_key": repo_key}
+
+    def repositories(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?", [limit]
+            ).fetchall()
+        return [
+            {"id": row[0], "repo_key": row[1], "repo_path": row[1], "snapshot_count": 0, "line_rate": None}
+            for row in rows
+        ]
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
 
 
 def row_dict(columns: list[str], row: tuple[Any, ...]) -> dict[str, Any]:

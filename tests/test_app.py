@@ -3,9 +3,19 @@ from __future__ import annotations
 import sys
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
-from coverage_mcp.app import create_app, default_db_path
+from coverage_mcp.app import (
+    REPOSITORY_HEADER,
+    CoverageRepoStore,
+    RepositoryStoreRouter,
+    create_app,
+    default_common_db_path,
+    default_daemon_lock_path,
+    default_db_path,
+)
+from coverage_mcp.storage import CommonStore
 
 
 def test_app_ingests_and_lists_snapshot(tmp_path):
@@ -64,6 +74,72 @@ end_of_record
 
 def test_default_database_is_anchored_to_repository_root(tmp_path):
     assert default_db_path(tmp_path.as_posix()) == (tmp_path / ".coverage-mcp" / "coverage.duckdb").as_posix()
+
+
+def test_common_store_registers_repositories(tmp_path):
+    store = CommonStore(tmp_path / "common.duckdb")
+    try:
+        first = store.register_repository("/repo/a")
+        second = store.register_repository("/repo/a")
+        assert first == second
+        assert first.items() <= store.repositories()[0].items()
+    finally:
+        store.close()
+
+
+def test_global_app_lazily_routes_coverage_to_repository_store(tmp_path):
+    report = tmp_path / "coverage.lcov"
+    report.write_text("TN:\nSF:a.py\nDA:1,1\nend_of_record\n", encoding="utf-8")
+    app = create_app(common_db_path=(tmp_path / "common.duckdb").as_posix())
+
+    with TestClient(app) as client:
+        health = client.get("/health").json()
+        assert health["common_db_path"] == (tmp_path / "common.duckdb").as_posix()
+        assert health["repository_count"] == 0
+        assert client.post("/api/ingest", json={"report_path": report.as_posix()}).status_code == 400
+
+        headers = {REPOSITORY_HEADER: tmp_path.as_posix()}
+        ingested = client.post(
+            "/api/ingest",
+            headers=headers,
+            json={"report_path": report.as_posix(), "repo_path": tmp_path.as_posix()},
+        )
+        assert ingested.status_code == 200
+        assert client.get("/api/snapshots", headers=headers).json()[0]["id"] == ingested.json()["id"]
+        assert client.get("/api/projects").json()[0]["repo_key"] == tmp_path.as_posix()
+        assert client.get("/health").json()["repository_count"] == 1
+
+
+def test_global_app_reports_invalid_repository_selection(monkeypatch, tmp_path):
+    app = create_app(common_db_path=(tmp_path / "common.duckdb").as_posix())
+    monkeypatch.setattr(app.state.coverage_store, "select", lambda _: (_ for _ in ()).throw(ValueError("bad repo")))
+    with TestClient(app) as client:
+        response = client.get("/api/snapshots", headers={REPOSITORY_HEADER: tmp_path.as_posix()})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "bad repo"
+
+
+def test_default_common_database_uses_user_coverage_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr("coverage_mcp.app.Path.home", lambda: tmp_path)
+    assert default_common_db_path() == (tmp_path / ".coverage-mcp" / "common.duckdb").as_posix()
+    assert default_daemon_lock_path() == (tmp_path / ".coverage-mcp" / "daemon.lock").as_posix()
+
+
+def test_repository_store_router_requires_selection_and_reuses_store(tmp_path):
+    common = CommonStore(tmp_path / "common.duckdb")
+    router = RepositoryStoreRouter(CoverageRepoStore(common))
+    try:
+        with pytest.raises(RuntimeError, match="repository"):
+            _ = router.db_path
+        token = router.select(tmp_path.as_posix())
+        try:
+            first = router.stores.for_repository(tmp_path.as_posix())
+            assert router.projects() == first.projects()
+            assert router.stores.for_repository(tmp_path.as_posix()) is first
+        finally:
+            router.reset(token)
+    finally:
+        router.close()
 
 
 def test_app_registers_and_runs_approved_command(tmp_path):

@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
+import subprocess
+import sys
+import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from filelock import FileLock
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
+from mcp.server.stdio import stdio_server
 from pydantic import BaseModel
 
 from coverage_mcp import __version__
@@ -89,10 +99,86 @@ from coverage_mcp.contracts import (
     WorktreeResult,
 )
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.storage import DEFAULT_RUN_CONCURRENCY, DEFAULT_RUN_RETENTION, CoverageStore
+from coverage_mcp.storage import DEFAULT_RUN_CONCURRENCY, DEFAULT_RUN_RETENTION, CommonStore, CoverageStore
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
+REPOSITORY_HEADER = "x-coverage-mcp-repo"
+DEFAULT_DAEMON_START_TIMEOUT_SECONDS = 10.0
+
+
+def default_common_db_path() -> str:
+    return (Path.home() / ".coverage-mcp" / "common.duckdb").as_posix()
+
+
+def default_daemon_lock_path() -> str:
+    return (Path(default_common_db_path()).parent / "daemon.lock").as_posix()
+
+
+def daemon_url() -> str:
+    host = os.environ.get("COVERAGE_MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("COVERAGE_MCP_PORT", str(DEFAULT_PORT)))
+    return f"http://{host}:{port}"
+
+
+class CoverageRepoStore:
+    """Lazily opens one CoverageStore for each canonical Git repository."""
+
+    def __init__(self, common_store: CommonStore) -> None:
+        self.common_store = common_store
+        self._stores: dict[str, CoverageStore] = {}
+        self._lock = threading.RLock()
+
+    def for_repository(self, path: str) -> CoverageStore:
+        repo_key = inspect_git(path).repo_key
+        with self._lock:
+            store = self._stores.get(repo_key)
+            if store is None:
+                store = CoverageStore(
+                    default_db_path(repo_key),
+                    run_retention=int(os.environ.get("COVERAGE_MCP_RUN_RETENTION", DEFAULT_RUN_RETENTION)),
+                    run_concurrency=int(os.environ.get("COVERAGE_MCP_RUN_CONCURRENCY", DEFAULT_RUN_CONCURRENCY)),
+                )
+                self._stores[repo_key] = store
+                self.common_store.register_repository(repo_key)
+            return store
+
+    def close(self) -> None:
+        with self._lock:
+            stores = list(self._stores.values())
+            self._stores.clear()
+        for store in stores:
+            store.close()
+
+
+class RepositoryStoreRouter(CoverageStore):
+    """Presents the selected repository store to REST and MCP handlers."""
+
+    def __init__(self, stores: CoverageRepoStore) -> None:
+        self.stores = stores
+        self._selected: contextvars.ContextVar[CoverageStore | None] = contextvars.ContextVar(
+            "coverage_mcp_repository_store", default=None
+        )
+
+    def select(self, path: str) -> contextvars.Token[CoverageStore | None]:
+        return self._selected.set(self.stores.for_repository(path))
+
+    def reset(self, token: contextvars.Token[CoverageStore | None]) -> None:
+        self._selected.reset(token)
+
+    def projects(self, limit: int = 100) -> list[dict[str, Any]]:
+        store = self._selected.get()
+        return store.projects(limit=limit) if store is not None else self.stores.common_store.repositories(limit=limit)
+
+    def close(self) -> None:
+        self.stores.close()
+        self.stores.common_store.close()
+
+    def __getattr__(self, name: str) -> Any:
+        store = self._selected.get()
+        if store is None:
+            raise RuntimeError("a repository must be selected before using coverage data")
+        return getattr(store, name)
 
 
 def validated_output[OutputT: OutputModel](model: type[OutputT], value: Any) -> OutputT:
@@ -149,14 +235,15 @@ class RunCommandRequest(BaseModel):
     wait: bool = False
 
 
-def create_app(db_path: str | None = None) -> FastAPI:
+def create_app(db_path: str | None = None, *, common_db_path: str | None = None) -> FastAPI:
     run_retention = int(os.environ.get("COVERAGE_MCP_RUN_RETENTION", DEFAULT_RUN_RETENTION))
     run_concurrency = int(os.environ.get("COVERAGE_MCP_RUN_CONCURRENCY", DEFAULT_RUN_CONCURRENCY))
-    store = CoverageStore(
-        db_path or os.environ.get("COVERAGE_MCP_DB", default_db_path()),
-        run_retention=run_retention,
-        run_concurrency=run_concurrency,
-    )
+    if db_path is None:
+        store: CoverageStore = RepositoryStoreRouter(
+            CoverageRepoStore(CommonStore(common_db_path or default_common_db_path()))
+        )
+    else:
+        store = CoverageStore(db_path, run_retention=run_retention, run_concurrency=run_concurrency)
     mcp = create_mcp(store)
     mcp_app = mcp.streamable_http_app()
 
@@ -176,12 +263,42 @@ def create_app(db_path: str | None = None) -> FastAPI:
     )
     app.state.coverage_store = store
 
+    if isinstance(store, RepositoryStoreRouter):
+
+        @app.middleware("http")
+        async def select_repository(request: Any, call_next: Any) -> Any:
+            if request.url.path in {"/", "/health", "/api/projects"}:
+                return await call_next(request)
+            repo_path = request.headers.get(REPOSITORY_HEADER)
+            if not repo_path:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": f"missing {REPOSITORY_HEADER} header"},
+                )
+            try:
+                token = store.select(repo_path)
+            except (FileNotFoundError, ValueError) as exc:
+                return JSONResponse(status_code=400, content={"detail": str(exc)})
+            try:
+                return await call_next(request)
+            finally:
+                store.reset(token)
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         return DASHBOARD_HTML
 
     @app.get("/health")
     def health() -> dict[str, Any]:
+        if isinstance(store, RepositoryStoreRouter):
+            return {
+                "ok": True,
+                "version": __version__,
+                "common_db_path": store.stores.common_store.db_path.as_posix(),
+                "repository_count": len(store.stores._stores),
+                "run_retention": run_retention,
+                "run_concurrency": run_concurrency,
+            }
         return {
             "ok": True,
             "version": __version__,
@@ -1872,7 +1989,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     };
 
     async function getJSON(url, options) {
-      const response = await fetch(url, options);
+      const requestOptions = {...(options || {})};
+      const headers = new Headers(requestOptions.headers || {});
+      if (url.startsWith('/api/') && !url.startsWith('/api/projects') && state.projectKey) {
+        headers.set('X-Coverage-MCP-Repo', state.projectKey);
+      }
+      requestOptions.headers = headers;
+      const response = await fetch(url, requestOptions);
       if (!response.ok) throw new Error(await response.text());
       return response.json();
     }
@@ -1933,9 +2056,18 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     async function refresh() {
       state.projects = await getJSON('/api/projects?limit=200');
+      if (!state.projectKey && state.projects.length) state.projectKey = state.projects[0].repo_key;
+      if (!state.projectKey) {
+        state.snapshots = [];
+        state.worktrees = [];
+        state.selected = null;
+        renderSnapshotSelectors();
+        renderProjectSelector();
+        await renderSelected();
+        return;
+      }
       state.snapshots = await getJSON('/api/snapshots?limit=200');
       state.worktrees = await getJSON('/api/worktrees?limit=200');
-      if (!state.projectKey && state.projects.length) state.projectKey = state.projects[0].repo_key;
       renderSnapshotSelectors();
       state.selected = projectSnapshots()[0] || state.snapshots[0] || null;
       if (state.selected && !state.projectKey) state.projectKey = state.selected.repo_key;
@@ -2584,10 +2716,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     document.getElementById('projectSelect').addEventListener('change', async event => {
       state.projectKey = event.target.value;
       state.trendScope = null;
-      renderSnapshotSelectors();
-      state.selected = projectSnapshots()[0] || null;
-      if (state.selected) document.getElementById('snapshotSelect').value = state.selected.id;
-      await renderSelected();
+      await refresh();
     });
     document.getElementById('snapshotSelect').addEventListener('change', async event => {
       state.selected = state.snapshots.find(snapshot => snapshot.id === event.target.value) || null;
@@ -2604,10 +2733,94 @@ DASHBOARD_HTML = r"""<!doctype html>
 """
 
 
-def main() -> None:
+def daemon_is_healthy(url: str | None = None) -> bool:
+    try:
+        response = httpx.get(f"{url or daemon_url()}/health", timeout=0.25)
+        return response.status_code == 200 and response.json().get("ok") is True
+    except (httpx.HTTPError, ValueError):
+        return False
+
+
+def start_daemon() -> None:
+    log_path = Path(default_common_db_path()).parent / "daemon.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("a", encoding="utf-8")
+    subprocess.Popen(
+        [sys.executable, "-m", "coverage_mcp.app", "serve"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log_file.close()
+
+
+def ensure_daemon(
+    *,
+    timeout_seconds: float = DEFAULT_DAEMON_START_TIMEOUT_SECONDS,
+    sleep_seconds: float = 0.05,
+) -> str:
+    url = daemon_url()
+    if daemon_is_healthy(url):
+        return url
+    lock_path = Path(default_daemon_lock_path())
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(lock_path)
+    with lock:
+        if daemon_is_healthy(url):
+            return url
+        start_daemon()
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if daemon_is_healthy(url):
+                return url
+            time.sleep(sleep_seconds)
+    raise RuntimeError(f"Coverage MCP daemon did not become healthy at {url}")
+
+
+async def forward_mcp_messages(source: Any, destination: Any) -> None:
+    try:
+        async with source:
+            async for message in source:
+                if isinstance(message, Exception):
+                    raise message
+                await destination.send(message)
+    finally:
+        await destination.aclose()
+
+
+async def proxy_stdio_to_http(url: str, repo_path: str) -> None:
+    async with (
+        stdio_server() as (stdio_read, stdio_write),
+        httpx.AsyncClient(headers={REPOSITORY_HEADER: repo_path}) as client,
+        streamable_http_client(f"{url}/mcp/", http_client=client) as (http_read, http_write, _),
+        anyio.create_task_group() as task_group,
+    ):
+        task_group.start_soon(forward_mcp_messages, stdio_read, http_write)
+        task_group.start_soon(forward_mcp_messages, http_read, stdio_write)
+
+
+def connect() -> None:
+    url = ensure_daemon()
+    repo_path = inspect_git(None).repo_key
+    anyio.run(proxy_stdio_to_http, url, repo_path)
+
+
+def serve() -> None:
     host = os.environ.get("COVERAGE_MCP_HOST", "127.0.0.1")
     port = int(os.environ.get("COVERAGE_MCP_PORT", str(DEFAULT_PORT)))
     uvicorn.run(create_app(), host=host, port=port, reload=False)
+
+
+def main(argv: list[str] | None = None) -> None:
+    arguments = sys.argv[1:] if argv is None else argv
+    if not arguments or arguments == ["serve"]:
+        serve()
+    elif arguments == ["connect"]:
+        connect()
+    else:
+        raise SystemExit("usage: coverage-mcp [serve|connect]")
 
 
 if __name__ == "__main__":

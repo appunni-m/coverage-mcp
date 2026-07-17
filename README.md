@@ -91,15 +91,15 @@ curl http://127.0.0.1:59471/health
 ```
 
 The response `version` must match the package version reported by `python -m pip show coverage-mcp`. Confirm that
-`db_path` is the intended shared database before ingesting data.
+`common_db_path` is the intended daemon registry before ingesting data.
 
 ## Start The Shared Server
 
-Start one server from the main checkout, not one server per worktree:
+Coverage MCP runs one loopback HTTP daemon per user and lazily opens one DuckDB per Git repository. Start it explicitly
+with:
 
 ```bash
-cd /path/to/main-checkout
-coverage-mcp
+coverage-mcp serve
 ```
 
 Verify it:
@@ -123,27 +123,27 @@ http://127.0.0.1:59471/mcp/
 Default database:
 
 ```text
-<main-repository>/.coverage-mcp/coverage.duckdb
+<repository>/.coverage-mcp/coverage.duckdb
 ```
 
-Coverage MCP resolves Git's shared repository root before choosing the default database. Starting it from `main` or
-from any linked worktree therefore opens the same DuckDB. This preserves baseline and worktree lineage without
-committing local history. The `.coverage-mcp/` directory should remain ignored by Git.
+The daemon's common registry is `~/.coverage-mcp/common.duckdb`. Coverage MCP resolves Git's shared repository root
+before opening a repository database, so the main checkout and its linked worktrees share one DuckDB. This preserves
+baseline and worktree lineage without committing local history. The repository `.coverage-mcp/` directory should remain
+ignored by Git.
 
 Add `.coverage-mcp/` to the repository's `.gitignore` or local Git exclude before the first run. This repository
 already ignores it.
 
-Do not start another Coverage MCP process from each worktree. Every agent and worktree should connect to this one
-server so DuckDB has one writer and one continuous project history.
+Do not start another daemon for each worktree or repository. Every connector reuses the same HTTP daemon; it remains
+the sole owner of each repository's DuckDB connection.
 
 Override host, port, or DB:
 
 ```bash
 COVERAGE_MCP_HOST=127.0.0.1 \
 COVERAGE_MCP_PORT=8765 \
-COVERAGE_MCP_DB=/path/to/coverage.duckdb \
 COVERAGE_MCP_RUN_CONCURRENCY=4 \
-coverage-mcp
+coverage-mcp serve
 ```
 
 `COVERAGE_MCP_RUN_CONCURRENCY` accepts 1-32 workers and defaults to `4`. Use
@@ -164,17 +164,33 @@ The `testing` plugin in
 [codegen-marketplace](https://github.com/appunni-m/codegen-marketplace) includes the Coverage MCP connection and
 agent instructions for approved test runs, bounded summaries, artifact ingestion, and worktree comparisons.
 
-The plugin expects Coverage MCP at `http://127.0.0.1:59471/mcp/`. Start the server before opening a new agent session.
-The current plugin compatibility declaration requires Coverage MCP `>=0.3.4,<0.4.0`.
+Configure agents with the stdio connector. It starts or reuses the loopback daemon and selects the connector's Git
+repository automatically:
+
+```json
+{
+  "command": "coverage-mcp",
+  "args": ["connect"]
+}
+```
+
+For an ephemeral public-GitHub installation, use `uvx`:
+
+```json
+{
+  "command": "uvx",
+  "args": ["--from", "git+https://github.com/appunni-m/coverage-mcp.git", "coverage-mcp", "connect"]
+}
+```
 
 The plugin installs only:
 
 - the `use-coverage-mcp` skill
-- the HTTP MCP connection metadata
+- the stdio MCP connection metadata
 - plugin documentation and prompts
 
-It does not install the Python server, start a background process, or copy the
-DuckDB. Upgrade the plugin for agent instructions and connection changes;
+It does not install the Python server or copy the DuckDB. The connector starts the background daemon on demand.
+Upgrade the plugin for agent instructions and connection changes;
 upgrade Coverage MCP for parser, storage, API, dashboard, or performance
 changes.
 
@@ -185,11 +201,7 @@ codex plugin marketplace add appunni-m/codegen-marketplace
 codex plugin add testing@codegen-marketplace
 ```
 
-Start a new Codex thread after installation. To install only the MCP connection without the testing skill:
-
-```bash
-codex mcp add coverage-mcp --url http://127.0.0.1:59471/mcp/
-```
+Start a new Codex thread after installation and configure its MCP connection with the stdio command above.
 
 ### Claude Code
 
@@ -198,11 +210,7 @@ claude plugin marketplace add appunni-m/codegen-marketplace
 claude plugin install testing@codegen-marketplace
 ```
 
-Start a new Claude Code session after installation. To install only the MCP connection:
-
-```bash
-claude mcp add --transport http --scope user coverage-mcp http://127.0.0.1:59471/mcp/
-```
+Start a new Claude Code session after installation and configure its MCP connection with the stdio command above.
 
 ### Pi
 

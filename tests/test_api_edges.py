@@ -5,6 +5,9 @@ import sys
 import time
 from pathlib import Path
 
+import anyio
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from coverage_mcp import app as app_module
@@ -236,12 +239,137 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
         calls.update({"app": app, "host": host, "port": port, "reload": reload})
 
     monkeypatch.setattr(app_module.uvicorn, "run", fake_run)
-    app_module.main()
+    app_module.main([])
     assert calls == {"app": "created-app", "host": "0.0.0.0", "port": 8765, "reload": False}
 
     calls.clear()
     monkeypatch.setenv("COVERAGE_MCP_DB", (tmp_path / "script.duckdb").as_posix())
+    monkeypatch.setattr(sys, "argv", [app_module.__file__])
     runpy.run_path(Path(app_module.__file__).as_posix(), run_name="__main__")
     assert calls["host"] == "0.0.0.0"
     assert calls["port"] == 8765
     assert calls["reload"] is False
+
+
+def test_daemon_health_and_startup(monkeypatch, tmp_path):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    monkeypatch.setattr(app_module.httpx, "get", lambda *args, **kwargs: Response())
+    assert app_module.daemon_is_healthy("http://daemon") is True
+
+    def unavailable(*args, **kwargs):
+        raise httpx.ConnectError("no")
+
+    monkeypatch.setattr(app_module.httpx, "get", unavailable)
+    assert app_module.daemon_is_healthy("http://daemon") is False
+
+    monkeypatch.setattr(app_module, "default_daemon_lock_path", lambda: (tmp_path / "daemon.lock").as_posix())
+    statuses = iter([False, False, True])
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: next(statuses))
+    started = []
+    monkeypatch.setattr(app_module, "start_daemon", lambda: started.append(True))
+    monkeypatch.setattr(app_module.time, "sleep", lambda _: None)
+    assert app_module.ensure_daemon(timeout_seconds=1) == app_module.daemon_url()
+    assert started == [True]
+
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: True)
+    assert app_module.ensure_daemon() == app_module.daemon_url()
+
+    statuses = iter([False, True])
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: next(statuses))
+    assert app_module.ensure_daemon() == app_module.daemon_url()
+
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: False)
+    monotonic_values = iter([0.0, 0.5, 2.0])
+    monkeypatch.setattr(app_module.time, "monotonic", lambda: next(monotonic_values))
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        app_module.ensure_daemon(timeout_seconds=1)
+
+
+def test_daemon_start_and_cli_commands(monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "default_common_db_path", lambda: (tmp_path / "common.duckdb").as_posix())
+    launched = {}
+
+    def popen(command, **kwargs):
+        launched.update({"command": command, **kwargs})
+
+    monkeypatch.setattr(app_module.subprocess, "Popen", popen)
+    app_module.start_daemon()
+    assert launched["command"][-1] == "serve"
+    assert launched["start_new_session"] is True
+    assert (tmp_path / "daemon.log").exists()
+
+    calls = []
+    monkeypatch.setattr(app_module, "serve", lambda: calls.append("serve"))
+    monkeypatch.setattr(app_module, "connect", lambda: calls.append("connect"))
+    app_module.main(["serve"])
+    app_module.main(["connect"])
+    with pytest.raises(SystemExit, match="usage"):
+        app_module.main(["unknown"])
+    assert calls == ["serve", "connect"]
+
+
+def test_forward_mcp_messages_closes_destination():
+    async def scenario():
+        sender, source = anyio.create_memory_object_stream(1)
+        destination, received = anyio.create_memory_object_stream(1)
+        await sender.send("message")
+        await sender.aclose()
+        await app_module.forward_mcp_messages(source, destination)
+        assert await received.receive() == "message"
+        with pytest.raises(anyio.EndOfStream):
+            await received.receive()
+
+    anyio.run(scenario)
+
+
+def test_forward_mcp_messages_propagates_errors_and_proxy_starts_two_directions(monkeypatch):
+    async def error_scenario():
+        sender, source = anyio.create_memory_object_stream(1)
+        destination, _ = anyio.create_memory_object_stream(1)
+        await sender.send(RuntimeError("bad message"))
+        await sender.aclose()
+        with pytest.raises(RuntimeError, match="bad message"):
+            await app_module.forward_mcp_messages(source, destination)
+
+    anyio.run(error_scenario)
+
+    class Context:
+        def __init__(self, value):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, *_):
+            return False
+
+    calls = []
+
+    async def forward(source, destination):
+        calls.append((source, destination))
+
+    monkeypatch.setattr(app_module, "stdio_server", lambda: Context(("stdio-read", "stdio-write")))
+    monkeypatch.setattr(app_module.httpx, "AsyncClient", lambda **kwargs: Context("http-client"))
+    monkeypatch.setattr(
+        app_module,
+        "streamable_http_client",
+        lambda *args, **kwargs: Context(("http-read", "http-write", lambda: None)),
+    )
+    monkeypatch.setattr(app_module, "forward_mcp_messages", forward)
+    anyio.run(app_module.proxy_stdio_to_http, "http://daemon", "/repo")
+    assert calls == [("stdio-read", "http-write"), ("http-read", "stdio-write")]
+
+
+def test_connect_uses_shared_daemon_and_repository(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module, "ensure_daemon", lambda: "http://daemon")
+    monkeypatch.setattr(app_module, "inspect_git", lambda _path: type("Git", (), {"repo_key": "/repo"})())
+    monkeypatch.setattr(app_module.anyio, "run", lambda function, *args: calls.append((function, args)))
+    app_module.connect()
+    assert calls == [(app_module.proxy_stdio_to_http, ("http://daemon", "/repo"))]
