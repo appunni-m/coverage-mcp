@@ -28,13 +28,14 @@ def service_for(store: Any, path: Path) -> CoverageService:
 
 
 def test_cursor_word_budget_and_projection_edges(tmp_path):
-    cursor = encode_cursor(2, scope="files")
-    assert decode_cursor(cursor, scope="files") == 2
+    anchor = "a" * 64
+    cursor = encode_cursor(anchor, scope="files")
+    assert decode_cursor(cursor, scope="files") == anchor
     assert serialized_word_count({"message": "one two", "count": 2}) == 5
     for invalid in ("not-base64", base64.urlsafe_b64encode(b"{}").decode()):
         with pytest.raises(ValueError, match="invalid pagination cursor"):
             decode_cursor(invalid, scope="files")
-    negative = base64.urlsafe_b64encode(json.dumps({"offset": -1, "scope": "wrong"}).encode()).decode()
+    negative = base64.urlsafe_b64encode(json.dumps({"after": "not-a-hash", "scope": "wrong"}).encode()).decode()
     with pytest.raises(ValueError, match="does not belong"):
         decode_cursor(negative, scope="files")
     with pytest.raises(ValueError, match="does not belong"):
@@ -49,8 +50,8 @@ def test_cursor_word_budget_and_projection_edges(tmp_path):
         service.apply_budget(service.envelope({"message": " ".join(["word"] * 60)}), max_words=50)
     with pytest.raises(ValueError, match="between"):
         service.page([], cursor=None, max_words=49, scope="x")
-    with pytest.raises(ValueError, match="beyond"):
-        service.page([], cursor=encode_cursor(1, scope="x"), max_words=50, scope="x")
+    with pytest.raises(ValueError, match="no longer matches"):
+        service.page([], cursor=encode_cursor(anchor, scope="x"), max_words=50, scope="x")
 
     values = [{"text": " ".join([str(index)] * 30)} for index in range(3)]
     first, page = service.page(values, cursor=None, max_words=50, scope="items", total=4)

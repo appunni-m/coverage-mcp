@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 .pytest_cache/
 .coverage-mcp/
 *.duckdb.wal
@@ -10,3 +11,8 @@ htmlcov/
 .ruff_cache/
 .tox/
 *.egg-info/
+build/
+dist/
+.DS_Store
+.idea/
+.vscode/

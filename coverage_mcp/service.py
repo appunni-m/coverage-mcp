@@ -36,24 +36,29 @@ def _cursor_scope(scope: str) -> str:
     return hashlib.sha256(scope.encode()).hexdigest()[:16]
 
 
-def encode_cursor(offset: int, *, scope: str) -> str:
-    payload = json.dumps({"offset": offset, "scope": _cursor_scope(scope)}, separators=(",", ":")).encode()
+def _cursor_anchor(value: Any) -> str:
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def encode_cursor(anchor: str, *, scope: str) -> str:
+    payload = json.dumps({"after": anchor, "scope": _cursor_scope(scope)}, separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def decode_cursor(cursor: str | None, *, scope: str) -> int:
+def decode_cursor(cursor: str | None, *, scope: str) -> str | None:
     if cursor is None:
-        return 0
+        return None
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded.encode()))
-        offset = int(payload["offset"])
+        anchor = str(payload["after"])
         cursor_scope = str(payload["scope"])
     except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error) as exc:
         raise ValueError("invalid pagination cursor") from exc
-    if offset < 0 or cursor_scope != _cursor_scope(scope):
+    if not re.fullmatch(r"[0-9a-f]{64}", anchor) or cursor_scope != _cursor_scope(scope):
         raise ValueError("pagination cursor does not belong to this query")
-    return offset
+    return anchor
 
 
 def compact_snapshot(value: dict[str, Any], *, detailed: bool = False) -> dict[str, Any]:
@@ -241,31 +246,36 @@ class CoverageService:
     ) -> tuple[list[Any], dict[str, Any]]:
         if not 50 <= max_words <= 5000:
             raise ValueError("max_words must be between 50 and 5000")
-        offset = decode_cursor(cursor, scope=scope)
         bounded = values[:MAX_COLLECTION_RECORDS]
-        if offset > len(bounded):
-            raise ValueError("pagination cursor is beyond the available results")
+        anchor = decode_cursor(cursor, scope=scope)
+        start = 0
+        if anchor is not None:
+            start = next(
+                (index + 1 for index, value in enumerate(bounded) if _cursor_anchor(value) == anchor),
+                -1,
+            )
+            if start < 0:
+                raise ValueError("pagination cursor no longer matches the available results")
         selected: list[Any] = []
         word_count = 0
-        next_offset = offset
-        for value in bounded[offset:]:
+        for value in bounded[start:]:
             item_words = serialized_word_count(value)
             if selected and word_count + item_words > max_words:
                 break
             selected.append(value)
             word_count += item_words
-            next_offset += 1
             if word_count >= max_words:
                 break
         known_total = len(values) if total is None else total
-        truncated = next_offset < min(known_total, MAX_COLLECTION_RECORDS)
+        consumed = start + len(selected)
+        truncated = consumed < min(known_total, MAX_COLLECTION_RECORDS)
         page = {
             "returned": len(selected),
             "total": known_total,
             "word_count": word_count,
             "max_words": max_words,
             "truncated": truncated,
-            "next_cursor": encode_cursor(next_offset, scope=scope) if truncated else None,
+            "next_cursor": encode_cursor(_cursor_anchor(selected[-1]), scope=scope) if truncated and selected else None,
         }
         return selected, page
 

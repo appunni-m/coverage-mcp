@@ -1,0 +1,11 @@
+{
+  "measurement": {
+    "source": "ten consecutive completed Coverage MCP jobs from one July 2026 Codex development session",
+    "tokenizer": "o200k_base",
+    "tokenizer_package": "tiktoken 0.13.0",
+    "raw_payloads_published": false,
+    "raw_payloads_note": "The private session transcript is not redistributed. These recorded per-job counts preserve the aggregate measurement without publishing repository or session data."
+  },
+  "recorded_tokens": [4987, 16117, 1518, 3601, 1545, 12512, 1791, 2611, 1813, 1772],
+  "modeled_budget_tokens_per_job": 500
+}

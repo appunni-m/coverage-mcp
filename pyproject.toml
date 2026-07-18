@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coverage-mcp"
-version = "0.7.0"
+dynamic = ["version"]
 description = "Local-first coverage time-series dashboard and MCP server."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,6 +20,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX",
     "Topic :: Software Development :: Quality Assurance",
     "Topic :: Software Development :: Testing",
 ]
@@ -34,6 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2",
     "coverage[toml]>=7.6",
     "httpx>=0.27",
     "mypy>=1.13",
@@ -41,10 +45,24 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.8",
     "tox>=4.23",
+    "twine>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/appunni-m/coverage-mcp"
+Documentation = "https://github.com/appunni-m/coverage-mcp#readme"
+Repository = "https://github.com/appunni-m/coverage-mcp.git"
+Issues = "https://github.com/appunni-m/coverage-mcp/issues"
+Changelog = "https://github.com/appunni-m/coverage-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 coverage-mcp = "coverage_mcp.app:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "coverage_mcp.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["coverage_mcp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -74,5 +92,4 @@ strict = true
 pretty = true
 show_error_codes = true
 warn_unused_ignores = true
-ignore_missing_imports = true
 cache_dir = "/tmp/coverage-mcp-mypy-cache"

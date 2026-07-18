@@ -355,15 +355,15 @@ LineChangeStatus = Literal["new", "removed", "regressed", "improved", "changed"]
 
 
 class OutputModel(BaseModel):
-    """Base for discoverable MCP response contracts that retain topology extensions."""
+    """Base for discoverable public response contracts with no undeclared fields."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
 
 class CompactOutputModel(OutputModel):
     """Token-conscious response model that intentionally drops detailed storage fields."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
 
 class ResponseContextResult(OutputModel):

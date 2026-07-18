@@ -1,0 +1,24 @@
+name: Feature request
+description: Propose a focused improvement
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or contributor problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the desired behavior and important tradeoffs.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Architecture or contract impact
+      description: Note daemon, storage, MCP, REST, dashboard, security, and token-budget implications.
