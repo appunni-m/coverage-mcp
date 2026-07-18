@@ -74,15 +74,9 @@ from coverage_mcp.contracts import (
 )
 from coverage_mcp.dashboard import DASHBOARD_HTML
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.service import (
-    COLLECTION_FETCH_LIMIT,
-    SCHEMA_REVISION,
-    CoverageService,
-    RequestContext,
-    compact_command,
-    compact_snapshot,
-)
+from coverage_mcp.service import SCHEMA_REVISION, CoverageService, RequestContext, compact_command, compact_snapshot
 from coverage_mcp.storage import (
+    COLLECTION_FETCH_LIMIT,
     DEFAULT_RUN_CONCURRENCY,
     DEFAULT_RUN_RETENTION,
     CommonStore,

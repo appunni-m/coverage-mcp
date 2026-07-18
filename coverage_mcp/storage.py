@@ -45,6 +45,13 @@ DEFAULT_RUN_RETENTION = 100
 DEFAULT_RUN_CONCURRENCY = 4
 MAX_RUN_CONCURRENCY = 32
 COMMAND_DURATION_SAMPLE_LIMIT = 20
+MAX_COLLECTION_RECORDS = 5000
+COLLECTION_FETCH_LIMIT = MAX_COLLECTION_RECORDS + 1
+
+
+def collection_query_limit(limit: int) -> int:
+    """Clamp collection reads only at the shared overflow-detection ceiling."""
+    return min(max(limit, 1), COLLECTION_FETCH_LIMIT)
 
 
 def normalize_line_ranges(ranges: Sequence[Mapping[str, int]]) -> list[tuple[int, int]]:
@@ -110,7 +117,8 @@ class CommonStore:
     def repositories(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?", [limit]
+                "SELECT id, repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?",
+                [collection_query_limit(limit)],
             ).fetchall()
         return [
             {
@@ -546,7 +554,7 @@ class CoverageStore:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                [min(max(limit, 1), 1000)],
+                [collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [
@@ -736,7 +744,7 @@ class CoverageStore:
                 ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, queued_at
                 LIMIT ?
                 """,
-                [min(max(limit, 1), 1000)],
+                [collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._job_from_row(columns, row) for row in rows]
@@ -2039,7 +2047,7 @@ class CoverageStore:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                [*args, min(max(limit, 1), 1000)],
+                [*args, collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._snapshot_from_row(columns, row) for row in rows]
@@ -2070,7 +2078,7 @@ class CoverageStore:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                [min(max(limit, 1), 1000)],
+                [collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._worktree_from_row(columns, row) for row in rows]
@@ -2160,7 +2168,7 @@ class CoverageStore:
                 ) DESC
                 LIMIT ?
                 """,
-                [min(max(limit, 1), 1000)],
+                [collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         projects = []
@@ -2189,7 +2197,7 @@ class CoverageStore:
                 ORDER BY line_rate ASC NULLS LAST, total_lines DESC, file_path ASC
                 LIMIT ? OFFSET ?
                 """,
-                [snapshot_id, min(max(limit, 1), 5000), max(offset, 0)],
+                [snapshot_id, collection_query_limit(limit), max(offset, 0)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._decode_json_fields(row_dict(columns, row), ["raw_metrics"]) for row in rows]
@@ -2217,7 +2225,7 @@ class CoverageStore:
                 ORDER BY line_number
                 LIMIT ?
                 """,
-                [snapshot_id, file_path, min(max(limit, 1), 20000)],
+                [snapshot_id, file_path, collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._decode_json_fields(row_dict(columns, row), ["details"]) for row in rows]
@@ -2419,7 +2427,7 @@ class CoverageStore:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                [*args, min(max(limit, 1), 2000)],
+                [*args, collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._serialize(row_dict(columns, row)) for row in reversed(rows)]
@@ -2593,7 +2601,7 @@ class CoverageStore:
                 ORDER BY line_rate_delta ASC, file_path ASC
                 LIMIT ?
                 """,
-                [baseline_snapshot_id, snapshot_id, min(max(file_limit, 1), 1000)],
+                [baseline_snapshot_id, snapshot_id, collection_query_limit(file_limit)],
             ).fetchall()
             file_columns = [column[0] for column in self._conn.description]
 
@@ -2630,7 +2638,7 @@ class CoverageStore:
         baseline_snapshot_id: str | None = None,
         limit: int = 10,
     ) -> dict[str, Any]:
-        limit = min(max(limit, 1), 50)
+        limit = collection_query_limit(limit)
         snapshot = self.snapshot(snapshot_id)
         items: list[dict[str, Any]] = []
 
@@ -2891,7 +2899,7 @@ class CoverageStore:
                     line_number
                 LIMIT ?
                 """,
-                [*args, min(max(limit, 1), 5000)],
+                [*args, collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._serialize(row_dict(columns, row)) for row in rows]
@@ -2935,7 +2943,7 @@ class CoverageStore:
                 ORDER BY s.created_at DESC
                 LIMIT ?
                 """,
-                [*args, min(max(limit, 1), 1000)],
+                [*args, collection_query_limit(limit)],
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._serialize(row_dict(columns, row)) for row in reversed(rows)]

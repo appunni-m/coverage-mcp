@@ -14,7 +14,7 @@ import pytest
 
 from coverage_mcp import storage as storage_module
 from coverage_mcp.models import CoverageReport, FileCoverage, LineCoverage
-from coverage_mcp.storage import CoverageStore
+from coverage_mcp.storage import COLLECTION_FETCH_LIMIT, CoverageStore, collection_query_limit
 from coverage_mcp.storage_helpers import (
     bounded_log_text,
     compact_run_result,
@@ -38,6 +38,12 @@ from coverage_mcp.storage_helpers import (
 def make_lcov(path: Path, *, file_path: str = "src/a.py", hits: tuple[int, ...] = (1, 0)) -> None:
     rows = [f"DA:{index},{hit}" for index, hit in enumerate(hits, start=1)]
     path.write_text(f"TN:\nSF:{file_path}\n" + "\n".join(rows) + "\nend_of_record\n", encoding="utf-8")
+
+
+def test_collection_query_limit_uses_one_shared_overflow_ceiling():
+    assert collection_query_limit(0) == 1
+    assert collection_query_limit(42) == 42
+    assert collection_query_limit(COLLECTION_FETCH_LIMIT + 100) == COLLECTION_FETCH_LIMIT
 
 
 def test_file_gaps_groups_only_relevant_lines_and_paginates_ranges(tmp_path):

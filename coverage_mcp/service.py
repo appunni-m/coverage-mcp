@@ -12,13 +12,11 @@ from typing import Any
 
 from coverage_mcp.contracts import ApiEnvelope
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.storage import CoverageStore
+from coverage_mcp.storage import COLLECTION_FETCH_LIMIT, MAX_COLLECTION_RECORDS, CoverageStore
 from coverage_mcp.storage_helpers import compact_run_result
 
 SCHEMA_REVISION = 7
 DEFAULT_MAX_WORDS = 600
-MAX_COLLECTION_RECORDS = 5000
-COLLECTION_FETCH_LIMIT = MAX_COLLECTION_RECORDS + 1
 
 
 @dataclass(frozen=True, slots=True)
