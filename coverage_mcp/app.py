@@ -49,14 +49,16 @@ from coverage_mcp.contracts import (
     CoverageFileResults,
     CoverageFileSummaryResult,
     CoverageFormat,
+    CoverageGapRangeLimit,
     CoverageInsightsResult,
+    CoverageLineRanges,
     DetailedResponse,
     FileLimit,
     FilePath,
     HistoryLimit,
     HumanApproval,
     IdempotencyKey,
-    IncludeLines,
+    IncludeRawMetrics,
     InsightLimit,
     LatestArtifactResult,
     LineHistoryResult,
@@ -896,12 +898,33 @@ def create_mcp(store: CoverageStore) -> FastMCP:
     async def coverage_file(
         snapshot_id: SnapshotId,
         file_path: FilePath,
-        include_lines: IncludeLines = True,
+        start_line: PositiveLineNumber = 1,
+        max_ranges: CoverageGapRangeLimit = 50,
+        line_ranges: CoverageLineRanges = None,
+        detailed: IncludeRawMetrics = False,
     ) -> CoverageFileResponse:
-        """Inspect one exact path's totals and optionally up to 5,000 line records."""
-        result: dict[str, Any] = {"file": await asyncio.to_thread(store.file_coverage, snapshot_id, file_path)}
-        if include_lines:
-            result["lines"] = await asyncio.to_thread(store.lines, snapshot_id, file_path)
+        """Return grouped gaps and optional normalized exact-line windows; raw metrics require detailed=true."""
+        file = await asyncio.to_thread(store.file_coverage, snapshot_id, file_path)
+        selection = await asyncio.to_thread(
+            store.lines_in_ranges,
+            snapshot_id,
+            file_path,
+            [{"start": item["start"], "end": item["end"]} for item in line_ranges or []],
+        )
+        result: dict[str, Any] = {
+            "file": {key: value for key, value in file.items() if key != "raw_metrics"},
+            "gaps": await asyncio.to_thread(
+                store.file_gaps,
+                snapshot_id,
+                file_path,
+                start_line=start_line,
+                max_ranges=max_ranges,
+            ),
+            "selected_lines": selection.pop("lines"),
+            "line_selection": selection,
+        }
+        if detailed:
+            result["raw_metrics"] = file["raw_metrics"]
             return validated_output(CoverageFileDetailResult, result)
         return validated_output(CoverageFileSummaryResult, result)
 

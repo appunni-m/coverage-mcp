@@ -59,7 +59,7 @@ EXPECTED_MCP_INPUTS = {
     "worktree_progress": {"worktree_id", "suite", "file_path", "limit"},
     "coverage_summary": {"snapshot_id", "repo_path", "branch", "suite"},
     "coverage_files": {"snapshot_id", "limit"},
-    "coverage_file": {"snapshot_id", "file_path", "include_lines"},
+    "coverage_file": {"snapshot_id", "file_path", "start_line", "max_ranges", "line_ranges", "detailed"},
     "coverage_insights": {"snapshot_id", "baseline_snapshot_id", "limit"},
     "compare_to_baseline": {"snapshot_id", "baseline_snapshot_id", "worktree_id", "file_limit", "line_limit"},
     "changed_lines": {"snapshot_id", "baseline_snapshot_id", "file_path", "only_regressions", "limit"},
@@ -91,7 +91,7 @@ EXPECTED_MCP_OUTPUTS = {
     "worktree_progress": {"worktree", "suite", "baseline", "current", "deltas", "points"},
     "coverage_summary": {"id", "suite", "total_lines", "line_rate", "warnings", "age"},
     "coverage_files": {"snapshot_id", "file_path", "total_lines", "line_rate", "raw_metrics"},
-    "coverage_file": {"file", "lines"},
+    "coverage_file": {"file", "gaps", "selected_lines", "line_selection", "raw_metrics"},
     "coverage_insights": {"snapshot", "baseline", "summary", "items"},
     "compare_to_baseline": {"baseline", "current", "overall", "files", "changed_lines", "worktree"},
     "changed_lines": {"file_path", "line_number", "status", "baseline_covered", "current_covered"},
@@ -173,6 +173,14 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
             idempotency_schema = run_schema["idempotency_key"]["anyOf"][0]
             assert idempotency_schema["minLength"] == 1
             assert idempotency_schema["maxLength"] == 200
+
+            coverage_file_schema = tools["coverage_file"].inputSchema["properties"]
+            assert coverage_file_schema["start_line"]["default"] == 1
+            assert coverage_file_schema["max_ranges"]["default"] == 50
+            assert coverage_file_schema["max_ranges"]["minimum"] == 1
+            assert coverage_file_schema["max_ranges"]["maximum"] == 100
+            assert coverage_file_schema["line_ranges"]["anyOf"][0]["maxItems"] == 10
+            assert coverage_file_schema["detailed"]["default"] is False
 
             registration = tools["register_test_command"].inputSchema
             assert set(registration["required"]) == {
@@ -432,10 +440,32 @@ end_of_record
             file_payload = structured(
                 await mcp.call_tool(
                     "coverage_file",
-                    {"snapshot_id": snapshot["id"], "file_path": "src/a.py", "include_lines": True},
+                    {
+                        "snapshot_id": snapshot["id"],
+                        "file_path": "src/a.py",
+                        "line_ranges": [{"start": 1, "end": 1}, {"start": 2, "end": 2}],
+                    },
                 )
             )
-            assert [line["covered"] for line in file_payload["lines"]] == [True, False]
+            assert "raw_metrics" not in file_payload
+            assert [line["covered"] for line in file_payload["selected_lines"]] == [True, False]
+            assert file_payload["line_selection"] == {
+                "requested_ranges": [{"start": 1, "end": 2}],
+                "requested_line_count": 2,
+                "returned_line_count": 2,
+                "unrecorded_line_count": 0,
+            }
+            assert file_payload["gaps"]["uncovered_line_count"] == 1
+            assert file_payload["gaps"]["ranges"] == [
+                {
+                    "start_line": 2,
+                    "end_line": 2,
+                    "line_count": 1,
+                    "reasons": ["uncovered"],
+                    "missed_branches": 0,
+                    "missed_functions": 0,
+                }
+            ]
 
             projects = structured(await mcp.call_tool("project_summaries", {"limit": 10}))
             assert projects[0]["latest_snapshot_id"] == snapshot["id"]
@@ -658,13 +688,16 @@ def test_mcp_coverage_query_surface_and_resources(tmp_path):
             assert summary["id"] == current_snapshot["id"]
             latest_summary = structured(await mcp.call_tool("coverage_summary", {"repo_path": tmp_path.as_posix()}))
             assert latest_summary["id"] == current_snapshot["id"]
-            file_without_lines = structured(
+            detailed_file = structured(
                 await mcp.call_tool(
                     "coverage_file",
-                    {"snapshot_id": current_snapshot["id"], "file_path": "src/a.py", "include_lines": False},
+                    {"snapshot_id": current_snapshot["id"], "file_path": "src/a.py", "detailed": True},
                 )
             )
-            assert "lines" not in file_without_lines
+            assert "lines" not in detailed_file
+            assert detailed_file["selected_lines"] == []
+            assert detailed_file["line_selection"]["requested_line_count"] == 0
+            assert "raw_metrics" in detailed_file
             comparison = structured(
                 await mcp.call_tool(
                     "compare_to_baseline",

@@ -40,6 +40,128 @@ def make_lcov(path: Path, *, file_path: str = "src/a.py", hits: tuple[int, ...] 
     path.write_text(f"TN:\nSF:{file_path}\n" + "\n".join(rows) + "\nend_of_record\n", encoding="utf-8")
 
 
+def test_file_gaps_groups_only_relevant_lines_and_paginates_ranges(tmp_path):
+    file_path = "src/gaps.py"
+    report = CoverageReport(
+        format="synthetic",
+        report_path=(tmp_path / "coverage.json").as_posix(),
+        files=[
+            FileCoverage(
+                file_path=file_path,
+                total_lines=5,
+                covered_lines=1,
+                total_branches=2,
+                covered_branches=1,
+                total_functions=1,
+                covered_functions=0,
+            )
+        ],
+        lines=[
+            LineCoverage(file_path, 1),
+            LineCoverage(file_path, 2),
+            LineCoverage(file_path, 3, hits=1, covered=True, total_branches=2, covered_branches=1),
+            LineCoverage(file_path, 4, total_functions=1),
+            LineCoverage(file_path, 5),
+        ],
+    )
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        snapshot_id = store.store_report(
+            report,
+            repo_path=tmp_path.as_posix(),
+            repo_key=tmp_path.as_posix(),
+            branch="main",
+            commit_sha="abc",
+            base_ref=None,
+            suite="unit",
+        )
+
+        first = store.file_gaps(snapshot_id, file_path, max_ranges=2)
+        assert first == {
+            "total_relevant_lines": 5,
+            "uncovered_line_count": 4,
+            "partial_branch_line_count": 1,
+            "uncovered_function_line_count": 1,
+            "returned_range_count": 2,
+            "truncated": True,
+            "next_start_line": 4,
+            "ranges": [
+                {
+                    "start_line": 1,
+                    "end_line": 2,
+                    "line_count": 2,
+                    "reasons": ["uncovered"],
+                    "missed_branches": 0,
+                    "missed_functions": 0,
+                },
+                {
+                    "start_line": 3,
+                    "end_line": 3,
+                    "line_count": 1,
+                    "reasons": ["partial_branch"],
+                    "missed_branches": 1,
+                    "missed_functions": 0,
+                },
+            ],
+        }
+        continuation = store.file_gaps(snapshot_id, file_path, start_line=first["next_start_line"], max_ranges=1000)
+        assert continuation["truncated"] is False
+        assert continuation["next_start_line"] is None
+        assert [gap["reasons"] for gap in continuation["ranges"]] == [
+            ["uncovered", "uncovered_function"],
+            ["uncovered"],
+        ]
+        selected = store.lines_in_ranges(
+            snapshot_id,
+            file_path,
+            [
+                {"start": 4, "end": 5},
+                {"start": 2, "end": 3},
+                {"start": 3, "end": 4},
+                {"start": 2, "end": 2},
+            ],
+        )
+        assert selected["requested_ranges"] == [{"start": 2, "end": 5}]
+        assert selected["requested_line_count"] == 4
+        assert selected["returned_line_count"] == 4
+        assert selected["unrecorded_line_count"] == 0
+        assert [line["line_number"] for line in selected["lines"]] == [2, 3, 4, 5]
+        assert selected["lines"][1]["covered"] is True
+        assert "details" not in selected["lines"][1]
+        assert store.lines_in_ranges(snapshot_id, file_path, []) == {
+            "requested_ranges": [],
+            "requested_line_count": 0,
+            "returned_line_count": 0,
+            "unrecorded_line_count": 0,
+            "lines": [],
+        }
+        store._conn.execute(
+            "INSERT INTO lines SELECT * FROM lines WHERE snapshot_id = ? AND line_number = 3", [snapshot_id]
+        )
+        deduplicated = store.lines_in_ranges(snapshot_id, file_path, [{"start": 3, "end": 3}] * 10)
+        assert deduplicated["requested_ranges"] == [{"start": 3, "end": 3}]
+        assert deduplicated["returned_line_count"] == 1
+        boundary = store.lines_in_ranges(
+            snapshot_id,
+            file_path,
+            [{"start": 1, "end": 100}, {"start": 50, "end": 200}],
+        )
+        assert boundary["requested_ranges"] == [{"start": 1, "end": 200}]
+        assert boundary["requested_line_count"] == 200
+        assert boundary["returned_line_count"] == 5
+        assert boundary["unrecorded_line_count"] == 195
+        with pytest.raises(ValueError, match="positive"):
+            store.lines_in_ranges(snapshot_id, file_path, [{"start": 0, "end": 1}])
+        with pytest.raises(ValueError, match="end"):
+            store.lines_in_ranges(snapshot_id, file_path, [{"start": 3, "end": 2}])
+        with pytest.raises(ValueError, match="10 ranges"):
+            store.lines_in_ranges(snapshot_id, file_path, [{"start": 1, "end": 1}] * 11)
+        with pytest.raises(ValueError, match="200 lines"):
+            store.lines_in_ranges(snapshot_id, file_path, [{"start": 1, "end": 201}])
+    finally:
+        store.close()
+
+
 def test_register_command_validation_and_disabled_run(tmp_path):
     store = CoverageStore(tmp_path / "coverage.duckdb")
     try:

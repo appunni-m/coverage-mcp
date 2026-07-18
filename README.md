@@ -691,11 +691,13 @@ returns an empty list; use `coverage_summary` first when snapshot existence must
 
 ### `coverage_file`
 
-`coverage_file(snapshot_id, file_path, include_lines = true)` drills into one exact path.
+`coverage_file(snapshot_id, file_path, start_line = 1, max_ranges = 50, line_ranges = null, detailed = false)` drills into one exact path without dumping every covered line.
 
-**Inputs:** `snapshot_id` and exact `file_path` are required; `include_lines` controls whether exact line records are included.
+**Inputs:** `snapshot_id` and exact `file_path` are required. `start_line` continues a truncated gap response and `max_ranges` bounds it to 1-100 contiguous groups. `line_ranges` optionally accepts up to 10 inclusive `{start, end}` windows with at most 200 unique requested lines after normalization. Bounds must be positive and `end >= start`. `detailed` adds only format-specific raw file metrics when true.
 
-**Returns:** A `file` object with totals/rates and, by default, a `lines` array capped at 5000 records containing line number, hits, covered state, and branch/function counters when available. With `include_lines=false`, the `lines` field is omitted.
+**Returns:** Compact common file totals/rates plus `gaps`: counts and contiguous ranges containing only uncovered counted lines, partial branches, or uncovered functions. Each range reports its reasons and summed missed branch/function outcomes. `truncated` and `next_start_line` support focused continuation. Requested windows are sorted and merge exact duplicates, nesting, overlap, and adjacency. `selected_lines` contains compact exact coverage records—including covered lines—deduplicated and sorted. `line_selection` reports the normalized windows plus unique requested, returned, and unrecorded line counts. Repeated snapshot/path fields and per-line parser details are never embedded.
+
+Use `source_context` for a small source window around a returned range. Use `detailed=true` only when parser-specific file counters are required.
 
 **Errors:** Unknown snapshots or paths produce a tool error.
 

@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,34 @@ DEFAULT_RUN_RETENTION = 100
 DEFAULT_RUN_CONCURRENCY = 4
 MAX_RUN_CONCURRENCY = 32
 COMMAND_DURATION_SAMPLE_LIMIT = 20
+
+
+def normalize_line_ranges(ranges: Sequence[Mapping[str, int]]) -> list[tuple[int, int]]:
+    """Validate, sort, and merge inclusive line ranges before applying bounds."""
+    if len(ranges) > 10:
+        raise ValueError("line_ranges accepts at most 10 ranges")
+    ordered: list[tuple[int, int]] = []
+    for line_range in ranges:
+        start = line_range["start"]
+        end = line_range["end"]
+        if start < 1 or end < 1:
+            raise ValueError(f"line range bounds must be positive: {start}-{end}")
+        if end < start:
+            raise ValueError(f"line range end must be at least start: {start}-{end}")
+        ordered.append((start, end))
+    ordered.sort()
+
+    normalized: list[tuple[int, int]] = []
+    for start, end in ordered:
+        if normalized and start <= normalized[-1][1] + 1:
+            previous_start, previous_end = normalized[-1]
+            normalized[-1] = (previous_start, max(previous_end, end))
+        else:
+            normalized.append((start, end))
+    requested_line_count = sum(end - start + 1 for start, end in normalized)
+    if requested_line_count > 200:
+        raise ValueError("line_ranges combined unique span may contain at most 200 lines")
+    return normalized
 
 
 class CommonStore:
@@ -2167,6 +2196,141 @@ class CoverageStore:
             ).fetchall()
             columns = [column[0] for column in self._conn.description]
         return [self._decode_json_fields(row_dict(columns, row), ["details"]) for row in rows]
+
+    def lines_in_ranges(
+        self,
+        snapshot_id: str,
+        file_path: str,
+        ranges: Sequence[Mapping[str, int]],
+    ) -> dict[str, Any]:
+        """Return compact exact coverage records for explicitly requested windows."""
+        normalized = normalize_line_ranges(ranges)
+        requested_line_count = sum(end - start + 1 for start, end in normalized)
+        if not normalized:
+            return {
+                "requested_ranges": [],
+                "requested_line_count": 0,
+                "returned_line_count": 0,
+                "unrecorded_line_count": 0,
+                "lines": [],
+            }
+
+        predicates = " OR ".join("line_number BETWEEN ? AND ?" for _range in normalized)
+        parameters: list[Any] = [snapshot_id, file_path]
+        for start, end in normalized:
+            parameters.extend([start, end])
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT line_number, MAX(hits) AS hits,
+                       BOOL_OR(covered) AS covered,
+                       BOOL_OR(count_line) AS count_line,
+                       MAX(total_branches) AS total_branches,
+                       MAX(covered_branches) AS covered_branches,
+                       MAX(total_functions) AS total_functions,
+                       MAX(covered_functions) AS covered_functions
+                FROM lines
+                WHERE snapshot_id = ? AND file_path = ? AND ({predicates})
+                GROUP BY line_number
+                ORDER BY line_number
+                """,
+                parameters,
+            ).fetchall()
+            columns = [column[0] for column in self._conn.description]
+        lines = [row_dict(columns, row) for row in rows]
+        return {
+            "requested_ranges": [{"start": start, "end": end} for start, end in normalized],
+            "requested_line_count": requested_line_count,
+            "returned_line_count": len(lines),
+            "unrecorded_line_count": requested_line_count - len(lines),
+            "lines": lines,
+        }
+
+    def file_gaps(
+        self,
+        snapshot_id: str,
+        file_path: str,
+        *,
+        start_line: int = 1,
+        max_ranges: int = 50,
+    ) -> dict[str, Any]:
+        """Summarize only uncovered lines and incomplete branch/function coverage."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT line_number, covered, count_line,
+                       total_branches, covered_branches,
+                       total_functions, covered_functions
+                FROM lines
+                WHERE snapshot_id = ? AND file_path = ?
+                ORDER BY line_number
+                """,
+                [snapshot_id, file_path],
+            ).fetchall()
+
+        relevant: list[tuple[int, tuple[str, ...], int, int]] = []
+        uncovered_line_count = 0
+        partial_branch_line_count = 0
+        uncovered_function_line_count = 0
+        for (
+            line_number,
+            covered,
+            count_line,
+            total_branches,
+            covered_branches,
+            total_functions,
+            covered_functions,
+        ) in rows:
+            reasons: list[str] = []
+            if count_line and not covered:
+                reasons.append("uncovered")
+                uncovered_line_count += 1
+            missed_branches = max(total_branches - covered_branches, 0)
+            if missed_branches:
+                reasons.append("partial_branch")
+                partial_branch_line_count += 1
+            missed_functions = max(total_functions - covered_functions, 0)
+            if missed_functions:
+                reasons.append("uncovered_function")
+                uncovered_function_line_count += 1
+            if reasons:
+                relevant.append((line_number, tuple(reasons), missed_branches, missed_functions))
+
+        ranges: list[dict[str, Any]] = []
+        next_start_line: int | None = None
+        for line_number, reason_keys, missed_branches, missed_functions in relevant:
+            if line_number < start_line:
+                continue
+            if ranges and ranges[-1]["end_line"] + 1 == line_number and ranges[-1]["reasons"] == list(reason_keys):
+                ranges[-1]["end_line"] = line_number
+                ranges[-1]["line_count"] += 1
+                ranges[-1]["missed_branches"] += missed_branches
+                ranges[-1]["missed_functions"] += missed_functions
+                continue
+            if len(ranges) >= min(max(max_ranges, 1), 100):
+                next_start_line = line_number
+                break
+            ranges.append(
+                {
+                    "start_line": line_number,
+                    "end_line": line_number,
+                    "line_count": 1,
+                    "reasons": list(reason_keys),
+                    "missed_branches": missed_branches,
+                    "missed_functions": missed_functions,
+                }
+            )
+
+        return {
+            "total_relevant_lines": len(relevant),
+            "uncovered_line_count": uncovered_line_count,
+            "partial_branch_line_count": partial_branch_line_count,
+            "uncovered_function_line_count": uncovered_function_line_count,
+            "returned_range_count": len(ranges),
+            "truncated": next_start_line is not None,
+            "next_start_line": next_start_line,
+            "ranges": ranges,
+        }
 
     def trend(
         self,

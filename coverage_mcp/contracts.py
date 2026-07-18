@@ -82,8 +82,32 @@ ArtifactPaths = Annotated[
     ),
 ]
 
+
+class CoverageLineRange(TypedDict):
+    """One inclusive source-line window requested from coverage_file."""
+
+    start: Annotated[int, Field(ge=1, description="First one-based line in the inclusive window.")]
+    end: Annotated[int, Field(ge=1, description="Last one-based line in the inclusive window.")]
+
+
+CoverageLineRanges = Annotated[
+    list[CoverageLineRange] | None,
+    Field(
+        max_length=10,
+        description=(
+            "Up to 10 inclusive windows whose exact coverage records should be returned; null returns no exact lines. "
+            "Windows are sorted and merge duplicates, nesting, overlap, and adjacency; their combined unique span may "
+            "contain at most 200 lines."
+        ),
+    ),
+]
+
 ResultLimit = Annotated[int, Field(ge=1, le=1000, description="Maximum records to return (1-1000).")]
 FileLimit = Annotated[int, Field(ge=1, le=5000, description="Maximum file records to return (1-5000).")]
+CoverageGapRangeLimit = Annotated[
+    int,
+    Field(ge=1, le=100, description="Maximum contiguous coverage-gap ranges to return (1-100)."),
+]
 InsightLimit = Annotated[int, Field(ge=1, le=50, description="Maximum prioritized insight items to return (1-50).")]
 TrendLimit = Annotated[int, Field(ge=1, le=2000, description="Maximum time-series points to return (1-2000).")]
 ChangedLineLimit = Annotated[int, Field(ge=1, le=5000, description="Maximum changed line records to return (1-5000).")]
@@ -242,9 +266,9 @@ CaseSensitiveLogSearch = Annotated[
     bool,
     Field(description="Match letter case exactly when true; default false performs Unicode case-folded matching."),
 ]
-IncludeLines = Annotated[
+IncludeRawMetrics = Annotated[
     bool,
-    Field(description="Include up to 5,000 exact line records in addition to file totals."),
+    Field(description="Include format-specific raw file metrics; false keeps the response compact."),
 ]
 OnlyRegressions = Annotated[
     bool,
@@ -707,37 +731,92 @@ class CoverageFileResult(CoverageMetrics):
     raw_metrics: dict[str, Any] = Field(description="Format-specific counters not represented by common metrics.")
 
 
-class CoverageLineResult(OutputModel):
-    """Exact coverage state for one source line."""
+class CoverageFileCompactResult(CoverageMetrics):
+    """Common coverage counters for one file without parser-specific payloads."""
 
     snapshot_id: str = Field(description="Owning immutable coverage snapshot UUID.")
     file_path: str = Field(description="Exact repository-relative source path.")
+
+
+class CoverageGapRangeResult(OutputModel):
+    """One contiguous range of lines sharing the same coverage-gap reasons."""
+
+    start_line: int = Field(description="First one-based line in this gap range.")
+    end_line: int = Field(description="Last one-based line in this gap range.")
+    line_count: int = Field(description="Number of relevant coverage lines in this range.")
+    reasons: list[Literal["uncovered", "partial_branch", "uncovered_function"]] = Field(
+        description="Why this range needs investigation."
+    )
+    missed_branches: int = Field(description="Uncovered branch outcomes summed across the range.")
+    missed_functions: int = Field(description="Uncovered function entries summed across the range.")
+
+
+class CoverageGapSummaryResult(OutputModel):
+    """Bounded grouped coverage gaps for one file."""
+
+    total_relevant_lines: int = Field(description="All distinct lines with at least one coverage gap.")
+    uncovered_line_count: int = Field(description="Counted lines that were not executed.")
+    partial_branch_line_count: int = Field(description="Lines with one or more uncovered branch outcomes.")
+    uncovered_function_line_count: int = Field(description="Lines with one or more uncovered function entries.")
+    returned_range_count: int = Field(description="Number of contiguous gap ranges in this response.")
+    truncated: bool = Field(description="Whether additional gap ranges remain after this response.")
+    next_start_line: int | None = Field(description="Continuation line for the next call, or null when complete.")
+    ranges: list[CoverageGapRangeResult] = Field(description="At most the requested number of relevant gap ranges.")
+
+
+class CoverageSelectedLineResult(OutputModel):
+    """Compact exact coverage state for one explicitly requested line."""
+
     line_number: int = Field(description="One-based source line number.")
     hits: int = Field(description="Recorded execution count.")
-    covered: bool = Field(description="Whether the line was executed.")
+    covered: bool = Field(description="Whether the counted line was executed.")
     count_line: bool = Field(description="Whether this record contributes to line totals.")
     total_branches: int = Field(description="Branch outcomes attached to the line.")
     covered_branches: int = Field(description="Covered branch outcomes attached to the line.")
     total_functions: int = Field(description="Function entries attached to the line.")
     covered_functions: int = Field(description="Covered function entries attached to the line.")
-    details: dict[str, Any] = Field(description="Format-specific exact-line details.")
+
+
+class CoverageSelectedRangeResult(OutputModel):
+    """One normalized inclusive window used for exact line selection."""
+
+    start: int = Field(description="First one-based requested line.")
+    end: int = Field(description="Last one-based requested line.")
+
+
+class CoverageLineSelectionResult(OutputModel):
+    """Normalization and completeness metadata for requested exact lines."""
+
+    requested_ranges: list[CoverageSelectedRangeResult] = Field(
+        description="Sorted disjoint windows after merging duplicates, overlaps, nesting, and adjacency."
+    )
+    requested_line_count: int = Field(description="Unique source-line numbers covered by normalized windows.")
+    returned_line_count: int = Field(description="Requested line numbers with coverage records.")
+    unrecorded_line_count: int = Field(description="Requested line numbers absent from the coverage report.")
 
 
 class CoverageFileSummaryResult(OutputModel):
-    """One file's metrics without exact line records."""
+    """One file's compact metrics and grouped relevant coverage gaps."""
 
-    file: CoverageFileResult = Field(description="Selected file totals and rates.")
+    file: CoverageFileCompactResult = Field(description="Selected file totals and rates without raw parser metrics.")
+    gaps: CoverageGapSummaryResult = Field(description="Relevant gaps grouped into contiguous ranges.")
+    selected_lines: list[CoverageSelectedLineResult] = Field(
+        description="Exact compact records from requested line_ranges; empty when no ranges were requested."
+    )
+    line_selection: CoverageLineSelectionResult = Field(
+        description="Normalized range and coverage-record completeness metadata."
+    )
 
 
 class CoverageFileDetailResult(CoverageFileSummaryResult):
-    """One file's metrics and requested exact line records."""
+    """Compact file coverage plus explicitly requested parser-specific metrics."""
 
-    lines: list[CoverageLineResult] = Field(description="Up to 5,000 exact line records.")
+    raw_metrics: dict[str, Any] = Field(description="Format-specific file counters requested with detailed=true.")
 
 
 CoverageFileResponse = Annotated[
     CoverageFileDetailResult | CoverageFileSummaryResult,
-    Field(description="Selected file metrics, plus exact lines only when requested."),
+    Field(description="Selected file metrics and bounded grouped gaps, plus raw metrics only when requested."),
 ]
 
 

@@ -48,7 +48,7 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     with TestClient(app) as client:
         health = client.get("/health").json()
-        assert health["version"] == "0.5.0"
+        assert health["version"] == "0.6.0"
         assert health["run_retention"] == 100
         assert health["run_concurrency"] == 4
         assert client.get("/api/snapshots/latest").status_code == 404
