@@ -64,6 +64,9 @@ version = {attr = "coverage_mcp.__version__"}
 [tool.setuptools.packages.find]
 include = ["coverage_mcp*"]
 
+[tool.setuptools.package-data]
+coverage_mcp = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

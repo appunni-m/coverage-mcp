@@ -37,7 +37,6 @@ from coverage_mcp.contracts import (
     CommandReference,
     CommandText,
     CommitSha,
-    CompactRunResult,
     CoverageComparisonView,
     CoverageFormat,
     CoverageLineRanges,
@@ -60,13 +59,11 @@ from coverage_mcp.contracts import (
     OptionalSnapshotId,
     OptionalSuite,
     OptionalWorktreeId,
-    OutputModel,
     PageCursor,
     ReportPath,
     ResponseWordBudget,
     RunAction,
     RunId,
-    RunResult,
     ShellPath,
     SnapshotId,
     SourceBoundary,
@@ -194,33 +191,6 @@ class RepositoryStoreRouter(CoverageStore):
         if store is None:
             raise RuntimeError("a repository must be selected before using coverage data")
         return getattr(store, name)
-
-
-def validated_output[OutputT: OutputModel](model: type[OutputT], value: Any) -> OutputT:  # pragma: no cover
-    return model.model_validate(value)
-
-
-def validated_outputs[OutputT: OutputModel](
-    model: type[OutputT],
-    values: list[dict[str, Any]],
-) -> list[OutputT]:  # pragma: no cover
-    return [model.model_validate(value) for value in values]
-
-
-def validated_run_response(  # pragma: no cover
-    value: dict[str, Any], *, detailed: bool
-) -> CompactRunResult | RunResult:
-    model = RunResult if detailed else CompactRunResult
-    if detailed:
-        projected = dict(value)
-        raw_summary = projected.get("parsed_summary")
-        if isinstance(raw_summary, dict):
-            summary = dict(raw_summary)
-            summary.pop("excerpts", None)
-            projected["parsed_summary"] = summary
-    else:
-        projected = compact_run_result(value)
-    return model.model_validate(projected)
 
 
 class IngestRequest(BaseModel):
@@ -1368,8 +1338,10 @@ def main(argv: list[str] | None = None) -> None:
         serve()
     elif arguments == ["connect"]:
         connect()
+    elif arguments == ["--version"]:
+        print(__version__)
     else:
-        raise SystemExit("usage: coverage-mcp [serve|connect]")
+        raise SystemExit("usage: coverage-mcp [serve|connect|--version]")
 
 
 if __name__ == "__main__":

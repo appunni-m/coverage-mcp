@@ -133,6 +133,7 @@ stores. Add `.coverage-mcp/` to Git ignore rules.
 - [Storage model](#storage-model)
 - [Security and privacy](#security-and-privacy)
 - [Architecture](docs/architecture.md)
+- [Release process](docs/releasing.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)

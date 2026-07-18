@@ -27,7 +27,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install project
-        run: python -m pip install --upgrade pip ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
       - name: Run tests with full coverage
         run: |
           coverage run -m pytest -q
@@ -43,7 +45,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install project
-        run: python -m pip install --upgrade pip ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
       - name: Lint and type-check
         run: |
           ruff check .

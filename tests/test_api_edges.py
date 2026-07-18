@@ -350,7 +350,7 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
         app_module.ensure_daemon(timeout_seconds=1)
 
 
-def test_daemon_start_and_cli_commands(monkeypatch, tmp_path):
+def test_daemon_start_and_cli_commands(capsys, monkeypatch, tmp_path):
     monkeypatch.setenv("COVERAGE_MCP_HOST", "0.0.0.0")
     with pytest.raises(RuntimeError, match="loopback"):
         app_module.serve()
@@ -372,6 +372,8 @@ def test_daemon_start_and_cli_commands(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "connect", lambda: calls.append("connect"))
     app_module.main(["serve"])
     app_module.main(["connect"])
+    app_module.main(["--version"])
+    assert capsys.readouterr().out.strip() == app_module.__version__
     with pytest.raises(SystemExit, match="usage"):
         app_module.main(["unknown"])
     assert calls == ["serve", "connect"]

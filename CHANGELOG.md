@@ -11,10 +11,14 @@ minor versions may contain breaking public-contract changes.
 - Replaced offset-bearing continuation tokens with record-anchored opaque cursors.
 - Made public response models reject undeclared fields.
 - Expanded packaging metadata and the supported Python CI matrix.
+- Separated the embedded dashboard document and storage projections from transport and persistence code.
+- Restricted the daemon to loopback interfaces and added browser security headers and trusted-host validation.
 
 ### Added
 
 - Contributor, governance, support, conduct, and security policies.
+- Reproducible token-savings benchmark inputs, connector verification, release documentation, and Trusted Publishing.
+- PEP 561 metadata for downstream type checkers.
 
 ## 0.7.0 - 2026-07-18
 
