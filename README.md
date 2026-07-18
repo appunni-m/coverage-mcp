@@ -854,6 +854,10 @@ must stay inside the selected repository, and agents can only run immutable regi
 HTTP port to an untrusted network. Review commands and artifact paths before approving them, especially in repositories
 you do not control.
 
+Remote HTTP binding is intentionally unsupported. The server validates loopback Host headers and does not enable CORS;
+use `coverage-mcp connect` when an MCP client needs stdio transport. The dashboard is served locally with a restrictive
+content policy and no third-party assets or telemetry.
+
 ## Test Coverage
 
 The test suite covers:

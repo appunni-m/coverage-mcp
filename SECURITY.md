@@ -22,4 +22,6 @@ credit reporters who want attribution. Please allow time for a release before pu
 
 Coverage MCP is a local developer tool. Registered test commands execute local code with the user's permissions.
 Loopback binding is not permission isolation, and repositories, coverage reports, logs, and commands should be treated
-as potentially hostile inputs. Never expose the daemon to an untrusted network.
+as potentially hostile inputs. Remote binding is unsupported. The server validates loopback Host headers, does not
+enable CORS, and serves no third-party dashboard assets, but other processes running as the same user remain inside the
+local trust boundary.

@@ -16,7 +16,8 @@ import anyio
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from filelock import FileLock
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
@@ -299,14 +300,31 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
         version=__version__,
         lifespan=lifespan,
     )
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
+    )
     app.state.coverage_store = store
     app.state.coverage_service = service
+
+    @app.middleware("http")
+    async def security_headers(request: Any, call_next: Any) -> Any:
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; base-uri 'none'; connect-src 'self'; frame-ancestors 'none'; "
+            "form-action 'self'; img-src 'self' data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+        )
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        return response
 
     if isinstance(store, RepositoryStoreRouter):
 
         @app.middleware("http")
         async def select_repository(request: Any, call_next: Any) -> Any:
-            if request.url.path in {"/", "/health", "/api/projects"}:
+            if request.url.path in {"/", "/favicon.ico", "/health", "/api/projects"}:
                 return await call_next(request)
             repo_path = request.headers.get(REPOSITORY_HEADER)
             if not repo_path:
@@ -326,6 +344,10 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> str:
         return DASHBOARD_HTML
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> Response:
+        return Response(status_code=204)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -1334,8 +1356,8 @@ def connect() -> None:
 
 def serve() -> None:
     host = os.environ.get("COVERAGE_MCP_HOST", "127.0.0.1")
-    if host not in {"127.0.0.1", "localhost", "::1"} and os.environ.get("COVERAGE_MCP_ALLOW_REMOTE") != "1":
-        raise RuntimeError("remote Coverage MCP binding requires COVERAGE_MCP_ALLOW_REMOTE=1 and is unauthenticated")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError("Coverage MCP only supports loopback HTTP binding")
     port = int(os.environ.get("COVERAGE_MCP_PORT", str(DEFAULT_PORT)))
     uvicorn.run(create_app(), host=host, port=port, reload=False)
 

@@ -40,6 +40,12 @@ end_of_record
     with TestClient(app) as client:
         dashboard = client.get("/")
         assert dashboard.status_code == 200
+        assert dashboard.headers["cache-control"] == "no-store"
+        assert "frame-ancestors 'none'" in dashboard.headers["content-security-policy"]
+        assert dashboard.headers["x-content-type-options"] == "nosniff"
+        assert dashboard.headers["x-frame-options"] == "DENY"
+        assert client.get("/", headers={"host": "untrusted.example"}).status_code == 400
+        assert client.get("/favicon.ico").status_code == 204
         assert 'id="projectSelect"' in dashboard.text
         assert 'id="insightsBody"' in dashboard.text
         assert 'id="coverageViewer"' in dashboard.text
@@ -106,6 +112,7 @@ def test_global_app_lazily_routes_coverage_to_repository_store(tmp_path):
         health = client.get("/health").json()
         assert health["common_db_path"] == (tmp_path / "common.duckdb").as_posix()
         assert health["repository_count"] == 0
+        assert client.get("/favicon.ico").status_code == 204
         assert client.post("/api/ingest", json={"report_path": report.as_posix()}).status_code == 400
 
         headers = {REPOSITORY_HEADER: tmp_path.as_posix()}

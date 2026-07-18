@@ -279,7 +279,6 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
     calls = {}
     monkeypatch.setenv("COVERAGE_MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("COVERAGE_MCP_PORT", "8765")
-    monkeypatch.setenv("COVERAGE_MCP_ALLOW_REMOTE", "1")
     monkeypatch.setattr(app_module, "create_app", lambda: "created-app")
 
     def fake_run(app, *, host, port, reload):
@@ -288,14 +287,17 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
         calls.update({"app": app, "host": host, "port": port, "reload": reload})
 
     monkeypatch.setattr(app_module.uvicorn, "run", fake_run)
+    with pytest.raises(RuntimeError, match="loopback"):
+        app_module.main([])
+    monkeypatch.setenv("COVERAGE_MCP_HOST", "127.0.0.1")
     app_module.main([])
-    assert calls == {"app": "created-app", "host": "0.0.0.0", "port": 8765, "reload": False}
+    assert calls == {"app": "created-app", "host": "127.0.0.1", "port": 8765, "reload": False}
 
     calls.clear()
     monkeypatch.setenv("COVERAGE_MCP_DB", (tmp_path / "script.duckdb").as_posix())
     monkeypatch.setattr(sys, "argv", [app_module.__file__])
     runpy.run_path(Path(app_module.__file__).as_posix(), run_name="__main__")
-    assert calls["host"] == "0.0.0.0"
+    assert calls["host"] == "127.0.0.1"
     assert calls["port"] == 8765
     assert calls["reload"] is False
 
@@ -350,8 +352,7 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
 
 def test_daemon_start_and_cli_commands(monkeypatch, tmp_path):
     monkeypatch.setenv("COVERAGE_MCP_HOST", "0.0.0.0")
-    monkeypatch.delenv("COVERAGE_MCP_ALLOW_REMOTE", raising=False)
-    with pytest.raises(RuntimeError, match="remote Coverage MCP"):
+    with pytest.raises(RuntimeError, match="loopback"):
         app_module.serve()
     monkeypatch.setenv("COVERAGE_MCP_HOST", "127.0.0.1")
     monkeypatch.setattr(app_module, "default_common_db_path", lambda: (tmp_path / "common.duckdb").as_posix())
