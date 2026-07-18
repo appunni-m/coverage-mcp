@@ -23,19 +23,20 @@ async def verify_connector(index: int, repository: Path, results: list[dict[str,
         initialized = await session.initialize()
         tools = await session.list_tools()
         context = await session.call_tool("project_context", {"max_words": 100})
+        health = httpx.get(f"{daemon_url()}/health", timeout=2).json()
         results.append(
             {
                 "index": index,
                 "server": initialized.serverInfo.name,
                 "tools": sorted(tool.name for tool in tools.tools),
                 "schema_revision": context.structuredContent["context"]["schema_revision"],
+                "daemon_pid": health["pid"],
             }
         )
 
 
 async def main_async(connector_count: int) -> None:
     repository = Path.cwd().resolve()
-    before = httpx.get(f"{daemon_url()}/health", timeout=2).json()
     results: list[dict[str, Any]] = []
     async with anyio.create_task_group() as tasks:
         for index in range(connector_count):
@@ -54,7 +55,7 @@ async def main_async(connector_count: int) -> None:
         "test_run",
     }
     assert len(results) == connector_count
-    assert before["pid"] == after["pid"]
+    assert all(result["daemon_pid"] == after["pid"] for result in results)
     assert all(result["server"] == "coverage-mcp" for result in results)
     assert all(result["schema_revision"] == 7 for result in results)
     assert all(set(result["tools"]) == expected_tools for result in results)

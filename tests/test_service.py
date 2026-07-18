@@ -30,12 +30,16 @@ def service_for(store: Any, path: Path) -> CoverageService:
 def test_cursor_word_budget_and_projection_edges(tmp_path):
     anchor = "a" * 64
     cursor = encode_cursor(anchor, scope="files")
-    assert decode_cursor(cursor, scope="files") == anchor
+    assert decode_cursor(cursor, scope="files") == (anchor, 1)
+    with pytest.raises(ValueError, match="occurrence must be positive"):
+        encode_cursor(anchor, scope="files", occurrence=0)
     assert serialized_word_count({"message": "one two", "count": 2}) == 5
     for invalid in ("not-base64", base64.urlsafe_b64encode(b"{}").decode()):
         with pytest.raises(ValueError, match="invalid pagination cursor"):
             decode_cursor(invalid, scope="files")
-    negative = base64.urlsafe_b64encode(json.dumps({"after": "not-a-hash", "scope": "wrong"}).encode()).decode()
+    negative = base64.urlsafe_b64encode(
+        json.dumps({"after": "not-a-hash", "occurrence": 1, "scope": "wrong"}).encode()
+    ).decode()
     with pytest.raises(ValueError, match="does not belong"):
         decode_cursor(negative, scope="files")
     with pytest.raises(ValueError, match="does not belong"):
@@ -54,12 +58,35 @@ def test_cursor_word_budget_and_projection_edges(tmp_path):
         service.page([], cursor=encode_cursor(anchor, scope="x"), max_words=50, scope="x")
 
     values = [{"text": " ".join([str(index)] * 30)} for index in range(3)]
-    first, page = service.page(values, cursor=None, max_words=50, scope="items", total=4)
+    first, page = service.page(values, cursor=None, max_words=50, scope="items")
     assert len(first) == 1
     assert page["truncated"] is True
     second, next_page = service.page(values, cursor=page["next_cursor"], max_words=5000, scope="items")
     assert len(second) == 2
     assert next_page["truncated"] is False
+    duplicate = {"text": " ".join(["same"] * 30)}
+    duplicates = [duplicate, duplicate, duplicate]
+    first_duplicate, duplicate_page = service.page(duplicates, cursor=None, max_words=50, scope="duplicates")
+    assert first_duplicate == [duplicate]
+    second_duplicate, second_duplicate_page = service.page(
+        duplicates,
+        cursor=duplicate_page["next_cursor"],
+        max_words=50,
+        scope="duplicates",
+    )
+    assert second_duplicate == [duplicate]
+    final_duplicate, final_duplicate_page = service.page(
+        duplicates,
+        cursor=second_duplicate_page["next_cursor"],
+        max_words=50,
+        scope="duplicates",
+    )
+    assert final_duplicate == [duplicate]
+    assert final_duplicate_page["next_cursor"] is None
+    with pytest.raises(ValueError, match="defensive 5000-record cap"):
+        service.page([{}] * 5001, cursor=None, max_words=50, scope="too-many")
+    with pytest.raises(ValueError, match="defensive 5000-record cap"):
+        service.page([{}], cursor=None, max_words=50, scope="incomplete", total=2)
     exact, _ = service.page([{"text": " ".join(["word"] * 49)}], cursor=None, max_words=50, scope="exact")
     assert len(exact) == 1
 

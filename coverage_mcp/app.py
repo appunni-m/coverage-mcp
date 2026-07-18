@@ -74,7 +74,14 @@ from coverage_mcp.contracts import (
 )
 from coverage_mcp.dashboard import DASHBOARD_HTML
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.service import SCHEMA_REVISION, CoverageService, RequestContext, compact_command, compact_snapshot
+from coverage_mcp.service import (
+    COLLECTION_FETCH_LIMIT,
+    SCHEMA_REVISION,
+    CoverageService,
+    RequestContext,
+    compact_command,
+    compact_snapshot,
+)
 from coverage_mcp.storage import (
     DEFAULT_RUN_CONCURRENCY,
     DEFAULT_RUN_RETENTION,
@@ -172,7 +179,7 @@ class RepositoryStoreRouter(CoverageStore):
         if store is not None:
             return store.projects(limit=limit)
         projects: list[dict[str, Any]] = []
-        for registered in self.stores.common_store.repositories(limit=1000):
+        for registered in self.stores.common_store.repositories(limit=COLLECTION_FETCH_LIMIT):
             try:
                 repository_projects = self.stores.for_repository(str(registered["repo_key"])).projects(limit=1)
             except (FileNotFoundError, OSError, ValueError):
@@ -384,7 +391,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
         max_words: int = Query(default=600, ge=50, le=5000),
         detailed: bool = False,
     ) -> dict[str, Any]:
-        values = store.list_worktrees(limit=1000)
+        values = store.list_worktrees(limit=COLLECTION_FETCH_LIMIT)
         if not detailed:
             values = [
                 {
@@ -431,7 +438,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
         max_words: int = Query(default=600, ge=50, le=5000),
         detailed: bool = False,
     ) -> dict[str, Any]:
-        values = store.projects(limit=1000)
+        values = store.projects(limit=COLLECTION_FETCH_LIMIT)
         if not detailed:
             keys = (
                 "repo_key",
@@ -492,7 +499,10 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
         max_words: int = Query(default=600, ge=50, le=5000),
         detailed: bool = False,
     ) -> dict[str, Any]:
-        values = [compact_command(item, detailed=detailed) for item in store.list_registered_commands(limit=1000)]
+        values = [
+            compact_command(item, detailed=detailed)
+            for item in store.list_registered_commands(limit=COLLECTION_FETCH_LIMIT)
+        ]
         return service.collection(
             values,
             cursor=cursor,
@@ -532,7 +542,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
         max_words: int = Query(default=600, ge=50, le=5000),
         detailed: bool = False,
     ) -> dict[str, Any]:
-        values = store.list_run_queue(limit=1000)
+        values = store.list_run_queue(limit=COLLECTION_FETCH_LIMIT)
         if not detailed:
             values = [compact_run_result(run) for run in values]
         return service.collection(
@@ -655,7 +665,12 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
     ) -> dict[str, Any]:
         values = [
             compact_snapshot(item, detailed=detailed)
-            for item in store.list_snapshots(repo_path=repo_path, branch=branch, suite=suite, limit=1000)
+            for item in store.list_snapshots(
+                repo_path=repo_path,
+                branch=branch,
+                suite=suite,
+                limit=COLLECTION_FETCH_LIMIT,
+            )
         ]
         return service.collection(
             values,
@@ -798,7 +813,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
             suite=suite,
             file_path=file_path,
             worktree_id=worktree_id,
-            limit=2000,
+            limit=COLLECTION_FETCH_LIMIT,
         )
         if not detailed:
             values = [
@@ -1284,6 +1299,10 @@ def ensure_daemon(
         if daemon_is_healthy(url):
             return url
         if daemon_is_reachable(url):
+            for _ in range(20):
+                if daemon_is_healthy(url):
+                    return url
+                time.sleep(sleep_seconds)
             raise RuntimeError(
                 f"Coverage MCP daemon at {url} uses an incompatible version or schema; stop it before reconnecting"
             )

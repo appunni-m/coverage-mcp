@@ -18,6 +18,7 @@ from coverage_mcp.storage_helpers import compact_run_result
 SCHEMA_REVISION = 7
 DEFAULT_MAX_WORDS = 600
 MAX_COLLECTION_RECORDS = 5000
+COLLECTION_FETCH_LIMIT = MAX_COLLECTION_RECORDS + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,24 +43,30 @@ def _cursor_anchor(value: Any) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
-def encode_cursor(anchor: str, *, scope: str) -> str:
-    payload = json.dumps({"after": anchor, "scope": _cursor_scope(scope)}, separators=(",", ":")).encode()
+def encode_cursor(anchor: str, *, scope: str, occurrence: int = 1) -> str:
+    if occurrence < 1:
+        raise ValueError("cursor occurrence must be positive")
+    payload = json.dumps(
+        {"after": anchor, "occurrence": occurrence, "scope": _cursor_scope(scope)},
+        separators=(",", ":"),
+    ).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def decode_cursor(cursor: str | None, *, scope: str) -> str | None:
+def decode_cursor(cursor: str | None, *, scope: str) -> tuple[str, int] | None:
     if cursor is None:
         return None
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded.encode()))
         anchor = str(payload["after"])
+        occurrence = int(payload["occurrence"])
         cursor_scope = str(payload["scope"])
     except (ValueError, TypeError, KeyError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error) as exc:
         raise ValueError("invalid pagination cursor") from exc
-    if not re.fullmatch(r"[0-9a-f]{64}", anchor) or cursor_scope != _cursor_scope(scope):
+    if not re.fullmatch(r"[0-9a-f]{64}", anchor) or occurrence < 1 or cursor_scope != _cursor_scope(scope):
         raise ValueError("pagination cursor does not belong to this query")
-    return anchor
+    return anchor, occurrence
 
 
 def compact_snapshot(value: dict[str, Any], *, detailed: bool = False) -> dict[str, Any]:
@@ -247,14 +254,22 @@ class CoverageService:
     ) -> tuple[list[Any], dict[str, Any]]:
         if not 50 <= max_words <= 5000:
             raise ValueError("max_words must be between 50 and 5000")
-        bounded = values[:MAX_COLLECTION_RECORDS]
-        anchor = decode_cursor(cursor, scope=scope)
+        known_total = len(values) if total is None else total
+        if len(values) > MAX_COLLECTION_RECORDS or known_total > len(values):
+            raise ValueError(f"result exceeds the defensive {MAX_COLLECTION_RECORDS}-record cap; refine the query")
+        bounded = values
+        cursor_position = decode_cursor(cursor, scope=scope)
         start = 0
-        if anchor is not None:
-            start = next(
-                (index + 1 for index, value in enumerate(bounded) if _cursor_anchor(value) == anchor),
-                -1,
-            )
+        if cursor_position is not None:
+            anchor, occurrence = cursor_position
+            matches_seen = 0
+            start = -1
+            for index, value in enumerate(bounded):
+                if _cursor_anchor(value) == anchor:
+                    matches_seen += 1
+                    if matches_seen == occurrence:
+                        start = index + 1
+                        break
             if start < 0:
                 raise ValueError("pagination cursor no longer matches the available results")
         selected: list[Any] = []
@@ -267,16 +282,20 @@ class CoverageService:
             word_count += item_words
             if word_count >= max_words:
                 break
-        known_total = len(values) if total is None else total
         consumed = start + len(selected)
-        truncated = consumed < min(known_total, MAX_COLLECTION_RECORDS)
+        truncated = consumed < known_total
+        next_cursor = None
+        if truncated and selected:
+            last_anchor = _cursor_anchor(selected[-1])
+            occurrence = sum(1 for value in bounded[:consumed] if _cursor_anchor(value) == last_anchor)
+            next_cursor = encode_cursor(last_anchor, scope=scope, occurrence=occurrence)
         page = {
             "returned": len(selected),
             "total": known_total,
             "word_count": word_count,
             "max_words": max_words,
             "truncated": truncated,
-            "next_cursor": encode_cursor(_cursor_anchor(selected[-1]), scope=scope) if truncated and selected else None,
+            "next_cursor": next_cursor,
         }
         return selected, page
 
@@ -358,7 +377,8 @@ class CoverageService:
             }
         )
         commands = [
-            compact_command(item, detailed=detailed) for item in self.store.list_registered_commands(limit=1000)
+            compact_command(item, detailed=detailed)
+            for item in self.store.list_registered_commands(limit=COLLECTION_FETCH_LIMIT)
         ]
         scope = f"project-context:{selected.repo_key}:{detailed}"
         selected_commands, page = self.page(
@@ -368,7 +388,7 @@ class CoverageService:
             scope=scope,
         )
         latest = self.store.latest_run()
-        active = [compact_run_result(item) for item in self.store.list_run_queue(limit=1000)]
+        active = [compact_run_result(item) for item in self.store.list_run_queue(limit=COLLECTION_FETCH_LIMIT)]
         compact_project_keys = (
             "snapshot_count",
             "branch_count",
@@ -521,7 +541,10 @@ class CoverageService:
             return self.envelope(compact_snapshot(snapshot, detailed=detailed), suite=selected_suite)
         if view == "files":
             assert snapshot_id is not None
-            values = [compact_file(item, detailed=detailed) for item in self.store.files(snapshot_id, limit=5000)]
+            values = [
+                compact_file(item, detailed=detailed)
+                for item in self.store.files(snapshot_id, limit=COLLECTION_FETCH_LIMIT)
+            ]
             scope = f"coverage-files:{snapshot_id}:{detailed}"
             selected_values, page = self.page(values, cursor=cursor, max_words=max_words, scope=scope)
             return self.envelope(selected_values, suite=selected_suite, page=page)
@@ -551,7 +574,7 @@ class CoverageService:
             result = self.store.insights(
                 snapshot_id=snapshot_id,
                 baseline_snapshot_id=baseline_snapshot_id,
-                limit=50,
+                limit=COLLECTION_FETCH_LIMIT,
             )
             items, page = self.page(
                 result["items"],
@@ -579,7 +602,7 @@ class CoverageService:
                     repo_path=selected.checkout_path,
                     branch=branch,
                     suite=suite,
-                    limit=1000,
+                    limit=COLLECTION_FETCH_LIMIT,
                 )
             ]
             selected_values, page = self.page(
@@ -608,7 +631,12 @@ class CoverageService:
         if view == "progress":
             if not worktree_id or not suite:
                 raise ValueError("worktree_id and suite are required for progress view")
-            progress = self.store.worktree_progress(worktree_id, suite=suite, file_path=file_path, limit=2000)
+            progress = self.store.worktree_progress(
+                worktree_id,
+                suite=suite,
+                file_path=file_path,
+                limit=COLLECTION_FETCH_LIMIT,
+            )
             points, page = self.page(
                 progress["points"],
                 cursor=cursor,
@@ -622,7 +650,10 @@ class CoverageService:
 
         if worktree_id:
             comparison = self.store.compare_worktree(
-                worktree_id, snapshot_id=snapshot_id, file_limit=5000, line_limit=5000
+                worktree_id,
+                snapshot_id=snapshot_id,
+                file_limit=COLLECTION_FETCH_LIMIT,
+                line_limit=COLLECTION_FETCH_LIMIT,
             )
         else:
             if not snapshot_id or not baseline_snapshot_id:
@@ -630,8 +661,8 @@ class CoverageService:
             comparison = self.store.compare(
                 snapshot_id=snapshot_id,
                 baseline_snapshot_id=baseline_snapshot_id,
-                file_limit=5000,
-                line_limit=5000,
+                file_limit=COLLECTION_FETCH_LIMIT,
+                line_limit=COLLECTION_FETCH_LIMIT,
             )
         current_suite = str(comparison["current"]["suite"])
         if suite is not None and suite != current_suite:
@@ -702,7 +733,7 @@ class CoverageService:
     ) -> ApiEnvelope:
         snapshot = self.store.snapshot(snapshot_id)
         file = self.store.file_coverage(snapshot_id, file_path)
-        lines = self.store.lines(snapshot_id, file_path, limit=20000)
+        lines = self.store.lines(snapshot_id, file_path, limit=COLLECTION_FETCH_LIMIT)
         if not detailed:
             lines = [
                 {

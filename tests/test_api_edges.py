@@ -333,8 +333,12 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: True)
     assert app_module.ensure_daemon() == app_module.daemon_url()
 
-    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: False)
+    statuses = iter([False, False, True])
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: next(statuses))
     monkeypatch.setattr(app_module, "daemon_is_reachable", lambda _url: True)
+    assert app_module.ensure_daemon() == app_module.daemon_url()
+
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: False)
     with pytest.raises(RuntimeError, match="incompatible"):
         app_module.ensure_daemon()
     monkeypatch.setattr(app_module, "daemon_is_reachable", lambda _url: False)

@@ -618,7 +618,7 @@ Some formats are lossy when normalized. For example, Go reports blocks, Istanbul
 
 Connect to `http://127.0.0.1:59471/mcp/`, or run `coverage-mcp connect` as a stdio proxy. Schema revision 7 exposes ten tools. Every result uses the same `{context, data, page}` envelope as REST and resources. `context` identifies `repo_key`, the exact `checkout_path`, the applicable `suite`, and `schema_revision` without repeating the full topology.
 
-`max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only. Agents should omit `detailed` or leave it `false`. Only `project_context`, `test_run`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
+`max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only: a result above the cap fails explicitly and asks the caller to refine the query instead of reporting a false end of collection. Agents should omit `detailed` or leave it `false`. Only `project_context`, `test_run`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
 
 ### `project_context`
 

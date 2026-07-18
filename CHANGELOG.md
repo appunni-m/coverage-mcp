@@ -9,10 +9,12 @@ minor versions may contain breaking public-contract changes.
 
 - Removed the retired schema-revision 6 MCP implementation and migration reference.
 - Replaced offset-bearing continuation tokens with record-anchored opaque cursors.
+- Disambiguated duplicate cursor anchors and made defensive collection caps fail explicitly instead of losing records.
 - Made public response models reject undeclared fields.
 - Expanded packaging metadata and the supported Python CI matrix.
 - Separated the embedded dashboard document and storage projections from transport and persistence code.
 - Restricted the daemon to loopback interfaces and added browser security headers and trusted-host validation.
+- Hardened concurrent lazy startup against transient health-probe timeouts.
 
 ### Added
 
