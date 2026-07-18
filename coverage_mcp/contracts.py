@@ -171,6 +171,22 @@ OptionalWorktreeId = Annotated[
     str | None,
     Field(description="Registered worktree UUID; null selects direct snapshot-comparison mode."),
 ]
+RunAction = Annotated[
+    Literal["status", "cancel"],
+    Field(description="Read durable status or request process-group cancellation."),
+]
+CoverageQueryView = Annotated[
+    Literal["summary", "files", "file", "insights", "line_history"],
+    Field(description="Coverage projection to return through the consolidated query."),
+]
+CoverageComparisonView = Annotated[
+    Literal["overview", "files", "lines", "progress"],
+    Field(description="Comparison projection to return through the consolidated query."),
+]
+OptionalLineNumber = Annotated[
+    int | None,
+    Field(ge=1, description="One-based source line for line_history; null for other views."),
+]
 FilePath = Annotated[
     str,
     Field(min_length=1, description="Repository-relative source path as stored in the coverage report."),
@@ -240,7 +256,12 @@ WaitForCompletion = Annotated[
 ]
 DetailedResponse = Annotated[
     bool,
-    Field(description="Return the full run, command, artifact, path, and topology payload instead of compact state."),
+    Field(
+        description=(
+            "Keep false for normal agent work. Set true only when the tool documents a specific required audit or "
+            "raw-provenance field that is absent from compact data; detailed output never contains logs."
+        )
+    ),
 ]
 LogQuery = Annotated[
     str,
@@ -269,6 +290,22 @@ CaseSensitiveLogSearch = Annotated[
 IncludeRawMetrics = Annotated[
     bool,
     Field(description="Include format-specific raw file metrics; false keeps the response compact."),
+]
+
+ResponseWordBudget = Annotated[
+    int,
+    Field(
+        ge=50,
+        le=5000,
+        description="Primary maximum serialized word budget for the response (50-5000).",
+    ),
+]
+PageCursor = Annotated[
+    str | None,
+    Field(
+        max_length=500,
+        description="Opaque continuation cursor returned by the previous response; null starts from the beginning.",
+    ),
 ]
 OnlyRegressions = Annotated[
     bool,
@@ -327,6 +364,34 @@ class CompactOutputModel(OutputModel):
     """Token-conscious response model that intentionally drops detailed storage fields."""
 
     model_config = ConfigDict(extra="ignore")
+
+
+class ResponseContextResult(OutputModel):
+    """Stable ownership and contract context attached to every public response."""
+
+    repo_key: str = Field(description="Stable shared Git repository identity.")
+    checkout_path: str = Field(description="Exact checkout selected by the connector or HTTP caller.")
+    suite: str | None = Field(description="Coverage suite governing this response, when applicable.")
+    schema_revision: int = Field(description="Public Coverage MCP contract revision.")
+
+
+class PageResult(OutputModel):
+    """Word-budgeted cursor pagination metadata."""
+
+    returned: int = Field(description="Records returned in this response.")
+    total: int | None = Field(description="Total matching records when known.")
+    word_count: int = Field(description="Serialized whitespace-delimited words returned in data.")
+    max_words: int = Field(description="Requested primary response word budget.")
+    truncated: bool = Field(description="Whether matching records remain after this response.")
+    next_cursor: str | None = Field(description="Opaque continuation cursor, or null when complete.")
+
+
+class ApiEnvelope(OutputModel):
+    """Shared compact envelope used by MCP, REST, resources, and the dashboard."""
+
+    context: ResponseContextResult = Field(description="Repository, checkout, suite, and schema ownership.")
+    data: Any = Field(description="Compact operation-specific response data.")
+    page: PageResult | None = Field(description="Cursor metadata for collections; null for singular responses.")
 
 
 class CoverageMetrics(OutputModel):
@@ -560,13 +625,14 @@ class CompactRunResult(CompactOutputModel):
     """Small default response for submission and polling decisions."""
 
     id: str = Field(description="Durable run UUID.")
+    command_id: str | None = Field(description="Exact immutable command registration UUID.")
     command_name: str = Field(description="Registered command name.")
     status: RunStatus = Field(description="Current or terminal run state.")
     terminal: bool = Field(description="Whether the run can change state again.")
     duration_ms: int = Field(description="Elapsed run duration in milliseconds.")
     exit_code: int | None = Field(description="Process exit code when available.")
     counters: dict[str, int] = Field(description="Recognized test counters; empty while unavailable.")
-    repo_path: str = Field(description="Exact checkout used for the run.")
+    checkout_path: str = Field(description="Exact checkout used for the run.")
     branch: str | None = Field(description="Git branch detected at submission.")
     commit_sha: str | None = Field(description="Git commit detected at submission.")
     coverage_ingest: CoverageIngestResult = Field(description="Aggregate coverage-ingestion outcome.")
@@ -576,7 +642,6 @@ class CompactRunResult(CompactOutputModel):
     age: str = Field(description="Human-readable age of the current lifecycle state.")
     eta_seconds: int | None = Field(description="Estimated seconds to completion.")
     eta: str | None = Field(description="Human-readable estimated time to completion.")
-    estimated_completion_at: str | None = Field(description="Estimated or actual completion time.")
     cancellation_requested: bool = Field(description="Whether cancellation was requested.")
     submission_reused: bool | None = Field(description="Whether idempotency reused an existing run.")
     error: str | None = Field(description="Bounded runner error for interrupted/internal failures.")
@@ -734,7 +799,6 @@ class CoverageFileResult(CoverageMetrics):
 class CoverageFileCompactResult(CoverageMetrics):
     """Common coverage counters for one file without parser-specific payloads."""
 
-    snapshot_id: str = Field(description="Owning immutable coverage snapshot UUID.")
     file_path: str = Field(description="Exact repository-relative source path.")
 
 

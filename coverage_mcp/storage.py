@@ -98,7 +98,20 @@ class CommonStore:
                 "SELECT id, repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?", [limit]
             ).fetchall()
         return [
-            {"id": row[0], "repo_key": row[1], "repo_path": row[1], "snapshot_count": 0, "line_rate": None}
+            {
+                "id": row[0],
+                "repo_key": row[1],
+                "repo_path": row[1],
+                "snapshot_count": 0,
+                "branch_count": 0,
+                "command_count": 0,
+                "run_count": 0,
+                "latest_snapshot_id": None,
+                "latest_snapshot_age": None,
+                "latest_run_age": None,
+                "latest_suite": None,
+                "line_rate": None,
+            }
             for row in rows
         ]
 
@@ -2075,7 +2088,7 @@ class CoverageStore:
                 snapshot_aggregate AS (
                     SELECT repo_key,
                            count(*) AS snapshot_count,
-                           count(DISTINCT branch) AS branch_count,
+                           count(DISTINCT COALESCE(branch, '')) AS branch_count,
                            min(created_at) AS first_snapshot_at,
                            max(created_at) AS latest_snapshot_at
                     FROM snapshots
@@ -2156,6 +2169,7 @@ class CoverageStore:
         return self._worktree_from_row(columns, row)
 
     def files(self, snapshot_id: str, *, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
+        self.snapshot(snapshot_id)
         with self._lock:
             rows = self._conn.execute(
                 """
@@ -2258,11 +2272,16 @@ class CoverageStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT line_number, covered, count_line,
-                       total_branches, covered_branches,
-                       total_functions, covered_functions
+                SELECT line_number,
+                       BOOL_OR(covered) AS covered,
+                       BOOL_OR(count_line) AS count_line,
+                       MAX(total_branches) AS total_branches,
+                       MAX(covered_branches) AS covered_branches,
+                       MAX(total_functions) AS total_functions,
+                       MAX(covered_functions) AS covered_functions
                 FROM lines
                 WHERE snapshot_id = ? AND file_path = ?
+                GROUP BY line_number
                 ORDER BY line_number
                 """,
                 [snapshot_id, file_path],
@@ -2514,6 +2533,10 @@ class CoverageStore:
     ) -> dict[str, Any]:
         current = self.snapshot(snapshot_id)
         baseline = self.snapshot(baseline_snapshot_id)
+        if current["repo_key"] != baseline["repo_key"]:
+            raise ValueError("coverage comparisons require snapshots from the same repository")
+        if current["suite"] != baseline["suite"]:
+            raise ValueError("coverage comparisons require snapshots from the same suite")
         with self._lock:
             rows = self._conn.execute(
                 """
@@ -2770,6 +2793,16 @@ class CoverageStore:
                 raise KeyError(f"no current snapshot found for worktree: {worktree_id}")
             current_id = points[-1]["id"]
         current = self.snapshot(current_id)
+        if current["repo_key"] != worktree["repo_key"] or current["repo_path"] != worktree["path"]:
+            raise ValueError("current snapshot does not belong to the selected worktree")
+        current_created_at = parse_datetime(current["created_at"])
+        worktree_created_at = parse_datetime(worktree["created_at"])
+        if (
+            current_created_at is not None
+            and worktree_created_at is not None
+            and current_created_at < worktree_created_at
+        ):
+            raise ValueError("current snapshot predates worktree registration")
         baseline_snapshot_id = self._worktree_baseline_snapshot_id(worktree, current["suite"])
         comparison = self.compare(
             snapshot_id=current_id,
@@ -2789,6 +2822,12 @@ class CoverageStore:
         only_regressions: bool = False,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
+        current = self.snapshot(snapshot_id)
+        baseline = self.snapshot(baseline_snapshot_id)
+        if current["repo_key"] != baseline["repo_key"]:
+            raise ValueError("changed lines require snapshots from the same repository")
+        if current["suite"] != baseline["suite"]:
+            raise ValueError("changed lines require snapshots from the same suite")
         filters = []
         args: list[Any] = [baseline_snapshot_id, snapshot_id]
         if file_path:
@@ -2859,6 +2898,7 @@ class CoverageStore:
         line_number: int,
         repo_path: str | None = None,
         branch: str | None = None,
+        suite: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         filters = ["l.file_path = ?", "l.line_number = ?"]
@@ -2869,6 +2909,9 @@ class CoverageStore:
         if branch:
             filters.append("s.branch = ?")
             args.append(branch)
+        if suite:
+            filters.append("s.suite = ?")
+            args.append(suite)
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -3321,13 +3364,14 @@ def compact_run_result(result: dict[str, Any]) -> dict[str, Any]:
     diagnostics_available = any(isinstance(count, int) and count > 0 for count in (stdout_count, stderr_count))
     return {
         "id": result["id"],
+        "command_id": result.get("command_id"),
         "command_name": result["command_name"],
         "status": status,
         "terminal": bool(result["terminal"]),
         "duration_ms": int(result["duration_ms"]),
         "exit_code": result.get("exit_code"),
         "counters": dict(summary.get("counters") or {}),
-        "repo_path": result["repo_path"],
+        "checkout_path": result["repo_path"],
         "branch": result.get("branch"),
         "commit_sha": result.get("commit_sha"),
         "coverage_ingest": result["coverage_ingest"],
@@ -3337,7 +3381,6 @@ def compact_run_result(result: dict[str, Any]) -> dict[str, Any]:
         "age": age,
         "eta_seconds": result.get("eta_seconds"),
         "eta": result.get("eta"),
-        "estimated_completion_at": result.get("estimated_completion_at"),
         "cancellation_requested": bool(result.get("cancellation_requested")),
         "submission_reused": result.get("submission_reused"),
         "error": result.get("error") or summary.get("execution_error"),

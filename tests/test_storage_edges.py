@@ -225,7 +225,7 @@ def test_storage_query_edges_and_worktree_without_baseline(tmp_path):
         )
 
         worktree = store.register_worktree(tmp_path.as_posix(), base_ref="no-such-branch")
-        with pytest.raises(KeyError, match="baseline"):
+        with pytest.raises(ValueError, match="predates"):
             store.compare_worktree(worktree["id"], snapshot_id=snapshot["id"])
         with pytest.raises(KeyError, match="baseline"):
             store.worktree_progress(worktree["id"])
@@ -236,6 +236,55 @@ def test_storage_query_edges_and_worktree_without_baseline(tmp_path):
             store.object_topology("project", "missing")
         with pytest.raises(ValueError, match="unsupported"):
             store.object_topology("unsupported", "x")
+    finally:
+        store.close()
+
+
+def test_comparison_and_source_lineage_guards(monkeypatch, tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        snapshots = {
+            "repo-a": {"id": "repo-a", "repo_key": "a", "repo_path": "/a", "suite": "unit"},
+            "repo-b": {"id": "repo-b", "repo_key": "b", "repo_path": "/b", "suite": "unit"},
+            "suite-b": {"id": "suite-b", "repo_key": "a", "repo_path": "/a", "suite": "integration"},
+        }
+        monkeypatch.setattr(store, "snapshot", lambda snapshot_id: snapshots[snapshot_id])
+        with pytest.raises(ValueError, match="same repository"):
+            store.compare(snapshot_id="repo-a", baseline_snapshot_id="repo-b")
+        with pytest.raises(ValueError, match="same suite"):
+            store.compare(snapshot_id="repo-a", baseline_snapshot_id="suite-b")
+        with pytest.raises(ValueError, match="same repository"):
+            store.changed_lines(snapshot_id="repo-a", baseline_snapshot_id="repo-b")
+        with pytest.raises(ValueError, match="same suite"):
+            store.changed_lines(snapshot_id="repo-a", baseline_snapshot_id="suite-b")
+        monkeypatch.setattr(store, "snapshot", lambda _snapshot_id: snapshots["repo-a"])
+        assert store.changed_lines(snapshot_id="repo-a", baseline_snapshot_id="repo-a", file_path="a.py") == []
+
+        worktree = {
+            "id": "worktree",
+            "repo_key": "a",
+            "path": "/worktree",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+        monkeypatch.setattr(store, "worktree", lambda _worktree_id: worktree)
+        monkeypatch.setattr(store, "snapshot", lambda _snapshot_id: snapshots["repo-a"])
+        with pytest.raises(ValueError, match="selected worktree"):
+            store.compare_worktree("worktree", snapshot_id="repo-a")
+        monkeypatch.setattr(store, "trend", lambda **kwargs: [])
+        with pytest.raises(KeyError, match="no current snapshot"):
+            store.compare_worktree("worktree")
+        with pytest.raises(KeyError, match="no baseline snapshot"):
+            store._worktree_baseline_snapshot_id({**worktree, "baseline_snapshot_id": None}, "unit")
+
+        monkeypatch.setattr(
+            store,
+            "snapshot",
+            lambda _snapshot_id: {"repo_path": tmp_path.as_posix(), "suite": "unit"},
+        )
+        with pytest.raises(ValueError, match="escapes"):
+            store.source_lines(snapshot_id="snapshot", file_path="../outside.py", start=1, end=1)
+        with pytest.raises(FileNotFoundError):
+            store.source_lines(snapshot_id="snapshot", file_path="missing.py", start=1, end=1)
     finally:
         store.close()
 
@@ -1307,6 +1356,7 @@ def test_log_summary_and_topology_helpers(tmp_path):
     compact = compact_run_result(
         {
             "id": "run",
+            "command_id": "command",
             "command_name": "unit",
             "status": "failed",
             "terminal": True,
@@ -1328,7 +1378,11 @@ def test_log_summary_and_topology_helpers(tmp_path):
         }
     )
     assert compact["counters"] == {"passed": 2, "skipped": 3, "failed": 1}
+    assert compact["command_id"] == "command"
     assert compact["diagnostics_available"] is True
+    assert compact["checkout_path"] == tmp_path.as_posix()
+    assert "repo_path" not in compact
+    assert "estimated_completion_at" not in compact
     assert "parsed_summary" not in compact
 
     search = search_log_file(

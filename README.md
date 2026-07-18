@@ -1,6 +1,137 @@
 # Coverage MCP
 
-Coverage MCP is a local coverage history server for people who run tests often and need to know:
+**Give coding agents the few test and coverage facts they need, without pouring entire logs, reports, and source files
+into their context window.**
+
+Coverage MCP is a local-first test-run ledger and coverage history service. It runs approved commands, retains their
+complete output outside the model context, normalizes coverage into queryable DuckDB records, and returns compact MCP
+projections by default. When an agent needs evidence, it searches for a literal and receives only the matching lines
+and their surrounding context.
+
+This matters because the usual agent loop is expensive: run a command, receive all of stdout and stderr, grep the
+output, read broad source ranges, then repeat after every edit. Most of those tokens describe passing tests, unchanged
+files, progress bars, or coverage rows the agent never uses. Coverage MCP keeps that data local and lets the agent ask
+questions such as “what failed?”, “where did coverage regress?”, or “show lines 340-355 and 812-826” directly.
+
+## Session-Calibrated Context Savings
+
+In one real Codex development session, ten completed coverage-related jobs returned **48,267 o200k tokens** of
+agent-visible run/status/diagnostic payloads before strict projection and response budgeting. Replaying the same
+ten-job workflow with a conservative **500-token budget per job** gives **5,000 tokens**: a session-calibrated
+reduction of **43,267 tokens, or 89.6%**.
+
+| Completed job | Recorded payload | Budgeted replay | Tokens avoided |
+| ---: | ---: | ---: | ---: |
+| 1 | 4,987 | 500 | 4,487 |
+| 2 | 16,117 | 500 | 15,617 |
+| 3 | 1,518 | 500 | 1,018 |
+| 4 | 3,601 | 500 | 3,101 |
+| 5 | 1,545 | 500 | 1,045 |
+| 6 | 12,512 | 500 | 12,012 |
+| 7 | 1,791 | 500 | 1,291 |
+| 8 | 2,611 | 500 | 2,111 |
+| 9 | 1,813 | 500 | 1,313 |
+| 10 | 1,772 | 500 | 1,272 |
+| **Total** | **48,267** | **5,000** | **43,267 (89.6%)** |
+
+### How the calculation was made
+
+The recorded side is not a synthetic log-size guess. It is the exact `o200k_base` token count of the Coverage MCP
+response payloads associated with ten consecutive completed jobs in a July 2026 Codex session transcript, counted
+with `tiktoken` 0.13.0. Prompts, reasoning, source reads, and edits were excluded; serialized tool responses were
+included because those are what entered the agent context. The replay side is an explicit budget model: 500 tokens per
+job for compact state plus one relevant diagnostic excerpt. The arithmetic is
+`48,267 - (10 × 500) = 43,267`, and `43,267 / 48,267 = 89.6%`.
+
+The 500-token replay is a target, not a promise that every repository saves exactly 89.6%. A failure needing several
+independent excerpts will use more; a passing run that only needs status will use less. The session transcript and
+tokenizer determine the recorded number, while the caller controls the replay with `detailed=false`, `max_words`, a
+specific log search, and cursor pagination. This makes the benchmark reproducible and the assumption visible.
+
+Compared with ordinary shell `grep` and broad file reads, the difference is where filtering happens. Shell output is
+returned to the agent first and consumes context before the agent can inspect it. Coverage MCP filters retained logs,
+coverage rows, and source ranges inside the local service, then sends only the bounded result. Full evidence remains on
+disk and can be queried again without making it permanent conversation history.
+
+## Getting Started
+
+### Recommended: install the agent plugin
+
+The [`testing` plugin in codegen-marketplace](https://github.com/appunni-m/codegen-marketplace/tree/main/plugins/testing)
+installs the agent workflow and a lightweight stdio connector. The connector uses `uvx` to obtain Coverage MCP from
+this public HTTPS repository, starts the shared HTTP daemon if needed, and proxies stdio to it.
+
+For Codex:
+
+```bash
+codex plugin marketplace add appunni-m/codegen-marketplace
+codex plugin add testing@codegen-marketplace
+```
+
+Start a new Codex thread after installation. The installed connector is equivalent to:
+
+```bash
+uvx --from git+https://github.com/appunni-m/coverage-mcp.git@main \
+  coverage-mcp connect
+```
+
+You do not need to clone either repository. `uvx` owns an isolated Python environment and the connector starts or
+reuses the daemon on demand.
+
+### Standalone server
+
+Python 3.12 or newer is required.
+
+```bash
+python -m pip install \
+  "coverage-mcp @ git+https://github.com/appunni-m/coverage-mcp.git@main"
+coverage-mcp serve
+```
+
+Then open <http://127.0.0.1:59471/> or connect an MCP client to
+<http://127.0.0.1:59471/mcp/>. For stdio clients, use:
+
+```json
+{
+  "command": "coverage-mcp",
+  "args": ["connect"]
+}
+```
+
+### What starts on your machine
+
+```text
+Codex / Claude / another MCP client
+              │ stdio
+              ▼
+   tiny coverage-mcp connect process
+              │ loopback HTTP
+              ▼
+ one user-level Coverage MCP daemon
+              │
+              ├── common registry: ~/.coverage-mcp/common.duckdb
+              └── one repository store: <shared-git-root>/.coverage-mcp/coverage.duckdb
+```
+
+Ten agents may create ten small stdio proxies, but they reuse one HTTP daemon. Repository selection is lazy. A Git
+repository and all of its linked worktrees share one repository DuckDB, while separate repositories get separate
+stores. Add `.coverage-mcp/` to Git ignore rules.
+
+## Documentation Map
+
+- [First managed run](#first-run)
+- [Approved command and run ledger](#approved-run-ledger)
+- [MCP usage guide](#mcp-usage-guide)
+- [Worktree baselines](#worktree-baselines)
+- [Dashboard](#dashboard)
+- [REST API](#rest-api)
+- [Storage model](#storage-model)
+- [Security and privacy](#security-and-privacy)
+- [Contributing](#contributing)
+
+## At A Glance
+
+Coverage MCP is for people who run tests often and need to know:
 
 - did coverage go up or down after this run?
 - which files changed coverage?
@@ -45,21 +176,13 @@ Coverage details are normalized into four levels:
 
 When the report format is lossy, the snapshot keeps a warning. For example, Go coverprofiles report blocks, Istanbul reports statements, and LLVM reports segments.
 
-## Install The Server
+## Installation And Updates
 
-Coverage MCP currently installs from GitHub:
-
-```bash
-python -m pip install "coverage-mcp @ git+https://github.com/appunni-m/coverage-mcp.git@main"
-```
-
-For development from this checkout:
+For development from a source checkout:
 
 ```bash
 python -m pip install -e '.[dev]'
 ```
-
-Python 3.12 or newer is required.
 
 ### Update The Server
 
@@ -249,14 +372,14 @@ this worktree improved against its frozen baseline.
 
 This is the preferred agent workflow:
 
-1. Call `project_summaries` and `list_registered_commands` before running anything.
+1. Call `project_context(detailed=false)` before running anything.
 2. Reuse an exact approved command. If none exists, present its complete command, cwd, shell, and artifacts for human
    approval, then call `register_test_command`.
-3. Submit it with `run_command_profiled`, save the returned run ID, and poll `run_result` no faster than
+3. Submit it with `run_test`, save the returned run ID, and poll `test_run(action="status", detailed=false)` no faster than
    `poll_after_ms`. Reuse one `idempotency_key` for retries of the same intended run.
 4. When the run is terminal, inspect `coverage_ingest.status` and `coverage_ingest.snapshot_ids`. A declared artifact
    with `coverage_format` is automatically ingested only when that run created or modified it.
-5. Query the returned snapshot with `coverage_summary`, `coverage_insights`, and `compare_to_baseline`, or open the
+5. Query the returned snapshot with `coverage_query` and `coverage_compare`, or open the
    dashboard. Do not call `ingest_coverage` again for an automatically ingested artifact.
 
 ### Ingest An Existing Report
@@ -287,9 +410,9 @@ The same ingest through MCP:
 ingest_coverage(
   report_path="coverage/lcov.info",
   format="lcov",
-  repo_path="/path/to/repo",
   branch="main",
-  suite="unit"
+  suite="unit",
+  max_words=500
 )
 ```
 
@@ -306,13 +429,15 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
   `COVERAGE_MCP_DB` to a worktree-local path.
 - Create reference-branch snapshots before calling `register_worktree(path, base_ref, name)`. Keep the returned
   `worktree_id`; its registration time freezes suite baselines for that worktree.
-- Run tests through an existing human-approved command with `run_command_profiled`. Record the returned run id and
-  use one stable `idempotency_key` for that intended run. Poll `run_result` no faster than `poll_after_ms`; retries
+- Keep `detailed=false` unless exact audit/provenance fields are necessary. Set a task-sized `max_words`, continue
+  collections with `cursor`, and search logs by literal text with small surrounding windows.
+- Run tests through an existing human-approved command with `run_test`. Record the returned run id and
+  use one stable `idempotency_key` for that intended run. Poll `test_run(action="status", detailed=false)` no faster than `poll_after_ms`; retries
   must reuse the same key. If no approved command exists, ask for explicit approval before registering one.
 - Declare managed coverage artifacts with `coverage_format` and a stable `suite`. On terminal runs, require
   `coverage_ingest.status` to report `ingested` and use its `snapshot_ids`; never ingest that artifact a second time.
 - Use `ingest_coverage` only for reports produced outside the Coverage MCP managed runner.
-- Use `worktree_progress(worktree_id, suite)` or `compare_to_baseline(worktree_id=...)` to report whether line, branch,
+- Use `coverage_compare(view="progress", worktree_id=..., suite=..., detailed=false)` to report whether line, branch,
   function, and region coverage improved. No current snapshot means "not measured", not "unchanged"; never compare
   unrelated worktrees.
 ```
@@ -346,9 +471,10 @@ register_test_command(
 After that, agents run only the registered command id or name:
 
 ```text
-run_command_profiled(
+run_test(
   command_ref="condition",
-  idempotency_key="condition:<commit-sha>:coverage"
+  idempotency_key="condition:<commit-sha>:coverage",
+  max_words=500
 )
 ```
 
@@ -356,13 +482,13 @@ Submission returns immediately with a durable run id and `status` set to `queued
 `terminal` is true:
 
 ```text
-run_result(run_id="returned-run-id")
+test_run(run_id="returned-run-id", action="status", detailed=false, max_words=500)
 ```
 
-Use `run_queue()` to inspect FIFO position. Set `wait=true` only for a command known to finish quickly; the default
-background mode keeps the MCP call responsive during long suites.
-Compact responses are the default. Use `detailed=true` once when command, artifact, path, or topology metadata is
-needed, and use `search_run_logs` for targeted diagnostics instead of increasing a generic excerpt limit.
+Use `project_context(detailed=false)` to inspect active work and queue position. Set `wait=true` only for a command
+known to finish quickly; the default background mode keeps the MCP call responsive during long suites. Compact
+responses are the default. Use `detailed=true` once when audit/provenance metadata is necessary, and use
+`search_test_logs` for targeted diagnostics instead of increasing a generic excerpt budget.
 
 Artifacts with a non-null `coverage_format` are automatically parsed after a managed process exits normally, whether
 the test status is `passed` or `failed`. The server compares file size, nanosecond modification/change times, and inode
@@ -430,11 +556,11 @@ logs are stored. While a run is active, polling is constant-time and defers log 
 Managed commands run outside the MCP event loop. Four local workers claim jobs in FIFO order by default, so dashboards,
 health checks, coverage insights, and other agents remain responsive while independent suites run concurrently. Queue
 ETA models the worker lanes instead of summing every earlier job as serial work. DuckDB operations remain internally
-serialized. A graceful shutdown waits for accepted work; check `run_queue` before restarting when a prompt restart
+serialized. A graceful shutdown waits for accepted work; check `project_context` before restarting when a prompt restart
 matters. After an unexpected process exit, active runs are preserved as `interrupted` and queued runs resume from the
 same DuckDB rather than being submitted again.
 
-Every command starts in its own process group. `cancel_run` and command timeouts signal the entire group, then escalate
+Every command starts in its own process group. `test_run(action="cancel")` and command timeouts signal the entire group, then escalate
 from `SIGTERM` to `SIGKILL` after two seconds if processes remain. This prevents child test processes from continuing
 after the managed run has ended.
 
@@ -478,7 +604,11 @@ This means a registered command is project-specific because registration stores 
 
 Some formats are lossy when normalized. For example, Go reports blocks, Istanbul reports statements, and LLVM reports segments. Coverage MCP stores warnings on snapshots when it has to approximate line records.
 
-## MCP Usage Guide
+<details>
+<summary>Legacy MCP v0.6 migration reference</summary>
+
+> This inventory describes the pre-v0.7 surface for migration only. New clients should use the consolidated
+> schema-revision 7 tools in the MCP Usage Guide below.
 
 Connect your MCP client to:
 
@@ -486,7 +616,8 @@ Connect your MCP client to:
 http://127.0.0.1:59471/mcp/
 ```
 
-The current server exposes 22 tools. `tools/list` returns concrete JSON Schemas
+Schema revision 6 exposed the following 22 tools; revision 7 consolidates them into the ten-tool contract documented
+in the current guide below. This section exists only to map older clients during migration. `tools/list` returns concrete JSON Schemas
 for both inputs and outputs, including nested fields, required fields, nullability,
 status enums, descriptions, and bounds. An agent can therefore use the MCP
 contract without reading this repository or guessing response keys. Invalid
@@ -763,6 +894,99 @@ Read-only discovery is also available through two exact resources and three temp
 | `coverage://snapshot/{snapshot_id}/insights` | Deterministic insights for one snapshot |
 | `coverage://snapshot/{snapshot_id}/files` | Up to 500 per-file records |
 
+</details>
+
+## MCP Usage Guide
+
+Connect to `http://127.0.0.1:59471/mcp/`, or run `coverage-mcp connect` as a stdio proxy. Schema revision 7 exposes ten tools. Every result uses the same `{context, data, page}` envelope as REST and resources. `context` identifies `repo_key`, the exact `checkout_path`, the applicable `suite`, and `schema_revision` without repeating the full topology.
+
+`max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only. Agents should omit `detailed` or leave it `false`. Only `project_context`, `test_run`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
+
+### `project_context`
+
+**Inputs:** `cursor` continues approved commands and `max_words` budgets the page. Keep `detailed` false; use true only for approval audit fields and full project chronology.
+
+**Returns:** Project metrics and freshness, complete executable command definitions, latest run, active runs, and cursor metadata.
+
+**Errors:** Invalid or query-mismatched `cursor` values and invalid `max_words` budgets are tool errors.
+
+### `register_test_command`
+
+**Inputs:** `name`, exact `command`, literal `human_approved` set to true, `approved_by`, and `approval_note` are required. `cwd` defaults to the selected checkout; `shell` defaults to `/bin/bash`; `artifact_paths` declares outputs. `max_words` budgets the response.
+
+**Returns:** The immutable registration with complete `command`, `cwd`, `shell`, artifact specifications, and duration estimates. No expanded mode is needed.
+
+**Errors:** False approval, blank audit fields, a `cwd` outside the selected repository, bad artifacts, or an undersized `max_words` budget fails.
+
+### `run_test`
+
+**Inputs:** `command_ref` selects an approved registration; `timeout_seconds`, `idempotency_key`, and `wait` control submission. `max_words` budgets output.
+
+**Returns:** Durable compact run state, queue position, polling guidance, age and duration estimates, counters, and coverage-ingestion state. Use `test_run` for subsequent state or exceptional audit detail.
+
+**Errors:** Unknown or disabled commands, conflicting idempotent submissions, invalid timeouts, or an insufficient `max_words` budget fails. Test failure remains result data.
+
+### `test_run`
+
+**Inputs:** `run_id`, `action` (`status` or `cancel`), and `max_words`. Keep `detailed` false; use true only when exact artifact records/paths, timestamps, or execution audit metadata are required.
+
+**Returns:** Current durable run state or cancellation state.
+
+**Errors:** Unknown `run_id`, unsupported `action`, invalid cancellation state, or an insufficient `max_words` budget fails.
+
+### `search_test_logs`
+
+**Inputs:** `run_id`, literal `query`, `stream`, `context_lines`, defensive `max_matches`, primary `max_words`, and `case_sensitive`.
+
+**Returns:** Merged, numbered stdout/stderr windows around matches, bounded by words rather than a generic output excerpt.
+
+**Errors:** Unknown `run_id`, invalid search options, or blank `query` fails. No matches returns an empty successful result.
+
+### `ingest_coverage`
+
+**Inputs:** `report_path`, `format`, `suite`, optional `branch`, `commit_sha`, and `base_ref`, plus `max_words`. Relative paths resolve inside the selected checkout.
+
+**Returns:** The normalized immutable snapshot summary and bounded parser warnings. Raw parser metadata remains available through `coverage_query(detailed=true)` when explicitly needed.
+
+**Errors:** Missing or malformed reports, unsupported `format`, blank `suite`, repository mismatch, or an insufficient `max_words` budget fails.
+
+### `register_worktree`
+
+**Inputs:** Git checkout `path`, frozen `base_ref`, optional `name`, and `max_words`.
+
+**Returns:** Worktree ID, name, registration time, exact checkout, head/base revisions, and frozen baseline when available. Repeated repository topology is omitted.
+
+**Errors:** Unknown paths, non-Git paths, a checkout from another repository, invalid refs, or an insufficient `max_words` budget fails.
+
+### `coverage_query`
+
+**Inputs:** `view` is `summary`, `files`, `file`, `insights`, or `line_history`. Selection uses `snapshot_id`, optional insights `baseline_snapshot_id`, `suite`, `branch`, `file_path`, and `line_number`; `line_ranges` accepts multiple inclusive ranges with overlap, adjacency, duplicates, and nesting normalized. `cursor` and `max_words` control paging. Keep `detailed` false; use true only for report/parser provenance on summary or insights, raw file metrics, or unabridged line-history records.
+
+**Returns:** The selected compact projection. Collection views include a `page.next_cursor`; file view returns gaps plus only explicitly requested covered-line ranges.
+
+**Errors:** Unknown parent IDs or paths, invalid range bounds or combined span, missing view-specific inputs, mismatched cursors, and invalid budgets fail.
+
+### `coverage_compare`
+
+**Inputs:** `view` is `overview`, `files`, `lines`, or `progress`. Direct mode uses `snapshot_id` and `baseline_snapshot_id`; worktree mode uses `worktree_id`. `suite`, `file_path`, `only_regressions`, `cursor`, and `max_words` refine the result. Keep `detailed` false; use true only when raw baseline/current snapshot provenance is explicitly required.
+
+**Returns:** Overall deltas or a word-budgeted page of changed files, changed lines, or worktree progress points.
+
+**Errors:** Unknown parents, mixed modes, repository/suite/worktree lineage mismatches, pre-registration snapshots, missing frozen baselines, invalid cursors, or invalid budgets fail.
+
+### `source_context`
+
+**Inputs:** `snapshot_id`, exact `file_path`, inclusive one-based `start` and `end`, `cursor`, and `max_words`.
+
+**Returns:** Snapshot commit identity and a word-budgeted page of numbered source lines. Several coverage ranges can be fetched first with `coverage_query`, then source windows requested as needed.
+
+**Errors:** Unknown snapshots/files, escaping paths, reversed bounds, invalid cursors, and invalid budgets fail.
+
+### MCP Resources
+
+- `coverage://context` returns the same compact project projection as `project_context`.
+- `coverage://snapshot/{snapshot_id}/summary` returns the same compact summary projection as `coverage_query`.
+
 ## Worktree Baselines
 
 The design goal is reproducible baseline comparison.
@@ -844,6 +1068,11 @@ The first viewport is designed to answer the main operational questions in one p
 
 ## REST API
 
+REST uses the same schema-7 service projections as MCP, resources, and the dashboard. All API responses carry
+`{context, data, page}`; `max_words` is the public budget, `cursor` is the only collection continuation mechanism,
+and `detailed=false` is the default. Numeric `limit`, `offset`, `file_limit`, and `line_limit` parameters are no longer
+part of the public API.
+
 Useful endpoints:
 
 - `GET /docs`
@@ -900,6 +1129,14 @@ Topology is derived, not separately stored. The same immutable rows power both d
 DuckDB is used because this is local-first and query-heavy. A bounded in-process worker pool drains the durable command
 queue; there is no broker or external time-series database.
 
+## Security And Privacy
+
+Coverage MCP binds to loopback by default and does not upload source, logs, coverage, or DuckDB data. Treat a registered
+test command as local code execution: registration requires an explicit human approval record, working directories
+must stay inside the selected repository, and agents can only run immutable registered commands. Do not expose the
+HTTP port to an untrusted network. Review commands and artifact paths before approving them, especially in repositories
+you do not control.
+
 ## Test Coverage
 
 The test suite covers:
@@ -917,8 +1154,8 @@ The test suite covers:
 - computed topology for projects, commands, runs, snapshots, and artifacts
 - FastAPI ingest/list endpoints
 - project summaries and coverage insights
-- the exact 21-tool MCP inventory, every input description, enum, required field, and numeric/string bound
-- all five MCP resources and templates
+- the exact 10-tool MCP inventory, every input description, enum, required field, and numeric/string bound
+- both MCP resources and templates
 - in-process MCP execution for every workflow and validation failure
 - a real Streamable HTTP session through the official MCP client, including initialization, schemas, calls, and resources
 - README contract coverage that requires every MCP tool to document all inputs, outputs, and errors
@@ -941,6 +1178,13 @@ To run the same gates through tox:
 ```bash
 tox
 ```
+
+## Contributing
+
+Issues and pull requests are welcome. Keep changes scoped, add regression coverage for behavior changes, preserve the
+shared service/projection contract across MCP, resources, REST, and the dashboard, and run the quality gates above.
+Public API changes should update this README and include contract tests. Please report security-sensitive problems
+privately to the repository owner instead of opening a public issue.
 
 ## License
 

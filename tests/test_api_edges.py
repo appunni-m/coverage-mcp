@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import runpy
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,12 @@ from fastapi.testclient import TestClient
 
 from coverage_mcp import app as app_module
 from coverage_mcp.app import create_app
+
+
+def response_data(response):
+    payload = response.json()
+    assert payload["context"]["schema_revision"] == 7
+    return payload["data"]
 
 
 def test_readme_lists_every_rest_endpoint(tmp_path):
@@ -40,6 +47,11 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
     source = tmp_path / "src"
     source.mkdir()
     (source / "a.py").write_text("one\ntwo\nthree\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-b", "main", tmp_path.as_posix()], check=True, capture_output=True)
+    subprocess.run(["git", "-C", tmp_path.as_posix(), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", tmp_path.as_posix(), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", tmp_path.as_posix(), "add", "src/a.py"], check=True)
+    subprocess.run(["git", "-C", tmp_path.as_posix(), "commit", "-m", "base"], check=True, capture_output=True)
     base = tmp_path / "base.lcov"
     current = tmp_path / "current.lcov"
     base.write_text("TN:\nSF:src/a.py\nDA:1,1\nDA:2,1\nend_of_record\n", encoding="utf-8")
@@ -48,7 +60,7 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     with TestClient(app) as client:
         health = client.get("/health").json()
-        assert health["version"] == "0.6.0"
+        assert health["version"] == "0.7.0"
         assert health["run_retention"] == 100
         assert health["run_concurrency"] == 4
         assert client.get("/api/snapshots/latest").status_code == 404
@@ -56,34 +68,39 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
         assert client.get("/api/runs/latest").status_code == 404
         assert client.get("/api/commands/missing").status_code == 404
         assert client.get("/api/topology/nope/value").status_code == 400
+        assert client.get("/api/projects?cursor=invalid").status_code == 400
 
-        base_snapshot = client.post(
-            "/api/ingest",
-            json={
-                "report_path": base.as_posix(),
-                "format": "lcov",
-                "repo_path": tmp_path.as_posix(),
-                "branch": "main",
-                "commit_sha": "base",
-                "suite": "unit",
-            },
-        ).json()
-        current_snapshot = client.post(
-            "/api/ingest",
-            json={
-                "report_path": current.as_posix(),
-                "format": "lcov",
-                "repo_path": tmp_path.as_posix(),
-                "branch": "feature",
-                "commit_sha": "head",
-                "base_ref": "main",
-                "suite": "unit",
-            },
-        ).json()
+        base_snapshot = response_data(
+            client.post(
+                "/api/ingest",
+                json={
+                    "report_path": base.as_posix(),
+                    "format": "lcov",
+                    "repo_path": tmp_path.as_posix(),
+                    "branch": "main",
+                    "commit_sha": "base",
+                    "suite": "unit",
+                },
+            )
+        )
+        current_snapshot = response_data(
+            client.post(
+                "/api/ingest",
+                json={
+                    "report_path": current.as_posix(),
+                    "format": "lcov",
+                    "repo_path": tmp_path.as_posix(),
+                    "branch": "feature",
+                    "commit_sha": "head",
+                    "base_ref": "main",
+                    "suite": "unit",
+                },
+            )
+        )
 
         assert client.get("/api/snapshots/latest?branch=missing").status_code == 404
         latest_response = client.get(f"/api/snapshots/latest?repo_path={tmp_path.as_posix()}&branch=feature")
-        assert latest_response.json()["id"] == current_snapshot["id"]
+        assert response_data(latest_response)["id"] == current_snapshot["id"]
         assert client.get(f"/api/snapshots/{current_snapshot['id']}").status_code == 200
         assert client.get("/api/snapshots/missing").status_code == 404
         assert client.get(f"/api/snapshots/{current_snapshot['id']}/files").status_code == 200
@@ -114,48 +131,67 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
         assert (
             client.get(
                 f"/api/changed-lines?snapshot_id={current_snapshot['id']}&baseline_snapshot_id={base_snapshot['id']}&file_path=src/a.py&only_regressions=true"
-            ).json()[0]["status"]
+            ).json()["data"]["lines"][0]["status"]
             == "regressed"
         )
         assert (
             client.get(
-                f"/api/line-history?file_path=src/a.py&line_number=1&repo_path={tmp_path.as_posix()}&branch=feature"
+                f"/api/line-history?file_path=src/a.py&line_number=1&repo_path={tmp_path.as_posix()}&branch=feature&suite=unit"
             ).status_code
             == 200
         )
         assert (
             client.get(
                 f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=src/a.py&start=1&end=500"
-            ).json()[-1]["line_number"]
+            ).json()["data"]["lines"][-1]["line_number"]
             == 3
         )
         assert (
             client.get(
                 f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=../secret&start=1&end=1"
             ).status_code
-            == 400
+            == 404
         )
         assert (
             client.get(
                 f"/api/source-lines?snapshot_id={current_snapshot['id']}&file_path=missing.py&start=1&end=1"
             ).status_code
-            == 400
+            == 404
         )
-        assert client.get("/api/worktrees").json() == []
+        assert response_data(client.get("/api/worktrees")) == []
         worktree_response = client.post(
             "/api/worktrees/register",
             json={"path": tmp_path.as_posix(), "base_ref": "main"},
         )
         assert worktree_response.status_code == 200
-        worktree = client.get("/api/worktrees").json()[0]
+        worktree = response_data(client.get("/api/worktrees"))[0]
         progress_response = client.get(f"/api/worktrees/{worktree['id']}/progress?suite=unit")
         assert progress_response.status_code == 200
-        assert progress_response.json()["baseline"]["id"] == base_snapshot["id"]
+        assert response_data(progress_response)["baseline"]["id"] == base_snapshot["id"]
         comparison_response = client.get(
             f"/api/worktrees/{worktree['id']}/compare?snapshot_id={current_snapshot['id']}"
         )
-        assert comparison_response.status_code == 200
+        assert comparison_response.status_code == 400
+        post_registration = response_data(
+            client.post(
+                "/api/ingest",
+                json={
+                    "report_path": current.as_posix(),
+                    "format": "lcov",
+                    "repo_path": tmp_path.as_posix(),
+                    "branch": "feature",
+                    "commit_sha": "head-2",
+                    "base_ref": "main",
+                    "suite": "unit",
+                },
+            )
+        )
+        assert (
+            client.get(f"/api/worktrees/{worktree['id']}/compare?snapshot_id={post_registration['id']}").status_code
+            == 200
+        )
         assert client.get("/api/worktrees/missing/compare").status_code == 404
+        assert client.get("/api/line-history?file_path=src/a.py&line_number=1").status_code == 400
 
 
 def test_rest_run_errors_and_timeout(tmp_path):
@@ -164,36 +200,42 @@ def test_rest_run_errors_and_timeout(tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     with TestClient(app) as client:
         assert client.post("/api/runs/profiled", json={"command_ref": "missing"}).status_code == 404
-        command = client.post(
-            "/api/commands/register",
-            json={
-                "name": "slow",
-                "command": f"{sys.executable} {script.name}",
-                "cwd": tmp_path.as_posix(),
-                "human_approved": True,
-                "approved_by": "tester",
-                "approval_note": "approved slow command",
-            },
-        ).json()
-        cancellable = client.post(
-            "/api/runs/profiled",
-            json={"command_ref": command["id"], "idempotency_key": "cancel-via-rest"},
-        ).json()
-        cancellation = client.post(f"/api/runs/{cancellable['id']}/cancel").json()
+        command = response_data(
+            client.post(
+                "/api/commands/register",
+                json={
+                    "name": "slow",
+                    "command": f"{sys.executable} {script.name}",
+                    "cwd": tmp_path.as_posix(),
+                    "human_approved": True,
+                    "approved_by": "tester",
+                    "approval_note": "approved slow command",
+                },
+            )
+        )
+        cancellable = response_data(
+            client.post(
+                "/api/runs/profiled",
+                json={"command_ref": command["id"], "idempotency_key": "cancel-via-rest"},
+            )
+        )
+        cancellation = response_data(client.post(f"/api/runs/{cancellable['id']}/cancel"))
         assert cancellation["status"] in {"running", "cancelled"}
         for _ in range(100):
-            cancellation = client.get(f"/api/runs/{cancellable['id']}").json()
+            cancellation = response_data(client.get(f"/api/runs/{cancellable['id']}"))
             if cancellation["terminal"]:
                 break
             time.sleep(0.02)
         assert cancellation["status"] == "cancelled"
-        assert client.post(f"/api/runs/{cancellable['id']}/cancel").json()["status"] == "cancelled"
-        run = client.post(
-            "/api/runs/profiled",
-            json={"command_ref": command["id"], "timeout_seconds": 1, "wait": True},
-        ).json()
+        assert response_data(client.post(f"/api/runs/{cancellable['id']}/cancel"))["status"] == "cancelled"
+        run = response_data(
+            client.post(
+                "/api/runs/profiled",
+                json={"command_ref": command["id"], "timeout_seconds": 1, "wait": True},
+            )
+        )
         assert run["status"] == "timeout"
-        assert client.get(f"/api/runs/{run['id']}").json()["id"] == run["id"]
+        assert response_data(client.get(f"/api/runs/{run['id']}"))["id"] == run["id"]
         assert client.get("/api/runs/missing").status_code == 404
         assert client.post("/api/runs/missing/cancel").status_code == 404
         assert client.get("/api/runs/missing/logs/search?query=x").status_code == 404
@@ -210,21 +252,26 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
         def runtime_error(*args, **kwargs):
             raise RuntimeError("boom")
 
-        for method_name, request in [
-            ("ingest_report", lambda: client.post("/api/ingest", json={"report_path": "missing"})),
+        for method_name, expected_status, request in [
+            ("ingest_report", 400, lambda: client.post("/api/ingest", json={"report_path": "missing"})),
             (
                 "register_worktree",
+                400,
                 lambda: client.post("/api/worktrees/register", json={"path": "missing", "base_ref": "main"}),
             ),
-            ("worktree_progress", lambda: client.get("/api/worktrees/w/progress")),
-            ("files", lambda: client.get("/api/snapshots/s/files")),
-            ("insights", lambda: client.get("/api/snapshots/s/insights")),
-            ("compare", lambda: client.post("/api/compare", json={"snapshot_id": "s", "baseline_snapshot_id": "b"})),
-            ("changed_lines", lambda: client.get("/api/changed-lines?snapshot_id=s&baseline_snapshot_id=b")),
-            ("source_lines", lambda: client.get("/api/source-lines?snapshot_id=s&file_path=f&start=1&end=1")),
+            ("worktree_progress", 400, lambda: client.get("/api/worktrees/w/progress")),
+            ("files", 404, lambda: client.get("/api/snapshots/s/files")),
+            ("insights", 404, lambda: client.get("/api/snapshots/s/insights")),
+            (
+                "compare",
+                400,
+                lambda: client.post("/api/compare", json={"snapshot_id": "s", "baseline_snapshot_id": "b"}),
+            ),
+            ("changed_lines", 400, lambda: client.get("/api/changed-lines?snapshot_id=s&baseline_snapshot_id=b")),
+            ("source_lines", 404, lambda: client.get("/api/source-lines?snapshot_id=s&file_path=f&start=1&end=1")),
         ]:
             monkeypatch.setattr(store, method_name, value_error)
-            assert request().status_code == 400
+            assert request().status_code == expected_status
 
         monkeypatch.setattr(store, "registered_command", runtime_error)
         assert client.get("/api/commands/x").status_code == 500
@@ -232,6 +279,7 @@ def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):
     calls = {}
     monkeypatch.setenv("COVERAGE_MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("COVERAGE_MCP_PORT", "8765")
+    monkeypatch.setenv("COVERAGE_MCP_ALLOW_REMOTE", "1")
     monkeypatch.setattr(app_module, "create_app", lambda: "created-app")
 
     def fake_run(app, *, host, port, reload):
@@ -258,16 +306,18 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
 
         @staticmethod
         def json():
-            return {"ok": True}
+            return {"ok": True, "version": app_module.__version__, "schema_revision": 7}
 
     monkeypatch.setattr(app_module.httpx, "get", lambda *args, **kwargs: Response())
     assert app_module.daemon_is_healthy("http://daemon") is True
+    assert app_module.daemon_is_reachable("http://daemon") is True
 
     def unavailable(*args, **kwargs):
         raise httpx.ConnectError("no")
 
     monkeypatch.setattr(app_module.httpx, "get", unavailable)
     assert app_module.daemon_is_healthy("http://daemon") is False
+    assert app_module.daemon_is_reachable("http://daemon") is False
 
     monkeypatch.setattr(app_module, "default_daemon_lock_path", lambda: (tmp_path / "daemon.lock").as_posix())
     statuses = iter([False, False, True])
@@ -281,6 +331,12 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: True)
     assert app_module.ensure_daemon() == app_module.daemon_url()
 
+    monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: False)
+    monkeypatch.setattr(app_module, "daemon_is_reachable", lambda _url: True)
+    with pytest.raises(RuntimeError, match="incompatible"):
+        app_module.ensure_daemon()
+    monkeypatch.setattr(app_module, "daemon_is_reachable", lambda _url: False)
+
     statuses = iter([False, True])
     monkeypatch.setattr(app_module, "daemon_is_healthy", lambda _url: next(statuses))
     assert app_module.ensure_daemon() == app_module.daemon_url()
@@ -293,6 +349,11 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
 
 
 def test_daemon_start_and_cli_commands(monkeypatch, tmp_path):
+    monkeypatch.setenv("COVERAGE_MCP_HOST", "0.0.0.0")
+    monkeypatch.delenv("COVERAGE_MCP_ALLOW_REMOTE", raising=False)
+    with pytest.raises(RuntimeError, match="remote Coverage MCP"):
+        app_module.serve()
+    monkeypatch.setenv("COVERAGE_MCP_HOST", "127.0.0.1")
     monkeypatch.setattr(app_module, "default_common_db_path", lambda: (tmp_path / "common.duckdb").as_posix())
     launched = {}
 
@@ -370,7 +431,7 @@ def test_forward_mcp_messages_propagates_errors_and_proxy_starts_two_directions(
 def test_connect_uses_shared_daemon_and_repository(monkeypatch):
     calls = []
     monkeypatch.setattr(app_module, "ensure_daemon", lambda: "http://daemon")
-    monkeypatch.setattr(app_module, "inspect_git", lambda _path: type("Git", (), {"repo_key": "/repo"})())
+    monkeypatch.setattr(app_module, "inspect_git", lambda _path: type("Git", (), {"path": "/repo/worktree"})())
     monkeypatch.setattr(app_module.anyio, "run", lambda function, *args: calls.append((function, args)))
     app_module.connect()
-    assert calls == [(app_module.proxy_stdio_to_http, ("http://daemon", "/repo"))]
+    assert calls == [(app_module.proxy_stdio_to_http, ("http://daemon", "/repo/worktree"))]

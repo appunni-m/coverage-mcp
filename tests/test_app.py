@@ -18,6 +18,12 @@ from coverage_mcp.app import (
 from coverage_mcp.storage import CommonStore
 
 
+def response_data(response):
+    payload = response.json()
+    assert payload["context"]["schema_revision"] == 7
+    return payload["data"]
+
+
 def test_app_ingests_and_lists_snapshot(tmp_path):
     report = tmp_path / "lcov.info"
     report.write_text(
@@ -45,6 +51,9 @@ end_of_record
         assert 'id="trendScope"' in dashboard.text
         assert "region_rate" in dashboard.text
         assert "Selected File Lines" not in dashboard.text
+        assert "getAllJSON('/api/projects?max_words=5000')" in dashboard.text
+        assert "requires schema revision 7" in dashboard.text
+        assert "project.snapshot_count) > 0" in dashboard.text
 
         response = client.post(
             "/api/ingest",
@@ -57,17 +66,18 @@ end_of_record
             },
         )
         assert response.status_code == 200
-        snapshot = response.json()
+        snapshot = response_data(response)
         assert snapshot["total_lines"] == 2
 
-        snapshots = client.get("/api/snapshots").json()
+        snapshots = response_data(client.get("/api/snapshots"))
         assert len(snapshots) == 1
-        projects = client.get("/api/projects").json()
+        projects = response_data(client.get("/api/projects"))
         assert projects[0]["snapshot_count"] == 1
+        assert projects[0]["branch_count"] == 1
         assert projects[0]["latest_snapshot_id"] == snapshot["id"]
-        files = client.get(f"/api/snapshots/{snapshot['id']}/files").json()
+        files = response_data(client.get(f"/api/snapshots/{snapshot['id']}/files"))
         assert files[0]["file_path"] == "src/a.py"
-        insights = client.get(f"/api/snapshots/{snapshot['id']}/insights").json()
+        insights = response_data(client.get(f"/api/snapshots/{snapshot['id']}/insights"))
         assert "summary" in insights
         assert "items" in insights
 
@@ -105,9 +115,33 @@ def test_global_app_lazily_routes_coverage_to_repository_store(tmp_path):
             json={"report_path": report.as_posix(), "repo_path": tmp_path.as_posix()},
         )
         assert ingested.status_code == 200
-        assert client.get("/api/snapshots", headers=headers).json()[0]["id"] == ingested.json()["id"]
-        assert client.get("/api/projects").json()[0]["repo_key"] == tmp_path.as_posix()
+        assert response_data(client.get("/api/snapshots", headers=headers))[0]["id"] == response_data(ingested)["id"]
+        project = response_data(client.get("/api/projects"))[0]
+        assert project["repo_key"] == tmp_path.as_posix()
+        assert project["snapshot_count"] == 1
+        assert project["branch_count"] == 1
+        assert project["latest_snapshot_id"] == response_data(ingested)["id"]
         assert client.get("/health").json()["repository_count"] == 1
+
+
+def test_repository_router_projects_falls_back_and_honors_limit(monkeypatch, tmp_path):
+    common = CommonStore(tmp_path / "common.duckdb")
+    common.register_repository("/repo/a")
+    common.register_repository("/repo/b")
+    stores = CoverageRepoStore(common)
+    router = RepositoryStoreRouter(stores)
+    monkeypatch.setattr(
+        stores,
+        "for_repository",
+        lambda _repo_key: (_ for _ in ()).throw(OSError("repository unavailable")),
+    )
+    try:
+        projects = router.projects(limit=1)
+        assert len(projects) == 1
+        assert projects[0]["repo_key"] in {"/repo/a", "/repo/b"}
+        assert projects[0]["snapshot_count"] == 0
+    finally:
+        router.close()
 
 
 def test_global_app_reports_invalid_repository_selection(monkeypatch, tmp_path):
@@ -131,6 +165,8 @@ def test_repository_store_router_requires_selection_and_reuses_store(tmp_path):
     try:
         with pytest.raises(RuntimeError, match="repository"):
             _ = router.db_path
+        with pytest.raises(RuntimeError, match="selected"):
+            router.request_context()
         token = router.select(tmp_path.as_posix())
         try:
             first = router.stores.for_repository(tmp_path.as_posix())
@@ -180,48 +216,50 @@ print("1 passed")
             },
         )
         assert registered.status_code == 200
-        command = registered.json()
-        assert command["topology"]["kind"] == "registered_command"
-        assert client.get("/api/commands").json()[0]["id"] == command["id"]
+        command = response_data(registered)
+        assert command["name"] == "unit"
+        assert response_data(client.get(f"/api/commands/{command['id']}"))["id"] == command["id"]
+        assert response_data(client.get("/api/commands"))[0]["id"] == command["id"]
 
         response = client.post(
             "/api/runs/profiled",
             json={"command_ref": command["id"], "idempotency_key": "api-unit"},
         )
         assert response.status_code == 200
-        run = response.json()
+        run = response_data(response)
         assert run["status"] in {"queued", "running"}
         assert run["terminal"] is False
-        assert client.get("/api/runs/queue").json()
+        assert response_data(client.get("/api/runs/queue"))
         for _ in range(100):
-            run = client.get(f"/api/runs/{run['id']}").json()
+            run = response_data(client.get(f"/api/runs/{run['id']}"))
             if run["terminal"]:
                 break
             time.sleep(0.02)
         assert run["status"] == "passed"
         assert run["counters"]["passed"] == 1
         assert "topology" not in run
-        detailed = client.get(f"/api/runs/{run['id']}?detailed=true").json()
+        detailed = response_data(client.get(f"/api/runs/{run['id']}?detailed=true"))
         assert detailed["topology"]["command"]["id"] == command["id"]
         assert detailed["parsed_summary"]["counters"]["passed"] == 1
         assert "excerpts" not in detailed["parsed_summary"]
-        search = client.get(f"/api/runs/{run['id']}/logs/search?query=passed&context_lines=1").json()
+        search = response_data(client.get(f"/api/runs/{run['id']}/logs/search?query=passed&context_lines=1"))
         assert search["match_count"] == 1
         assert search["returned_line_count"] <= 3
         repeated = client.post(
             "/api/runs/profiled",
             json={"command_ref": command["id"], "idempotency_key": "api-unit"},
-        ).json()
+        )
+        repeated = response_data(repeated)
         assert repeated["id"] == run["id"]
         assert repeated["submission_reused"] is True
         assert client.post(f"/api/runs/{run['id']}/cancel").status_code == 400
-        assert client.get("/api/runs/latest").json()["id"] == run["id"]
-        assert client.get(f"/api/runs/latest?command_ref={command['id']}").json()["id"] == run["id"]
+        assert response_data(client.get("/api/runs/latest"))["id"] == run["id"]
+        assert response_data(client.get(f"/api/runs/latest?command_ref={command['id']}"))["id"] == run["id"]
 
         topology = client.get(f"/api/topology/run/{run['id']}")
         assert topology.status_code == 200
-        assert topology.json()["topology"]["kind"] == "run"
+        assert response_data(topology)["topology"]["kind"] == "run"
 
         artifact = client.get("/api/artifacts/latest?command_ref=unit&kind=json")
         assert artifact.status_code == 200
-        assert artifact.json()["exists"] is True
+        assert response_data(artifact)["exists"] is True
