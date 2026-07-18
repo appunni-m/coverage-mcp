@@ -214,6 +214,34 @@ WaitForCompletion = Annotated[
     bool,
     Field(description="When true, block the MCP call until terminal; normally false so callers poll run_result."),
 ]
+DetailedResponse = Annotated[
+    bool,
+    Field(description="Return the full run, command, artifact, path, and topology payload instead of compact state."),
+]
+LogQuery = Annotated[
+    str,
+    Field(min_length=1, max_length=500, description="Literal text to find in retained stdout/stderr."),
+]
+LogStream = Annotated[
+    Literal["both", "stdout", "stderr"],
+    Field(description="Retained stream(s) to search."),
+]
+LogContextLines = Annotated[
+    int,
+    Field(ge=0, le=10, description="Lines before and after each match (0-10)."),
+]
+LogMatchLimit = Annotated[
+    int,
+    Field(ge=1, le=20, description="Maximum matching lines to anchor returned context (1-20)."),
+]
+LogWordLimit = Annotated[
+    int,
+    Field(ge=20, le=2000, description="Maximum words returned across all matching context windows (20-2000)."),
+]
+CaseSensitiveLogSearch = Annotated[
+    bool,
+    Field(description="Match letter case exactly when true; default false performs Unicode case-folded matching."),
+]
 IncludeLines = Annotated[
     bool,
     Field(description="Include up to 5,000 exact line records in addition to file totals."),
@@ -269,6 +297,12 @@ class OutputModel(BaseModel):
     """Base for discoverable MCP response contracts that retain topology extensions."""
 
     model_config = ConfigDict(extra="allow")
+
+
+class CompactOutputModel(OutputModel):
+    """Token-conscious response model that intentionally drops detailed storage fields."""
+
+    model_config = ConfigDict(extra="ignore")
 
 
 class CoverageMetrics(OutputModel):
@@ -383,7 +417,7 @@ class LogExcerptResult(OutputModel):
 
 
 class ParsedRunSummaryResult(OutputModel):
-    """Bounded test-process summary; full output remains on disk."""
+    """Counter-only test-process summary; retained output is searched separately."""
 
     status: RunStatus = Field(description="Current or terminal run state.")
     exit_code: int | None = Field(description="Process exit code, or null before completion/no process launch.")
@@ -395,9 +429,6 @@ class ParsedRunSummaryResult(OutputModel):
         description="Total stderr lines, or null while summary generation is deferred."
     )
     counters: dict[str, int] = Field(description="Recognized pass/fail/error counters extracted from logs.")
-    excerpts: list[LogExcerptResult] = Field(
-        description="Bounded error-first excerpts followed by useful log tail lines."
-    )
     truncated: bool = Field(description="Whether logs contain more lines than this bounded response.")
     stdout_path: str = Field(description="Local path to the retained complete stdout log.")
     stderr_path: str = Field(description="Local path to the retained complete stderr log.")
@@ -462,7 +493,7 @@ class RunResult(OutputModel):
     status: RunStatus = Field(description="Lifecycle state of the managed run.")
     stdout_path: str = Field(description="Path to retained complete stdout.")
     stderr_path: str = Field(description="Path to retained complete stderr.")
-    parsed_summary: ParsedRunSummaryResult = Field(description="Bounded counters and diagnostic excerpts.")
+    parsed_summary: ParsedRunSummaryResult = Field(description="Counter and line-count summary without log text.")
     artifact_paths: list[RunArtifactResult] = Field(description="Declared artifact observations and ingestion links.")
     coverage_ingest: CoverageIngestResult = Field(description="Aggregate automatic coverage-ingestion outcome.")
     terminal: bool = Field(description="True when no further polling state transition is possible.")
@@ -499,6 +530,71 @@ class RunResult(OutputModel):
     )
     running_age: str | None = Field(default=None, description="Human-readable running age.")
     topology: dict[str, Any] = Field(description="Computed project, Git, command, run, and artifact relationships.")
+
+
+class CompactRunResult(CompactOutputModel):
+    """Small default response for submission and polling decisions."""
+
+    id: str = Field(description="Durable run UUID.")
+    command_name: str = Field(description="Registered command name.")
+    status: RunStatus = Field(description="Current or terminal run state.")
+    terminal: bool = Field(description="Whether the run can change state again.")
+    duration_ms: int = Field(description="Elapsed run duration in milliseconds.")
+    exit_code: int | None = Field(description="Process exit code when available.")
+    counters: dict[str, int] = Field(description="Recognized test counters; empty while unavailable.")
+    repo_path: str = Field(description="Exact checkout used for the run.")
+    branch: str | None = Field(description="Git branch detected at submission.")
+    commit_sha: str | None = Field(description="Git commit detected at submission.")
+    coverage_ingest: CoverageIngestResult = Field(description="Aggregate coverage-ingestion outcome.")
+    poll_after_ms: int | None = Field(description="Minimum polling delay; null when terminal.")
+    queue_position: int | None = Field(description="Queue position, zero while running, null when terminal.")
+    age_seconds: int = Field(description="Age of the current lifecycle state in whole seconds.")
+    age: str = Field(description="Human-readable age of the current lifecycle state.")
+    eta_seconds: int | None = Field(description="Estimated seconds to completion.")
+    eta: str | None = Field(description="Human-readable estimated time to completion.")
+    estimated_completion_at: str | None = Field(description="Estimated or actual completion time.")
+    cancellation_requested: bool = Field(description="Whether cancellation was requested.")
+    submission_reused: bool | None = Field(description="Whether idempotency reused an existing run.")
+    error: str | None = Field(description="Bounded runner error for interrupted/internal failures.")
+    diagnostics_available: bool = Field(description="Whether retained stdout/stderr can be searched.")
+
+
+class RunLogLineResult(CompactOutputModel):
+    """One bounded retained log line returned by contextual search."""
+
+    line_number: int = Field(description="One-based line number.")
+    text: str = Field(description="Log text truncated to 500 characters.")
+    match: bool = Field(description="Whether this line contains the search query.")
+
+
+class RunLogContextResult(CompactOutputModel):
+    """One merged context window around one or more nearby matches."""
+
+    stream: Literal["stdout", "stderr"] = Field(description="Retained stream containing this context.")
+    start_line: int = Field(description="First returned one-based line number.")
+    end_line: int = Field(description="Last returned one-based line number.")
+    lines: list[RunLogLineResult] = Field(description="Bounded ordered context lines.")
+
+
+class RunLogSearchResult(CompactOutputModel):
+    """Bounded literal search over retained run output."""
+
+    run_id: str = Field(description="Searched durable run UUID.")
+    query: str = Field(description="Literal query used for matching.")
+    case_sensitive: bool = Field(description="Whether matching preserved case.")
+    streams: list[Literal["stdout", "stderr"]] = Field(description="Streams searched.")
+    match_count: int = Field(description="Total matching lines found across searched streams.")
+    returned_match_count: int = Field(description="Matching lines represented in returned contexts.")
+    returned_line_count: int = Field(description="Total context lines returned.")
+    returned_word_count: int = Field(description="Total whitespace-delimited words returned across context lines.")
+    truncated: bool = Field(description="Whether match or output limits omitted relevant context.")
+    contexts: list[RunLogContextResult] = Field(description="Merged bounded windows around matches.")
+
+
+RunResponse = Annotated[
+    CompactRunResult | RunResult,
+    Field(description="Compact run state by default, or the full durable run record when detailed is true."),
+]
 
 
 class LatestArtifactResult(RunArtifactResult):
@@ -795,7 +891,7 @@ RegisteredCommandResults = Annotated[
     Field(description="Approved immutable command registrations ordered newest first."),
 ]
 RunQueueResults = Annotated[
-    list[RunResult],
+    list[CompactRunResult],
     Field(description="Running jobs followed by queued jobs in FIFO order."),
 ]
 CoverageFileResults = Annotated[

@@ -31,6 +31,7 @@ from coverage_mcp.contracts import (
     ArtifactPaths,
     BaseRef,
     Branch,
+    CaseSensitiveLogSearch,
     ChangedLineLimit,
     ChangedLineResult,
     ChangedLineResults,
@@ -38,6 +39,7 @@ from coverage_mcp.contracts import (
     CommandReference,
     CommandText,
     CommitSha,
+    CompactRunResult,
     ComparisonFileLimit,
     ComparisonLineLimit,
     ComparisonResult,
@@ -48,6 +50,7 @@ from coverage_mcp.contracts import (
     CoverageFileSummaryResult,
     CoverageFormat,
     CoverageInsightsResult,
+    DetailedResponse,
     FileLimit,
     FilePath,
     HistoryLimit,
@@ -58,6 +61,11 @@ from coverage_mcp.contracts import (
     LatestArtifactResult,
     LineHistoryResult,
     LineHistoryResults,
+    LogContextLines,
+    LogMatchLimit,
+    LogQuery,
+    LogStream,
+    LogWordLimit,
     NonEmptyName,
     ObjectReference,
     OnlyRegressions,
@@ -78,7 +86,9 @@ from coverage_mcp.contracts import (
     ReportPath,
     ResultLimit,
     RunId,
+    RunLogSearchResult,
     RunQueueResults,
+    RunResponse,
     RunResult,
     ShellPath,
     SnapshotId,
@@ -87,7 +97,6 @@ from coverage_mcp.contracts import (
     SourceLineResult,
     SourceLineResults,
     Suite,
-    SummaryLineLimit,
     TimeoutSeconds,
     TopologyKind,
     TopologyResult,
@@ -99,7 +108,13 @@ from coverage_mcp.contracts import (
     WorktreeResult,
 )
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.storage import DEFAULT_RUN_CONCURRENCY, DEFAULT_RUN_RETENTION, CommonStore, CoverageStore
+from coverage_mcp.storage import (
+    DEFAULT_RUN_CONCURRENCY,
+    DEFAULT_RUN_RETENTION,
+    CommonStore,
+    CoverageStore,
+    compact_run_result,
+)
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
@@ -108,6 +123,9 @@ DEFAULT_DAEMON_START_TIMEOUT_SECONDS = 10.0
 
 
 def default_common_db_path() -> str:
+    configured = os.environ.get("COVERAGE_MCP_COMMON_DB") or os.environ.get("COVERAGE_MCP_DB")
+    if configured:
+        return Path(configured).expanduser().as_posix()
     return (Path.home() / ".coverage-mcp" / "common.duckdb").as_posix()
 
 
@@ -192,6 +210,20 @@ def validated_outputs[OutputT: OutputModel](
     return [model.model_validate(value) for value in values]
 
 
+def validated_run_response(value: dict[str, Any], *, detailed: bool) -> CompactRunResult | RunResult:
+    model = RunResult if detailed else CompactRunResult
+    if detailed:
+        projected = dict(value)
+        raw_summary = projected.get("parsed_summary")
+        if isinstance(raw_summary, dict):
+            summary = dict(raw_summary)
+            summary.pop("excerpts", None)
+            projected["parsed_summary"] = summary
+    else:
+        projected = compact_run_result(value)
+    return model.model_validate(projected)
+
+
 class IngestRequest(BaseModel):
     report_path: str
     format: str = "auto"
@@ -229,10 +261,10 @@ class RegisterCommandRequest(BaseModel):
 
 class RunCommandRequest(BaseModel):
     command_ref: str
-    max_summary_lines: SummaryLineLimit = 80
     timeout_seconds: TimeoutSeconds = None
     idempotency_key: IdempotencyKey = None
     wait: bool = False
+    detailed: bool = False
 
 
 def create_app(db_path: str | None = None, *, common_db_path: str | None = None) -> FastAPI:
@@ -386,37 +418,64 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
     def run_profiled(request: RunCommandRequest) -> dict[str, Any]:
         try:
             runner = store.run_command_profiled if request.wait else store.submit_command_profiled
-            return runner(
+            result = runner(
                 request.command_ref,
-                max_summary_lines=request.max_summary_lines,
+                max_summary_lines=20,
                 timeout_seconds=request.timeout_seconds,
                 idempotency_key=request.idempotency_key,
             )
+            return validated_run_response(result, detailed=request.detailed).model_dump()
         except Exception as exc:
             raise _http_error(exc) from exc
 
     @app.get("/api/runs/queue")
     def run_queue(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict[str, Any]]:
-        return store.list_run_queue(limit=limit)
+        return [compact_run_result(run) for run in store.list_run_queue(limit=limit)]
 
     @app.post("/api/runs/{run_id}/cancel")
-    def cancel_run(run_id: str, max_summary_lines: int = Query(default=80, ge=1, le=500)) -> dict[str, Any]:
+    def cancel_run(run_id: str, detailed: bool = False) -> dict[str, Any]:
         try:
-            return store.cancel_run(run_id, max_summary_lines=max_summary_lines)
+            result = store.cancel_run(run_id, max_summary_lines=20)
+            return validated_run_response(result, detailed=detailed).model_dump()
         except Exception as exc:
             raise _http_error(exc) from exc
 
     @app.get("/api/runs/latest")
-    def latest_run(command_ref: str | None = None) -> dict[str, Any]:
-        run = store.latest_run(command_ref=command_ref)
-        if run is None:
+    def latest_run(command_ref: str | None = None, detailed: bool = False) -> dict[str, Any]:
+        latest = store.latest_run(command_ref=command_ref)
+        if latest is None:
             raise HTTPException(status_code=404, detail="no runs found")
-        return run
+        result = store.run_result(latest["id"], max_summary_lines=20)
+        return validated_run_response(result, detailed=detailed).model_dump()
+
+    @app.get("/api/runs/{run_id}/logs/search")
+    def search_run_logs(
+        run_id: str,
+        query: str = Query(min_length=1, max_length=500),
+        stream: str = Query(default="both", pattern="^(both|stdout|stderr)$"),
+        context_lines: int = Query(default=3, ge=0, le=10),
+        max_matches: int = Query(default=5, ge=1, le=20),
+        max_words: int = Query(default=400, ge=20, le=2000),
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            return store.search_run_logs(
+                run_id,
+                query,
+                stream=stream,
+                context_lines=context_lines,
+                max_matches=max_matches,
+                max_words=max_words,
+                case_sensitive=case_sensitive,
+            )
+        except Exception as exc:
+            raise _http_error(exc) from exc
 
     @app.get("/api/runs/{run_id}")
-    def run(run_id: str, max_summary_lines: int = Query(default=80, ge=1, le=500)) -> dict[str, Any]:
+    def run(run_id: str, detailed: bool = False) -> dict[str, Any]:
         try:
-            return store.run_result(run_id, max_summary_lines=max_summary_lines)
+            result = store.run_result(run_id, max_summary_lines=20)
+            return validated_run_response(result, detailed=detailed).model_dump()
         except Exception as exc:
             raise _http_error(exc) from exc
 
@@ -662,61 +721,78 @@ def create_mcp(store: CoverageStore) -> FastMCP:
     @mcp.tool()
     async def run_command_profiled(
         command_ref: CommandReference,
-        max_summary_lines: SummaryLineLimit = 80,
         timeout_seconds: TimeoutSeconds = None,
         idempotency_key: IdempotencyKey = None,
         wait: WaitForCompletion = False,
-    ) -> RunResult:
-        """Submit approved work; terminal state links freshly auto-ingested coverage snapshots."""
+        detailed: DetailedResponse = False,
+    ) -> RunResponse:
+        """Submit approved work; compact by default, with full metadata only when detailed is true."""
         runner = store.run_command_profiled if wait else store.submit_command_profiled
-        return validated_output(
-            RunResult,
-            await asyncio.to_thread(
-                runner,
-                command_ref,
-                max_summary_lines=max_summary_lines,
-                timeout_seconds=timeout_seconds,
-                idempotency_key=idempotency_key,
-            ),
+        result = await asyncio.to_thread(
+            runner,
+            command_ref,
+            max_summary_lines=20,
+            timeout_seconds=timeout_seconds,
+            idempotency_key=idempotency_key,
         )
+        return validated_run_response(result, detailed=detailed)
 
     @mcp.tool()
     async def run_queue(limit: ResultLimit = 100) -> RunQueueResults:
-        """List running jobs followed by queued jobs with position and lane-aware historical ETA."""
+        """List compact running/queued state with position, age, and lane-aware ETA."""
         runs = await asyncio.to_thread(store.list_run_queue, limit=limit)
-        return validated_outputs(RunResult, runs)
+        return validated_outputs(CompactRunResult, [compact_run_result(run) for run in runs])
 
     @mcp.tool()
-    async def cancel_run(run_id: RunId, max_summary_lines: SummaryLineLimit = 80) -> RunResult:
-        """Request process-group cancellation for queued/running work and return bounded state."""
-        return validated_output(
-            RunResult,
-            await asyncio.to_thread(store.cancel_run, run_id, max_summary_lines=max_summary_lines),
-        )
+    async def cancel_run(run_id: RunId, detailed: DetailedResponse = False) -> RunResponse:
+        """Request process-group cancellation and return compact state unless detailed is true."""
+        result = await asyncio.to_thread(store.cancel_run, run_id, max_summary_lines=20)
+        return validated_run_response(result, detailed=detailed)
 
     @mcp.tool()
-    async def run_result(run_id: RunId, max_summary_lines: SummaryLineLimit = 80) -> RunResult:
-        """Poll bounded run state; terminal coverage_ingest reports automatic snapshot results."""
-        return validated_output(
-            RunResult,
-            await asyncio.to_thread(store.run_result, run_id, max_summary_lines=max_summary_lines),
-        )
+    async def run_result(run_id: RunId, detailed: DetailedResponse = False) -> RunResponse:
+        """Poll token-conscious state; set detailed for paths, artifacts, timestamps, and topology."""
+        result = await asyncio.to_thread(store.run_result, run_id, max_summary_lines=20)
+        return validated_run_response(result, detailed=detailed)
 
     @mcp.tool()
     async def latest_run(
         command_ref: OptionalCommandReference = None,
-        max_summary_lines: SummaryLineLimit = 80,
-    ) -> RunResult:
-        """Return the newest run with freshness and terminal automatic-ingestion results."""
+        detailed: DetailedResponse = False,
+    ) -> RunResponse:
+        """Return compact newest-run freshness and ETA state unless detailed is true."""
         latest = await asyncio.to_thread(store.latest_run, command_ref=command_ref)
         if latest is None:
             raise KeyError("no runs found")
+        result = await asyncio.to_thread(
+            store.run_result,
+            latest["id"],
+            max_summary_lines=20,
+        )
+        return validated_run_response(result, detailed=detailed)
+
+    @mcp.tool()
+    async def search_run_logs(
+        run_id: RunId,
+        query: LogQuery,
+        stream: LogStream = "both",
+        context_lines: LogContextLines = 3,
+        max_matches: LogMatchLimit = 5,
+        max_words: LogWordLimit = 400,
+        case_sensitive: CaseSensitiveLogSearch = False,
+    ) -> RunLogSearchResult:
+        """Find literal text in retained output and return bounded merged context windows."""
         return validated_output(
-            RunResult,
+            RunLogSearchResult,
             await asyncio.to_thread(
-                store.run_result,
-                latest["id"],
-                max_summary_lines=max_summary_lines,
+                store.search_run_logs,
+                run_id,
+                query,
+                stream=stream,
+                context_lines=context_lines,
+                max_matches=max_matches,
+                max_words=max_words,
+                case_sensitive=case_sensitive,
             ),
         )
 

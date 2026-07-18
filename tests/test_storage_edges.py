@@ -16,6 +16,8 @@ from coverage_mcp import storage as storage_module
 from coverage_mcp.models import CoverageReport, FileCoverage, LineCoverage
 from coverage_mcp.storage import (
     CoverageStore,
+    bounded_log_text,
+    compact_run_result,
     format_age,
     infer_topology,
     is_interesting_log_line,
@@ -25,8 +27,10 @@ from coverage_mcp.storage import (
     percent_delta,
     profile_log,
     relative_age,
+    search_log_file,
     summarize_coverage_ingest,
     summarize_run_logs,
+    truncate_to_word_budget,
     update_log_counters,
 )
 
@@ -995,6 +999,17 @@ print("1 passed")
             store.run_result(primary_result["id"], max_summary_lines=0)
         with pytest.raises(ValueError, match="max_summary_lines"):
             store.cancel_run(primary_result["id"], max_summary_lines=501)
+        with pytest.raises(KeyError, match="run not found"):
+            store.search_run_logs("missing", "x")
+        for kwargs, message in [
+            ({"query": ""}, "query"),
+            ({"query": "x", "stream": "invalid"}, "stream"),
+            ({"query": "x", "context_lines": 11}, "context_lines"),
+            ({"query": "x", "max_matches": 0}, "max_matches"),
+            ({"query": "x", "max_words": 19}, "max_words"),
+        ]:
+            with pytest.raises(ValueError, match=message):
+                store.search_run_logs(primary_result["id"], **kwargs)
     finally:
         store.close()
 
@@ -1167,6 +1182,85 @@ def test_log_summary_and_topology_helpers(tmp_path):
     assert summary["counters"]["passed"] == 2
     assert summary["counters"]["failed"] == 1
     assert len(summary["excerpts"]) == 3
+    compact = compact_run_result(
+        {
+            "id": "run",
+            "command_name": "unit",
+            "status": "failed",
+            "terminal": True,
+            "duration_ms": 12,
+            "exit_code": 1,
+            "repo_path": tmp_path.as_posix(),
+            "branch": "main",
+            "commit_sha": "abc",
+            "coverage_ingest": summarize_coverage_ingest([]),
+            "poll_after_ms": None,
+            "queue_position": None,
+            "age_seconds": 3,
+            "age": "3 seconds ago",
+            "eta_seconds": 0,
+            "eta": "0 seconds",
+            "estimated_completion_at": "2026-07-16T15:00:00Z",
+            "cancellation_requested": False,
+            "parsed_summary": summary,
+        }
+    )
+    assert compact["counters"] == {"passed": 2, "skipped": 3, "failed": 1}
+    assert compact["diagnostics_available"] is True
+    assert "parsed_summary" not in compact
+
+    search = search_log_file(
+        stdout,
+        stream="stdout",
+        query="PASSED",
+        case_sensitive=False,
+        context_lines=1,
+        max_matches=2,
+        max_words=20,
+    )
+    assert search["match_count"] == 1
+    assert search["returned_match_count"] == 1
+    assert search["returned_line_count"] == 3
+    assert search["returned_word_count"] == 5
+    assert search["contexts"][0]["lines"][1]["match"] is True
+    overlapping = search_log_file(
+        stderr,
+        stream="stderr",
+        query="a",
+        case_sensitive=False,
+        context_lines=1,
+        max_matches=2,
+        max_words=20,
+    )
+    assert overlapping["match_count"] == 2
+    assert len(overlapping["contexts"]) == 1
+    assert (
+        search_log_file(
+            tmp_path / "missing.log",
+            stream="stderr",
+            query="x",
+            case_sensitive=True,
+            context_lines=0,
+            max_matches=1,
+            max_words=20,
+        )["contexts"]
+        == []
+    )
+    assert truncate_to_word_budget("one two three", max_words=2) == ("one two", 2, True)
+    assert truncate_to_word_budget("one two", max_words=3) == ("one two", 2, False)
+    assert truncate_to_word_budget("one", max_words=0) == ("", 0, True)
+    assert bounded_log_text("short", query="short", case_sensitive=True, matched=True) == "short"
+    long_prefix = "x" * 600
+    assert bounded_log_text(long_prefix, query="z", case_sensitive=False, matched=False) == "x" * 500
+    centered = bounded_log_text(
+        long_prefix + " NEEDLE " + "y" * 300,
+        query="needle",
+        case_sensitive=False,
+        matched=True,
+    )
+    assert centered.startswith("…")
+    assert "NEEDLE" in centered
+    assert centered.endswith("…")
     assert percent(None) == "unknown"
     assert percent(0.5) == "50.0%"
     assert percent_delta(None) == "unknown"

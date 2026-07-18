@@ -230,6 +230,13 @@ sys.exit(2)
         assert run["parsed_summary"]["stderr_line_count"] == 1
         assert len(run["parsed_summary"]["excerpts"]) <= 3
         assert any("FAILED" in item["text"] for item in run["parsed_summary"]["excerpts"])
+        search = store.search_run_logs(run["id"], "stdout line 15", context_lines=2, max_words=20)
+        assert search["match_count"] == 1
+        assert search["returned_line_count"] == 5
+        assert search["returned_word_count"] == 15
+        assert [line["line_number"] for line in search["contexts"][0]["lines"]] == [14, 15, 16, 17, 18]
+        stderr_search = store.search_run_logs(run["id"], "failed", stream="stderr", context_lines=0)
+        assert stderr_search["returned_match_count"] == 1
         Path(run["stdout_path"]).unlink()
         Path(run["stderr_path"]).unlink()
         bounded = store.run_result(run["id"], max_summary_lines=1)

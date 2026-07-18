@@ -348,7 +348,6 @@ After that, agents run only the registered command id or name:
 ```text
 run_command_profiled(
   command_ref="condition",
-  max_summary_lines=80,
   idempotency_key="condition:<commit-sha>:coverage"
 )
 ```
@@ -357,11 +356,13 @@ Submission returns immediately with a durable run id and `status` set to `queued
 `terminal` is true:
 
 ```text
-run_result(run_id="returned-run-id", max_summary_lines=80)
+run_result(run_id="returned-run-id")
 ```
 
 Use `run_queue()` to inspect FIFO position. Set `wait=true` only for a command known to finish quickly; the default
 background mode keeps the MCP call responsive during long suites.
+Compact responses are the default. Use `detailed=true` once when command, artifact, path, or topology metadata is
+needed, and use `search_run_logs` for targeted diagnostics instead of increasing a generic excerpt limit.
 
 Artifacts with a non-null `coverage_format` are automatically parsed after a managed process exits normally, whether
 the test status is `passed` or `failed`. The server compares file size, nanosecond modification/change times, and inode
@@ -485,7 +486,7 @@ Connect your MCP client to:
 http://127.0.0.1:59471/mcp/
 ```
 
-The current server exposes 21 tools. `tools/list` returns concrete JSON Schemas
+The current server exposes 22 tools. `tools/list` returns concrete JSON Schemas
 for both inputs and outputs, including nested fields, required fields, nullability,
 status enums, descriptions, and bounds. An agent can therefore use the MCP
 contract without reading this repository or guessing response keys. Invalid
@@ -497,7 +498,8 @@ General conventions:
 
 - IDs are durable UUID strings. A `command_ref` accepts either a registration ID or its latest matching name.
 - `file_path` is the exact repository-relative path stored by the report. Rename history is intentionally not inferred.
-- Result limits are inclusive. `limit` is tool-specific; `max_summary_lines` is always 1-500.
+- Result limits are inclusive. `limit` is tool-specific. Run operations are compact unless `detailed=true`.
+- Retained logs are queried with `search_run_logs`; line context preserves locality while `max_words` controls text volume.
 - Times are returned as UTC timestamps plus `age_seconds` and a human-readable `age` such as `10 minutes 3 seconds ago`.
 - Lookup tools normally return MCP tool errors for missing objects; list and history queries may return an empty list as documented.
 
@@ -552,13 +554,13 @@ register_test_command(
 
 ### `run_command_profiled`
 
-`run_command_profiled(command_ref, max_summary_lines = 80, timeout_seconds = null, idempotency_key = null, wait = false)` submits an approved command to the bounded FIFO worker pool.
+`run_command_profiled(command_ref, timeout_seconds = null, idempotency_key = null, wait = false, detailed = false)` submits an approved command to the bounded FIFO worker pool.
 
-**Inputs:** `command_ref` is a registration ID or name; `max_summary_lines` is 1-500; `timeout_seconds` is null or 1-86400; `idempotency_key` is null or a 1-200 character key scoped to that command; `wait` blocks until terminal only when true.
+**Inputs:** `command_ref` is a registration ID or name; `timeout_seconds` is null or 1-86400; `idempotency_key` is null or a 1-200 character key scoped to that command; `wait` blocks until terminal only when true; `detailed` selects the full response instead of compact state.
 
-**Returns:** Normally a durable run with `status` queued/running, `terminal: false`, `poll_after_ms`, queue position, log paths, historical ETA fields, and `coverage_ingest.status` set to `pending` or `not_configured`. A terminal result also contains exit code, timing, bounded excerpts/counters, artifacts, freshness, and status `passed`, `failed`, `cancelled`, `timeout`, `interrupted`, or `internal_error`. `coverage_ingest` then summarizes configured/ingested/failed/skipped artifacts and returns immutable `snapshot_ids`; each finalized coverage artifact reports `modified_by_run`, `ingest_status`, `snapshot_id`, and bounded `ingest_error`. Reusing the same idempotency key returns the original run and snapshot links with `submission_reused: true`.
+**Returns:** Compact state contains `id`, `command_name`, `status`, `terminal`, `duration_ms`, `exit_code`, `counters`, `poll_after_ms`, queue position, contextual age, ETA, Git identity, `coverage_ingest`, cancellation/error state, and `diagnostics_available`. With `detailed: true`, it additionally returns the exact command, paths, timestamps, artifacts, full ETA internals, stored summary, and topology. Reusing the same idempotency key sets `submission_reused: true`.
 
-**Errors:** Unknown/disabled commands, invalid limits/timeouts, or reusing one idempotency key with different submission parameters produces a tool error. A test failure is a successful tool response with `status: "failed"`, not an MCP protocol error. Missing, stale, or malformed coverage is likewise terminal response data under `coverage_ingest`, not a transport error.
+**Errors:** Unknown/disabled commands, invalid timeouts, or reusing one idempotency key with different submission parameters produces a tool error. A test failure is a successful tool response with `status: "failed"`, not an MCP protocol error. Missing, stale, or malformed coverage is likewise terminal response data under `coverage_ingest`, not a transport error.
 
 ### `run_queue`
 
@@ -566,15 +568,15 @@ register_test_command(
 
 **Inputs:** `limit` is 1-1000.
 
-**Returns:** Running runs first with `queue_position: 0`, followed by queued runs with positive positions, polling guidance, and lane-aware ETA. If history is insufficient, `eta_unavailable_reason` explains why.
+**Returns:** Compact running runs first with `queue_position: 0`, followed by queued runs with positive positions, contextual age, polling guidance, and lane-aware `eta_seconds`/`eta`.
 
 **Errors:** Schema validation errors only; an idle worker returns an empty list.
 
 ### `cancel_run`
 
-`cancel_run(run_id, max_summary_lines = 80)` requests cancellation of queued or running work.
+`cancel_run(run_id, detailed = false)` requests cancellation of queued or running work.
 
-**Inputs:** `run_id` is the durable run UUID; `max_summary_lines` is 1-500.
+**Inputs:** `run_id` is the durable run UUID; `detailed` selects full metadata instead of compact state.
 
 **Returns:** A queued run becomes terminal immediately. A running run reports `cancellation_requested: true` while Coverage MCP terminates its process group; poll `run_result` until terminal. Repeating cancellation on an already cancelled run is idempotent.
 
@@ -582,23 +584,33 @@ register_test_command(
 
 ### `run_result`
 
-`run_result(run_id, max_summary_lines = 80)` polls one submitted run.
+`run_result(run_id, detailed = false)` polls one submitted run.
 
-**Inputs:** `run_id` is required; `max_summary_lines` is 1-500.
+**Inputs:** `run_id` is required; `detailed` selects full metadata instead of compact state.
 
-**Returns:** Active state avoids reading full logs and includes `poll_after_ms`, queue/ETA details, and log paths. Terminal state includes bounded output summaries, counters, artifact-level automatic ingestion outcomes, linked snapshot IDs, exact timing, and freshness. Poll no faster than `poll_after_ms`; ETA is historical, while timeout is an execution limit.
+**Returns:** Compact state includes polling, counters, contextual age, queue/ETA, Git identity, coverage-ingestion outcome, and `diagnostics_available`; it contains no log text. With `detailed: true`, paths, artifact records, timestamps, stored summary, and topology are included. Poll no faster than `poll_after_ms`.
 
-**Errors:** Unknown run IDs or invalid limits produce a tool error.
+**Errors:** Unknown run IDs produce a tool error.
 
 ### `latest_run`
 
-`latest_run(command_ref = null, max_summary_lines = 80)` retrieves the newest active or terminal run.
+`latest_run(command_ref = null, detailed = false)` retrieves the newest active or terminal run.
 
-**Inputs:** `command_ref` optionally restricts lookup to a command ID/name; `max_summary_lines` is 1-500.
+**Inputs:** `command_ref` optionally restricts lookup to a command ID/name; `detailed` selects full metadata instead of compact state.
 
-**Returns:** The same bounded state as `run_result`, including automatic ingestion outcomes plus `age` and `age_seconds` so callers can decide whether it is stale.
+**Returns:** The same compact state as `run_result`, including automatic ingestion outcomes plus contextual `age` and `age_seconds`; detailed mode restores command, artifact, path, timing, summary, and topology fields.
 
-**Errors:** Unknown command references, no matching runs, or invalid limits produce a tool error.
+**Errors:** Unknown command references or no matching runs produce a tool error.
+
+### `search_run_logs`
+
+`search_run_logs(run_id, query, stream = "both", context_lines = 3, max_matches = 5, max_words = 400, case_sensitive = false)` searches retained output without returning an entire generic excerpt.
+
+**Inputs:** `run_id` selects the durable run; `query` is literal text; `stream` is `both`, `stdout`, or `stderr`; `context_lines` is 0-10 lines before and after a match; `max_matches` is 1-20 context anchors; `max_words` is the 20-2,000 word budget across all returned context; `case_sensitive` controls Unicode case-folded versus exact matching.
+
+**Returns:** `run_id`, `query`, searched streams, total `match_count`, `returned_match_count`, `returned_line_count`, `returned_word_count`, `truncated`, and merged `contexts`. Each context identifies stdout/stderr and contains numbered lines with a `match` flag. Long lines are centered on the match, and the final line is cut at a word boundary when the budget is exhausted.
+
+**Errors:** Unknown runs, empty queries, unsupported streams, or out-of-range context/match/line limits produce a tool error. Zero matches returns empty contexts.
 
 ### `latest_artifact`
 
@@ -841,6 +853,7 @@ Useful endpoints:
 - `GET /api/runs/queue`
 - `POST /api/runs/{run_id}/cancel`
 - `GET /api/runs/latest`
+- `GET /api/runs/{run_id}/logs/search`
 - `GET /api/runs/{run_id}`
 - `GET /api/artifacts/latest`
 - `GET /api/topology/{object_kind}/{object_ref:path}`

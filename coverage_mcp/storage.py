@@ -1155,6 +1155,77 @@ class CoverageStore:
         run["poll_after_ms"] = None
         return run
 
+    def search_run_logs(
+        self,
+        run_id: str,
+        query: str,
+        *,
+        stream: str = "both",
+        context_lines: int = 3,
+        max_matches: int = 5,
+        max_words: int = 400,
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        if not query:
+            raise ValueError("query must not be empty")
+        if stream not in {"both", "stdout", "stderr"}:
+            raise ValueError("stream must be one of: both, stdout, stderr")
+        if not 0 <= context_lines <= 10:
+            raise ValueError("context_lines must be between 0 and 10")
+        if not 1 <= max_matches <= 20:
+            raise ValueError("max_matches must be between 1 and 20")
+        if not 20 <= max_words <= 2000:
+            raise ValueError("max_words must be between 20 and 2000")
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT stdout_path, stderr_path FROM runs WHERE id = ?
+                UNION ALL
+                SELECT stdout_path, stderr_path FROM run_jobs WHERE id = ?
+                LIMIT 1
+                """,
+                [run_id, run_id],
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"run not found: {run_id}")
+
+        paths = {"stdout": Path(str(row[0])), "stderr": Path(str(row[1]))}
+        streams = ["stdout", "stderr"] if stream == "both" else [stream]
+        contexts: list[dict[str, Any]] = []
+        match_count = 0
+        returned_match_count = 0
+        returned_line_count = 0
+        returned_word_count = 0
+        truncated = False
+        for selected_stream in streams:
+            result = search_log_file(
+                paths[selected_stream],
+                stream=selected_stream,
+                query=query,
+                case_sensitive=case_sensitive,
+                context_lines=context_lines,
+                max_matches=max(max_matches - returned_match_count, 0),
+                max_words=max(max_words - returned_word_count, 0),
+            )
+            contexts.extend(result["contexts"])
+            match_count += result["match_count"]
+            returned_match_count += result["returned_match_count"]
+            returned_line_count += result["returned_line_count"]
+            returned_word_count += result["returned_word_count"]
+            truncated = bool(truncated or result["truncated"])
+        return {
+            "run_id": run_id,
+            "query": query,
+            "case_sensitive": case_sensitive,
+            "streams": streams,
+            "match_count": match_count,
+            "returned_match_count": returned_match_count,
+            "returned_line_count": returned_line_count,
+            "returned_word_count": returned_word_count,
+            "truncated": truncated,
+            "contexts": contexts,
+        }
+
     def run(self, run_id: str) -> dict[str, Any]:
         with self._lock:
             row = self._conn.execute("SELECT * FROM runs WHERE id = ?", [run_id]).fetchone()
@@ -3065,6 +3136,160 @@ def summarize_run_logs(
         "stdout_path": stdout_path.as_posix(),
         "stderr_path": stderr_path.as_posix(),
     }
+
+
+def compact_run_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Project a verbose storage record into the default polling contract."""
+    raw_summary = result.get("parsed_summary")
+    summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
+    status = str(result["status"])
+    if status == "queued":
+        age_seconds = int(result.get("queued_age_seconds") or 0)
+        age = str(result.get("queued_age") or format_age(age_seconds))
+    elif status == "running":
+        age_seconds = int(result.get("running_age_seconds") or 0)
+        age = str(result.get("running_age") or format_age(age_seconds))
+    else:
+        age_seconds = int(result.get("age_seconds") or 0)
+        age = str(result.get("age") or format_age(age_seconds))
+    stdout_count = summary.get("stdout_line_count")
+    stderr_count = summary.get("stderr_line_count")
+    diagnostics_available = any(isinstance(count, int) and count > 0 for count in (stdout_count, stderr_count))
+    return {
+        "id": result["id"],
+        "command_name": result["command_name"],
+        "status": status,
+        "terminal": bool(result["terminal"]),
+        "duration_ms": int(result["duration_ms"]),
+        "exit_code": result.get("exit_code"),
+        "counters": dict(summary.get("counters") or {}),
+        "repo_path": result["repo_path"],
+        "branch": result.get("branch"),
+        "commit_sha": result.get("commit_sha"),
+        "coverage_ingest": result["coverage_ingest"],
+        "poll_after_ms": result.get("poll_after_ms"),
+        "queue_position": result.get("queue_position"),
+        "age_seconds": age_seconds,
+        "age": age,
+        "eta_seconds": result.get("eta_seconds"),
+        "eta": result.get("eta"),
+        "estimated_completion_at": result.get("estimated_completion_at"),
+        "cancellation_requested": bool(result.get("cancellation_requested")),
+        "submission_reused": result.get("submission_reused"),
+        "error": result.get("error") or summary.get("execution_error"),
+        "diagnostics_available": diagnostics_available,
+    }
+
+
+def search_log_file(
+    path: Path,
+    *,
+    stream: str,
+    query: str,
+    case_sensitive: bool,
+    context_lines: int,
+    max_matches: int,
+    max_words: int,
+) -> dict[str, Any]:
+    """Find literal matches in two streaming passes and retain only bounded context."""
+    needle = query if case_sensitive else query.casefold()
+    anchors: list[int] = []
+    match_count = 0
+    line_count = 0
+    if path.exists():
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                line_count = line_number
+                haystack = raw if case_sensitive else raw.casefold()
+                if needle in haystack:
+                    match_count += 1
+                    if len(anchors) < max_matches:
+                        anchors.append(line_number)
+
+    ranges: list[list[int]] = []
+    for anchor in anchors:
+        start, end = max(1, anchor - context_lines), min(line_count, anchor + context_lines)
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+
+    contexts: list[dict[str, Any]] = []
+    returned_match_count = 0
+    returned_line_count = 0
+    returned_word_count = 0
+    word_truncated = False
+    range_index = 0
+    current: dict[str, Any] | None = None
+    if ranges and max_words and path.exists():
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                while range_index < len(ranges) and line_number > ranges[range_index][1]:
+                    if current is not None:
+                        contexts.append(current)
+                        current = None
+                    range_index += 1
+                if range_index >= len(ranges) or returned_word_count >= max_words:
+                    break
+                start, end = ranges[range_index]
+                if line_number < start:
+                    continue
+                full_text = raw.rstrip("\n")
+                haystack = full_text if case_sensitive else full_text.casefold()
+                matched = needle in haystack
+                text = bounded_log_text(full_text, query=query, case_sensitive=case_sensitive, matched=matched)
+                text, word_count, line_truncated = truncate_to_word_budget(
+                    text,
+                    max_words=max_words - returned_word_count,
+                )
+                if current is None:
+                    current = {"stream": stream, "start_line": line_number, "end_line": line_number, "lines": []}
+                current["end_line"] = line_number
+                current["lines"].append({"line_number": line_number, "text": text[:500], "match": matched})
+                returned_line_count += 1
+                returned_word_count += word_count
+                word_truncated = bool(word_truncated or line_truncated)
+                if matched:
+                    returned_match_count += 1
+        if current is not None:
+            contexts.append(current)
+
+    expected_context_end = ranges[-1][1] if ranges else 0
+    actual_context_end = contexts[-1]["end_line"] if contexts else 0
+    return {
+        "match_count": match_count,
+        "returned_match_count": returned_match_count,
+        "returned_line_count": returned_line_count,
+        "returned_word_count": returned_word_count,
+        "truncated": match_count > len(anchors) or actual_context_end < expected_context_end or word_truncated,
+        "contexts": contexts,
+    }
+
+
+def truncate_to_word_budget(text: str, *, max_words: int) -> tuple[str, int, bool]:
+    """Preserve original spacing while truncating text at a whitespace-delimited word boundary."""
+    words = list(re.finditer(r"\S+", text))
+    if len(words) <= max_words:
+        return text, len(words), False
+    if max_words <= 0:
+        return "", 0, bool(words)
+    return text[: words[max_words - 1].end()], max_words, True
+
+
+def bounded_log_text(text: str, *, query: str, case_sensitive: bool, matched: bool) -> str:
+    """Keep long matching lines centered on the query instead of returning an irrelevant prefix."""
+    if len(text) <= 500:
+        return text
+    if not matched:
+        return text[:500]
+    haystack = text if case_sensitive else text.casefold()
+    needle = query if case_sensitive else query.casefold()
+    match_at = max(haystack.find(needle), 0)
+    start = max(match_at - 200, 0)
+    end = min(start + 500, len(text))
+    prefix = "…" if start else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + text[start:end] + suffix
 
 
 def profile_log(path: Path, *, stream: str, max_lines: int) -> dict[str, Any]:

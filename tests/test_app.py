@@ -186,7 +186,7 @@ print("1 passed")
 
         response = client.post(
             "/api/runs/profiled",
-            json={"command_ref": command["id"], "max_summary_lines": 5, "idempotency_key": "api-unit"},
+            json={"command_ref": command["id"], "idempotency_key": "api-unit"},
         )
         assert response.status_code == 200
         run = response.json()
@@ -194,13 +194,20 @@ print("1 passed")
         assert run["terminal"] is False
         assert client.get("/api/runs/queue").json()
         for _ in range(100):
-            run = client.get(f"/api/runs/{run['id']}?max_summary_lines=5").json()
+            run = client.get(f"/api/runs/{run['id']}").json()
             if run["terminal"]:
                 break
             time.sleep(0.02)
         assert run["status"] == "passed"
-        assert run["topology"]["command"]["id"] == command["id"]
-        assert run["parsed_summary"]["counters"]["passed"] == 1
+        assert run["counters"]["passed"] == 1
+        assert "topology" not in run
+        detailed = client.get(f"/api/runs/{run['id']}?detailed=true").json()
+        assert detailed["topology"]["command"]["id"] == command["id"]
+        assert detailed["parsed_summary"]["counters"]["passed"] == 1
+        assert "excerpts" not in detailed["parsed_summary"]
+        search = client.get(f"/api/runs/{run['id']}/logs/search?query=passed&context_lines=1").json()
+        assert search["match_count"] == 1
+        assert search["returned_line_count"] <= 3
         repeated = client.post(
             "/api/runs/profiled",
             json={"command_ref": command["id"], "idempotency_key": "api-unit"},

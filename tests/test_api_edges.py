@@ -48,7 +48,7 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
     with TestClient(app) as client:
         health = client.get("/health").json()
-        assert health["version"] == "0.4.0"
+        assert health["version"] == "0.5.0"
         assert health["run_retention"] == 100
         assert health["run_concurrency"] == 4
         assert client.get("/api/snapshots/latest").status_code == 404
@@ -190,12 +190,13 @@ def test_rest_run_errors_and_timeout(tmp_path):
         assert client.post(f"/api/runs/{cancellable['id']}/cancel").json()["status"] == "cancelled"
         run = client.post(
             "/api/runs/profiled",
-            json={"command_ref": command["id"], "timeout_seconds": 1, "max_summary_lines": 5, "wait": True},
+            json={"command_ref": command["id"], "timeout_seconds": 1, "wait": True},
         ).json()
         assert run["status"] == "timeout"
-        assert client.get(f"/api/runs/{run['id']}?max_summary_lines=1").json()["id"] == run["id"]
+        assert client.get(f"/api/runs/{run['id']}").json()["id"] == run["id"]
         assert client.get("/api/runs/missing").status_code == 404
         assert client.post("/api/runs/missing/cancel").status_code == 404
+        assert client.get("/api/runs/missing/logs/search?query=x").status_code == 404
 
 
 def test_rest_error_wrappers_and_main(monkeypatch, tmp_path):

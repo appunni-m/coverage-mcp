@@ -34,15 +34,24 @@ EXPECTED_MCP_INPUTS = {
     "list_registered_commands": {"limit"},
     "run_command_profiled": {
         "command_ref",
-        "max_summary_lines",
         "timeout_seconds",
         "idempotency_key",
         "wait",
+        "detailed",
     },
     "run_queue": {"limit"},
-    "cancel_run": {"run_id", "max_summary_lines"},
-    "run_result": {"run_id", "max_summary_lines"},
-    "latest_run": {"command_ref", "max_summary_lines"},
+    "cancel_run": {"run_id", "detailed"},
+    "run_result": {"run_id", "detailed"},
+    "latest_run": {"command_ref", "detailed"},
+    "search_run_logs": {
+        "run_id",
+        "query",
+        "stream",
+        "context_lines",
+        "max_matches",
+        "max_words",
+        "case_sensitive",
+    },
     "latest_artifact": {"kind", "command_ref"},
     "object_topology": {"object_kind", "object_ref"},
     "ingest_coverage": {"report_path", "format", "repo_path", "suite", "branch", "commit_sha", "base_ref"},
@@ -62,11 +71,19 @@ EXPECTED_MCP_OUTPUTS = {
     "project_summaries": {"repo_key", "latest_snapshot_id", "latest_run_age", "topology"},
     "register_test_command": {"id", "command", "artifact_specs", "approved_by", "topology"},
     "list_registered_commands": {"id", "name", "duration_estimate_ms", "artifact_specs"},
-    "run_command_profiled": {"id", "status", "terminal", "poll_after_ms", "coverage_ingest", "artifact_paths"},
+    "run_command_profiled": {"id", "status", "terminal", "poll_after_ms", "coverage_ingest", "counters"},
     "run_queue": {"id", "status", "queue_position", "eta_seconds"},
     "cancel_run": {"id", "status", "cancellation_requested", "terminal"},
-    "run_result": {"id", "status", "parsed_summary", "coverage_ingest", "age"},
-    "latest_run": {"id", "status", "age", "age_seconds", "topology"},
+    "run_result": {"id", "status", "counters", "coverage_ingest", "age"},
+    "latest_run": {"id", "status", "age", "age_seconds", "diagnostics_available"},
+    "search_run_logs": {
+        "run_id",
+        "query",
+        "match_count",
+        "returned_line_count",
+        "returned_word_count",
+        "contexts",
+    },
     "latest_artifact": {"run_id", "kind", "ingest_status", "snapshot_id", "run_age"},
     "object_topology": {"object_kind", "object_ref", "topology"},
     "ingest_coverage": {"id", "suite", "format", "line_rate", "age", "topology"},
@@ -149,8 +166,7 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
                         )
 
             run_schema = tools["run_command_profiled"].inputSchema["properties"]
-            assert run_schema["max_summary_lines"]["minimum"] == 1
-            assert run_schema["max_summary_lines"]["maximum"] == 500
+            assert run_schema["detailed"]["default"] is False
             timeout_schema = run_schema["timeout_seconds"]["anyOf"][0]
             assert timeout_schema["minimum"] == 1
             assert timeout_schema["maximum"] == 86400
@@ -230,9 +246,9 @@ def test_mcp_contract_has_exact_inventory_descriptions_and_bounds(tmp_path):
             assert templates == EXPECTED_MCP_RESOURCE_TEMPLATES
 
             for tool_name, arguments in (
-                ("run_command_profiled", {"command_ref": "unit", "max_summary_lines": 501}),
                 ("run_command_profiled", {"command_ref": "unit", "timeout_seconds": 0}),
                 ("run_command_profiled", {"command_ref": "unit", "idempotency_key": "x" * 201}),
+                ("search_run_logs", {"run_id": "x", "query": "x", "max_words": 19}),
                 ("register_test_command", {"name": "x", "command": "echo x", "human_approved": False}),
                 ("ingest_coverage", {"report_path": "coverage.out", "format": "unknown"}),
                 ("object_topology", {"object_kind": "unknown", "object_ref": "x"}),
@@ -282,7 +298,12 @@ print("1 passed")
             result = structured(
                 await mcp.call_tool(
                     "run_command_profiled",
-                    {"command_ref": command["id"], "wait": True, "idempotency_key": "managed-coverage"},
+                    {
+                        "command_ref": command["id"],
+                        "wait": True,
+                        "idempotency_key": "managed-coverage",
+                        "detailed": True,
+                    },
                 )
             )
             snapshot_id = result["coverage_ingest"]["snapshot_ids"][0]
@@ -352,12 +373,12 @@ def test_streamable_http_protocol_with_official_client(tmp_path):
         assert not thread.is_alive()
 
 
-async def completed_run(mcp, run_id, max_summary_lines=80):
+async def completed_run(mcp, run_id, *, detailed=False):
     for _ in range(200):
         result = structured(
             await mcp.call_tool(
                 "run_result",
-                {"run_id": run_id, "max_summary_lines": max_summary_lines},
+                {"run_id": run_id, "detailed": detailed},
             )
         )
         if result["terminal"]:
@@ -466,7 +487,6 @@ sys.exit(1)
                     "run_command_profiled",
                     {
                         "command_ref": command["id"],
-                        "max_summary_lines": 2,
                         "idempotency_key": "failing-run",
                     },
                 )
@@ -474,16 +494,20 @@ sys.exit(1)
             assert run["status"] in {"queued", "running"}
             assert run["terminal"] is False
             assert run["poll_after_ms"] == 1000
-            assert run["parsed_summary"]["summary_deferred"] is True
-            assert run["duration_sample_count"] == 0
             assert run["eta_seconds"] is None
-            assert run["eta_unavailable_reason"] == "no_command_history"
-            run = await completed_run(mcp, run["id"], max_summary_lines=2)
-            result = structured(await mcp.call_tool("run_result", {"run_id": run["id"], "max_summary_lines": 1}))
+            run = await completed_run(mcp, run["id"])
+            result = structured(await mcp.call_tool("run_result", {"run_id": run["id"]}))
             latest_run = structured(
                 await mcp.call_tool(
                     "latest_run",
-                    {"command_ref": command["id"], "max_summary_lines": 1},
+                    {"command_ref": command["id"]},
+                )
+            )
+            detailed = structured(await mcp.call_tool("run_result", {"run_id": run["id"], "detailed": True}))
+            logs = structured(
+                await mcp.call_tool(
+                    "search_run_logs",
+                    {"run_id": run["id"], "query": "synthetic failure", "context_lines": 1},
                 )
             )
             commands = structured(await mcp.call_tool("list_registered_commands", {"limit": 5}))
@@ -510,10 +534,14 @@ sys.exit(1)
             assert commands[0]["id"] == command["id"]
             assert commands[0]["duration_sample_count"] == 1
             assert commands[0]["duration_estimate_ms"] >= 0
-            assert run["topology"]["command"]["id"] == command["id"]
+            assert detailed["topology"]["command"]["id"] == command["id"]
             assert topology["topology"]["kind"] == "run"
-            assert run["parsed_summary"]["stdout_line_count"] == 20
-            assert len(run["parsed_summary"]["excerpts"]) <= 2
+            assert detailed["parsed_summary"]["stdout_line_count"] == 20
+            assert "excerpts" not in detailed["parsed_summary"]
+            assert "parsed_summary" not in run
+            assert logs["match_count"] == 1
+            assert logs["contexts"][0]["stream"] == "stderr"
+            assert any(line["match"] for line in logs["contexts"][0]["lines"])
             assert artifact["exists"] is True
             assert projects[0]["latest_run_age_seconds"] >= 0
             assert projects[0]["latest_run_age"].endswith(" ago")
@@ -569,14 +597,18 @@ def test_mcp_remains_responsive_while_registered_command_runs(tmp_path):
             )
             assert commands[0]["id"] == command["id"]
             first_result, second_result = await asyncio.gather(
-                completed_run(mcp, first["id"]),
-                completed_run(mcp, second["id"]),
+                completed_run(mcp, first["id"], detailed=True),
+                completed_run(mcp, second["id"], detailed=True),
             )
             assert first_result["status"] == "passed"
             assert second_result["status"] == "passed"
             assert max(first_result["started_at"], second_result["started_at"]) < min(
                 first_result["ended_at"], second_result["ended_at"]
             )
+            cancellable = structured(await mcp.call_tool("run_command_profiled", {"command_ref": command["id"]}))
+            cancellation = structured(await mcp.call_tool("cancel_run", {"run_id": cancellable["id"]}))
+            assert cancellation["id"] == cancellable["id"]
+            assert cancellation["cancellation_requested"] is True
 
         run(scenario())
     finally:
