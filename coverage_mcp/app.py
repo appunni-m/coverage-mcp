@@ -82,8 +82,8 @@ from coverage_mcp.storage import (
     DEFAULT_RUN_RETENTION,
     CommonStore,
     CoverageStore,
-    compact_run_result,
 )
+from coverage_mcp.storage_helpers import compact_run_result
 
 DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471

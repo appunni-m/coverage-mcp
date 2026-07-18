@@ -14,8 +14,8 @@ import pytest
 
 from coverage_mcp import storage as storage_module
 from coverage_mcp.models import CoverageReport, FileCoverage, LineCoverage
-from coverage_mcp.storage import (
-    CoverageStore,
+from coverage_mcp.storage import CoverageStore
+from coverage_mcp.storage_helpers import (
     bounded_log_text,
     compact_run_result,
     format_age,

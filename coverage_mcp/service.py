@@ -12,7 +12,8 @@ from typing import Any
 
 from coverage_mcp.contracts import ApiEnvelope
 from coverage_mcp.git_utils import inspect_git
-from coverage_mcp.storage import CoverageStore, compact_run_result
+from coverage_mcp.storage import CoverageStore
+from coverage_mcp.storage_helpers import compact_run_result
 
 SCHEMA_REVISION = 7
 DEFAULT_MAX_WORDS = 600
