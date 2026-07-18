@@ -41,3 +41,7 @@ cursors, while server-side record caps exist only as defensive bounds.
 - Unknown parents are errors, never empty-success responses.
 - Managed command execution requires an immutable human-approved registration.
 - MCP, resources, REST, and dashboard calls use the same service and projection behavior.
+
+The embedded dashboard document lives in `coverage_mcp/dashboard.py`; transport and lifecycle assembly remain in
+`coverage_mcp/app.py`. Keeping the dashboard local and dependency-free lets `uvx coverage-mcp connect` install one
+small Python distribution without a separate frontend build toolchain.
