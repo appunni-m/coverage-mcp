@@ -22,6 +22,7 @@ from filelock import FileLock
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from coverage_mcp import __version__
@@ -989,8 +990,26 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         stateless_http=True,
         streamable_http_path="/",
     )
+    read_only = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+    local_write = ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+    command_execution = ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    )
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only)
     async def project_context(
         cursor: PageCursor = None,
         max_words: ResponseWordBudget = 600,
@@ -1004,7 +1023,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
             detailed=detailed,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=local_write)
     async def register_test_command(
         name: NonEmptyName,
         command: CommandText,
@@ -1031,7 +1050,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         )
         return shared.apply_budget(response, max_words=max_words)
 
-    @mcp.tool()
+    @mcp.tool(annotations=command_execution)
     async def run_test(
         command_ref: CommandReference,
         timeout_seconds: TimeoutSeconds = None,
@@ -1050,7 +1069,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         )
         return shared.apply_budget(response, max_words=max_words)
 
-    @mcp.tool()
+    @mcp.tool(annotations=command_execution)
     async def test_run(
         run_id: RunId,
         action: RunAction = "status",
@@ -1061,7 +1080,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         response = await asyncio.to_thread(shared.run_state, run_id, action=action, detailed=detailed)
         return shared.apply_budget(response, max_words=max_words)
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only)
     async def search_test_logs(
         run_id: RunId,
         query: LogQuery,
@@ -1083,7 +1102,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
             case_sensitive=case_sensitive,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=local_write)
     async def ingest_coverage(
         report_path: ReportPath,
         format: CoverageFormat = "auto",
@@ -1106,7 +1125,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         )
         return shared.apply_budget(response, max_words=max_words)
 
-    @mcp.tool()
+    @mcp.tool(annotations=local_write)
     async def register_worktree(
         path: WorktreePath,
         base_ref: BaseRef,
@@ -1122,7 +1141,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         )
         return shared.apply_budget(response, max_words=max_words)
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only)
     async def coverage_query(
         view: CoverageQueryView,
         snapshot_id: OptionalSnapshotId = None,
@@ -1152,7 +1171,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
             detailed=detailed,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only)
     async def coverage_compare(
         view: CoverageComparisonView = "overview",
         snapshot_id: OptionalSnapshotId = None,
@@ -1180,7 +1199,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
             detailed=detailed,
         )
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only)
     async def source_context(
         snapshot_id: SnapshotId,
         file_path: FilePath,

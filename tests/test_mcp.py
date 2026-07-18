@@ -120,6 +120,7 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
             for name, expected_inputs in EXPECTED_MCP_INPUTS.items():
                 tool = tools[name]
                 assert tool.description
+                assert tool.annotations is not None
                 properties = tool.inputSchema["properties"]
                 assert set(properties) == expected_inputs
                 assert all(properties[field].get("description") for field in expected_inputs)
@@ -131,6 +132,23 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
                 output = tool.outputSchema
                 assert {"context", "data", "page"} <= set(output["properties"])
                 assert all(field.get("description") for field in output["properties"].values())
+
+            read_only_tools = {
+                "project_context",
+                "search_test_logs",
+                "coverage_query",
+                "coverage_compare",
+                "source_context",
+            }
+            for name, tool in tools.items():
+                assert tool.annotations is not None
+                assert tool.annotations.readOnlyHint is (name in read_only_tools)
+                if name in read_only_tools:
+                    assert tool.annotations.destructiveHint is False
+                    assert tool.annotations.idempotentHint is True
+                    assert tool.annotations.openWorldHint is False
+            assert tools["run_test"].annotations.destructiveHint is True
+            assert tools["run_test"].annotations.openWorldHint is True
 
             assert set(tools["coverage_query"].inputSchema["properties"]["view"]["enum"]) == {
                 "summary",

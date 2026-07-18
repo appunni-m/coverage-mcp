@@ -15,6 +15,7 @@ minor versions may contain breaking public-contract changes.
 - Separated the embedded dashboard document and storage projections from transport and persistence code.
 - Restricted the daemon to loopback interfaces and added browser security headers and trusted-host validation.
 - Hardened concurrent lazy startup against transient health-probe timeouts.
+- Added explicit MCP safety annotations so Codex can invoke read-only tools without mutation approval.
 
 ### Added
 
