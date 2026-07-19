@@ -453,9 +453,9 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
 
 ## Approved Run Ledger
 
-For managed workflows, Coverage MCP stores test runs without requiring a YAML suite file.
-
-Instead, a human explicitly registers the full command string once, including cwd and expected artifacts. Registration requires approval fields:
+For managed workflows, Coverage MCP stores test runs against immutable registered commands. If an exact command is not
+already registered, the agent presents the full command, cwd, shell, and declared artifacts for human approval. After
+the human approves those exact values, the agent registers them with approval audit fields:
 
 ```text
 register_test_command(
