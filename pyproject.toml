@@ -32,7 +32,7 @@ dependencies = [
     "fastapi>=0.115",
     "mcp>=1.23,<2",
     "pydantic>=2.8",
-    "uvicorn[standard]>=0.30",
+    "uvicorn[standard]>=0.51.0",
 ]
 
 [project.optional-dependencies]
