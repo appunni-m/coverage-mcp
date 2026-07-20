@@ -399,6 +399,15 @@ print('diagnostic needle')
             )
             assert logs["match_count"] == 1
             assert "streams" not in logs
+            multi_logs = data(
+                await mcp.call_tool(
+                    "search_test_logs",
+                    {"run_id": result["id"], "query": ["needle", "passed"], "context_lines": 0, "max_words": 50},
+                )
+            )
+            assert multi_logs["query"] == ["needle", "passed"]
+            assert multi_logs["queries"] == ["needle", "passed"]
+            assert multi_logs["match_count"] == 2
             repeated = data(
                 await mcp.call_tool(
                     "run_test",

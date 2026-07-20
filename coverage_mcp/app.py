@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import anyio
 import httpx
@@ -571,7 +571,10 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
     @app.get("/api/runs/{run_id}/logs/search")
     def search_run_logs(
         run_id: str,
-        query: str = Query(min_length=1, max_length=500),
+        query: Annotated[
+            list[str],
+            Query(description="One or more literal text terms to find in retained stdout/stderr."),
+        ],
         stream: str = Query(default="both", pattern="^(both|stdout|stderr)$"),
         context_lines: int = Query(default=3, ge=0, le=10),
         max_matches: int = Query(default=5, ge=1, le=20),

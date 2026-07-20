@@ -656,11 +656,11 @@ The server publishes MCP safety annotations: context, coverage, log-search, comp
 
 ### `search_test_logs`
 
-**Inputs:** `run_id`, literal `query`, `stream`, `context_lines`, defensive `max_matches`, primary `max_words`, and `case_sensitive`.
+**Inputs:** `run_id`, literal `query` string or list of query strings, `stream`, `context_lines`, defensive `max_matches`, primary `max_words`, and `case_sensitive`.
 
 **Returns:** Merged, numbered stdout/stderr windows around matches, bounded by words rather than a generic output excerpt.
 
-**Errors:** Unknown `run_id`, invalid search options, or blank `query` fails. No matches returns an empty successful result.
+**Errors:** Unknown `run_id`, invalid search options, blank query terms, or more than 20 query terms fails. No matches returns an empty successful result.
 
 ### `ingest_coverage`
 
@@ -825,6 +825,8 @@ Useful endpoints:
 - `GET /api/changed-lines`
 - `GET /api/line-history`
 - `GET /api/source-lines`
+
+`GET /api/runs/{run_id}/logs/search` accepts repeated `query` parameters, for example `?query=failed&query=timeout`.
 
 ## Storage Model
 

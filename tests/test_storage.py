@@ -235,6 +235,16 @@ sys.exit(2)
         assert search["returned_line_count"] == 5
         assert search["returned_word_count"] == 15
         assert [line["line_number"] for line in search["contexts"][0]["lines"]] == [14, 15, 16, 17, 18]
+        multi_search = store.search_run_logs(
+            run["id"],
+            ["stdout line 15", "FAILED"],
+            context_lines=0,
+            max_words=50,
+        )
+        assert multi_search["query"] == ["stdout line 15", "FAILED"]
+        assert multi_search["queries"] == ["stdout line 15", "FAILED"]
+        assert multi_search["match_count"] == 2
+        assert multi_search["returned_line_count"] == 2
         stderr_search = store.search_run_logs(run["id"], "failed", stream="stderr", context_lines=0)
         assert stderr_search["returned_match_count"] == 1
         Path(run["stdout_path"]).unlink()

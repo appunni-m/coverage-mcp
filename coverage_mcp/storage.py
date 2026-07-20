@@ -29,6 +29,7 @@ from coverage_mcp.storage_helpers import (
     infer_topology,
     milliseconds_to_seconds,
     normalize_artifact_specs,
+    normalize_log_queries,
     parse_datetime,
     percent,
     percent_delta,
@@ -1219,7 +1220,7 @@ class CoverageStore:
     def search_run_logs(
         self,
         run_id: str,
-        query: str,
+        query: str | Sequence[str],
         *,
         stream: str = "both",
         context_lines: int = 3,
@@ -1227,8 +1228,7 @@ class CoverageStore:
         max_words: int = 400,
         case_sensitive: bool = False,
     ) -> dict[str, Any]:
-        if not query:
-            raise ValueError("query must not be empty")
+        queries = normalize_log_queries(query)
         if stream not in {"both", "stdout", "stderr"}:
             raise ValueError("stream must be one of: both, stdout, stderr")
         if not 0 <= context_lines <= 10:
@@ -1262,7 +1262,7 @@ class CoverageStore:
             result = search_log_file(
                 paths[selected_stream],
                 stream=selected_stream,
-                query=query,
+                query=queries,
                 case_sensitive=case_sensitive,
                 context_lines=context_lines,
                 max_matches=max(max_matches - returned_match_count, 0),
@@ -1276,7 +1276,8 @@ class CoverageStore:
             truncated = bool(truncated or result["truncated"])
         return {
             "run_id": run_id,
-            "query": query,
+            "query": queries[0] if len(queries) == 1 else queries,
+            "queries": queries,
             "case_sensitive": case_sensitive,
             "streams": streams,
             "match_count": match_count,

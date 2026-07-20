@@ -191,6 +191,7 @@ def test_app_registers_and_runs_approved_command(tmp_path):
         """from pathlib import Path
 Path("result.json").write_text("{}")
 print("1 passed")
+print("diagnostic warning")
 """,
         encoding="utf-8",
     )
@@ -252,6 +253,16 @@ print("1 passed")
         search = response_data(client.get(f"/api/runs/{run['id']}/logs/search?query=passed&context_lines=1"))
         assert search["match_count"] == 1
         assert search["returned_line_count"] <= 3
+        multi_search = response_data(
+            client.get(
+                f"/api/runs/{run['id']}/logs/search",
+                params=[("query", "passed"), ("query", "warning"), ("context_lines", "0")],
+            )
+        )
+        assert multi_search["query"] == ["passed", "warning"]
+        assert multi_search["queries"] == ["passed", "warning"]
+        assert multi_search["match_count"] == 2
+        assert multi_search["returned_line_count"] == 2
         repeated = client.post(
             "/api/runs/profiled",
             json={"command_ref": command["id"], "idempotency_key": "api-unit"},

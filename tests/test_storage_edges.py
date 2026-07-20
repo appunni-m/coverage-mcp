@@ -23,6 +23,7 @@ from coverage_mcp.storage_helpers import (
     is_interesting_log_line,
     merge_counters,
     normalize_artifact_specs,
+    normalize_log_queries,
     percent,
     percent_delta,
     profile_log,
@@ -1405,6 +1406,17 @@ def test_log_summary_and_topology_helpers(tmp_path):
     assert search["returned_line_count"] == 3
     assert search["returned_word_count"] == 5
     assert search["contexts"][0]["lines"][1]["match"] is True
+    multi = search_log_file(
+        stdout,
+        stream="stdout",
+        query=["PASSED", "skipped"],
+        case_sensitive=False,
+        context_lines=0,
+        max_matches=5,
+        max_words=20,
+    )
+    assert multi["match_count"] == 2
+    assert multi["returned_match_count"] == 2
     overlapping = search_log_file(
         stderr,
         stream="stderr",
@@ -1443,6 +1455,19 @@ def test_log_summary_and_topology_helpers(tmp_path):
     assert centered.startswith("…")
     assert "NEEDLE" in centered
     assert centered.endswith("…")
+    list_centered = bounded_log_text(
+        long_prefix + " NEEDLE " + "y" * 300,
+        query=["missing", "needle"],
+        case_sensitive=False,
+        matched=True,
+    )
+    assert "NEEDLE" in list_centered
+    with pytest.raises(ValueError, match="empty"):
+        normalize_log_queries([])
+    with pytest.raises(ValueError, match="at most 20"):
+        normalize_log_queries(["x"] * 21)
+    with pytest.raises(ValueError, match="500"):
+        normalize_log_queries(["x" * 501])
     assert percent(None) == "unknown"
     assert percent(0.5) == "50.0%"
     assert percent_delta(None) == "unknown"

@@ -2,11 +2,28 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from coverage_mcp.contracts import MAX_SUMMARY_LINES, MAX_TIMEOUT_SECONDS, MIN_SUMMARY_LINES, MIN_TIMEOUT_SECONDS
+
+MAX_LOG_QUERY_TERMS = 20
+
+
+def normalize_log_queries(query: str | Sequence[str]) -> list[str]:
+    queries = [query] if isinstance(query, str) else list(query)
+    if not queries:
+        raise ValueError("query must not be empty")
+    if len(queries) > MAX_LOG_QUERY_TERMS:
+        raise ValueError(f"query accepts at most {MAX_LOG_QUERY_TERMS} terms")
+    for term in queries:
+        if not term.strip():
+            raise ValueError("query terms must not be blank")
+        if len(term) > 500:
+            raise ValueError("query terms must be at most 500 characters")
+    return queries
 
 
 def utcnow() -> datetime:
@@ -379,14 +396,15 @@ def search_log_file(
     path: Path,
     *,
     stream: str,
-    query: str,
+    query: str | Sequence[str],
     case_sensitive: bool,
     context_lines: int,
     max_matches: int,
     max_words: int,
 ) -> dict[str, Any]:
     """Find literal matches in two streaming passes and retain only bounded context."""
-    needle = query if case_sensitive else query.casefold()
+    queries = normalize_log_queries(query)
+    needles = queries if case_sensitive else [term.casefold() for term in queries]
     anchors: list[int] = []
     match_count = 0
     line_count = 0
@@ -395,7 +413,7 @@ def search_log_file(
             for line_number, raw in enumerate(handle, start=1):
                 line_count = line_number
                 haystack = raw if case_sensitive else raw.casefold()
-                if needle in haystack:
+                if any(needle in haystack for needle in needles):
                     match_count += 1
                     if len(anchors) < max_matches:
                         anchors.append(line_number)
@@ -430,8 +448,8 @@ def search_log_file(
                     continue
                 full_text = raw.rstrip("\n")
                 haystack = full_text if case_sensitive else full_text.casefold()
-                matched = needle in haystack
-                text = bounded_log_text(full_text, query=query, case_sensitive=case_sensitive, matched=matched)
+                matched = any(needle in haystack for needle in needles)
+                text = bounded_log_text(full_text, query=queries, case_sensitive=case_sensitive, matched=matched)
                 text, word_count, line_truncated = truncate_to_word_budget(
                     text,
                     max_words=max_words - returned_word_count,
@@ -470,15 +488,16 @@ def truncate_to_word_budget(text: str, *, max_words: int) -> tuple[str, int, boo
     return text[: words[max_words - 1].end()], max_words, True
 
 
-def bounded_log_text(text: str, *, query: str, case_sensitive: bool, matched: bool) -> str:
+def bounded_log_text(text: str, *, query: str | Sequence[str], case_sensitive: bool, matched: bool) -> str:
     """Keep long matching lines centered on the query instead of returning an irrelevant prefix."""
     if len(text) <= 500:
         return text
     if not matched:
         return text[:500]
+    queries = normalize_log_queries(query)
     haystack = text if case_sensitive else text.casefold()
-    needle = query if case_sensitive else query.casefold()
-    match_at = max(haystack.find(needle), 0)
+    needles = queries if case_sensitive else [term.casefold() for term in queries]
+    match_at = min((index for needle in needles if (index := haystack.find(needle)) >= 0), default=0)
     start = max(match_at - 200, 0)
     end = min(start + 500, len(text))
     prefix = "…" if start else ""

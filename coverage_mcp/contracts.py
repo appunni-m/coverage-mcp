@@ -264,8 +264,8 @@ DetailedResponse = Annotated[
     ),
 ]
 LogQuery = Annotated[
-    str,
-    Field(min_length=1, max_length=500, description="Literal text to find in retained stdout/stderr."),
+    str | list[str],
+    Field(description="One literal text term, or up to 20 literal text terms, to find in retained stdout/stderr."),
 ]
 LogStream = Annotated[
     Literal["both", "stdout", "stderr"],
@@ -653,7 +653,7 @@ class RunLogLineResult(CompactOutputModel):
 
     line_number: int = Field(description="One-based line number.")
     text: str = Field(description="Log text truncated to 500 characters.")
-    match: bool = Field(description="Whether this line contains the search query.")
+    match: bool = Field(description="Whether this line contains any search query.")
 
 
 class RunLogContextResult(CompactOutputModel):
@@ -669,7 +669,8 @@ class RunLogSearchResult(CompactOutputModel):
     """Bounded literal search over retained run output."""
 
     run_id: str = Field(description="Searched durable run UUID.")
-    query: str = Field(description="Literal query used for matching.")
+    query: str | list[str] = Field(description="Literal query term or terms used for matching.")
+    queries: list[str] = Field(description="Normalized literal query terms used for matching.")
     case_sensitive: bool = Field(description="Whether matching preserved case.")
     streams: list[Literal["stdout", "stderr"]] = Field(description="Streams searched.")
     match_count: int = Field(description="Total matching lines found across searched streams.")

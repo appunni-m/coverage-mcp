@@ -431,7 +431,7 @@ class CoverageService:
     def search_logs(
         self,
         run_id: str,
-        query: str,
+        query: str | Sequence[str],
         *,
         stream: str,
         context_lines: int,
