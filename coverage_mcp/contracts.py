@@ -252,7 +252,7 @@ CommandCwd = Annotated[
 ]
 WaitForCompletion = Annotated[
     bool,
-    Field(description="When true, block the MCP call until terminal; normally false so callers poll run_result."),
+    Field(description="When true, block the MCP call until terminal; normally false so callers poll test_run."),
 ]
 DetailedResponse = Annotated[
     bool,
@@ -265,7 +265,12 @@ DetailedResponse = Annotated[
 ]
 LogQuery = Annotated[
     str | list[str],
-    Field(description="One literal text term, or up to 20 literal text terms, to find in retained stdout/stderr."),
+    Field(
+        description=(
+            "One literal text term, or up to 20 literal text terms, to find in retained stdout/stderr. "
+            "Multiple terms match a line when any term is present."
+        )
+    ),
 ]
 LogStream = Annotated[
     Literal["both", "stdout", "stderr"],

@@ -622,6 +622,14 @@ The server publishes MCP safety annotations: context, coverage, log-search, comp
 
 `max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only: a result above the cap fails explicitly and asks the caller to refine the query instead of reporting a false end of collection. Agents should omit `detailed` or leave it `false`. Only `project_context`, `test_run`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
 
+The MCP server instructions plus `tools/list` are intended to be sufficient without this README. The effective workflow is:
+
+1. Call `project_context` first and inspect approved commands, latest run freshness, active runs, and queue state.
+2. Run only an exact approved command. If one is missing, call `register_test_command` only after a human approves the exact command, cwd, shell, and artifacts.
+3. Submit with `run_test(wait=false)` and a stable `idempotency_key`, then poll `test_run(action="status")` no sooner than `poll_after_ms` until `terminal` is true.
+4. Use `search_test_logs` for targeted retained stdout/stderr evidence; never request raw logs through `detailed`.
+5. Inspect `coverage_ingest.status` and `snapshot_ids`. Query returned snapshots with `coverage_query`, compare lineage-compatible snapshots or registered worktrees with `coverage_compare`, and fetch bounded source windows with `source_context`.
+
 ### `project_context`
 
 **Inputs:** `cursor` continues approved commands and `max_words` budgets the page. Keep `detailed` false; use true only for approval audit fields and full project chronology.
@@ -656,7 +664,7 @@ The server publishes MCP safety annotations: context, coverage, log-search, comp
 
 ### `search_test_logs`
 
-**Inputs:** `run_id`, literal `query` string or list of query strings, `stream`, `context_lines`, defensive `max_matches`, primary `max_words`, and `case_sensitive`.
+**Inputs:** `run_id`, literal `query` string or list of query strings, `stream`, `context_lines`, defensive `max_matches`, primary `max_words`, and `case_sensitive`. Multiple query terms match a line when any term is present.
 
 **Returns:** Merged, numbered stdout/stderr windows around matches, bounded by words rather than a generic output excerpt.
 

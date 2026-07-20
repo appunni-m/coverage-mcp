@@ -115,6 +115,9 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
 
         async def scenario():
             tools = {tool.name: tool for tool in await mcp.list_tools()}
+            assert "Start with project_context" in mcp.instructions
+            assert "poll test_run at poll_after_ms" in mcp.instructions
+            assert "Every response is {context,data,page}" in mcp.instructions
             assert set(tools) == set(EXPECTED_MCP_INPUTS)
             assert len(tools) == 10
             for name, expected_inputs in EXPECTED_MCP_INPUTS.items():
@@ -149,6 +152,16 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
                     assert tool.annotations.openWorldHint is False
             assert tools["run_test"].annotations.destructiveHint is True
             assert tools["run_test"].annotations.openWorldHint is True
+            assert "Poll test_run until terminal" in tools["run_test"].description
+            assert "terminal=false" in tools["test_run"].description
+            assert "one query string or a list of query strings" in tools["search_test_logs"].description
+            assert "no matches is a successful empty result" in tools["search_test_logs"].description
+            assert "summary, files, file gaps, insights, or line_history" in tools["coverage_query"].description
+            assert "Direct mode uses snapshot_id plus baseline_snapshot_id" in tools["coverage_compare"].description
+            assert "coverage_compare worktree mode" in tools["register_worktree"].description
+            wait_description = tools["run_test"].inputSchema["properties"]["wait"]["description"]
+            assert "test_run" in wait_description
+            assert "run_result" not in wait_description
 
             assert set(tools["coverage_query"].inputSchema["properties"]["view"]["enum"]) == {
                 "summary",
@@ -164,6 +177,9 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
                 "progress",
             }
             assert set(tools["test_run"].inputSchema["properties"]["action"]["enum"]) == {"status", "cancel"}
+            log_query = tools["search_test_logs"].inputSchema["properties"]["query"]
+            assert {schema["type"] for schema in log_query["anyOf"]} == {"string", "array"}
+            assert "any term is present" in log_query["description"]
 
             resources = {str(resource.uri) for resource in await mcp.list_resources()}
             templates = {str(template.uriTemplate) for template in await mcp.list_resource_templates()}
@@ -497,6 +513,9 @@ def test_streamable_http_protocol_uses_consolidated_contract(tmp_path):
 def test_readme_documents_consolidated_mcp_contract():
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
     guide = readme.split("## MCP Usage Guide", 1)[1].split("## Worktree Baselines", 1)[0]
+    assert "The MCP server instructions plus `tools/list` are intended to be sufficient" in guide
+    assert "Submit with `run_test(wait=false)`" in guide
+    assert "Multiple query terms match a line when any term is present" in guide
     for tool_name, inputs in EXPECTED_MCP_INPUTS.items():
         marker = f"### `{tool_name}`"
         assert guide.count(marker) == 1

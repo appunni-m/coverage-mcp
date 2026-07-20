@@ -984,11 +984,14 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         "coverage-mcp",
         instructions=(
             f"Coverage MCP {__version__} schema 7 exposes a compact agent interface. Start with project_context, "
-            "run only exact approved registrations, use coverage_query for snapshot reads, and use "
-            "coverage_compare only for lineage-compatible snapshots. max_words is the primary response budget; "
-            "continue collections with next_cursor. Always omit detailed or keep it false for normal work. Set it "
-            "true only when a tool's description names a required audit/raw-provenance field; never use detailed "
-            "to obtain logs."
+            "then run only exact approved registrations returned there or created with register_test_command after "
+            "human approval. Submit with run_test(wait=false), poll test_run at poll_after_ms until terminal, and use "
+            "search_test_logs for targeted retained stdout/stderr evidence. Use coverage_query for snapshot reads, "
+            "coverage_compare only for lineage-compatible snapshots or registered worktrees, and source_context only "
+            "for bounded source ranges already identified by coverage data. Every response is {context,data,page}; "
+            "max_words is the primary response budget and collections continue with page.next_cursor. Omit detailed "
+            "or keep it false for normal work; set it true only when a tool description names required audit or "
+            "raw-provenance fields. detailed never returns logs."
         ),
         stateless_http=True,
         streamable_http_path="/",
@@ -1018,7 +1021,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         max_words: ResponseWordBudget = 600,
         detailed: DetailedResponse = False,
     ) -> ApiEnvelope:
-        """Return compact project, exact approved commands, newest run, and queue. Use detailed only for audit data."""
+        """Discover project state before work: metrics/freshness, exact approved commands, latest run, active runs, and page metadata. Use detailed only for approval audit fields and full project chronology."""
         return await asyncio.to_thread(
             shared.project_context,
             cursor=cursor,
@@ -1038,7 +1041,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         artifact_paths: ArtifactPaths = None,
         max_words: ResponseWordBudget = 600,
     ) -> ApiEnvelope:
-        """Record one exact approved command; compact output already includes its complete execution definition."""
+        """Register one immutable command after human approval of the exact command, cwd, shell, and artifacts. The returned id/name can be passed to run_test; declare coverage artifacts with coverage_format and suite for automatic ingestion."""
         response = await asyncio.to_thread(
             shared.command_registration,
             name=name,
@@ -1061,7 +1064,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         wait: WaitForCompletion = False,
         max_words: ResponseWordBudget = 600,
     ) -> ApiEnvelope:
-        """Submit one approved test command in compact mode; poll test_run for state or exceptional audit detail."""
+        """Submit one approved command. Prefer wait=false with a stable idempotency_key; returns durable run id, queue/ETA, poll_after_ms, counters when known, and coverage_ingest. Poll test_run until terminal."""
         response = await asyncio.to_thread(
             shared.run_submission,
             command_ref,
@@ -1079,7 +1082,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         max_words: ResponseWordBudget = 600,
         detailed: DetailedResponse = False,
     ) -> ApiEnvelope:
-        """Poll or cancel a run. Keep detailed false; use true only for artifact paths, exact timestamps, or audit."""
+        """Poll status or cancel a durable run. terminal=false means poll again no sooner than poll_after_ms; terminal=true is final result data. Use detailed only for artifact paths, exact timestamps, or execution audit."""
         response = await asyncio.to_thread(shared.run_state, run_id, action=action, detailed=detailed)
         return shared.apply_budget(response, max_words=max_words)
 
@@ -1093,7 +1096,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         max_words: LogWordLimit = 400,
         case_sensitive: CaseSensitiveLogSearch = False,
     ) -> ApiEnvelope:
-        """Search retained output literally; returns only word-bounded merged context without redundant input echoes."""
+        """Search retained stdout/stderr literally for one query string or a list of query strings matched with OR. Returns word-bounded merged context windows; no matches is a successful empty result and full logs are never embedded."""
         return await asyncio.to_thread(
             shared.search_logs,
             run_id,
@@ -1115,7 +1118,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         base_ref: OptionalBaseRef = None,
         max_words: ResponseWordBudget = 600,
     ) -> ApiEnvelope:
-        """Ingest one external report compactly; parser warnings are included by default."""
+        """Ingest one external or historical coverage report. Relative report_path resolves inside the selected checkout; returns immutable snapshot summary, parser warnings, and provenance compactly."""
         response = await asyncio.to_thread(
             shared.ingest,
             report_path,
@@ -1135,7 +1138,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         name: OptionalLabel = None,
         max_words: ResponseWordBudget = 600,
     ) -> ApiEnvelope:
-        """Register one linked checkout and return all useful frozen-baseline identity without topology duplication."""
+        """Register one linked checkout and freeze the current baseline for base_ref when available. Returns worktree_id, checkout/head/base identity, and baseline_snapshot_id for coverage_compare worktree mode."""
         response = await asyncio.to_thread(
             shared.worktree_registration,
             path,
@@ -1158,7 +1161,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         max_words: ResponseWordBudget = 600,
         detailed: DetailedResponse = False,
     ) -> ApiEnvelope:
-        """Read compact coverage. Use detailed only for parser metadata/report provenance or raw file metrics."""
+        """Read one coverage projection: summary, files, file gaps, insights, or line_history. Use snapshot_id/suite/branch/file_path/line_number/line_ranges as required by the view; continue collections with cursor. Use detailed only for report/parser provenance, raw file metrics, or unabridged line-history records."""
         return await asyncio.to_thread(
             shared.coverage_query,
             view=view,
@@ -1187,7 +1190,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         max_words: ResponseWordBudget = 600,
         detailed: DetailedResponse = False,
     ) -> ApiEnvelope:
-        """Compare compact lineage. Use detailed only when raw snapshot provenance is explicitly required."""
+        """Compare compatible coverage lineage. Direct mode uses snapshot_id plus baseline_snapshot_id; worktree mode uses worktree_id. Views are overview, files, lines, and progress. Use detailed only for raw baseline/current snapshot provenance."""
         return await asyncio.to_thread(
             shared.coverage_comparison,
             view=view,
@@ -1211,7 +1214,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         cursor: PageCursor = None,
         max_words: ResponseWordBudget = 600,
     ) -> ApiEnvelope:
-        """Read word-bounded source lines with snapshot commit identity; no expanded mode is needed."""
+        """Read numbered source lines for one snapshot and repository-relative file_path. Request bounded one-based start/end ranges, usually after coverage_query identifies gaps or lines of interest."""
         return await asyncio.to_thread(
             shared.source,
             snapshot_id=snapshot_id,
