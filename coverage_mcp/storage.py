@@ -46,6 +46,9 @@ DEFAULT_RUN_RETENTION = 100
 DEFAULT_RUN_CONCURRENCY = 4
 MAX_RUN_CONCURRENCY = 32
 COMMAND_DURATION_SAMPLE_LIMIT = 20
+MIN_POLL_AFTER_MS = 1000
+UNKNOWN_HISTORY_POLL_AFTER_MS = 2500
+MAX_POLL_AFTER_MS = 30000
 MAX_COLLECTION_RECORDS = 5000
 COLLECTION_FETCH_LIMIT = MAX_COLLECTION_RECORDS + 1
 
@@ -1527,6 +1530,28 @@ class CoverageStore:
         )
         return fields
 
+    def _job_poll_after_ms(
+        self,
+        *,
+        terminal: bool,
+        status: str,
+        duration_ms: int,
+        eta_fields: dict[str, Any],
+    ) -> int | None:
+        if terminal:
+            return None
+        if status == "queued":
+            queue_wait_seconds = eta_fields.get("queue_wait_estimate_seconds")
+            if isinstance(queue_wait_seconds, int):
+                return min(max(queue_wait_seconds * 1000 // 2, MIN_POLL_AFTER_MS), MAX_POLL_AFTER_MS)
+        elif status == "running":
+            estimate_ms = eta_fields.get("duration_estimate_ms")
+            if isinstance(estimate_ms, int):
+                remaining_ms = max(estimate_ms - duration_ms, 0)
+                if remaining_ms > 0:
+                    return min(max(remaining_ms // 2, MIN_POLL_AFTER_MS), MAX_POLL_AFTER_MS)
+        return UNKNOWN_HISTORY_POLL_AFTER_MS
+
     def _job_response(self, job: dict[str, Any], *, max_summary_lines: int | None = None) -> dict[str, Any]:
         status = str(job["status"])
         terminal = status not in {"queued", "running"}
@@ -1542,11 +1567,17 @@ class CoverageStore:
             "artifact_paths": [],
             "coverage_ingest": self._job_coverage_ingest(job, terminal=terminal),
             "terminal": terminal,
-            "poll_after_ms": None if terminal else 1000,
             "execution_mode": "background",
             "cancellation_requested": job.get("cancellation_requested_at") is not None,
         }
-        result.update(self._job_eta_fields(job, status=status, now=now, duration_ms=result["duration_ms"]))
+        eta_fields = self._job_eta_fields(job, status=status, now=now, duration_ms=result["duration_ms"])
+        result.update(eta_fields)
+        result["poll_after_ms"] = self._job_poll_after_ms(
+            terminal=terminal,
+            status=status,
+            duration_ms=result["duration_ms"],
+            eta_fields=eta_fields,
+        )
         if terminal:
             result["parsed_summary"] = summarize_run_logs(
                 stdout_path=Path(job["stdout_path"]),

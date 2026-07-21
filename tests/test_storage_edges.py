@@ -1000,6 +1000,89 @@ print("1 passed")
         store.close()
 
 
+def test_poll_after_uses_eta_instead_of_fixed_heartbeat(tmp_path):
+    script = tmp_path / "sleep.py"
+    script.write_text(
+        """import sys
+import time
+
+time.sleep(float(sys.argv[1]))
+print("1 passed")
+""",
+        encoding="utf-8",
+    )
+
+    store = CoverageStore(tmp_path / "coverage.duckdb", run_concurrency=1)
+    try:
+        long_running = store.register_command(
+            name="long-running",
+            command=f"{sys.executable} {script.name} 0.8",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved dynamic polling running command",
+        )
+        queued_command = store.register_command(
+            name="queued",
+            command=f"{sys.executable} {script.name} 0.8",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved dynamic polling queued command",
+        )
+        no_history_command = store.register_command(
+            name="no-history",
+            command=f"{sys.executable} {script.name} 0.8",
+            cwd=tmp_path.as_posix(),
+            human_approved=True,
+            approved_by="tester",
+            approval_note="approved dynamic polling no-history command",
+        )
+        store._conn.execute(
+            """
+            UPDATE registered_commands
+            SET duration_estimate_ms = 10000, duration_p90_ms = 10000,
+                duration_sample_count = 3, duration_stats_updated_at = ?
+            WHERE id IN (?, ?)
+            """,
+            [datetime.now(UTC), long_running["id"], queued_command["id"]],
+        )
+
+        running = store.submit_command_profiled(long_running["id"])
+        for _ in range(100):
+            running = store.run_result(running["id"])
+            if running["status"] == "running":
+                break
+            time.sleep(0.01)
+        assert running["poll_after_ms"] > storage_module.MIN_POLL_AFTER_MS
+        assert running["poll_after_ms"] <= storage_module.MAX_POLL_AFTER_MS
+
+        queued = store.submit_command_profiled(queued_command["id"])
+        queued = store.run_result(queued["id"])
+        assert queued["status"] == "queued"
+        assert queued["queue_wait_estimate_seconds"] is not None
+        assert queued["poll_after_ms"] > storage_module.MIN_POLL_AFTER_MS
+        assert queued["poll_after_ms"] <= storage_module.MAX_POLL_AFTER_MS
+
+        store.cancel_run(queued["id"])
+        cancelled = store.cancel_run(running["id"])
+        if not cancelled["terminal"]:
+            cancelled = store.wait_for_run(running["id"])
+        assert cancelled["poll_after_ms"] is None
+
+        no_history = store.submit_command_profiled(no_history_command["id"])
+        for _ in range(100):
+            no_history = store.run_result(no_history["id"])
+            if no_history["status"] == "running":
+                break
+            time.sleep(0.01)
+        assert no_history["status"] == "running"
+        assert no_history["poll_after_ms"] == storage_module.UNKNOWN_HISTORY_POLL_AFTER_MS
+        store.cancel_run(no_history["id"])
+    finally:
+        store.close()
+
+
 def test_four_worker_pool_runs_in_parallel_and_estimates_by_lane(tmp_path):
     store = CoverageStore(tmp_path / "coverage.duckdb")
     try:

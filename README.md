@@ -385,7 +385,7 @@ This is the preferred agent workflow:
 2. Reuse an exact approved command. If none exists, present its complete command, cwd, shell, and artifacts for human
    approval, then call `register_test_command`.
 3. Submit it with `run_test`, save the returned run ID, and poll `test_run(action="status", detailed=false)` no faster than
-   `poll_after_ms`. Reuse one `idempotency_key` for retries of the same intended run.
+   the ETA-aware `poll_after_ms`. Reuse one `idempotency_key` for retries of the same intended run.
 4. When the run is terminal, inspect `coverage_ingest.status` and `coverage_ingest.snapshot_ids`. A declared artifact
    with `coverage_format` is automatically ingested only when that run created or modified it.
 5. Query the returned snapshot with `coverage_query` and `coverage_compare`, or open the
@@ -541,7 +541,9 @@ own history. The command record stores the median duration, p90 duration, sample
 time for its latest 20 natural completions. Passed and failed test processes contribute; cancellations, timeouts,
 interruptions, and launch failures do not. Queued ETA includes the estimated remaining time of FIFO jobs ahead plus
 the current command's median. When required history is missing, `eta_seconds` is `null` and
-`eta_unavailable_reason` explains why.
+`eta_unavailable_reason` explains why. `poll_after_ms` follows those same estimates: queued jobs poll around the
+estimated start, running jobs poll around estimated completion, and jobs without usable history use a conservative
+backoff instead of a one-second heartbeat.
 
 An idempotency key identifies one intended run and is scoped to the registered command. Repeating the same key returns
 the existing queued, running, or terminal run with `submission_reused: true`. Use a new key only when a genuinely new
@@ -626,7 +628,7 @@ The MCP server instructions plus `tools/list` are intended to be sufficient with
 
 1. Call `project_context` first and inspect approved commands, latest run freshness, active runs, and queue state.
 2. Run only an exact approved command. If one is missing, call `register_test_command` only after a human approves the exact command, cwd, shell, and artifacts.
-3. Submit with `run_test(wait=false)` and a stable `idempotency_key`, then poll `test_run(action="status")` no sooner than `poll_after_ms` until `terminal` is true.
+3. Submit with `run_test(wait=false)` and a stable `idempotency_key`, then poll `test_run(action="status")` no sooner than the ETA-aware `poll_after_ms` until `terminal` is true.
 4. Use `search_test_logs` for targeted retained stdout/stderr evidence; never request raw logs through `detailed`.
 5. Inspect `coverage_ingest.status` and `snapshot_ids`. Query returned snapshots with `coverage_query`, compare lineage-compatible snapshots or registered worktrees with `coverage_compare`, and fetch bounded source windows with `source_context`.
 
