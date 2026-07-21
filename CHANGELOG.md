@@ -5,8 +5,13 @@ minor versions may contain breaking public-contract changes.
 
 ## Unreleased
 
+## 0.7.1 - 2026-07-21
+
 ### Changed
 
+- Renamed the MCP run status fetch tool from `test_run` to `get_run_data`.
+- Added a separate `cancel_run` tool so read-only status fetches and mutating cancellation are explicit.
+- Clarified that agents must wait for the ETA-aware `poll_after_ms` before fetching non-terminal run data again.
 - Removed the retired schema-revision 6 MCP implementation and migration reference.
 - Replaced offset-bearing continuation tokens with record-anchored opaque cursors.
 - Disambiguated duplicate cursor anchors and made defensive collection caps fail explicitly instead of losing records.
