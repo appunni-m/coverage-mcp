@@ -65,7 +65,6 @@ from coverage_mcp.contracts import (
     PageCursor,
     ReportPath,
     ResponseWordBudget,
-    RunAction,
     RunId,
     ShellPath,
     SnapshotId,
@@ -987,10 +986,14 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         instructions=(
             f"Coverage MCP {__version__} schema 7 exposes a compact agent interface. Start with project_context, "
             "then run only exact approved registrations returned there or created with register_test_command after "
-            "human approval. Submit with run_test(wait=false), poll test_run at poll_after_ms until terminal, and use "
-            "search_test_logs for targeted retained stdout/stderr evidence. Use coverage_query for snapshot reads, "
-            "coverage_compare only for lineage-compatible snapshots or registered worktrees, and source_context only "
-            "for bounded source ranges already identified by coverage data. Every response is {context,data,page}; "
+            "human approval. Submit with run_test(wait=false), save the run id, then fetch status with "
+            "get_run_data(detailed=false). get_run_data is read-only: it only returns durable run data and never "
+            "starts, advances, reruns, or cancels work. For every non-terminal response, wait at least the returned "
+            "poll_after_ms before the next get_run_data call; do not poll immediately. Use cancel_run only when the "
+            "user no longer wants the run. Use search_test_logs for targeted retained stdout/stderr evidence. Use "
+            "coverage_query for snapshot reads, coverage_compare only for lineage-compatible snapshots or registered "
+            "worktrees, and source_context only for bounded source ranges already identified by coverage data. Every "
+            "response is {context,data,page}; "
             "max_words is the primary response budget and collections continue with page.next_cursor. Omit detailed "
             "or keep it false for normal work; set it true only when a tool description names required audit or "
             "raw-provenance fields. detailed never returns logs."
@@ -1066,7 +1069,7 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         wait: WaitForCompletion = False,
         max_words: ResponseWordBudget = 600,
     ) -> ApiEnvelope:
-        """Submit one approved command. Prefer wait=false with a stable idempotency_key; returns durable run id, queue/ETA, poll_after_ms, counters when known, and coverage_ingest. Poll test_run until terminal."""
+        """Submit one approved command. Prefer wait=false with a stable idempotency_key; returns durable run id, queue/ETA, poll_after_ms, counters when known, and coverage_ingest. Use get_run_data only after waiting the returned poll_after_ms."""
         response = await asyncio.to_thread(
             shared.run_submission,
             command_ref,
@@ -1077,15 +1080,24 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
         )
         return shared.apply_budget(response, max_words=max_words)
 
-    @mcp.tool(annotations=command_execution)
-    async def test_run(
+    @mcp.tool(annotations=read_only)
+    async def get_run_data(
         run_id: RunId,
-        action: RunAction = "status",
         max_words: ResponseWordBudget = 600,
         detailed: DetailedResponse = False,
     ) -> ApiEnvelope:
-        """Poll status or cancel a durable run. terminal=false means poll again no sooner than poll_after_ms; terminal=true is final result data. Use detailed only for artifact paths, exact timestamps, or execution audit."""
-        response = await asyncio.to_thread(shared.run_state, run_id, action=action, detailed=detailed)
+        """Fetch durable run data. This tool is read-only: it only returns current state and never starts, advances, reruns, or cancels a run. terminal=false means wait at least poll_after_ms before the next get_run_data call; do not immediately call again. Use detailed only for artifact paths, exact timestamps, or execution audit."""
+        response = await asyncio.to_thread(shared.run_state, run_id, action="status", detailed=detailed)
+        return shared.apply_budget(response, max_words=max_words)
+
+    @mcp.tool(annotations=command_execution)
+    async def cancel_run(
+        run_id: RunId,
+        max_words: ResponseWordBudget = 600,
+        detailed: DetailedResponse = False,
+    ) -> ApiEnvelope:
+        """Request process-group cancellation for a durable run that the user no longer wants. This is the mutating counterpart to read-only get_run_data. Use detailed only for artifact paths, exact timestamps, or execution audit."""
+        response = await asyncio.to_thread(shared.run_state, run_id, action="cancel", detailed=detailed)
         return shared.apply_budget(response, max_words=max_words)
 
     @mcp.tool(annotations=read_only)

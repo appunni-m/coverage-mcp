@@ -160,7 +160,7 @@ OptionalCommandReference = Annotated[
     str | None,
     Field(description="Registered command UUID or name; null searches across all commands."),
 ]
-RunId = Annotated[str, Field(min_length=1, description="Durable run UUID returned by run_command_profiled.")]
+RunId = Annotated[str, Field(min_length=1, description="Durable run UUID returned by run_test.")]
 SnapshotId = Annotated[str, Field(min_length=1, description="Immutable coverage snapshot UUID.")]
 OptionalSnapshotId = Annotated[
     str | None,
@@ -170,10 +170,6 @@ WorktreeId = Annotated[str, Field(min_length=1, description="Registered worktree
 OptionalWorktreeId = Annotated[
     str | None,
     Field(description="Registered worktree UUID; null selects direct snapshot-comparison mode."),
-]
-RunAction = Annotated[
-    Literal["status", "cancel"],
-    Field(description="Read durable status or request process-group cancellation."),
 ]
 CoverageQueryView = Annotated[
     Literal["summary", "files", "file", "insights", "line_history"],
@@ -252,7 +248,11 @@ CommandCwd = Annotated[
 ]
 WaitForCompletion = Annotated[
     bool,
-    Field(description="When true, block the MCP call until terminal; normally false so callers poll test_run."),
+    Field(
+        description=(
+            "When true, block the MCP call until terminal; normally false so callers fetch status with get_run_data."
+        )
+    ),
 ]
 DetailedResponse = Annotated[
     bool,
@@ -591,7 +591,12 @@ class RunResult(OutputModel):
     artifact_paths: list[RunArtifactResult] = Field(description="Declared artifact observations and ingestion links.")
     coverage_ingest: CoverageIngestResult = Field(description="Aggregate automatic coverage-ingestion outcome.")
     terminal: bool = Field(description="True when no further polling state transition is possible.")
-    poll_after_ms: int | None = Field(description="ETA-aware minimum recommended polling delay, or null when terminal.")
+    poll_after_ms: int | None = Field(
+        description=(
+            "ETA-aware minimum delay before the next status fetch; wait this many milliseconds after each "
+            "non-terminal response, or null when terminal."
+        )
+    )
     queue_position: int | None = Field(description="Zero for running, one-based for queued, null when terminal.")
     execution_mode: Literal["background"] = Field(description="Runner execution mode.")
     cancellation_requested: bool = Field(description="Whether process-group cancellation has been requested.")
@@ -641,7 +646,12 @@ class CompactRunResult(CompactOutputModel):
     branch: str | None = Field(description="Git branch detected at submission.")
     commit_sha: str | None = Field(description="Git commit detected at submission.")
     coverage_ingest: CoverageIngestResult = Field(description="Aggregate coverage-ingestion outcome.")
-    poll_after_ms: int | None = Field(description="ETA-aware minimum polling delay; null when terminal.")
+    poll_after_ms: int | None = Field(
+        description=(
+            "ETA-aware minimum delay before the next status fetch; wait this many milliseconds after each "
+            "non-terminal response, or null when terminal."
+        )
+    )
     queue_position: int | None = Field(description="Queue position, zero while running, null when terminal.")
     age_seconds: int = Field(description="Age of the current lifecycle state in whole seconds.")
     age: str = Field(description="Human-readable age of the current lifecycle state.")

@@ -37,7 +37,8 @@ EXPECTED_MCP_INPUTS = {
         "max_words",
     },
     "run_test": {"command_ref", "timeout_seconds", "idempotency_key", "wait", "max_words"},
-    "test_run": {"run_id", "action", "max_words", "detailed"},
+    "get_run_data": {"run_id", "max_words", "detailed"},
+    "cancel_run": {"run_id", "max_words", "detailed"},
     "search_test_logs": {
         "run_id",
         "query",
@@ -141,10 +142,11 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
         async def scenario():
             tools = {tool.name: tool for tool in await mcp.list_tools()}
             assert "Start with project_context" in mcp.instructions
-            assert "poll test_run at poll_after_ms" in mcp.instructions
+            assert "wait at least the returned poll_after_ms" in mcp.instructions
+            assert "do not poll immediately" in mcp.instructions
             assert "Every response is {context,data,page}" in mcp.instructions
             assert set(tools) == set(EXPECTED_MCP_INPUTS)
-            assert len(tools) == 10
+            assert len(tools) == 11
             for name, expected_inputs in EXPECTED_MCP_INPUTS.items():
                 tool = tools[name]
                 assert tool.description
@@ -163,6 +165,7 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
 
             read_only_tools = {
                 "project_context",
+                "get_run_data",
                 "search_test_logs",
                 "coverage_query",
                 "coverage_compare",
@@ -177,15 +180,18 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
                     assert tool.annotations.openWorldHint is False
             assert tools["run_test"].annotations.destructiveHint is True
             assert tools["run_test"].annotations.openWorldHint is True
-            assert "Poll test_run until terminal" in tools["run_test"].description
-            assert "terminal=false" in tools["test_run"].description
+            assert "waiting the returned poll_after_ms" in tools["run_test"].description
+            assert "This tool is read-only" in tools["get_run_data"].description
+            assert "never starts, advances, reruns, or cancels" in tools["get_run_data"].description
+            assert "do not immediately call again" in tools["get_run_data"].description
+            assert "mutating counterpart" in tools["cancel_run"].description
             assert "one query string or a list of query strings" in tools["search_test_logs"].description
             assert "no matches is a successful empty result" in tools["search_test_logs"].description
             assert "summary, files, file gaps, insights, or line_history" in tools["coverage_query"].description
             assert "Direct mode uses snapshot_id plus baseline_snapshot_id" in tools["coverage_compare"].description
             assert "coverage_compare worktree mode" in tools["register_worktree"].description
             wait_description = tools["run_test"].inputSchema["properties"]["wait"]["description"]
-            assert "test_run" in wait_description
+            assert "get_run_data" in wait_description
             assert "run_result" not in wait_description
 
             assert set(tools["coverage_query"].inputSchema["properties"]["view"]["enum"]) == {
@@ -201,7 +207,6 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
                 "lines",
                 "progress",
             }
-            assert set(tools["test_run"].inputSchema["properties"]["action"]["enum"]) == {"status", "cancel"}
             log_query = tools["search_test_logs"].inputSchema["properties"]["query"]
             assert {schema["type"] for schema in log_query["anyOf"]} == {"string", "array"}
             assert "any term is present" in log_query["description"]
@@ -383,7 +388,7 @@ def test_mcp_coverage_query_compare_source_and_resources(tmp_path):
 
 async def completed_run(mcp, run_id: str, *, detailed: bool = False):
     for _ in range(200):
-        result = data(await mcp.call_tool("test_run", {"run_id": run_id, "detailed": detailed}))
+        result = data(await mcp.call_tool("get_run_data", {"run_id": run_id, "detailed": detailed}))
         if result["terminal"]:
             return result
         await asyncio.sleep(0.02)
@@ -462,9 +467,7 @@ print('diagnostic needle')
             assert project["data"]["commands"][0]["command"] == f"{sys.executable} {script.name}"
             assert project["data"]["latest_run"]["id"] == result["id"]
             with pytest.raises(ToolError, match="already terminal"):
-                await mcp.call_tool("test_run", {"run_id": result["id"], "action": "cancel"})
-            with pytest.raises(ToolError, match="action"):
-                await mcp.call_tool("test_run", {"run_id": result["id"], "action": "unknown"})
+                await mcp.call_tool("cancel_run", {"run_id": result["id"]})
 
         run(scenario())
     finally:

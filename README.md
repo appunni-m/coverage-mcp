@@ -384,8 +384,9 @@ This is the preferred agent workflow:
 1. Call `project_context(detailed=false)` before running anything.
 2. Reuse an exact approved command. If none exists, present its complete command, cwd, shell, and artifacts for human
    approval, then call `register_test_command`.
-3. Submit it with `run_test`, save the returned run ID, and poll `test_run(action="status", detailed=false)` no faster than
-   the ETA-aware `poll_after_ms`. Reuse one `idempotency_key` for retries of the same intended run.
+3. Submit it with `run_test`, save the returned run ID, and fetch status with `get_run_data(detailed=false)`.
+   For every non-terminal response, wait at least the returned ETA-aware `poll_after_ms` before the next status fetch.
+   Reuse one `idempotency_key` for retries of the same intended run.
 4. When the run is terminal, inspect `coverage_ingest.status` and `coverage_ingest.snapshot_ids`. A declared artifact
    with `coverage_format` is automatically ingested only when that run created or modified it.
 5. Query the returned snapshot with `coverage_query` and `coverage_compare`, or open the
@@ -441,7 +442,7 @@ Projects using Coverage MCP can place this small policy in their `AGENTS.md`:
 - Keep `detailed=false` unless exact audit/provenance fields are necessary. Set a task-sized `max_words`, continue
   collections with `cursor`, and search logs by literal text with small surrounding windows.
 - Run tests through an existing human-approved command with `run_test`. Record the returned run id and
-  use one stable `idempotency_key` for that intended run. Poll `test_run(action="status", detailed=false)` no faster than `poll_after_ms`; retries
+  use one stable `idempotency_key` for that intended run. Fetch status with `get_run_data(detailed=false)` no faster than `poll_after_ms`; retries
   must reuse the same key. If no approved command exists, ask for explicit approval before registering one.
 - Declare managed coverage artifacts with `coverage_format` and a stable `suite`. On terminal runs, require
   `coverage_ingest.status` to report `ingested` and use its `snapshot_ids`; never ingest that artifact a second time.
@@ -487,11 +488,11 @@ run_test(
 )
 ```
 
-Submission returns immediately with a durable run id and `status` set to `queued` or `running`. Poll that id until
-`terminal` is true:
+Submission returns immediately with a durable run id and `status` set to `queued` or `running`. Fetch run data for
+that id until `terminal` is true:
 
 ```text
-test_run(run_id="returned-run-id", action="status", detailed=false, max_words=500)
+get_run_data(run_id="returned-run-id", detailed=false, max_words=500)
 ```
 
 Use `project_context(detailed=false)` to inspect active work and queue position. Set `wait=true` only for a command
@@ -543,7 +544,8 @@ interruptions, and launch failures do not. Queued ETA includes the estimated rem
 the current command's median. When required history is missing, `eta_seconds` is `null` and
 `eta_unavailable_reason` explains why. `poll_after_ms` follows those same estimates: queued jobs poll around the
 estimated start, running jobs poll around estimated completion, and jobs without usable history use a conservative
-backoff instead of a one-second heartbeat.
+10-second backoff instead of a one-second heartbeat. Treat `poll_after_ms` as the minimum delay after each
+non-terminal response before the next `get_run_data()` call.
 
 An idempotency key identifies one intended run and is scoped to the registered command. Repeating the same key returns
 the existing queued, running, or terminal run with `submission_reused: true`. Use a new key only when a genuinely new
@@ -571,7 +573,7 @@ serialized. A graceful shutdown waits for accepted work; check `project_context`
 matters. After an unexpected process exit, active runs are preserved as `interrupted` and queued runs resume from the
 same DuckDB rather than being submitted again.
 
-Every command starts in its own process group. `test_run(action="cancel")` and command timeouts signal the entire group, then escalate
+Every command starts in its own process group. `cancel_run()` and command timeouts signal the entire group, then escalate
 from `SIGTERM` to `SIGKILL` after two seconds if processes remain. This prevents child test processes from continuing
 after the managed run has ended.
 
@@ -618,17 +620,17 @@ Some formats are lossy when normalized. For example, Go reports blocks, Istanbul
 
 ## MCP Usage Guide
 
-Connect to `http://127.0.0.1:59471/mcp/`, or run `coverage-mcp connect` as a stdio proxy. Schema revision 7 exposes ten tools. Every result uses the same `{context, data, page}` envelope as REST and resources. `context` identifies `repo_key`, the exact `checkout_path`, the applicable `suite`, and `schema_revision` without repeating the full topology.
+Connect to `http://127.0.0.1:59471/mcp/`, or run `coverage-mcp connect` as a stdio proxy. Schema revision 7 exposes eleven tools. Every result uses the same `{context, data, page}` envelope as REST and resources. `context` identifies `repo_key`, the exact `checkout_path`, the applicable `suite`, and `schema_revision` without repeating the full topology.
 
 The server publishes MCP safety annotations: context, coverage, log-search, comparison, and source tools are read-only; command execution is explicitly marked as potentially destructive and open-world; registration and ingestion are local writes. Clients can therefore apply approval policy according to actual effects instead of treating every coverage lookup as a mutation.
 
-`max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only: a result above the cap fails explicitly and asks the caller to refine the query instead of reporting a false end of collection. Agents should omit `detailed` or leave it `false`. Only `project_context`, `test_run`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
+`max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only: a result above the cap fails explicitly and asks the caller to refine the query instead of reporting a false end of collection. Agents should omit `detailed` or leave it `false`. Only `project_context`, `get_run_data`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
 
 The MCP server instructions plus `tools/list` are intended to be sufficient without this README. The effective workflow is:
 
 1. Call `project_context` first and inspect approved commands, latest run freshness, active runs, and queue state.
 2. Run only an exact approved command. If one is missing, call `register_test_command` only after a human approves the exact command, cwd, shell, and artifacts.
-3. Submit with `run_test(wait=false)` and a stable `idempotency_key`, then poll `test_run(action="status")` no sooner than the ETA-aware `poll_after_ms` until `terminal` is true.
+3. Submit with `run_test(wait=false)` and a stable `idempotency_key`, then fetch status with `get_run_data()` no sooner than the ETA-aware `poll_after_ms` returned by the previous non-terminal response until `terminal` is true.
 4. Use `search_test_logs` for targeted retained stdout/stderr evidence; never request raw logs through `detailed`.
 5. Inspect `coverage_ingest.status` and `snapshot_ids`. Query returned snapshots with `coverage_query`, compare lineage-compatible snapshots or registered worktrees with `coverage_compare`, and fetch bounded source windows with `source_context`.
 
@@ -652,17 +654,25 @@ The MCP server instructions plus `tools/list` are intended to be sufficient with
 
 **Inputs:** `command_ref` selects an approved registration; `timeout_seconds`, `idempotency_key`, and `wait` control submission. `max_words` budgets output.
 
-**Returns:** Durable compact run state, queue position, polling guidance, age and duration estimates, counters, and coverage-ingestion state. Use `test_run` for subsequent state or exceptional audit detail.
+**Returns:** Durable compact run state, queue position, next-fetch guidance, age and duration estimates, counters, and coverage-ingestion state. Use `get_run_data()` for subsequent read-only state fetches or exceptional audit detail.
 
 **Errors:** Unknown or disabled commands, conflicting idempotent submissions, invalid timeouts, or an insufficient `max_words` budget fails. Test failure remains result data.
 
-### `test_run`
+### `get_run_data`
 
-**Inputs:** `run_id`, `action` (`status` or `cancel`), and `max_words`. Keep `detailed` false; use true only when exact artifact records/paths, timestamps, or execution audit metadata are required.
+**Inputs:** `run_id` and `max_words`. Keep `detailed` false; use true only when exact artifact records/paths, timestamps, or execution audit metadata are required.
 
-**Returns:** Current durable run state or cancellation state.
+**Returns:** Current durable run state. This tool is read-only: it only fetches stored run data and does not start, advance, rerun, or cancel anything. When `terminal` is false, wait at least the returned `poll_after_ms` before the next `get_run_data` call; do not poll immediately.
 
-**Errors:** Unknown `run_id`, unsupported `action`, invalid cancellation state, or an insufficient `max_words` budget fails.
+**Errors:** Unknown `run_id` or an insufficient `max_words` budget fails.
+
+### `cancel_run`
+
+**Inputs:** `run_id` and `max_words`. Keep `detailed` false; use true only when exact artifact records/paths, timestamps, or execution audit metadata are required.
+
+**Returns:** Durable run state after requesting process-group cancellation.
+
+**Errors:** Unknown `run_id`, invalid cancellation state, or an insufficient `max_words` budget fails.
 
 ### `search_test_logs`
 
