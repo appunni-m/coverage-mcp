@@ -7,6 +7,8 @@ import threading
 import time
 from pathlib import Path
 
+import duckdb
+import httpx
 import pytest
 import uvicorn
 from mcp import ClientSession
@@ -17,7 +19,7 @@ try:
 except ImportError:  # MCP 1.23 compatibility
     from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
-from coverage_mcp.app import create_app, create_mcp
+from coverage_mcp.app import REPOSITORY_HEADER, create_app, create_mcp, daemon_mcp_is_healthy
 from coverage_mcp.service import CoverageService, RequestContext
 from coverage_mcp.storage import CoverageStore
 
@@ -89,6 +91,29 @@ EXPECTED_MCP_RESOURCE_TEMPLATES = {"coverage://snapshot/{snapshot_id}/summary"}
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def start_http_server(app):
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="critical"))
+    thread = threading.Thread(target=server.run, name="coverage-mcp-http-test", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.started
+    port = server.servers[0].sockets[0].getsockname()[1]
+    return server, thread, f"http://127.0.0.1:{port}"
+
+
+def make_git_repo(path: Path) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-b", "main", path.as_posix()], check=True, capture_output=True)
+    subprocess.run(["git", "-C", path.as_posix(), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", path.as_posix(), "config", "user.name", "Test"], check=True)
+    (path / "a.py").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "-C", path.as_posix(), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", path.as_posix(), "commit", "-m", "base"], check=True, capture_output=True)
+    return path
 
 
 def structured(payload):
@@ -477,18 +502,11 @@ def test_mcp_worktree_registration_and_progress_validation(tmp_path):
 
 def test_streamable_http_protocol_uses_consolidated_contract(tmp_path):
     app = create_app((tmp_path / "coverage.duckdb").as_posix())
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="critical"))
-    thread = threading.Thread(target=server.run, name="coverage-mcp-http-test", daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 10
-    while not server.started and thread.is_alive() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert server.started
-    port = server.servers[0].sockets[0].getsockname()[1]
+    server, thread, url = start_http_server(app)
 
     async def scenario():
         async with (
-            streamable_http_client(f"http://127.0.0.1:{port}/mcp/") as (read_stream, write_stream, _),
+            streamable_http_client(f"{url}/mcp/") as (read_stream, write_stream, _),
             ClientSession(read_stream, write_stream) as session,
         ):
             initialized = await session.initialize()
@@ -504,6 +522,52 @@ def test_streamable_http_protocol_uses_consolidated_contract(tmp_path):
 
     try:
         run(scenario())
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+
+def test_streamable_http_protocol_routes_repository_context(tmp_path):
+    repo = make_git_repo(tmp_path / "repo")
+    app = create_app(common_db_path=(tmp_path / "common.duckdb").as_posix())
+    server, thread, url = start_http_server(app)
+
+    async def scenario():
+        async with (
+            httpx.AsyncClient(headers={REPOSITORY_HEADER: repo.as_posix()}) as http_client,
+            streamable_http_client(f"{url}/mcp/", http_client=http_client) as (read_stream, write_stream, _),
+            ClientSession(read_stream, write_stream) as session,
+        ):
+            initialized = await session.initialize()
+            assert initialized.serverInfo.name == "coverage-mcp"
+            tools = await session.list_tools()
+            assert {tool.name for tool in tools.tools} == set(EXPECTED_MCP_INPUTS)
+            result = await session.call_tool("project_context", {"max_words": 100})
+            assert result.isError is False
+            assert result.structuredContent["context"]["checkout_path"] == repo.as_posix()
+
+    try:
+        assert daemon_mcp_is_healthy(url, repo.as_posix()) is True
+        run(scenario())
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+
+def test_daemon_mcp_health_rejects_repository_selection_failure(monkeypatch, tmp_path):
+    repo = make_git_repo(tmp_path / "repo")
+    app = create_app(common_db_path=(tmp_path / "common.duckdb").as_posix())
+    monkeypatch.setattr(
+        app.state.coverage_store,
+        "select",
+        lambda _: (_ for _ in ()).throw(duckdb.IOException("database is locked")),
+    )
+    server, thread, url = start_http_server(app)
+
+    try:
+        assert daemon_mcp_is_healthy(url, repo.as_posix()) is False
     finally:
         server.should_exit = True
         thread.join(timeout=10)

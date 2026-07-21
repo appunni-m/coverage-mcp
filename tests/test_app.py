@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 
+import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
@@ -158,6 +159,19 @@ def test_global_app_reports_invalid_repository_selection(monkeypatch, tmp_path):
         response = client.get("/api/snapshots", headers={REPOSITORY_HEADER: tmp_path.as_posix()})
     assert response.status_code == 400
     assert response.json()["detail"] == "bad repo"
+
+
+def test_global_app_reports_locked_repository_selection(monkeypatch, tmp_path):
+    app = create_app(common_db_path=(tmp_path / "common.duckdb").as_posix())
+    monkeypatch.setattr(
+        app.state.coverage_store,
+        "select",
+        lambda _: (_ for _ in ()).throw(duckdb.IOException("database is locked")),
+    )
+    with TestClient(app) as client:
+        response = client.get("/api/snapshots", headers={REPOSITORY_HEADER: tmp_path.as_posix()})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "database is locked"
 
 
 def test_default_common_database_uses_user_coverage_directory(monkeypatch, tmp_path):

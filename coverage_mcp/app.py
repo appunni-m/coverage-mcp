@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import anyio
+import duckdb
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from filelock import FileLock
+from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
@@ -306,7 +308,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
                 )
             try:
                 token = store.select(repo_path)
-            except (FileNotFoundError, ValueError) as exc:
+            except (duckdb.Error, FileNotFoundError, OSError, ValueError) as exc:
                 return JSONResponse(status_code=400, content={"detail": str(exc)})
             try:
                 return await call_next(request)
@@ -1288,6 +1290,27 @@ def daemon_is_reachable(url: str | None = None) -> bool:
         return False
 
 
+async def _probe_mcp_transport(url: str, repo_path: str) -> bool:
+    async with (
+        httpx.AsyncClient(headers={REPOSITORY_HEADER: repo_path}) as client,
+        streamable_http_client(f"{url}/mcp/", http_client=client) as (read_stream, write_stream, _),
+        ClientSession(read_stream, write_stream) as session,
+    ):
+        initialized = await session.initialize()
+        if initialized.serverInfo.name != "coverage-mcp":
+            return False
+        tools = await session.list_tools()
+        return bool(tools.tools)
+
+
+def daemon_mcp_is_healthy(url: str | None = None, repo_path: str | None = None) -> bool:
+    """Verify that the daemon's MCP transport can initialize for a repository."""
+    try:
+        return anyio.run(_probe_mcp_transport, url or daemon_url(), repo_path or inspect_git(None).path)
+    except Exception:
+        return False
+
+
 def start_daemon() -> None:
     log_path = Path(default_common_db_path()).parent / "daemon.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1359,6 +1382,8 @@ async def proxy_stdio_to_http(url: str, repo_path: str) -> None:
 def connect() -> None:
     url = ensure_daemon()
     repo_path = inspect_git(None).path
+    if not daemon_mcp_is_healthy(url, repo_path):
+        raise RuntimeError(f"Coverage MCP daemon at {url} is healthy but its MCP transport is unavailable")
     anyio.run(proxy_stdio_to_http, url, repo_path)
 
 

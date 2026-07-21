@@ -439,6 +439,15 @@ def test_connect_uses_shared_daemon_and_repository(monkeypatch):
     calls = []
     monkeypatch.setattr(app_module, "ensure_daemon", lambda: "http://daemon")
     monkeypatch.setattr(app_module, "inspect_git", lambda _path: type("Git", (), {"path": "/repo/worktree"})())
+    monkeypatch.setattr(app_module, "daemon_mcp_is_healthy", lambda _url, _repo_path: True)
     monkeypatch.setattr(app_module.anyio, "run", lambda function, *args: calls.append((function, args)))
     app_module.connect()
     assert calls == [(app_module.proxy_stdio_to_http, ("http://daemon", "/repo/worktree"))]
+
+
+def test_connect_refuses_daemon_with_broken_mcp_transport(monkeypatch):
+    monkeypatch.setattr(app_module, "ensure_daemon", lambda: "http://daemon")
+    monkeypatch.setattr(app_module, "inspect_git", lambda _path: type("Git", (), {"path": "/repo/worktree"})())
+    monkeypatch.setattr(app_module, "daemon_mcp_is_healthy", lambda _url, _repo_path: False)
+    with pytest.raises(RuntimeError, match="MCP transport is unavailable"):
+        app_module.connect()
