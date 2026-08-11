@@ -267,7 +267,7 @@ class CoverageStore:
                     snapshot_id VARCHAR NOT NULL,
                     file_path VARCHAR NOT NULL,
                     line_number INTEGER NOT NULL,
-                    hits INTEGER NOT NULL,
+                    hits BIGINT NOT NULL,
                     covered BOOLEAN NOT NULL,
                     count_line BOOLEAN NOT NULL,
                     total_branches INTEGER NOT NULL,
@@ -408,7 +408,13 @@ class CoverageStore:
                     self._conn.execute(statement)
 
     def _migrate_schema(self) -> None:
-        line_columns = {row[1] for row in self._conn.execute("PRAGMA table_info('lines')").fetchall()}
+        line_info = self._conn.execute("PRAGMA table_info('lines')").fetchall()
+        line_columns = {row[1] for row in line_info}
+        line_types = {row[1]: row[2] for row in line_info if len(row) > 2}
+        if line_types.get("hits") == "INTEGER":
+            with suppress(duckdb.Error):
+                self._conn.execute("DROP INDEX IF EXISTS idx_lines_lookup")
+            self._conn.execute("ALTER TABLE lines ALTER COLUMN hits SET DATA TYPE BIGINT")
         if "count_line" not in line_columns:
             self._conn.execute("ALTER TABLE lines ADD COLUMN count_line BOOLEAN DEFAULT true")
         for table in ("snapshots", "files"):

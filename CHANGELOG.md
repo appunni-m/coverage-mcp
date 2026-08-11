@@ -5,6 +5,13 @@ minor versions may contain breaking public-contract changes.
 
 ## Unreleased
 
+### Changed
+
+- Hardened the stable MCP 1.x transport against client-disconnect shutdown races by dropping transport exceptions
+  locally instead of writing notifications through a failed stream.
+- Switched the stateless MCP endpoint to JSON responses and bounded concurrent POST work with
+  `COVERAGE_MCP_HTTP_CONCURRENCY` (default `16`, range `1-128`).
+
 ## 0.7.1 - 2026-07-21
 
 ### Changed

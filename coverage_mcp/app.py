@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import logging
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.stdio import stdio_server
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
+from starlette.requests import ClientDisconnect
 
 from coverage_mcp import __version__
 from coverage_mcp.contracts import (
@@ -90,6 +92,11 @@ DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
 REPOSITORY_HEADER = "x-coverage-mcp-repo"
 DEFAULT_DAEMON_START_TIMEOUT_SECONDS = 10.0
+DEFAULT_MCP_HTTP_CONCURRENCY = 16
+MAX_MCP_HTTP_CONCURRENCY = 128
+MCP_HTTP_CONCURRENCY_ENV = "COVERAGE_MCP_HTTP_CONCURRENCY"
+
+logger = logging.getLogger(__name__)
 
 
 def default_common_db_path() -> str:
@@ -107,6 +114,35 @@ def daemon_url() -> str:
     host = os.environ.get("COVERAGE_MCP_HOST", "127.0.0.1")
     port = int(os.environ.get("COVERAGE_MCP_PORT", str(DEFAULT_PORT)))
     return f"http://{host}:{port}"
+
+
+def configured_mcp_http_concurrency() -> int:
+    value = int(os.environ.get(MCP_HTTP_CONCURRENCY_ENV, str(DEFAULT_MCP_HTTP_CONCURRENCY)))
+    if not 1 <= value <= MAX_MCP_HTTP_CONCURRENCY:
+        raise ValueError(f"{MCP_HTTP_CONCURRENCY_ENV} must be between 1 and {MAX_MCP_HTTP_CONCURRENCY}")
+    return value
+
+
+class BoundedMCPApp:
+    """Queue MCP POST work so client bursts cannot exhaust the daemon."""
+
+    def __init__(self, app: Any, max_concurrency: int) -> None:
+        self.app = app
+        self._limiter = anyio.CapacityLimiter(max_concurrency)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        async with self._limiter:
+            await self.app(scope, receive, send)
+
+
+class _ExpectedMCPDisconnectFilter(logging.Filter):
+    """Keep normal peer disconnects out of the daemon's error log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not (record.exc_info and isinstance(record.exc_info[1], ClientDisconnect))
 
 
 class CoverageRepoStore:
@@ -241,6 +277,7 @@ class RunCommandRequest(BaseModel):
 def create_app(db_path: str | None = None, *, common_db_path: str | None = None) -> FastAPI:
     run_retention = int(os.environ.get("COVERAGE_MCP_RUN_RETENTION", DEFAULT_RUN_RETENTION))
     run_concurrency = int(os.environ.get("COVERAGE_MCP_RUN_CONCURRENCY", DEFAULT_RUN_CONCURRENCY))
+    mcp_http_concurrency = configured_mcp_http_concurrency()
     if db_path is None:
         store: CoverageStore = RepositoryStoreRouter(
             CoverageRepoStore(CommonStore(common_db_path or default_common_db_path()))
@@ -257,7 +294,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
 
     service = CoverageService(store, context_provider)
     mcp = create_mcp(store, service)
-    mcp_app = mcp.streamable_http_app()
+    mcp_app = BoundedMCPApp(mcp.streamable_http_app(), mcp_http_concurrency)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -279,6 +316,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
     )
     app.state.coverage_store = store
     app.state.coverage_service = service
+    app.state.mcp_http_concurrency = mcp_http_concurrency
 
     @app.middleware("http")
     async def security_headers(request: Any, call_next: Any) -> Any:
@@ -334,6 +372,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
                 "repository_count": len(store.stores._stores),
                 "run_retention": run_retention,
                 "run_concurrency": run_concurrency,
+                "mcp_http_concurrency": mcp_http_concurrency,
             }
         return {
             "ok": True,
@@ -343,6 +382,7 @@ def create_app(db_path: str | None = None, *, common_db_path: str | None = None)
             "db_path": store.db_path.as_posix(),
             "run_retention": store.run_retention,
             "run_concurrency": store.run_concurrency,
+            "mcp_http_concurrency": mcp_http_concurrency,
         }
 
     @app.post("/api/ingest")
@@ -996,8 +1036,11 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
             "response is {context,data,page}; "
             "max_words is the primary response budget and collections continue with page.next_cursor. Omit detailed "
             "or keep it false for normal work; set it true only when a tool description names required audit or "
-            "raw-provenance fields. detailed never returns logs."
+            "raw-provenance fields. detailed never returns logs. The daemon uses stateless JSON responses and bounds "
+            "concurrent MCP requests; keep query fan-out bounded and retry an individual request if its client "
+            "connection is interrupted."
         ),
+        json_response=True,
         stateless_http=True,
         streamable_http_path="/",
     )
@@ -1263,7 +1306,41 @@ def create_mcp(store: CoverageStore, service: CoverageService | None = None) -> 
             )
         ).model_dump()
 
+    _harden_mcp_transport_errors(mcp)
     return mcp
+
+
+def _harden_mcp_transport_errors(mcp: FastMCP) -> None:
+    """Do not write a notification back through a transport that already failed.
+
+    Stable MCP 1.x sends an ``Exception`` from a broken transport into the
+    server session, then tries to emit ``notifications/message`` on that same
+    closed transport. That creates a shutdown race and can take down a
+    stateless request. The MCP 2.x fix removes that write; keep the compatible
+    behavior locally while Coverage MCP supports stable 1.x.
+    """
+
+    transport_logger = logging.getLogger("mcp.server.streamable_http")
+    if not any(isinstance(item, _ExpectedMCPDisconnectFilter) for item in transport_logger.filters):
+        transport_logger.addFilter(_ExpectedMCPDisconnectFilter())
+
+    server: Any = mcp._mcp_server
+    original_handle_message = server._handle_message
+
+    async def handle_message(
+        message: Any,
+        session: Any,
+        lifespan_context: Any,
+        raise_exceptions: bool = False,
+    ) -> None:
+        if isinstance(message, Exception):
+            logger.debug("MCP transport ended before request completion: %s", message)
+            if raise_exceptions:
+                raise message
+            return
+        await original_handle_message(message, session, lifespan_context, raise_exceptions)
+
+    server._handle_message = handle_message
 
 
 def _http_error(exc: Exception) -> HTTPException:

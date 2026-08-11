@@ -156,6 +156,7 @@ It runs locally, stores coverage snapshots in DuckDB, exposes a dashboard, and p
 | MCP endpoint | `http://127.0.0.1:59471/mcp/` |
 | Database | `<shared-git-root>/.coverage-mcp/coverage.duckdb` |
 | Run concurrency | Four managed commands, FIFO assignment |
+| MCP request concurrency | Sixteen active HTTP POST requests; excess queued |
 | Run retention | Newest 100 terminal runs per registered command |
 
 ## What Problem It Solves
@@ -275,12 +276,18 @@ Override host, port, or DB:
 COVERAGE_MCP_HOST=127.0.0.1 \
 COVERAGE_MCP_PORT=8765 \
 COVERAGE_MCP_RUN_CONCURRENCY=4 \
+COVERAGE_MCP_HTTP_CONCURRENCY=16 \
 coverage-mcp serve
 ```
 
 `COVERAGE_MCP_RUN_CONCURRENCY` accepts 1-32 workers and defaults to `4`. Use
 `1` for suites that share non-isolated build outputs and cannot safely overlap.
 The active value is returned by `/health`.
+
+`COVERAGE_MCP_HTTP_CONCURRENCY` accepts 1-128 concurrent MCP POST requests and defaults to `16`. Additional
+requests wait for a slot instead of creating an unbounded burst of DuckDB and worker activity. The active value is
+returned by `/health`. The MCP endpoint uses stateless JSON responses because Coverage MCP exposes request/response
+tools and does not require server-initiated notifications.
 
 Retain more or fewer terminal test runs per approved command:
 
@@ -622,7 +629,7 @@ Some formats are lossy when normalized. For example, Go reports blocks, Istanbul
 
 Connect to `http://127.0.0.1:59471/mcp/`, or run `coverage-mcp connect` as a stdio proxy. Schema revision 7 exposes eleven tools. Every result uses the same `{context, data, page}` envelope as REST and resources. `context` identifies `repo_key`, the exact `checkout_path`, the applicable `suite`, and `schema_revision` without repeating the full topology.
 
-The server publishes MCP safety annotations: context, coverage, log-search, comparison, and source tools are read-only; command execution is explicitly marked as potentially destructive and open-world; registration and ingestion are local writes. Clients can therefore apply approval policy according to actual effects instead of treating every coverage lookup as a mutation.
+The server publishes MCP safety annotations: context, coverage, log-search, comparison, and source tools are read-only; command execution is explicitly marked as potentially destructive and open-world; registration and ingestion are local writes. Clients can therefore apply approval policy according to actual effects instead of treating every coverage lookup as a mutation. The daemon bounds concurrent MCP requests and treats a disconnected client as a completed transport cleanup, so an interrupted request does not poison other requests.
 
 `max_words` is the primary response budget. Collections continue through opaque `cursor`/`next_cursor` values; numeric offsets are not public. Internal item caps are defensive only: a result above the cap fails explicitly and asks the caller to refine the query instead of reporting a false end of collection. Agents should omit `detailed` or leave it `false`. Only `project_context`, `get_run_data`, `coverage_query`, and `coverage_compare` expose it, for specifically requested audit or raw-provenance fields; it is never a way to retrieve logs. Parent lookups fail for unknown IDs, and comparisons reject mismatched repositories, suites, checkout lineage, or snapshots predating worktree registration.
 

@@ -1,25 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+import anyio
 import duckdb
 import httpx
 import pytest
 import uvicorn
 from mcp import ClientSession
 from mcp.server.fastmcp.exceptions import ToolError
+from starlette.requests import ClientDisconnect
 
 try:
     from mcp.client.streamable_http import streamable_http_client
 except ImportError:  # MCP 1.23 compatibility
     from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
-from coverage_mcp.app import REPOSITORY_HEADER, create_app, create_mcp, daemon_mcp_is_healthy
+from coverage_mcp import app as app_module
+from coverage_mcp.app import (
+    REPOSITORY_HEADER,
+    BoundedMCPApp,
+    create_app,
+    create_mcp,
+    daemon_mcp_is_healthy,
+)
 from coverage_mcp.service import CoverageService, RequestContext
 from coverage_mcp.storage import CoverageStore
 
@@ -474,6 +484,43 @@ print('diagnostic needle')
         store.close()
 
 
+def test_mcp_cancel_run_returns_updated_state(tmp_path):
+    script = tmp_path / "slow.py"
+    script.write_text("import time\ntime.sleep(2)\n", encoding="utf-8")
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        mcp = mcp_for(store, tmp_path)
+
+        async def scenario():
+            command = data(
+                await mcp.call_tool(
+                    "register_test_command",
+                    {
+                        "name": "slow",
+                        "command": f"{sys.executable} {script.name}",
+                        "cwd": tmp_path.as_posix(),
+                        "human_approved": True,
+                        "approved_by": "tester",
+                        "approval_note": "approved cancellation response test",
+                    },
+                )
+            )
+            submitted = data(
+                await mcp.call_tool(
+                    "run_test",
+                    {"command_ref": command["id"], "idempotency_key": "cancel-success"},
+                )
+            )
+            cancellation = data(await mcp.call_tool("cancel_run", {"run_id": submitted["id"]}))
+            assert cancellation["cancellation_requested"] is True
+            result = await completed_run(mcp, submitted["id"])
+            assert result["status"] == "cancelled"
+
+        run(scenario())
+    finally:
+        store.close()
+
+
 def test_mcp_worktree_registration_and_progress_validation(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -531,6 +578,55 @@ def test_streamable_http_protocol_uses_consolidated_contract(tmp_path):
         assert not thread.is_alive()
 
 
+def test_mcp_transport_errors_are_not_rebroadcast(tmp_path):
+    store = CoverageStore(tmp_path / "coverage.duckdb")
+    try:
+        server = mcp_for(store, tmp_path)._mcp_server
+
+        async def scenario():
+            await server._handle_message(object(), object(), object())
+            await server._handle_message(RuntimeError("client disconnected"), object(), object())
+            with pytest.raises(RuntimeError, match="raise this"):
+                await server._handle_message(RuntimeError("raise this"), object(), object(), True)
+
+        run(scenario())
+    finally:
+        store.close()
+
+
+def test_expected_mcp_disconnect_filter_drops_only_peer_disconnects():
+    expected = app_module._ExpectedMCPDisconnectFilter()
+    record = logging.LogRecord("test", logging.ERROR, __file__, 1, "disconnect", (), None)
+    record.exc_info = (ClientDisconnect, ClientDisconnect(), None)
+    assert expected.filter(record) is False
+
+    record.exc_info = (ValueError, ValueError("other"), None)
+    assert expected.filter(record) is True
+    record.exc_info = None
+    assert expected.filter(record) is True
+
+
+def test_bounded_mcp_app_limits_post_work():
+    active = 0
+    peak = 0
+
+    async def endpoint(_scope, _receive, _send):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await anyio.sleep(0.01)
+        active -= 1
+
+    bounded = BoundedMCPApp(endpoint, max_concurrency=2)
+
+    async def scenario():
+        await asyncio.gather(*(bounded({"type": "http", "method": "POST"}, None, None) for _ in range(5)))
+        await bounded({"type": "http", "method": "GET"}, None, None)
+
+    run(scenario())
+    assert peak == 2
+
+
 def test_streamable_http_protocol_routes_repository_context(tmp_path):
     repo = make_git_repo(tmp_path / "repo")
     app = create_app(common_db_path=(tmp_path / "common.duckdb").as_posix())
@@ -575,6 +671,37 @@ def test_daemon_mcp_health_rejects_repository_selection_failure(monkeypatch, tmp
         server.should_exit = True
         thread.join(timeout=10)
         assert not thread.is_alive()
+
+
+def test_daemon_mcp_health_rejects_wrong_server(monkeypatch):
+    class Context:
+        def __init__(self, value):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, *_):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return type("Initialized", (), {"serverInfo": type("ServerInfo", (), {"name": "other"})()})()
+
+    monkeypatch.setattr(app_module.httpx, "AsyncClient", lambda **kwargs: Context("client"))
+    monkeypatch.setattr(
+        app_module,
+        "streamable_http_client",
+        lambda *args, **kwargs: Context(("read", "write", None)),
+    )
+    monkeypatch.setattr(app_module, "ClientSession", lambda *_args: Session())
+    assert app_module.daemon_mcp_is_healthy("http://daemon", "/repo") is False
 
 
 def test_readme_documents_consolidated_mcp_contract():

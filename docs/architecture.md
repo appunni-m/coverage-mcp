@@ -43,8 +43,10 @@ cursors, while server-side record caps exist only as defensive bounds.
 - MCP, resources, REST, and dashboard calls use the same service and projection behavior.
 
 The embedded dashboard document lives in `coverage_mcp/dashboard.py`; transport and lifecycle assembly remain in
-`coverage_mcp/app.py`. Keeping the dashboard local and dependency-free lets `uvx coverage-mcp connect` install one
-small Python distribution without a separate frontend build toolchain.
+`coverage_mcp/app.py`. The MCP endpoint is stateless, uses JSON request/response messages, and queues concurrent POST
+requests behind a bounded limiter. A client disconnect is treated as transport cleanup and is not rebroadcast through
+the already-closed session stream. Keeping the dashboard local and dependency-free lets `uvx coverage-mcp connect`
+install one small Python distribution without a separate frontend build toolchain.
 
 `coverage_mcp/storage.py` owns DuckDB state and run scheduling. Pure response, topology, time, and bounded-log
 projections live in `coverage_mcp/storage_helpers.py`, keeping data ownership separate from presentation logic and

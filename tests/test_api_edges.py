@@ -63,6 +63,7 @@ def test_rest_endpoints_cover_success_and_error_paths(tmp_path):
         assert health["version"] == "0.7.1"
         assert health["run_retention"] == 100
         assert health["run_concurrency"] == 4
+        assert health["mcp_http_concurrency"] == 16
         assert client.get("/api/snapshots/latest").status_code == 404
         assert client.get("/api/artifacts/latest?kind=missing").status_code == 404
         assert client.get("/api/runs/latest").status_code == 404
@@ -352,6 +353,19 @@ def test_daemon_health_and_startup(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module.time, "monotonic", lambda: next(monotonic_values))
     with pytest.raises(RuntimeError, match="did not become healthy"):
         app_module.ensure_daemon(timeout_seconds=1)
+
+
+def test_mcp_http_concurrency_configuration(monkeypatch, tmp_path):
+    monkeypatch.setenv(app_module.MCP_HTTP_CONCURRENCY_ENV, "2")
+    app = create_app((tmp_path / "coverage.duckdb").as_posix())
+    try:
+        assert app.state.mcp_http_concurrency == 2
+    finally:
+        app.state.coverage_store.close()
+
+    monkeypatch.setenv(app_module.MCP_HTTP_CONCURRENCY_ENV, "129")
+    with pytest.raises(ValueError, match="between 1 and 128"):
+        create_app((tmp_path / "invalid.duckdb").as_posix())
 
 
 def test_daemon_start_and_cli_commands(capsys, monkeypatch, tmp_path):
