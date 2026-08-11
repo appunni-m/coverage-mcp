@@ -21,7 +21,7 @@ agent workflow.
 2. Update typed contract descriptions in `coverage_mcp/contracts.py`.
    - Input descriptions are what clients see in `tools/list`.
    - Keep names consistent with actual tool names. For example, polling uses
-     `test_run`, not internal storage names such as `run_result`.
+     `get_run_data`, not internal storage names such as `run_result`.
    - Describe non-obvious semantics such as OR matching, cursor ownership, or
      detailed-mode limits.
 
@@ -78,7 +78,7 @@ Agents should:
    `register_test_command` only after human approval of the exact command, cwd,
    shell, and artifacts.
 3. Submit with `run_test(wait=false)` and a stable `idempotency_key`.
-4. Poll `test_run(action="status", detailed=false)` no sooner than
+4. Poll `get_run_data(detailed=false)` no sooner than
    `poll_after_ms` until `terminal` is true.
 5. Use `search_test_logs` for targeted retained stdout/stderr evidence; never
    use `detailed` to retrieve logs.

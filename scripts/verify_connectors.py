@@ -12,6 +12,28 @@ from mcp.client.stdio import stdio_client
 
 from coverage_mcp.app import daemon_url
 
+EXPECTED_MCP_TOOLS = {
+    "cancel_run",
+    "coverage_compare",
+    "coverage_query",
+    "ingest_coverage",
+    "project_context",
+    "register_test_command",
+    "register_worktree",
+    "run_test",
+    "get_run_data",
+    "search_test_logs",
+    "source_context",
+}
+EXPECTED_READ_ONLY_MCP_TOOLS = {
+    "coverage_compare",
+    "coverage_query",
+    "get_run_data",
+    "project_context",
+    "search_test_logs",
+    "source_context",
+}
+
 
 async def verify_connector(index: int, repository: Path, results: list[dict[str, Any]]) -> None:
     server = StdioServerParameters(
@@ -52,36 +74,17 @@ async def main_async(connector_count: int) -> None:
         for index in range(connector_count):
             tasks.start_soon(verify_connector, index, repository, results)
     after = httpx.get(f"{daemon_url()}/health", timeout=2).json()
-    expected_tools = {
-        "coverage_compare",
-        "coverage_query",
-        "ingest_coverage",
-        "project_context",
-        "register_test_command",
-        "register_worktree",
-        "run_test",
-        "search_test_logs",
-        "source_context",
-        "test_run",
-    }
-    expected_read_only_tools = {
-        "coverage_compare",
-        "coverage_query",
-        "project_context",
-        "search_test_logs",
-        "source_context",
-    }
     assert len(results) == connector_count
     assert all(result["daemon_pid"] == after["pid"] for result in results)
     assert all(result["server"] == "coverage-mcp" for result in results)
     assert all(result["schema_revision"] == 7 for result in results)
-    assert all(set(result["tools"]) == expected_tools for result in results)
-    assert all(set(result["read_only_tools"]) == expected_read_only_tools for result in results)
+    assert all(set(result["tools"]) == EXPECTED_MCP_TOOLS for result in results)
+    assert all(set(result["read_only_tools"]) == EXPECTED_READ_ONLY_MCP_TOOLS for result in results)
     assert all(result["run_test_destructive"] is True for result in results)
     assert all(result["run_test_open_world"] is True for result in results)
     print(f"verified_connectors={connector_count}")
     print(f"shared_daemon_pid={after['pid']}")
-    print("tool_count=10")
+    print(f"tool_count={len(EXPECTED_MCP_TOOLS)}")
 
 
 def main() -> None:

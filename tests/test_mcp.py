@@ -32,6 +32,7 @@ from coverage_mcp.app import (
 )
 from coverage_mcp.service import CoverageService, RequestContext
 from coverage_mcp.storage import CoverageStore
+from scripts.verify_connectors import EXPECTED_MCP_TOOLS, EXPECTED_READ_ONLY_MCP_TOOLS
 
 EXPECTED_MCP_INPUTS = {
     "project_context": {"cursor", "max_words", "detailed"},
@@ -156,6 +157,8 @@ def test_mcp_contract_is_compact_described_and_word_budgeted(tmp_path):
             assert "do not poll immediately" in mcp.instructions
             assert "Every response is {context,data,page}" in mcp.instructions
             assert set(tools) == set(EXPECTED_MCP_INPUTS)
+            assert set(tools) == EXPECTED_MCP_TOOLS
+            assert set(tools) >= EXPECTED_READ_ONLY_MCP_TOOLS
             assert len(tools) == 11
             for name, expected_inputs in EXPECTED_MCP_INPUTS.items():
                 tool = tools[name]
