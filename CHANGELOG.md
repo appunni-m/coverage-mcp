@@ -11,6 +11,10 @@ minor versions may contain breaking public-contract changes.
   locally instead of writing notifications through a failed stream.
 - Switched the stateless MCP endpoint to JSON responses and bounded concurrent POST work with
   `COVERAGE_MCP_HTTP_CONCURRENCY` (default `16`, range `1-128`).
+- Made each stdio connector validate the complete schema-7 tool inventory, safety annotations, and a live
+  `project_context` response before proxying client traffic.
+- Increased the loopback health-probe tolerance used by concurrent lazy connectors so a busy existing daemon is
+  reused instead of being duplicated against DuckDB's single-owner lock.
 
 ## 0.7.1 - 2026-07-21
 

@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import duckdb
@@ -705,6 +706,101 @@ def test_daemon_mcp_health_rejects_wrong_server(monkeypatch):
     )
     monkeypatch.setattr(app_module, "ClientSession", lambda *_args: Session())
     assert app_module.daemon_mcp_is_healthy("http://daemon", "/repo") is False
+
+
+def test_daemon_mcp_health_rejects_partial_unsafe_or_unusable_contract(monkeypatch):
+    class Context:
+        def __init__(self, value):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, *_):
+            return False
+
+    def valid_tools():
+        tools = []
+        for name in app_module.MCP_TOOL_NAMES:
+            annotations = SimpleNamespace(
+                readOnlyHint=name in app_module.MCP_READ_ONLY_TOOL_NAMES,
+                destructiveHint=name in {"run_test", "cancel_run"},
+                openWorldHint=name in {"run_test", "cancel_run"},
+            )
+            tools.append(SimpleNamespace(name=name, annotations=annotations))
+        return tools
+
+    class Session:
+        def __init__(self, tools, result):
+            self.tools = tools
+            self.result = result
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def initialize(self):
+            return SimpleNamespace(serverInfo=SimpleNamespace(name="coverage-mcp"))
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=self.tools)
+
+        async def call_tool(self, *_args):
+            return self.result
+
+    valid_result = SimpleNamespace(
+        isError=False,
+        structuredContent={"context": {"schema_revision": app_module.SCHEMA_REVISION}},
+    )
+    cases = [
+        valid_tools()[:-1],
+        [
+            SimpleNamespace(
+                name=tool.name,
+                annotations=SimpleNamespace(
+                    readOnlyHint=tool.annotations.readOnlyHint or tool.name == "ingest_coverage",
+                    destructiveHint=tool.annotations.destructiveHint,
+                    openWorldHint=tool.annotations.openWorldHint,
+                ),
+            )
+            for tool in valid_tools()
+        ],
+        [
+            SimpleNamespace(
+                name=tool.name,
+                annotations=SimpleNamespace(
+                    readOnlyHint=tool.annotations.readOnlyHint,
+                    destructiveHint=False if tool.name == "run_test" else tool.annotations.destructiveHint,
+                    openWorldHint=tool.annotations.openWorldHint,
+                ),
+            )
+            for tool in valid_tools()
+        ],
+    ]
+    results = [
+        valid_result,
+        SimpleNamespace(isError=True, structuredContent=None),
+        SimpleNamespace(isError=False, structuredContent=[]),
+        SimpleNamespace(isError=False, structuredContent={"context": None}),
+    ]
+
+    monkeypatch.setattr(app_module.httpx, "AsyncClient", lambda **kwargs: Context("client"))
+    monkeypatch.setattr(
+        app_module,
+        "streamable_http_client",
+        lambda *args, **kwargs: Context(("read", "write", None)),
+    )
+    for tools in cases:
+        monkeypatch.setattr(app_module, "ClientSession", lambda *_args, tools=tools: Session(tools, valid_result))
+        assert app_module.daemon_mcp_is_healthy("http://daemon", "/repo") is False
+    for result in results[1:]:
+        monkeypatch.setattr(app_module, "ClientSession", lambda *_args, result=result: Session(valid_tools(), result))
+        assert app_module.daemon_mcp_is_healthy("http://daemon", "/repo") is False
+
+    monkeypatch.setattr(app_module, "ClientSession", lambda *_args: Session(valid_tools(), valid_result))
+    assert app_module.daemon_mcp_is_healthy("http://daemon", "/repo") is True
 
 
 def test_readme_documents_consolidated_mcp_contract():

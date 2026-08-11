@@ -11,28 +11,11 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from coverage_mcp.app import daemon_url
+from coverage_mcp.contracts import MCP_READ_ONLY_TOOL_NAMES, MCP_TOOL_NAMES
 
-EXPECTED_MCP_TOOLS = {
-    "cancel_run",
-    "coverage_compare",
-    "coverage_query",
-    "ingest_coverage",
-    "project_context",
-    "register_test_command",
-    "register_worktree",
-    "run_test",
-    "get_run_data",
-    "search_test_logs",
-    "source_context",
-}
-EXPECTED_READ_ONLY_MCP_TOOLS = {
-    "coverage_compare",
-    "coverage_query",
-    "get_run_data",
-    "project_context",
-    "search_test_logs",
-    "source_context",
-}
+# Keep the old verifier names as aliases for downstream release scripts.
+EXPECTED_MCP_TOOLS = MCP_TOOL_NAMES
+EXPECTED_READ_ONLY_MCP_TOOLS = MCP_READ_ONLY_TOOL_NAMES
 
 
 async def verify_connector(index: int, repository: Path, results: list[dict[str, Any]]) -> None:

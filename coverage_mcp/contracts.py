@@ -9,6 +9,35 @@ MAX_SUMMARY_LINES = 500
 MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 86400
 
+# Keep the public inventory in the shipped package so a connector can verify a
+# live daemon without importing development-only scripts. The MCP server and
+# the connector verifier both consume this contract.
+MCP_TOOL_NAMES = frozenset(
+    {
+        "cancel_run",
+        "coverage_compare",
+        "coverage_query",
+        "ingest_coverage",
+        "project_context",
+        "register_test_command",
+        "register_worktree",
+        "run_test",
+        "get_run_data",
+        "search_test_logs",
+        "source_context",
+    }
+)
+MCP_READ_ONLY_TOOL_NAMES = frozenset(
+    {
+        "coverage_compare",
+        "coverage_query",
+        "get_run_data",
+        "project_context",
+        "search_test_logs",
+        "source_context",
+    }
+)
+
 CoverageFormat = Annotated[
     Literal[
         "auto",

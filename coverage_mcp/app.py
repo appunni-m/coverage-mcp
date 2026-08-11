@@ -31,6 +31,8 @@ from starlette.requests import ClientDisconnect
 
 from coverage_mcp import __version__
 from coverage_mcp.contracts import (
+    MCP_READ_ONLY_TOOL_NAMES,
+    MCP_TOOL_NAMES,
     ApiEnvelope,
     ApprovalNote,
     ApprovedBy,
@@ -92,6 +94,7 @@ DEFAULT_DB_NAME = ".coverage-mcp/coverage.duckdb"
 DEFAULT_PORT = 59471
 REPOSITORY_HEADER = "x-coverage-mcp-repo"
 DEFAULT_DAEMON_START_TIMEOUT_SECONDS = 10.0
+DAEMON_HEALTH_TIMEOUT_SECONDS = 1.0
 DEFAULT_MCP_HTTP_CONCURRENCY = 16
 MAX_MCP_HTTP_CONCURRENCY = 128
 MCP_HTTP_CONCURRENCY_ENV = "COVERAGE_MCP_HTTP_CONCURRENCY"
@@ -1358,7 +1361,7 @@ def default_db_path(path: str | None = None) -> str:
 
 def daemon_is_healthy(url: str | None = None) -> bool:
     try:
-        response = httpx.get(f"{url or daemon_url()}/health", timeout=0.25)
+        response = httpx.get(f"{url or daemon_url()}/health", timeout=DAEMON_HEALTH_TIMEOUT_SECONDS)
         payload = response.json()
         return (
             response.status_code == 200
@@ -1373,7 +1376,7 @@ def daemon_is_healthy(url: str | None = None) -> bool:
 def daemon_is_reachable(url: str | None = None) -> bool:
     """Distinguish an occupied Coverage MCP port from an absent daemon."""
     try:
-        response = httpx.get(f"{url or daemon_url()}/health", timeout=0.25)
+        response = httpx.get(f"{url or daemon_url()}/health", timeout=DAEMON_HEALTH_TIMEOUT_SECONDS)
         return response.status_code == 200 and response.json().get("ok") is True
     except (httpx.HTTPError, ValueError):
         return False
@@ -1389,7 +1392,28 @@ async def _probe_mcp_transport(url: str, repo_path: str) -> bool:
         if initialized.serverInfo.name != "coverage-mcp":
             return False
         tools = await session.list_tools()
-        return bool(tools.tools)
+        tool_map = {tool.name: tool for tool in tools.tools}
+        if set(tool_map) != MCP_TOOL_NAMES:
+            return False
+        read_only_tools = {
+            name
+            for name, tool in tool_map.items()
+            if tool.annotations is not None and tool.annotations.readOnlyHint is True
+        }
+        if read_only_tools != MCP_READ_ONLY_TOOL_NAMES:
+            return False
+        run_test_annotations = tool_map["run_test"].annotations
+        if (
+            run_test_annotations is None
+            or run_test_annotations.destructiveHint is not True
+            or run_test_annotations.openWorldHint is not True
+        ):
+            return False
+        context = await session.call_tool("project_context", {"max_words": 100})
+        if context.isError or not isinstance(context.structuredContent, dict):
+            return False
+        response_context = context.structuredContent.get("context")
+        return isinstance(response_context, dict) and response_context.get("schema_revision") == SCHEMA_REVISION
 
 
 def daemon_mcp_is_healthy(url: str | None = None, repo_path: str | None = None) -> bool:

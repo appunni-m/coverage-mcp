@@ -81,7 +81,8 @@ uvx --from git+https://github.com/appunni-m/coverage-mcp.git@main \
 ```
 
 You do not need to clone either repository. `uvx` owns an isolated Python environment and the connector starts or
-reuses the daemon on demand.
+reuses the daemon on demand. Before proxying client traffic, it verifies the daemon version/schema, all eleven tools,
+their safety annotations, and a live `project_context` response, so a stale or partial daemon fails clearly.
 
 ### Standalone server
 
