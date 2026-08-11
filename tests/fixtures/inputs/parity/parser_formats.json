@@ -1,0 +1,23 @@
+{
+  "schema": "migration-parity/parity-input@1",
+  "cases": [
+    {
+      "case_id": "coverage-mcp.parser.parse.formats",
+      "surface": "coverage-mcp.parser",
+      "operation": "parse",
+      "covers": ["coverage-mcp.parser.parse.formats"],
+      "target_profiles": ["rust-default"],
+      "assets": [],
+      "steps": [
+        {
+          "step_id": "parse",
+          "surface": "coverage-mcp.parser",
+          "operation": "parse",
+          "receiver": null,
+          "arguments": {"input": {"kind": "literal", "value": {"formats": ["lcov", "coveragepy", "cobertura", "jacoco", "istanbul", "go", "llvm"]}}}
+        }
+      ],
+      "observations": ["parse"]
+    }
+  ]
+}

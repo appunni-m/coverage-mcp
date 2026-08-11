@@ -1,0 +1,32 @@
+{
+  "schema": "migration-parity/benchmark-input@1",
+  "workloads": [
+    {
+      "workload_id": "coverage-mcp.storage.compact.benchmark",
+      "covers": ["coverage-mcp.storage.compact.project-policy"],
+      "subjects": [
+        {"kind": "oracle", "id": "frozen-contract"},
+        {"kind": "target_profile", "id": "rust-default"}
+      ],
+      "input": {"kind": "parity_case", "case_id": "coverage-mcp.storage.compact.project-policy"},
+      "measurement": {
+        "boundary": "observed_steps",
+        "step_ids": ["compact"],
+        "metrics": ["latency"],
+        "warmup_iterations": 1,
+        "measurement_iterations": 3,
+        "samples": 3,
+        "concurrency": 1,
+        "cache_state": "warm",
+        "correctness_gate": "parity_pass"
+      }
+    }
+  ],
+  "suites": [
+    {
+      "suite_id": "coverage-mcp-compaction",
+      "description": "Deterministic compaction maintenance workload.",
+      "members": [{"workload_id": "coverage-mcp.storage.compact.benchmark", "weight": 1}]
+    }
+  ]
+}

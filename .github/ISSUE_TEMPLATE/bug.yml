@@ -26,7 +26,7 @@ body:
   - type: input
     id: environment
     attributes:
-      label: Python version and operating system
+      label: Rust version, target, and operating system
     validations:
       required: true
   - type: checkboxes

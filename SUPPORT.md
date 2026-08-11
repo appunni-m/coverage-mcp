@@ -1,12 +1,18 @@
 # Support
 
-Use GitHub issues for reproducible bugs and focused feature requests:
+Use [GitHub issues](https://github.com/appunni-m/coverage-mcp/issues) for
+reproducible bugs and focused feature requests. Include:
 
-<https://github.com/appunni-m/coverage-mcp/issues>
+- Coverage MCP version and schema revision;
+- operating system and Rust installation method;
+- sanitized `GET /health` output;
+- the exact command or MCP method that failed;
+- a minimal reproducible repository or fixture when possible.
 
-Include the Coverage MCP version, schema revision, operating system, Python version, installation method, relevant
-health output, and a minimal reproduction. Search existing issues first and remove private source, logs, paths, tokens,
-and database contents.
+Remove credentials, private source, logs, local paths, tokens, and database
+contents that are not necessary to reproduce the issue. Search existing issues
+first. Security vulnerabilities must be reported through
+[`SECURITY.md`](SECURITY.md), not a public issue.
 
-Coverage MCP is maintained on a best-effort basis. There is no guaranteed response time or commercial support SLA.
-Security vulnerabilities must be reported through [SECURITY.md](SECURITY.md).
+Coverage MCP is maintained on a best-effort basis; response times are not
+promised and there is no commercial support SLA.

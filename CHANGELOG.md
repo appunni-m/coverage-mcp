@@ -7,14 +7,19 @@ minor versions may contain breaking public-contract changes.
 
 ### Changed
 
-- Hardened the stable MCP 1.x transport against client-disconnect shutdown races by dropping transport exceptions
-  locally instead of writing notifications through a failed stream.
-- Switched the stateless MCP endpoint to JSON responses and bounded concurrent POST work with
-  `COVERAGE_MCP_HTTP_CONCURRENCY` (default `16`, range `1-128`).
-- Made each stdio connector validate the complete schema-7 tool inventory, safety annotations, and a live
-  `project_context` response before proxying client traffic.
-- Increased the loopback health-probe tolerance used by concurrent lazy connectors so a busy existing daemon is
-  reused instead of being duplicated against DuckDB's single-owner lock.
+- Completed the runtime migration to a single Rust binary for HTTP, native
+  stdio MCP, REST, dashboard, storage, parsers, managed runs, and background
+  compaction.
+- Unified HTTP and stdio MCP JSON-RPC dispatch so inventory, safety behavior,
+  resource reads, tool calls, notifications, and errors share one contract.
+- Added per-project background compaction of older coverage detail with
+  project-creation defaults, dashboard/API edits, manual passes, and durable
+  byte/status metrics.
+- Added strict Cargo formatting, clippy, test, line-coverage, rustdoc, and
+  supply-chain verification guidance.
+- Added OS-backed single-instance and per-database leases, bounded DuckDB
+  pooling, connection checkout deadlines, interruptible query deadlines,
+  bounded HTTP/MCP concurrency, and graceful signal shutdown.
 
 ## 0.7.1 - 2026-07-21
 
@@ -27,7 +32,7 @@ minor versions may contain breaking public-contract changes.
 - Replaced offset-bearing continuation tokens with record-anchored opaque cursors.
 - Disambiguated duplicate cursor anchors and made defensive collection caps fail explicitly instead of losing records.
 - Made public response models reject undeclared fields.
-- Expanded packaging metadata and the supported Python CI matrix.
+- Expanded packaging metadata and the supported runtime/toolchain policy.
 - Separated the embedded dashboard document and storage projections from transport and persistence code.
 - Restricted the daemon to loopback interfaces and added browser security headers and trusted-host validation.
 - Hardened concurrent lazy startup against transient health-probe timeouts.

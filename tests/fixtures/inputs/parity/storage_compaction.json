@@ -1,0 +1,23 @@
+{
+  "schema": "migration-parity/parity-input@1",
+  "cases": [
+    {
+      "case_id": "coverage-mcp.storage.compact.project-policy",
+      "surface": "coverage-mcp.storage",
+      "operation": "compact",
+      "covers": ["coverage-mcp.storage.compact.project-policy"],
+      "target_profiles": ["rust-default"],
+      "assets": [],
+      "steps": [
+        {
+          "step_id": "compact",
+          "surface": "coverage-mcp.storage",
+          "operation": "compact",
+          "receiver": null,
+          "arguments": {"input": {"kind": "literal", "value": {"default_after_days": 30, "batch_size": 100}}}
+        }
+      ],
+      "observations": ["compact"]
+    }
+  ]
+}

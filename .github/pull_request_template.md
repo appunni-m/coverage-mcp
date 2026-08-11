@@ -5,9 +5,10 @@ Describe the problem and the user-visible result.
 ## Verification
 
 - [ ] Tests added or updated
-- [ ] `ruff check .` and `ruff format --check .`
-- [ ] `mypy coverage_mcp`
-- [ ] Full suite and 100% coverage
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- [ ] Full suite and 100% function/line coverage gate
+- [ ] Rustdoc builds with warnings denied
 - [ ] Documentation/changelog updated when user-visible
 - [ ] No private source, logs, databases, or credentials included
 

@@ -1,0 +1,235 @@
+schema: migration-parity/manifest@2
+scope:
+  id: coverage-mcp-rust-migration
+  mode: full
+  inventory:
+    authority: README.md-and-src-mcp.rs
+    revision: schema-7
+    command_id: inventory
+oracles:
+  - id: frozen-contract
+    name: Frozen schema-7 behavior contract
+    version: "1"
+    runtime: specification
+    identity_command_id: frozen-contract-identity
+    contract: docs/rust-migration-parity.md and the input-only fixture corpus
+    components: []
+targets:
+  - id: rust
+    name: Coverage MCP Rust production target
+    runtime: Rust 1.85+
+    identity_command_id: rust-target-identity
+    contract: Rust REST, dashboard, storage, compaction, and MCP implementation
+target_profiles:
+  - id: rust-default
+    target_id: rust
+    backend: cpu
+    features: [bundled-duckdb]
+commands:
+  - id: inventory
+    argv: [cargo, test, --offline, --all-targets]
+    cwd: .
+    timeout_seconds: 900
+  - id: frozen-contract-identity
+    argv: [cargo, metadata, --no-deps, --format-version, "1"]
+    cwd: .
+    timeout_seconds: 60
+  - id: rust-target-identity
+    argv: [rustc, --version]
+    cwd: .
+    timeout_seconds: 30
+  - id: parity
+    argv: [cargo, test, --offline, --test, rust_migration]
+    cwd: .
+    timeout_seconds: 900
+  - id: coverage
+    argv: [cargo, llvm-cov, --offline, --lib, --all-features, --locked, '--ignore-filename-regex=/src/main\.rs$', '--fail-under-lines=100', '--fail-under-functions=100', '--fail-uncovered-lines=0', '--fail-uncovered-functions=0', --summary-only]
+    cwd: .
+    timeout_seconds: 900
+  - id: benchmark
+    argv: [cargo, test, --offline, --test, rust_migration, rust_storage_queries_compare_and_compacts_old_detail]
+    cwd: .
+    timeout_seconds: 300
+  - id: aggregate
+    argv: [cargo, test, --offline, --workspace, --all-targets]
+    cwd: .
+    timeout_seconds: 900
+  - id: docs
+    argv: [cargo, doc, --offline, --workspace, --no-deps]
+    cwd: .
+    timeout_seconds: 300
+interfaces:
+  parity:
+    input_schema: migration-parity/parity-input@1
+    result_schema: migration-parity/parity-result@1
+    command_id: parity
+  coverage:
+    input_schema: migration-parity/coverage-input@1
+    result_schema: migration-parity/coverage-result@1
+    command_id: coverage
+  benchmark:
+    input_schema: migration-parity/benchmark-input@1
+    result_schema: migration-parity/benchmark-result@1
+    command_id: benchmark
+  aggregation:
+    input_schemas:
+      - migration-parity/parity-result@1
+      - migration-parity/coverage-result@1
+      - migration-parity/benchmark-result@1
+    result_schema: migration-parity/status-report@1
+    command_id: aggregate
+input_index:
+  parity:
+    - inputs/parity/parser_formats.json
+    - inputs/parity/storage_compaction.json
+    - inputs/parity/transport_contract.json
+  coverage:
+    - inputs/coverage/rust_source.json
+  benchmark:
+    - inputs/benchmark/compaction_workload.json
+coverage_components:
+  - id: rust-source
+    target_profile: rust-default
+    paths: [src]
+    dimensions: [function, line]
+    thresholds:
+      - dimension: function
+        minimum_percent: 100
+      - dimension: line
+        minimum_percent: 100
+surfaces:
+  - id: coverage-mcp.parser
+    kind: service
+    source_path: src/parser.rs
+    storage_slug: parser
+    operations:
+      - id: parse
+        kind: function
+        classification: endpoint
+        lifecycle: {status: current}
+        source:
+          oracle_id: frozen-contract
+          path: docs/rust-migration-parity.md#surface-mapping
+          signature: parse report into normalized coverage data
+          parameters:
+            - id: input
+              style: positional
+              value_types: [mapping]
+              omission: {kind: required}
+          result:
+            shape: mapping
+            observations:
+              - path: result
+                value_types: [mapping]
+                comparison: {kind: exact}
+            error:
+              fields: [class, kind, message]
+              message: {mode: normalized, transforms: [strip_runtime_addresses], reason: parser errors are compared without runtime addresses}
+        targets:
+          - target_id: rust
+            path: coverage_mcp::parser::parse_coverage_report
+            signature: parse_coverage_report(path, format, repo_path)
+            support: {status: supported}
+        requirements:
+          - id: coverage-mcp.parser.parse.formats
+            dimension: format
+            description: All supported report formats normalize to one report model.
+            lanes: [parity, coverage]
+            target_profiles: [rust-default]
+        parity: {applicability: required, target_profiles: [rust-default]}
+        coverage: {applicability: required, target_profiles: [rust-default], component_ids: [rust-source]}
+        benchmark: {applicability: not_applicable, reason: Parser behavior is correctness-gated rather than benchmarked here.}
+  - id: coverage-mcp.storage
+    kind: service
+    source_path: src/storage.rs
+    storage_slug: storage
+    operations:
+      - id: compact
+        kind: method
+        classification: endpoint
+        lifecycle: {status: current}
+        source:
+          oracle_id: frozen-contract
+          path: docs/rust-migration-parity.md#compaction-policy-carried-forward
+          signature: compact project detail according to persisted policy
+          parameters:
+            - id: input
+              style: positional
+              value_types: [mapping]
+              omission: {kind: required}
+          result:
+            shape: mapping
+            observations:
+              - path: result
+                value_types: [mapping]
+                comparison: {kind: exact}
+            error:
+              fields: [class, kind, message]
+              message: {mode: normalized, transforms: [strip_runtime_addresses], reason: storage errors are compared without runtime addresses}
+        targets:
+          - target_id: rust
+            path: coverage_mcp::storage::CoverageStore::compact_now
+            signature: compact_now(&self)
+            support: {status: supported}
+        requirements:
+          - id: coverage-mcp.storage.compact.project-policy
+            dimension: code_path
+            description: Project defaults, edits, manual passes, compressed payloads, and transparent restore remain compatible.
+            lanes: [parity, coverage, benchmark]
+            target_profiles: [rust-default]
+            budget:
+              kind: absolute
+              metric: latency
+              statistic: median
+              operator: less_than_or_equal
+              value: 5000
+              unit: milliseconds
+              baseline_subject: null
+        parity: {applicability: required, target_profiles: [rust-default]}
+        coverage: {applicability: required, target_profiles: [rust-default], component_ids: [rust-source]}
+        benchmark: {applicability: required, target_profiles: [rust-default], metrics: [latency]}
+  - id: coverage-mcp.transport
+    kind: protocol
+    source_path: src/mcp.rs
+    storage_slug: transport
+    operations:
+      - id: contract
+        kind: protocol_operation
+        classification: endpoint
+        lifecycle: {status: current}
+        source:
+          oracle_id: frozen-contract
+          path: docs/rust-migration-parity.md#compatibility-invariants
+          signature: schema-7 REST and MCP protocol surface
+          parameters:
+            - id: input
+              style: positional
+              value_types: [mapping]
+              omission: {kind: required}
+          result:
+            shape: protocol
+            observations:
+              - path: result
+                value_types: [mapping]
+                comparison: {kind: exact}
+            error:
+              fields: [class, kind, message]
+              message: {mode: normalized, transforms: [strip_runtime_addresses], reason: transport errors are compared without runtime addresses}
+        targets:
+          - target_id: rust
+            path: coverage_mcp::mcp::dispatch_json_rpc
+            signature: shared HTTP and native stdio JSON-RPC dispatcher
+            support: {status: supported}
+        requirements:
+          - id: coverage-mcp.transport.contract.schema7
+            dimension: protocol_variant
+            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-7 compatible.
+            lanes: [parity, coverage]
+            target_profiles: [rust-default]
+        parity: {applicability: required, target_profiles: [rust-default]}
+        coverage: {applicability: required, target_profiles: [rust-default], component_ids: [rust-source]}
+        benchmark: {applicability: not_applicable, reason: Transport correctness is validated by live wire and stdio tests.}
+documentation:
+  command_id: docs
+  specification_outputs: [docs/rust-migration-parity.md]
+  evidence_outputs: [docs/generated/parity-status.md, docs/generated/coverage-status.md]

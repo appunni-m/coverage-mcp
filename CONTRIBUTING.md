@@ -1,49 +1,75 @@
-# Contributing to Coverage MCP
+# Contributing
 
-Thank you for improving Coverage MCP. Small, focused pull requests are easiest to review.
+Coverage MCP is a Rust workspace with a public REST/MCP contract, persistent
+DuckDB behavior, and an embedded dashboard. Keep those surfaces synchronized
+when changing behavior.
 
-## Before opening a change
+## Prerequisites
 
-- Search existing issues and discussions.
-- Open an issue before changing a public contract, storage schema, security boundary, or supported platform.
-- Never commit coverage databases, run logs, credentials, or private repository data.
+- Rust 1.85 or newer and Cargo;
+- Git;
+- `cargo-llvm-cov` for the required coverage gate;
+- optional `cargo-deny` and `cargo-audit` for supply-chain checks.
 
-## Local setup
+Build from a checkout:
 
-Coverage MCP requires Python 3.12 or newer and Git.
-
-```bash
-git clone https://github.com/appunni-m/coverage-mcp.git
-cd coverage-mcp
-python -m venv .venv
-. .venv/bin/activate
-python -m pip install -e '.[dev]'
+```sh
+cargo build --locked
 ```
 
-Run the complete local gate before submitting:
+## Change workflow
 
-```bash
-ruff check .
-ruff format --check .
-mypy coverage_mcp
-coverage run -m pytest -q
-coverage report -m
-python -m build
-python -m twine check dist/*
+1. Read [`docs/architecture.md`](docs/architecture.md) and the relevant
+   module documentation.
+2. For MCP tool, resource, instruction, schema, or safety changes, update
+   `src/mcp.rs`, the affected service/storage layer, tests, and the MCP Usage
+   Guide in `README.md` together.
+3. For REST changes, update route tests and the README REST surface.
+4. For dashboard changes, keep the embedded document dependency-free and run
+   its JavaScript syntax check.
+5. For storage changes, add migration-safe tests and verify compaction,
+   lineage, and database reopen behavior.
+6. Keep public Rust APIs documented with errors, panic behavior, and safety
+   invariants where relevant. Prefer `Result` for recoverable failures.
+7. Update the changelog for user-visible changes.
+
+## Required local gate
+
+Run the same commands used by CI before opening a pull request:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo llvm-cov --offline --lib --all-features --locked \
+  --ignore-filename-regex '/src/main\.rs$' \
+  --fail-under-lines 100 --fail-under-functions 100 \
+  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+git diff --check
 ```
 
-Behavior changes require regression tests. Public contract changes must update the shared service projection, REST,
-MCP, resources, dashboard, documentation, and contract tests together.
+Convenience aliases are available through `make lint`, `make test`,
+`make coverage`, and `make docs`.
+
+The coverage threshold is a line-coverage gate. The report also displays
+function and region data; do not describe a percentage without naming its
+dimension and measured target set.
+
+## Contract and safety review
+
+MCP tools must document purpose, inputs, pagination/budget behavior, errors,
+and the next workflow step. Safety annotations must describe actual side
+effects. Never turn a mutating operation into a read-only annotation merely
+to simplify client approval.
+
+Command execution must retain the human approval record, exact command, cwd,
+shell, and declared artifacts. Tests must not depend on private paths,
+network services, or a pre-existing user database.
 
 ## Pull requests
 
-- Explain the user-visible problem and why the chosen design solves it.
-- Keep refactors separate from behavior changes when practical.
-- Preserve one shared daemon, one common registry, and one lazily opened coverage store per canonical Git repository.
-- Keep `detailed=false`, word budgets, and bounded queries as the default agent experience.
-- Add a changelog entry for user-visible behavior.
-
-By submitting a contribution, you agree that it is licensed under this repository's MIT License. Contributors retain
-copyright in their work. Coverage MCP does not require a contributor license agreement.
-
-Security reports follow [SECURITY.md](SECURITY.md), not public issues.
+Pull requests should state the user-visible result, storage/schema impact,
+security impact, and exact verification commands. Keep commits focused and do
+not include `.coverage-mcp/`, DuckDB WAL files, build output, credentials, or
+private coverage reports.

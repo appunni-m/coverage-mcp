@@ -1,0 +1,69 @@
+# Rust migration and parity evidence
+
+The migration is complete at the runtime boundary: the repository contains
+one Rust implementation, Rust tests, and input-only migration fixtures. The
+pre-migration implementation is not required, installed, imported, or
+executed. This document preserves the behavior-family mapping so future
+changes can be reviewed against the contract that was carried forward.
+
+## Surface mapping
+
+| Behavior family | Rust implementation | Rust evidence |
+| --- | --- | --- |
+| Report parsing and normalization | `src/parser.rs`, `src/models.rs` | `rust_migrates_all_parser_formats_and_aliases`, model merge/rate/path tests |
+| Git identity and worktree lineage | `src/git.rs`, `src/storage.rs` | `rust_worktree_registration_and_lineage_guards`, storage lineage tests |
+| DuckDB snapshots, queries, runs, artifacts, and compaction | `src/storage.rs`, `src/compaction.rs` | `rust_storage_queries_compare_and_compacts_old_detail`, storage tests, smoke test |
+| Response budgets, cursors, compact projections, and service validation | `src/service.rs` | `rust_service_pagination_projection_and_mcp_contract_match` |
+| MCP inventory, schemas, resources, safety, and JSON-RPC dispatch | `src/mcp.rs` | MCP contract assertions, HTTP wire test, native stdio smoke test |
+| REST routing, health, dashboard, common registry, and lifecycle | `src/http.rs`, `src/dashboard.html` | live REST/dashboard/health/MCP test and browser smoke verification |
+| Background detail compaction | `src/compaction.rs`, `src/storage.rs` | policy default/edit/manual-pass, compressed payload, transparent restore tests |
+
+## Compatibility invariants
+
+- The public MCP inventory contains eleven tools and schema revision 7.
+- Every successful public projection uses the `{context,data,page}` envelope.
+- Word budgets, opaque query-scoped cursors, defensive collection caps, and
+  compact-by-default detailed fields remain enforced at the service boundary.
+- DuckDB schema migrations are additive and run when a store opens.
+- Compacted snapshots remain readable through file, line, source, insight, and
+  comparison queries.
+- HTTP and native stdio call the same JSON-RPC dispatcher and therefore share
+  notifications, inventory, resource, tool, and error semantics.
+
+## Fixture and evidence contract
+
+The machine-readable manifest at `tests/fixtures/manifest.yaml` identifies the
+frozen schema-7 contract, Rust target profile, public surfaces, input-only
+parity cases, coverage plan, and compaction benchmark workload. Inputs contain
+no expected outputs; generated reports, logs, and coverage artifacts are
+runtime evidence and are never checked in as claimed results.
+
+The manifest is a migration specification, not a second runtime. The Rust
+tests are the executable authority. Any percentage in a release or review
+must name its dimension, target set, numerator, denominator, and command.
+
+## Verification
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo llvm-cov --offline --lib --all-features --locked \
+  --ignore-filename-regex '/src/main\.rs$' \
+  --fail-under-lines 100 --fail-under-functions 100 \
+  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+```
+
+The coverage gate proves 100% measured function and line coverage for the Rust
+library/runtime target set. The CLI launcher is excluded from aggregate LLVM
+counters because it is exercised in a child process; native-stdio and CLI
+smoke tests still verify that launcher directly. Region and branch percentages
+remain diagnostics and are not represented as 100%.
+
+## Compaction policy carried forward
+
+New projects default to enabled compaction after 30 days, on a 3600-second
+cadence, with a 100-snapshot batch. Creation-time overrides are accepted by
+the project API and environment defaults; later edits are available through
+REST, dashboard, and the manual CLI pass.

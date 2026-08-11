@@ -1,85 +1,38 @@
 # Coverage MCP Agent Notes
 
-This repository owns the Coverage MCP server, REST API, MCP tool contract,
-storage behavior, dashboard, and primary README. When changing MCP behavior,
-keep the server contract, user docs, marketplace plugin docs, and installed
-tooling in sync.
+This repository owns the Rust Coverage MCP binary, REST API, MCP contract,
+storage behavior, dashboard, migration fixtures, and primary README. Keep
+these surfaces synchronized when changing behavior.
 
-## MCP Contract Change Checklist
+## MCP contract change checklist
 
-Use this checklist for any change that affects MCP tool names, inputs, output
-shape, descriptions, server instructions, safety annotations, resources, or the
-agent workflow.
+For changes to tool names, inputs, output shapes, descriptions, instructions,
+safety annotations, resources, pagination, or workflow:
 
-1. Update server code in `coverage_mcp/app.py`.
-   - `create_mcp()` instructions must be sufficient for an agent without
-     reading the README.
-   - Tool docstrings must explain when to use the tool, important mode choices,
-     pagination/budget behavior, and where to go next.
-   - Safety annotations must match actual side effects.
+1. Update `src/mcp.rs`. Initialization instructions must be sufficient for an
+   agent without opening the README; tool descriptions must explain purpose,
+   mode choices, budget/pagination behavior, errors, and the next step.
+2. Update the service/storage implementation when validation or side effects
+   change. Keep compact envelopes and hidden detailed fields consistent across
+   HTTP and stdio.
+3. Update `README.md` MCP Usage Guide with every tool, input, return shape,
+   error class, resource, and workflow rule.
+4. Add the lowest-layer behavior test and one public HTTP or stdio test when a
+   public input/output changes.
+5. Verify both transports. The shared dispatcher is
+   `mcp::dispatch_json_rpc`; do not fork transport-specific semantics.
 
-2. Update typed contract descriptions in `coverage_mcp/contracts.py`.
-   - Input descriptions are what clients see in `tools/list`.
-   - Keep names consistent with actual tool names. For example, polling uses
-     `get_run_data`, not internal storage names such as `run_result`.
-   - Describe non-obvious semantics such as OR matching, cursor ownership, or
-     detailed-mode limits.
-
-3. Update implementation layers that share the behavior.
-   - Storage and helpers own validation and core semantics.
-   - Service owns compact envelopes and fields hidden from default MCP output.
-   - REST should remain consistent with MCP when it exposes the same behavior.
-
-4. Update tests that lock the public contract.
-   - `tests/test_mcp.py` must assert tool inventory, input names, generated
-     schema descriptions, server instructions, resources, and README coverage.
-   - Add behavior tests at the lowest useful layer, then one REST or MCP path
-     test when public input/output changed.
-
-5. Update `README.md`.
-   - The MCP Usage Guide must list every tool, every input, returns, errors,
-     resources, and the effective workflow.
-   - State that MCP instructions plus `tools/list` are intended to be
-     sufficient without the README.
-
-6. Update `codegen-marketplace` when agent instructions or connector guidance
-   changes.
-   - Root: `/Users/lazytrot/work/codegen-marketplace/README.md` when examples
-     or user-facing marketplace instructions change.
-   - Plugin docs: `plugins/testing/README.md`.
-   - Skill workflow: `plugins/testing/skills/use-coverage-mcp/SKILL.md`.
-   - If generated marketplace artifacts are affected, follow that repo's
-     `CLAUDE.md` and run its build/check workflow. Do not edit generated root
-     artifacts directly.
-
-7. Reinstall and restart after merging or pushing.
-   - Reinstall the local Codex plugin when marketplace docs/skills change:
-     `codex plugin add testing@codegen-marketplace`.
-   - Reinstall the server from this checkout when server code changes:
-     `/Users/lazytrot/Library/Python/3.9/bin/uv pip install --python /Users/lazytrot/work/coverage-mcp/.venv/bin/python -e '/Users/lazytrot/work/coverage-mcp[dev]'`.
-   - Restart the daemon with the built-in helper:
-     `/Users/lazytrot/work/coverage-mcp/.venv/bin/python -c 'from coverage_mcp.app import ensure_daemon; print(ensure_daemon())'`.
-
-8. Verify the live contract, not only local unit tests.
-   - `/health` must report schema revision 7 and the expected daemon path.
-   - A live MCP `tools/list` call over `http://127.0.0.1:59471/mcp/` must show
-     updated instructions, tool descriptions, and input schema.
-   - Run the repo gate relevant to the change. For MCP changes, at minimum run
-     `ruff check .`, `ruff format --check .`, `mypy coverage_mcp`, and
-     `pytest -q tests/test_mcp.py`; use the approved full coverage command
-     before finalizing broad or public-contract changes.
-
-## Current MCP Workflow
+## Current MCP workflow
 
 Agents should:
 
 1. Call `project_context` first.
-2. Run only exact approved registrations returned by `project_context`, or call
-   `register_test_command` only after human approval of the exact command, cwd,
+2. Run only exact approved registrations returned by `project_context`, or
+   register a command only after human approval of the exact command, cwd,
    shell, and artifacts.
 3. Submit with `run_test(wait=false)` and a stable `idempotency_key`.
-4. Poll `get_run_data(detailed=false)` no sooner than
-   `poll_after_ms` until `terminal` is true.
+4. Poll `get_run_data(detailed=false)` no sooner than `poll_after_ms` until
+   `terminal` is true.
 5. Use `search_test_logs` for targeted retained stdout/stderr evidence; never
    use `detailed` to retrieve logs.
 6. Inspect `coverage_ingest.status` and `snapshot_ids` before making coverage
@@ -87,3 +40,29 @@ Agents should:
 7. Use `coverage_query` for snapshot reads, `coverage_compare` only for
    compatible lineage or registered worktrees, and `source_context` only for
    bounded source ranges already identified by coverage data.
+
+## Rust verification
+
+The required local gate is:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo llvm-cov --offline --lib --all-features --locked \
+  --ignore-filename-regex '/src/main\.rs$' \
+  --fail-under-lines 100 --fail-under-functions 100 \
+  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+git diff --check
+```
+
+After a release or installed-binary change, rebuild with
+`cargo install --path . --locked`, restart `coverage-mcp serve` or the native
+`coverage-mcp connect` process, verify `/health`, and make a live `tools/list`
+call over both transports.
+
+When external marketplace/plugin guidance changes, update the corresponding
+documentation in the marketplace checkout only after the Rust contract and
+local tests are green. Do not restore or add a second runtime to satisfy
+connector documentation.
