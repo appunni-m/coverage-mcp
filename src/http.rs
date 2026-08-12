@@ -11,17 +11,18 @@ use duckdb::Connection;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{
-    CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderMap, HeaderValue,
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderMap,
+    HeaderValue,
 };
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper::{Method, Request, Response, StatusCode, Uri, http::uri::Authority};
 use hyper_util::rt::TokioIo;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration as TokioDuration, timeout};
 
-use crate::config::ServerConfig;
+use crate::config::{MAX_HTTP_MAX_BODY_BYTES, MIN_HTTP_MAX_BODY_BYTES, ServerConfig};
 use crate::error::{AppError, AppResult};
 use crate::git::inspect_git;
 use crate::lock::{FileLease, daemon_lock_path};
@@ -40,6 +41,7 @@ type HttpResponse = Response<Full<Bytes>>;
 pub struct CoverageServer {
     config: ServerConfig,
     stores: Arc<Mutex<HashMap<String, CoverageStore>>>,
+    store_open_gate: Arc<Mutex<()>>,
     mcp_limiter: Arc<Semaphore>,
 }
 
@@ -55,10 +57,18 @@ impl std::fmt::Debug for CoverageServer {
 impl CoverageServer {
     /// Creates a server without opening a repository until the first request.
     pub fn new(config: ServerConfig) -> AppResult<Self> {
+        if !(MIN_HTTP_MAX_BODY_BYTES..=MAX_HTTP_MAX_BODY_BYTES)
+            .contains(&config.http_max_body_bytes)
+        {
+            return Err(AppError::Validation(format!(
+                "http_max_body_bytes must be between {MIN_HTTP_MAX_BODY_BYTES} and {MAX_HTTP_MAX_BODY_BYTES}"
+            )));
+        }
         Ok(Self {
             mcp_limiter: Arc::new(Semaphore::new(config.mcp_http_concurrency)),
             config,
             stores: Arc::new(Mutex::new(HashMap::new())),
+            store_open_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -108,7 +118,7 @@ impl CoverageServer {
     #[cfg(test)]
     async fn serve_until_shutdown_with<F>(self, listener: TcpListener, shutdown: F) -> AppResult<()>
     where
-        F: Future<Output = ()>,
+        F: Future<Output = AppResult<()>>,
     {
         self.serve_until_shutdown_with_acceptor(|| listener.accept(), shutdown)
             .await
@@ -120,14 +130,14 @@ impl CoverageServer {
         shutdown: F,
     ) -> AppResult<()>
     where
-        F: Future<Output = ()>,
+        F: Future<Output = AppResult<()>>,
         A: FnMut() -> Fut,
         Fut: Future<Output = std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>,
     {
         let mut shutdown = Box::pin(shutdown);
         let result = loop {
             tokio::select! {
-                _ = &mut shutdown => break Ok(()),
+                shutdown_result = &mut shutdown => break shutdown_result,
                 result = acceptor() => {
                     if let Err(error) = self.process_listener_result(result) { break Err(error); }
                 }
@@ -165,13 +175,14 @@ impl CoverageServer {
     }
 
     /// Returns the shared health payload.
-    pub fn health(&self) -> Value {
+    pub fn health(&self) -> AppResult<Value> {
         let repository_count = self
             .stores
             .lock()
-            .map(|stores| stores.len())
-            .unwrap_or_default();
-        json!({
+            .map_err(|_| AppError::Runtime("store lock poisoned".to_owned()))?
+            .len();
+        let daemon_path = std::env::current_exe()?.to_string_lossy().into_owned();
+        Ok(json!({
             "status":"ok",
             "version":VERSION,
             "schema_revision":SCHEMA_REVISION,
@@ -182,19 +193,31 @@ impl CoverageServer {
             "db_acquire_timeout_ms":self.config.db_acquire_timeout_ms,
             "db_query_timeout_ms":self.config.db_query_timeout_ms,
             "http_request_timeout_seconds":self.config.http_request_timeout_seconds,
+            "http_max_body_bytes":self.config.http_max_body_bytes,
+            "run_log_max_bytes":self.config.run_log_max_bytes,
             "common_db_path":self.config.common_db_path,
             "repository_count":repository_count,
-            "daemon_path":std::env::current_exe().ok().map(|path| path.to_string_lossy().into_owned())
-        })
+            "daemon_path":daemon_path
+        }))
     }
 
     async fn handle(self, request: Request<Incoming>) -> Result<HttpResponse, Infallible> {
         let _mcp_permit = if request.uri().path() == "/mcp" || request.uri().path() == "/mcp/" {
-            self.mcp_limiter.clone().acquire_owned().await.ok()
+            Some(
+                self.mcp_limiter
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::Runtime("MCP request limiter is closed".to_owned())),
+            )
         } else {
             None
         };
-        let result = self.dispatch(request).await;
+        let result = match _mcp_permit {
+            Some(Ok(_permit)) => self.dispatch(request).await,
+            Some(Err(error)) => Err(error),
+            None => self.dispatch(request).await,
+        };
         Ok(match result {
             Ok(response) => response,
             Err(error) => error_response(error),
@@ -202,12 +225,12 @@ impl CoverageServer {
     }
 
     async fn dispatch(&self, request: Request<Incoming>) -> AppResult<HttpResponse> {
-        if !trusted_host(&request) {
+        if !trusted_host(&request)? {
             return Err(AppError::Validation("untrusted host".to_owned()));
         }
         let path = request.uri().path().to_owned();
         if path == "/health" && request.method() == Method::GET {
-            return Ok(json_response(StatusCode::OK, self.health()));
+            return Ok(json_response(StatusCode::OK, self.health()?));
         }
         if path == "/favicon.ico" {
             return Ok(empty_response(StatusCode::NO_CONTENT));
@@ -225,12 +248,12 @@ impl CoverageServer {
         if request.method() != Method::POST {
             return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
         }
-        let repository = repository_header(request.headers());
-        let body = json_body(request).await?;
+        let repository = repository_header(request.headers())?;
+        let body = json_body(request, self.config.http_max_body_bytes).await?;
         let method = body
             .get("method")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .ok_or_else(|| AppError::Validation("method is required".to_owned()))?;
         let service = matches!(method, "resources/read" | "tools/call")
             .then(|| {
                 self.service_for_repository_path(
@@ -249,11 +272,11 @@ impl CoverageServer {
     async fn dispatch_rest(&self, request: Request<Incoming>) -> AppResult<HttpResponse> {
         let method = request.method().clone();
         let uri = request.uri().clone();
-        let repository_header = repository_header(request.headers());
+        let repository_header = repository_header(request.headers())?;
         let query = query_params(&uri);
         let path = uri.path().trim_matches('/').split('/').collect::<Vec<_>>();
         let body = if matches!(method, Method::POST | Method::PATCH | Method::PUT) {
-            json_body(request).await?
+            json_body(request, self.config.http_max_body_bytes).await?
         } else {
             Value::Null
         };
@@ -277,9 +300,7 @@ impl CoverageServer {
             _ => None,
         };
         let repository = if creating_project {
-            body.get("repo_path")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            optional_body_string(&body, "repo_path")?.map(str::to_owned)
         } else if let Some(project_id) = project_reference {
             if project_id == "project" {
                 repository_header
@@ -309,15 +330,8 @@ impl CoverageServer {
             ))
         })?)?;
         let store = service.store().clone();
-        let max_words = query
-            .get("max_words")
-            .and_then(|values| values.first())
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(DEFAULT_MAX_WORDS);
-        let detailed = query
-            .get("detailed")
-            .and_then(|values| values.first())
-            .is_some_and(|value| value == "true" || value == "1");
+        let max_words = query_usize(&query, "max_words", DEFAULT_MAX_WORDS)?;
+        let detailed = query_bool(&query, "detailed")?;
         if method == Method::GET
             && path.len() >= 5
             && path[0] == "api"
@@ -339,18 +353,15 @@ impl CoverageServer {
         }
         let response = match (method, path.as_slice()) {
             (Method::POST, ["api", "ingest"]) => {
-                if let Some(repo_path) = body.get("repo_path").and_then(Value::as_str) { service.validate_repository_path(Some(repo_path))?; }
-                service.ingest(body.get("report_path").and_then(Value::as_str).ok_or_else(|| AppError::Validation("report_path is required".to_owned()))?, body.get("format").and_then(Value::as_str).unwrap_or("auto"), body.get("suite").and_then(Value::as_str).unwrap_or("default"), body.get("branch").and_then(Value::as_str), body.get("commit_sha").and_then(Value::as_str), body.get("base_ref").and_then(Value::as_str), detailed)?
+                if let Some(repo_path) = optional_body_string(&body, "repo_path")? { service.validate_repository_path(Some(repo_path))?; }
+                service.ingest(required_body(&body, "report_path")?, optional_body_string(&body, "format")?.unwrap_or("auto"), optional_body_string(&body, "suite")?.unwrap_or("default"), optional_body_string(&body, "branch")?, optional_body_string(&body, "commit_sha")?, optional_body_string(&body, "base_ref")?, detailed)?
             }
             (Method::GET, ["api", "projects"]) => self.project_list(service.clone(), query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?,
             (Method::POST, ["api", "projects"]) => {
-                let repo_path = body
-                    .get("repo_path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                self.service_for_repository_path(repo_path)?.update_project_settings(project_patch(&body))?
+                let repo_path = required_body(&body, "repo_path")?;
+                self.service_for_repository_path(repo_path)?.update_project_settings(project_patch(&body)?)?
             }
-            (Method::PATCH, ["api", "projects", _]) => service.update_project_settings(project_patch(&body))?,
+            (Method::PATCH, ["api", "projects", _]) => service.update_project_settings(project_patch(&body)?)?,
             (Method::POST, ["api", "projects", _, "compact"]) => service.compact_now()?,
             (Method::GET, ["api", "projects", _]) => service.envelope(store.project_summary()?, None, None),
             (Method::GET, ["api", "snapshots"]) => {
@@ -373,25 +384,25 @@ impl CoverageServer {
                 }
             }
             (Method::GET, ["api", "snapshots", snapshot_id, "insights"]) => service.envelope(store.insights(snapshot_id, query_value(&query, "baseline_snapshot_id"), COLLECTION_FETCH_LIMIT)?, None, None),
-            (Method::GET, ["api", "trend"]) => service.envelope(Value::Array(store.trend(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), query_value(&query, "file_path"), query_value(&query, "worktree_id"), query.get("limit").and_then(|values| values.first()).and_then(|value| value.parse().ok()).unwrap_or(100))?), None, None),
+            (Method::GET, ["api", "trend"]) => service.envelope(Value::Array(store.trend(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), query_value(&query, "file_path"), query_value(&query, "worktree_id"), query_usize(&query, "limit", 100)? )?), None, None),
             (Method::GET, ["api", "compare"]) => service.envelope(store.compare(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None),
             (Method::POST, ["api", "compare"]) => service.envelope(store.compare(required_body(&body, "snapshot_id")?, required_body(&body, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None),
-            (Method::GET, ["api", "changed-lines"]) => service.envelope(json!({"lines":store.changed_lines(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), query_bool(&query, "only_regressions"), COLLECTION_FETCH_LIMIT)?}), None, None),
+            (Method::GET, ["api", "changed-lines"]) => service.envelope(json!({"lines":store.changed_lines(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), query_bool(&query, "only_regressions")?, COLLECTION_FETCH_LIMIT)?}), None, None),
             (Method::GET, ["api", "line-history"]) => service.envelope(Value::Array(store.line_history(required_query(&query, "file_path")?, required_query(&query, "line_number")?.parse().map_err(|_| AppError::Validation("line_number must be an integer".to_owned()))?, query_value(&query, "branch"), query_value(&query, "suite"), COLLECTION_FETCH_LIMIT)?), None, None),
             (Method::GET, ["api", "source-lines"]) => service.source(required_query(&query, "snapshot_id")?, required_query(&query, "file_path")?, required_query(&query, "start")?.parse().map_err(|_| AppError::Validation("start must be an integer".to_owned()))?, required_query(&query, "end")?.parse().map_err(|_| AppError::Validation("end must be an integer".to_owned()))?, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?,
             (Method::GET, ["api", "worktrees"]) => service.envelope(Value::Array(store.list_worktrees(COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::POST, ["api", "worktrees", "register"]) => service.worktree_registration(required_body(&body, "path")?, required_body(&body, "base_ref")?, body.get("name").and_then(Value::as_str))?,
+            (Method::POST, ["api", "worktrees", "register"]) => service.worktree_registration(required_body(&body, "path")?, required_body(&body, "base_ref")?, optional_body_string(&body, "name")?)?,
             (Method::GET, ["api", "worktrees", worktree_id, "progress"]) => service.envelope(store.worktree_progress(worktree_id, query_value(&query, "suite").ok_or_else(|| AppError::Validation("suite is required".to_owned()))?, query_value(&query, "file_path"), COLLECTION_FETCH_LIMIT)?, None, None),
             (Method::GET, ["api", "worktrees", worktree_id, "compare"]) => service.envelope(store.compare_worktree(worktree_id, query_value(&query, "snapshot_id"), COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None),
             (Method::GET, ["api", "commands"]) => service.envelope(Value::Array(store.list_registered_commands(COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::POST, ["api", "commands", "register"]) => service.command_registration(required_body(&body, "name")?, required_body(&body, "command")?, body.get("human_approved").and_then(Value::as_bool).unwrap_or(false), body.get("approved_by").and_then(Value::as_str).unwrap_or_default(), body.get("approval_note").and_then(Value::as_str).unwrap_or_default(), body.get("cwd").and_then(Value::as_str), body.get("shell").and_then(Value::as_str).unwrap_or("/bin/bash"), body.get("artifact_paths").cloned(), detailed)?,
+            (Method::POST, ["api", "commands", "register"]) => service.command_registration(required_body(&body, "name")?, required_body(&body, "command")?, optional_body_bool(&body, "human_approved")?.unwrap_or(false), optional_body_string(&body, "approved_by")?.unwrap_or_default(), optional_body_string(&body, "approval_note")?.unwrap_or_default(), optional_body_string(&body, "cwd")?, optional_body_string(&body, "shell")?.unwrap_or("/bin/bash"), body.get("artifact_paths").cloned(), detailed)?,
             (Method::GET, ["api", "commands", reference]) => service.envelope(store.registered_command(reference)?, None, None),
-            (Method::POST, ["api", "runs", "profiled"]) => service.run_submission(required_body(&body, "command_ref")?, body.get("timeout_seconds").and_then(Value::as_u64), body.get("idempotency_key").and_then(Value::as_str), body.get("wait").and_then(Value::as_bool).unwrap_or(false), detailed)?,
+            (Method::POST, ["api", "runs", "profiled"]) => service.run_submission(required_body(&body, "command_ref")?, optional_body_u64(&body, "timeout_seconds")?, optional_body_string(&body, "idempotency_key")?, optional_body_bool(&body, "wait")?.unwrap_or(false), detailed)?,
             (Method::GET, ["api", "runs", "queue"]) => service.envelope(Value::Array(store.list_run_queue(COLLECTION_FETCH_LIMIT)?), None, None),
             (Method::GET, ["api", "runs", "latest"]) => service.envelope(store.latest_run(query_value(&query, "command_ref"))?.ok_or_else(|| AppError::NotFound("no runs found".to_owned()))?, None, None),
             (Method::GET, ["api", "runs", run_id]) => service.run_state(run_id, "status", detailed)?,
             (Method::POST, ["api", "runs", run_id, "cancel"]) => service.run_state(run_id, "cancel", detailed)?,
-            (Method::GET, ["api", "runs", run_id, "logs", "search"]) => service.search_logs(run_id, query_values(&query, "query"), query.get("stream").and_then(|values| values.first()).map(String::as_str).unwrap_or("both"), query.get("context_lines").and_then(|values| values.first()).and_then(|value| value.parse().ok()).unwrap_or(3), query.get("max_matches").and_then(|values| values.first()).and_then(|value| value.parse().ok()).unwrap_or(5), max_words, query_bool(&query, "case_sensitive"))?,
+            (Method::GET, ["api", "runs", run_id, "logs", "search"]) => service.search_logs(run_id, query_values(&query, "query"), query_value(&query, "stream").unwrap_or("both"), query_usize(&query, "context_lines", 3)?, query_usize(&query, "max_matches", 5)?, max_words, query_bool(&query, "case_sensitive")?)?,
             (Method::GET, ["api", "artifacts", "latest"]) => service.envelope(store.latest_artifact(required_query(&query, "kind")?, query_value(&query, "command_ref"))?.ok_or_else(|| AppError::NotFound("artifact not found".to_owned()))?, None, None),
             (Method::GET, ["api", "topology", kind, reference]) => service.envelope(topology(&store, kind, reference)?, None, None),
             _ => return Err(AppError::NotFound("route not found".to_owned())),
@@ -424,6 +435,10 @@ impl CoverageServer {
         let git = inspect_git(Path::new(repo_path))?;
         let key = git.repo_key.clone();
         self.register_repository(&key)?;
+        let _open_gate = self
+            .store_open_gate
+            .lock()
+            .map_err(|_| AppError::Runtime("store-open lock poisoned".to_owned()))?;
         if let Some(store) = self.stores()?.get(&key).cloned() {
             store.ensure_project(Path::new(&git.repo_path))?;
             return Ok(CoverageService::new(
@@ -491,9 +506,7 @@ impl CoverageServer {
         let mut values = Vec::new();
         let stores = self.stores()?;
         for store in stores.values() {
-            if let Ok(value) = store.project_summary() {
-                values.push(value);
-            }
+            values.push(store.project_summary()?);
         }
         if values.is_empty() {
             values.push(selected.store().project_summary()?);
@@ -510,7 +523,7 @@ impl CoverageServer {
             for repo_key in registered {
                 match self.service_for_repository_path(&repo_key) {
                     Ok(service) => values.push(service.store().project_summary()?),
-                    Err(_) => values.push(registry_project(&repo_key)),
+                    Err(error) => values.push(registry_project_unavailable(&repo_key, &error)),
                 }
             }
             let context = json!({
@@ -565,13 +578,8 @@ impl CoverageServer {
             return Ok(Vec::new());
         }
         let connection = Connection::open(&self.config.common_db_path)?;
-        let mut statement = match connection
-            .prepare("SELECT repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?")
-        {
-            Ok(statement) => statement,
-            Err(error) if error.to_string().contains("does not exist") => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
+        let mut statement = connection
+            .prepare("SELECT repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?")?;
         let rows = statement.query_map(duckdb::params![limit], |row| row.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
     }
@@ -589,23 +597,70 @@ fn combine_shutdown_results(result: AppResult<()>, close_result: AppResult<()>) 
     }
 }
 
-async fn json_body(request: Request<Incoming>) -> AppResult<Value> {
-    let bytes = request.into_body().collect().await?.to_bytes();
+async fn json_body(request: Request<Incoming>, max_bytes: usize) -> AppResult<Value> {
+    if let Some(content_length) = request.headers().get(CONTENT_LENGTH) {
+        let declared = parse_content_length(content_length)?;
+        if declared > max_bytes {
+            return Err(AppError::Validation(format!(
+                "request body exceeds {max_bytes} bytes"
+            )));
+        }
+    }
+    let mut body = request.into_body();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await.transpose()? {
+        append_body_data(&mut bytes, frame.data_ref(), max_bytes)?;
+    }
+    parse_json_body(&bytes)
+}
+fn append_body_chunk(bytes: &mut Vec<u8>, data: &Bytes, max_bytes: usize) -> AppResult<()> {
+    let next_len = checked_body_length(bytes.len(), data.len())?;
+    if next_len > max_bytes {
+        return Err(AppError::Validation(format!(
+            "request body exceeds {max_bytes} bytes"
+        )));
+    }
+    bytes.extend_from_slice(data);
+    Ok(())
+}
+
+fn append_body_data(bytes: &mut Vec<u8>, data: Option<&Bytes>, max_bytes: usize) -> AppResult<()> {
+    if let Some(data) = data {
+        append_body_chunk(bytes, data, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn parse_content_length(value: &HeaderValue) -> AppResult<usize> {
+    header_to_str(value, CONTENT_LENGTH.as_str())?
+        .parse::<usize>()
+        .map_err(|_| AppError::Validation("content-length must be an integer".to_owned()))
+}
+
+fn checked_body_length(current: usize, added: usize) -> AppResult<usize> {
+    current
+        .checked_add(added)
+        .ok_or_else(|| AppError::Validation("request body is too large".to_owned()))
+}
+
+fn parse_json_body(bytes: &[u8]) -> AppResult<Value> {
     if bytes.is_empty() {
         return Ok(json!({}));
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(serde_json::from_slice(bytes)?)
 }
 
-fn repository_header(headers: &HeaderMap) -> Option<String> {
+fn repository_header(headers: &HeaderMap) -> AppResult<Option<String>> {
     headers
         .get(REPOSITORY_HEADER)
-        .and_then(header_to_str)
-        .map(str::to_owned)
+        .map(|value| header_to_str(value, REPOSITORY_HEADER).map(str::to_owned))
+        .transpose()
 }
 
-fn header_to_str(value: &HeaderValue) -> Option<&str> {
-    value.to_str().ok()
+fn header_to_str<'a>(value: &'a HeaderValue, name: &str) -> AppResult<&'a str> {
+    value
+        .to_str()
+        .map_err(|_| AppError::Validation(format!("{name} must be valid UTF-8")))
 }
 
 #[cfg(test)]
@@ -613,57 +668,54 @@ fn error_string(error: AppError) -> String {
     error.to_string()
 }
 
-fn trusted_host<B>(request: &Request<B>) -> bool {
-    request
-        .headers()
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(|host| {
-            host.starts_with("127.0.0.1")
-                || host.starts_with("localhost")
-                || host.starts_with("[::1]")
-                || host.starts_with("::1")
-                || host.starts_with("testserver")
-        })
-        .unwrap_or(true)
+fn trusted_host<B>(request: &Request<B>) -> AppResult<bool> {
+    let Some(host) = request.headers().get(HOST) else {
+        return Ok(false);
+    };
+    let host = header_to_str(host, HOST.as_str())?;
+    let authority = parse_authority(host)?;
+    Ok(matches!(
+        authority.host(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "testserver"
+    ))
 }
 
-async fn shutdown_signal() {
+fn parse_authority(host: &str) -> AppResult<Authority> {
+    host.parse::<Authority>()
+        .map_err(|_| AppError::Validation("host must be a valid authority".to_owned()))
+}
+
+async fn shutdown_signal() -> AppResult<()> {
     #[cfg(unix)]
     {
-        type ShutdownFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .ok()
-            .map(|mut signal| {
-                Box::pin(async move {
-                    let _ = signal.recv().await;
-                }) as ShutdownFuture
-            });
-        let ctrl_c = Box::pin(async {
-            let _ = tokio::signal::ctrl_c().await;
+        type ShutdownFuture = Pin<Box<dyn Future<Output = AppResult<()>> + Send>>;
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let terminate = Box::pin(async move {
+            signal.recv().await;
+            Ok(())
         }) as ShutdownFuture;
-        wait_for_shutdown(terminate, ctrl_c).await;
+        let ctrl_c = Box::pin(async { tokio::signal::ctrl_c().await.map_err(AppError::from) })
+            as ShutdownFuture;
+        wait_for_shutdown(Some(terminate), ctrl_c).await
     }
     #[cfg(not(unix))]
     {
-        let ctrl_c = Box::pin(async {
-            let _ = tokio::signal::ctrl_c().await;
-        });
-        ctrl_c.await;
+        let ctrl_c = Box::pin(async { tokio::signal::ctrl_c().await.map_err(AppError::from) });
+        ctrl_c.await
     }
 }
 
 async fn wait_for_shutdown(
-    terminate: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    ctrl_c: Pin<Box<dyn Future<Output = ()> + Send>>,
-) {
+    terminate: Option<Pin<Box<dyn Future<Output = AppResult<()>> + Send>>>,
+    ctrl_c: Pin<Box<dyn Future<Output = AppResult<()>> + Send>>,
+) -> AppResult<()> {
     if let Some(terminate) = terminate {
         tokio::select! {
-            _ = ctrl_c => {}
-            _ = terminate => {}
+            result = ctrl_c => result,
+            result = terminate => result,
         }
     } else {
-        ctrl_c.await;
+        ctrl_c.await
     }
 }
 
@@ -716,6 +768,15 @@ fn registry_project(repo_key: &str) -> Value {
     })
 }
 
+fn registry_project_unavailable(repo_key: &str, error: &AppError) -> Value {
+    let mut value = registry_project(repo_key);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("status".to_owned(), json!("unavailable"));
+        object.insert("error".to_owned(), json!(error.to_string()));
+    }
+    value
+}
+
 fn project_database_path(common_db_path: &Path, repo_key: &str) -> PathBuf {
     common_db_path
         .parent()
@@ -744,32 +805,105 @@ fn query_value<'a>(query: &'a HashMap<String, Vec<String>>, key: &str) -> Option
 fn query_values(query: &HashMap<String, Vec<String>>, key: &str) -> Vec<String> {
     query.get(key).cloned().unwrap_or_default()
 }
+fn query_usize(
+    query: &HashMap<String, Vec<String>>,
+    key: &str,
+    default: usize,
+) -> AppResult<usize> {
+    query_value(query, key)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| AppError::Validation(format!("{key} must be an integer")))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
 fn required_query<'a>(query: &'a HashMap<String, Vec<String>>, key: &str) -> AppResult<&'a str> {
     query_value(query, key).ok_or_else(|| AppError::Validation(format!("{key} is required")))
 }
 fn required_body<'a>(body: &'a Value, key: &str) -> AppResult<&'a str> {
-    body.get(key)
-        .and_then(Value::as_str)
+    optional_body_string(body, key)?
         .ok_or_else(|| AppError::Validation(format!("{key} is required")))
 }
-fn query_bool(query: &HashMap<String, Vec<String>>, key: &str) -> bool {
-    query_value(query, key).is_some_and(|value| value == "true" || value == "1")
+fn optional_body_string<'a>(body: &'a Value, key: &str) -> AppResult<Option<&'a str>> {
+    body.get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| AppError::Validation(format!("{key} must be a string")))
+        })
+        .transpose()
 }
-fn project_patch(body: &Value) -> ProjectSettingsPatch {
-    let source = body.get("compaction").unwrap_or(body);
-    ProjectSettingsPatch {
-        compaction_enabled: source.get("compaction_enabled").and_then(Value::as_bool),
-        compaction_after_days: source
-            .get("compaction_after_days")
-            .and_then(Value::as_u64)
-            .map(|value| value as u32),
-        compaction_interval_seconds: source
-            .get("compaction_interval_seconds")
-            .and_then(Value::as_u64),
-        compaction_batch_size: source
-            .get("compaction_batch_size")
-            .and_then(Value::as_u64)
-            .map(|value| value as u32),
+fn optional_body_bool(body: &Value, key: &str) -> AppResult<Option<bool>> {
+    body.get(key)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| AppError::Validation(format!("{key} must be a boolean")))
+        })
+        .transpose()
+}
+fn optional_body_u64(body: &Value, key: &str) -> AppResult<Option<u64>> {
+    body.get(key)
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| AppError::Validation(format!("{key} must be an unsigned integer")))
+        })
+        .transpose()
+}
+fn query_bool(query: &HashMap<String, Vec<String>>, key: &str) -> AppResult<bool> {
+    match query_value(query, key) {
+        None => Ok(false),
+        Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(_) => Err(AppError::Validation(format!(
+            "{key} must be true, false, 1, or 0"
+        ))),
+    }
+}
+fn project_patch(body: &Value) -> AppResult<ProjectSettingsPatch> {
+    let source = body
+        .get("compaction")
+        .unwrap_or(body)
+        .as_object()
+        .ok_or_else(|| AppError::Validation("project settings must be an object".to_owned()))?;
+    Ok(ProjectSettingsPatch {
+        compaction_enabled: optional_json_bool(source, "compaction_enabled")?,
+        compaction_after_days: optional_json_u32(source, "compaction_after_days")?,
+        compaction_interval_seconds: optional_json_u64(source, "compaction_interval_seconds")?,
+        compaction_batch_size: optional_json_u32(source, "compaction_batch_size")?,
+    })
+}
+fn optional_json_bool(object: &Map<String, Value>, key: &str) -> AppResult<Option<bool>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| AppError::Validation(format!("{key} must be a boolean"))),
+    }
+}
+fn optional_json_u32(object: &Map<String, Value>, key: &str) -> AppResult<Option<u32>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                AppError::Validation(format!("{key} must be a 32-bit unsigned integer"))
+            }),
+    }
+}
+fn optional_json_u64(object: &Map<String, Value>, key: &str) -> AppResult<Option<u64>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| AppError::Validation(format!("{key} must be an unsigned integer"))),
     }
 }
 fn topology(store: &CoverageStore, kind: &str, reference: &str) -> AppResult<Value> {
@@ -876,6 +1010,8 @@ mod tests {
             db_acquire_timeout_ms: 5_000,
             db_query_timeout_ms: 30_000,
             http_request_timeout_seconds: 60,
+            http_max_body_bytes: 1_048_576,
+            run_log_max_bytes: 10 * 1024 * 1024,
             default_compaction_after_days: 30,
             default_compaction_interval_seconds: 3_600,
             default_compaction_batch_size: 100,
@@ -888,11 +1024,11 @@ mod tests {
             .header(HOST, "127.0.0.1:59471")
             .body(())
             .unwrap();
-        assert!(trusted_host(&request));
+        assert!(trusted_host(&request).unwrap());
         let mut selected_headers = HeaderMap::new();
         selected_headers.insert(REPOSITORY_HEADER, HeaderValue::from_static("repo"));
         assert_eq!(
-            repository_header(&selected_headers).as_deref(),
+            repository_header(&selected_headers).unwrap().as_deref(),
             Some("repo")
         );
         let mut invalid_header = HeaderMap::new();
@@ -900,37 +1036,61 @@ mod tests {
             REPOSITORY_HEADER,
             HeaderValue::from_bytes(&[0xff]).expect("invalid header bytes are accepted"),
         );
-        assert!(repository_header(&invalid_header).is_none());
+        assert!(repository_header(&invalid_header).is_err());
         let request = Request::builder()
             .header(HOST, "localhost:59471")
             .body(())
             .unwrap();
-        assert!(trusted_host(&request));
+        assert!(trusted_host(&request).unwrap());
         let request = Request::builder()
             .header(HOST, "[::1]:59471")
             .body(())
             .unwrap();
-        assert!(trusted_host(&request));
+        assert!(trusted_host(&request).unwrap());
         let request = Request::builder()
             .header(HOST, "testserver")
             .body(())
             .unwrap();
-        assert!(trusted_host(&request));
+        assert!(trusted_host(&request).unwrap());
         let request = Request::builder()
             .header(HOST, "evil.example")
             .body(())
             .unwrap();
-        assert!(!trusted_host(&request));
+        assert!(!trusted_host(&request).unwrap());
+        let request = Request::builder()
+            .header(HOST, "localhost.evil")
+            .body(())
+            .unwrap();
+        assert!(!trusted_host(&request).unwrap());
+        let request = Request::builder()
+            .header(HOST, "127.0.0.1.evil:59471")
+            .body(())
+            .unwrap();
+        assert!(!trusted_host(&request).unwrap());
         let request = Request::new(());
-        assert!(trusted_host(&request));
+        assert!(!trusted_host(&request).unwrap());
+        let request = Request::builder()
+            .header(HOST, HeaderValue::from_bytes(&[0xff]).unwrap())
+            .body(())
+            .unwrap();
+        assert!(trusted_host(&request).is_err());
+        let request = Request::builder().header(HOST, "[").body(()).unwrap();
+        assert!(trusted_host(&request).is_err());
 
         let uri: Uri = "/api/items?query=one&query=two&flag=1".parse().unwrap();
-        let query = query_params(&uri);
+        let mut query = query_params(&uri);
         assert_eq!(query_values(&query, "query"), vec!["one", "two"]);
         assert_eq!(query_value(&query, "flag"), Some("1"));
         assert!(query_value(&query, "missing").is_none());
-        assert!(query_bool(&query, "flag"));
-        assert!(!query_bool(&query, "missing"));
+        assert!(query_bool(&query, "flag").unwrap());
+        assert!(!query_bool(&query, "missing").unwrap());
+        query.insert("invalid".to_owned(), vec!["maybe".to_owned()]);
+        assert!(query_bool(&query, "invalid").is_err());
+        assert_eq!(query_usize(&query, "missing", 17).unwrap(), 17);
+        query.insert("limit".to_owned(), vec!["4".to_owned()]);
+        assert_eq!(query_usize(&query, "limit", 17).unwrap(), 4);
+        query.insert("invalid_limit".to_owned(), vec!["many".to_owned()]);
+        assert!(query_usize(&query, "invalid_limit", 17).is_err());
         assert_eq!(required_query(&query, "query").unwrap(), "one");
         assert!(required_query(&query, "missing").is_err());
         assert_eq!(
@@ -938,18 +1098,28 @@ mod tests {
             "value"
         );
         assert!(required_body(&json!({}), "name").is_err());
+        assert!(optional_body_string(&json!({"name":9}), "name").is_err());
+        assert!(optional_body_bool(&json!({"enabled":"yes"}), "enabled").is_err());
+        assert!(optional_body_u64(&json!({"timeout":"60"}), "timeout").is_err());
 
         let patch = project_patch(
             &json!({"compaction":{"compaction_enabled":true,"compaction_after_days":7,"compaction_interval_seconds":60,"compaction_batch_size":5}}),
-        );
+        )
+        .unwrap();
         assert_eq!(patch.compaction_enabled, Some(true));
         assert_eq!(patch.compaction_after_days, Some(7));
         assert_eq!(patch.compaction_interval_seconds, Some(60));
         assert_eq!(patch.compaction_batch_size, Some(5));
         assert_eq!(
-            project_patch(&json!({"compaction_after_days":9})).compaction_after_days,
+            project_patch(&json!({"compaction_after_days":9}))
+                .unwrap()
+                .compaction_after_days,
             Some(9)
         );
+        assert!(project_patch(&json!({"compaction_after_days":"9"})).is_err());
+        assert!(project_patch(&json!({"compaction": []})).is_err());
+        assert!(project_patch(&json!({"compaction_enabled":"true"})).is_err());
+        assert!(project_patch(&json!({"compaction_interval_seconds":"60"})).is_err());
 
         let normal_db = database_repository(Path::new("/tmp/data.duckdb"));
         assert!(normal_db.ends_with("/tmp"));
@@ -970,6 +1140,23 @@ mod tests {
             AppError::Io(_)
         ));
         let server = CoverageServer::new(config()).unwrap();
+        let mut invalid_body_config = config();
+        invalid_body_config.http_max_body_bytes = MIN_HTTP_MAX_BODY_BYTES - 1;
+        assert!(CoverageServer::new(invalid_body_config).is_err());
+        let mut body = Vec::new();
+        append_body_chunk(&mut body, &Bytes::from_static(b"{}"), 2).unwrap();
+        assert_eq!(body, b"{}".to_vec());
+        assert!(append_body_chunk(&mut body, &Bytes::from_static(b"!"), 2).is_err());
+        append_body_data(&mut body, None, 2).unwrap();
+        assert_eq!(
+            parse_content_length(&HeaderValue::from_static("2")).unwrap(),
+            2
+        );
+        assert!(parse_content_length(&HeaderValue::from_static("bad")).is_err());
+        assert_eq!(checked_body_length(1, 2).unwrap(), 3);
+        assert!(checked_body_length(usize::MAX, 1).is_err());
+        assert!(parse_authority("[").is_err());
+        assert_eq!(parse_json_body(&[]).unwrap(), json!({}));
         assert!(
             server
                 .process_listener_result(Err(std::io::Error::other("accept")))
@@ -1013,8 +1200,16 @@ mod tests {
     #[test]
     fn server_health_and_unscoped_projects_are_safe_before_selection() {
         let server = CoverageServer::new(config()).unwrap();
-        assert_eq!(server.health()["status"], "ok");
-        assert_eq!(server.health()["schema_revision"], SCHEMA_REVISION);
+        assert_eq!(server.health().unwrap()["status"], "ok");
+        assert_eq!(server.health().unwrap()["schema_revision"], SCHEMA_REVISION);
+        let poisoned_server = CoverageServer::new(config()).unwrap();
+        let stores = poisoned_server.stores.clone();
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stores.lock().unwrap();
+            panic!("intentional store-lock poison for health error coverage");
+        }));
+        assert!(poison_result.is_err());
+        assert!(poisoned_server.health().is_err());
         assert!(server.unscoped_projects().unwrap()["data"].is_array());
         assert!(
             server
@@ -1065,7 +1260,7 @@ mod tests {
         let selected = server
             .service_for_repository_path(directory.path().to_str().unwrap())
             .unwrap();
-        assert!(server.project_list(selected, None, 600).is_ok());
+        assert!(server.project_list(selected, None, 600).is_err());
         store.close().unwrap();
         assert!(
             topology(
@@ -1090,6 +1285,19 @@ mod tests {
         );
         assert!(poisoned_server.project_list(service, None, 600).is_err());
         assert!(poisoned_server.unscoped_projects().is_err());
+
+        let poisoned_gate_server = CoverageServer::new(config()).unwrap();
+        let poisoned_gate = poisoned_gate_server.store_open_gate.clone();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_gate.lock().unwrap();
+            panic!("injected HTTP store-open lock poison");
+        }));
+        assert!(poison.is_err());
+        assert!(
+            poisoned_gate_server
+                .service_for_repository_path(directory.path().to_str().unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1112,12 +1320,11 @@ mod tests {
         drop(Connection::open(&missing_table).unwrap());
         let mut missing_config = config();
         missing_config.common_db_path = missing_table;
-        assert_eq!(
+        assert!(
             CoverageServer::new(missing_config)
                 .unwrap()
                 .unscoped_projects()
-                .unwrap()["data"],
-            json!([])
+                .is_err()
         );
 
         let query_error = directory.path().join("query-error.duckdb");
@@ -1245,6 +1452,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_mcp_limiter_returns_an_explicit_error() {
+        let server = CoverageServer::new(config()).unwrap();
+        server.mcp_limiter.close();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(server.serve_listener_until(listener, Some(1)));
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                b"POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(
+            String::from_utf8(response)
+                .unwrap()
+                .contains("500 Internal Server Error")
+        );
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn server_startup_shutdown_and_signal_wait_paths_are_testable() {
         let directory = tempfile::tempdir().unwrap();
         let mut startup_config = config();
@@ -1311,19 +1542,39 @@ mod tests {
         {
             shutdown_server
                 .clone()
-                .serve_until_shutdown_with(listener, async {})
+                .serve_until_shutdown_with(listener, async { Ok(()) })
                 .await
                 .unwrap();
             assert!(shutdown_server.stores.lock().unwrap().is_empty());
         }
         store.close().unwrap();
 
-        let immediate_ctrl_c: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async {});
-        wait_for_shutdown(None, immediate_ctrl_c).await;
-        let immediate_terminate: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async {});
-        let pending_ctrl_c: Pin<Box<dyn Future<Output = ()> + Send>> =
+        let immediate_ctrl_c: Pin<Box<dyn Future<Output = AppResult<()>> + Send>> =
+            Box::pin(async { Ok(()) });
+        wait_for_shutdown(None, immediate_ctrl_c).await.unwrap();
+        let immediate_terminate: Pin<Box<dyn Future<Output = AppResult<()>> + Send>> =
+            Box::pin(async { Ok(()) });
+        let pending_ctrl_c: Pin<Box<dyn Future<Output = AppResult<()>> + Send>> =
             Box::pin(std::future::pending());
-        wait_for_shutdown(Some(immediate_terminate), pending_ctrl_c).await;
+        wait_for_shutdown(Some(immediate_terminate), pending_ctrl_c)
+            .await
+            .unwrap();
+        let failed_ctrl_c: Pin<Box<dyn Future<Output = AppResult<()>> + Send>> =
+            Box::pin(async { Err(AppError::Runtime("ctrl-c registration failed".to_owned())) });
+        assert!(wait_for_shutdown(None, failed_ctrl_c).await.is_err());
+        let failed_terminate: Pin<Box<dyn Future<Output = AppResult<()>> + Send>> =
+            Box::pin(async {
+                Err(AppError::Runtime(
+                    "terminate registration failed".to_owned(),
+                ))
+            });
+        let pending_ctrl_c: Pin<Box<dyn Future<Output = AppResult<()>> + Send>> =
+            Box::pin(std::future::pending());
+        assert!(
+            wait_for_shutdown(Some(failed_terminate), pending_ctrl_c)
+                .await
+                .is_err()
+        );
 
         #[cfg(unix)]
         {
@@ -1333,22 +1584,35 @@ mod tests {
                 .args(["-INT", &std::process::id().to_string()])
                 .status()
                 .unwrap();
-            tokio::time::timeout(TokioDuration::from_secs(2), signal_task)
+            let signal_result = tokio::time::timeout(TokioDuration::from_secs(2), signal_task)
                 .await
                 .unwrap()
                 .unwrap();
+            signal_result.unwrap();
         }
     }
 
     #[tokio::test]
     async fn shutdown_accept_errors_are_reported_and_stores_are_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(client);
+        let mut first_stream = Some(stream);
         let server = CoverageServer::new(config()).unwrap();
         let result = server
             .serve_until_shutdown_with_acceptor(
-                || async {
-                    Err::<(tokio::net::TcpStream, std::net::SocketAddr), _>(std::io::Error::other(
-                        "accept failure",
-                    ))
+                move || {
+                    let result = first_stream
+                        .take()
+                        .map(|stream| Ok((stream, address)))
+                        .unwrap_or_else(|| {
+                            Err::<(tokio::net::TcpStream, std::net::SocketAddr), std::io::Error>(
+                                std::io::Error::other("accept failure"),
+                            )
+                        });
+                    std::future::ready(result)
                 },
                 std::future::pending(),
             )
@@ -1381,6 +1645,131 @@ mod tests {
             stream.read_to_end(&mut response).await.unwrap();
             let response = String::from_utf8(response).unwrap();
             assert!(response.contains("504 Gateway Timeout"));
+            task.await.unwrap().unwrap();
+        }
+
+        for listener in std::iter::once(
+            listener_or_skip(TcpListener::bind("127.0.0.1:0").await).unwrap_or(None),
+        )
+        .flatten()
+        {
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.clone().serve_listener_until(listener, Some(1)));
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    b"POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains("400 Bad Request")
+            );
+            task.await.unwrap().unwrap();
+        }
+
+        for listener in std::iter::once(
+            listener_or_skip(TcpListener::bind("127.0.0.1:0").await).unwrap_or(None),
+        )
+        .flatten()
+        {
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.clone().serve_listener_until(listener, Some(1)));
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    b"POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains("400 Bad Request")
+            );
+            task.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut server_config = config();
+        server_config.common_db_path = directory.path().join("body-limit-common.duckdb");
+        server_config.http_max_body_bytes = 1_024;
+        let server = CoverageServer::new(server_config).unwrap();
+        for listener in std::iter::once(
+            listener_or_skip(TcpListener::bind("127.0.0.1:0").await).unwrap_or(None),
+        )
+        .flatten()
+        {
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.clone().serve_listener_until(listener, Some(1)));
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    b"POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 1025\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.contains("400 Bad Request"));
+            assert!(response.contains("request body exceeds 1024 bytes"));
+            task.await.unwrap().unwrap();
+        }
+
+        for listener in std::iter::once(
+            listener_or_skip(TcpListener::bind("127.0.0.1:0").await).unwrap_or(None),
+        )
+        .flatten()
+        {
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.clone().serve_listener_until(listener, Some(1)));
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let oversized = vec![b'a'; 1_025];
+            let mut request = "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n401\r\n"
+                .to_owned()
+                .into_bytes();
+            request.extend_from_slice(&oversized);
+            request.extend_from_slice(b"\r\n0\r\n\r\n");
+            stream.write_all(&request).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.contains("400 Bad Request"));
+            assert!(response.contains("request body exceeds 1024 bytes"));
+            task.await.unwrap().unwrap();
+        }
+
+        for listener in std::iter::once(
+            listener_or_skip(TcpListener::bind("127.0.0.1:0").await).unwrap_or(None),
+        )
+        .flatten()
+        {
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(server.clone().serve_listener_until(listener, Some(1)));
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    b"POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains("400 Bad Request")
+            );
             task.await.unwrap().unwrap();
         }
     }

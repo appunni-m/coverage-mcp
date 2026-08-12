@@ -39,6 +39,8 @@ fn config() -> ServerConfig {
         db_acquire_timeout_ms: 5_000,
         db_query_timeout_ms: 30_000,
         http_request_timeout_seconds: 60,
+        http_max_body_bytes: 1_048_576,
+        run_log_max_bytes: 10 * 1024 * 1024,
         default_compaction_after_days: 30,
         default_compaction_interval_seconds: 3_600,
         default_compaction_batch_size: 100,
@@ -130,7 +132,7 @@ fn rust_migrates_all_parser_formats_and_aliases() {
         ("cover.out", "mode: set\nsrc/a.go:1.1,2.1 2 1\n", "go"),
         (
             "llvm.json",
-            r#"{"data":[{"files":[{"filename":"src/a.c","segments":[[1,0,2,1]],"branches":[{"line":1,"true_count":1,"false_count":0}],"summary":{"lines":{"count":1,"covered":1},"regions":{"count":1,"covered":1}}}]}]}"#,
+            r#"{"data":[{"files":[{"filename":"src/a.c","segments":[[1,0,2,true]],"branches":[{"line":1,"true_count":1,"false_count":0}],"summary":{"lines":{"count":1,"covered":1},"regions":{"count":1,"covered":1}}}]}]}"#,
             "llvm",
         ),
     ];
@@ -265,6 +267,37 @@ fn run_compaction_benchmark_sample() -> (Duration, Value) {
     (elapsed, result)
 }
 
+fn maybe_write_benchmark_report(
+    report_path: Option<PathBuf>,
+    samples: &[Duration],
+    median: Duration,
+) {
+    let Some(report_path) = report_path else {
+        return;
+    };
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let sample_ms = samples
+        .iter()
+        .map(|sample| sample.as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
+    std::fs::write(
+        report_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema":"migration-parity/benchmark-result@1",
+            "workload_id":"coverage-mcp.storage.compact.benchmark",
+            "target_profile":"rust-default",
+            "correctness_gate":"parity_pass",
+            "samples_latency_ms":sample_ms,
+            "median_latency_ms":median.as_secs_f64() * 1_000.0,
+            "budget":{"operator":"less_than_or_equal","value":5000,"unit":"milliseconds","outcome":"pass"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn rust_compaction_benchmark_workload() {
     let workload: Value = serde_json::from_str(include_str!(
@@ -292,30 +325,25 @@ fn rust_compaction_benchmark_workload() {
         median <= Duration::from_secs(5),
         "compaction median exceeded the manifest budget: {median:?}"
     );
-    if let Some(report_path) = std::env::var_os("MIGRATION_BENCHMARK_REPORT") {
-        let report_path = PathBuf::from(report_path);
-        if let Some(parent) = report_path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        let sample_ms = samples
-            .iter()
-            .map(|sample| sample.as_secs_f64() * 1_000.0)
-            .collect::<Vec<_>>();
-        std::fs::write(
-            report_path,
-            serde_json::to_vec_pretty(&json!({
-                "schema":"migration-parity/benchmark-result@1",
-                "workload_id":"coverage-mcp.storage.compact.benchmark",
-                "target_profile":"rust-default",
-                "correctness_gate":"parity_pass",
-                "samples_latency_ms":sample_ms,
-                "median_latency_ms":median.as_secs_f64() * 1_000.0,
-                "budget":{"operator":"less_than_or_equal","value":5000,"unit":"milliseconds","outcome":"pass"}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
+    maybe_write_benchmark_report(
+        std::env::var_os("MIGRATION_BENCHMARK_REPORT").map(PathBuf::from),
+        &samples,
+        median,
+    );
+}
+
+#[test]
+fn rust_benchmark_report_can_be_written() {
+    let directory = tempfile::tempdir().unwrap();
+    let report_path = directory.path().join("nested/benchmark.json");
+    maybe_write_benchmark_report(
+        Some(report_path.clone()),
+        &[Duration::from_millis(1), Duration::from_millis(2)],
+        Duration::from_millis(2),
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["schema"], "migration-parity/benchmark-result@1");
+    assert_eq!(report["samples_latency_ms"][1], 2.0);
 }
 
 #[test]
@@ -408,17 +436,17 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
     let base_report = write_file(
         directory.path(),
         "base.lcov",
-        "TN:\nSF:src/a.py\nDA:1,1\nDA:2,1\nend_of_record\n",
+        "TN:\nSF:src/a.py\nDA:1,1\nDA:2,1\nDA:4,1\nend_of_record\n",
     );
     let current_report = write_file(
         directory.path(),
         "current.lcov",
-        "TN:\nSF:src/a.py\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\n",
+        "TN:\nSF:src/a.py\nDA:1,1\nDA:2,0\nDA:3,1\nDA:4,0\nend_of_record\n",
     );
     let store = store(directory.path());
     let base = ingest(&store, &base_report, "main", "base");
     let current = ingest(&store, &current_report, "feature", "head");
-    assert_eq!(current["total_lines"], 3);
+    assert_eq!(current["total_lines"], 4);
     assert_eq!(
         store
             .latest_snapshot(None, Some("feature"), Some("unit"))
@@ -433,7 +461,7 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
     let gaps = store
         .file_gaps(current["id"].as_str().unwrap(), "src/a.py", 10)
         .unwrap();
-    assert_eq!(gaps["uncovered_line_count"], 1);
+    assert_eq!(gaps["uncovered_line_count"], 2);
     assert_eq!(gaps["ranges"][0]["start"], 2);
     assert_eq!(
         store
@@ -480,6 +508,39 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
             .unwrap()[0]["status"],
         "regressed"
     );
+    let targets = store
+        .targets(current["id"].as_str().unwrap(), "priority", 100)
+        .unwrap();
+    assert_eq!(targets[0]["file_path"], "src/a.py");
+    assert_eq!(targets[0]["regions"][0]["start"], 2);
+    assert!(
+        store
+            .targets(base["id"].as_str().unwrap(), "priority", 100)
+            .unwrap()
+            .is_empty()
+    );
+    for order_by in ["uncovered_lines", "line_rate", "file_path"] {
+        assert!(
+            store
+                .targets(current["id"].as_str().unwrap(), order_by, 100)
+                .is_ok()
+        );
+    }
+    assert!(
+        store
+            .targets(current["id"].as_str().unwrap(), "invalid", 100)
+            .is_err()
+    );
+    let regions = store
+        .changed_regions(
+            current["id"].as_str().unwrap(),
+            base["id"].as_str().unwrap(),
+            None,
+            false,
+            100,
+        )
+        .unwrap();
+    assert!(regions.iter().any(|value| value["status"] == "regressed"));
     assert!(
         store
             .insights(
@@ -514,7 +575,11 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
     assert_eq!(reopened.files(&snapshot_id, 100).unwrap().len(), 1);
     assert_eq!(
         reopened.lines(&snapshot_id, "src/a.py", 100).unwrap().len(),
-        3
+        4
+    );
+    assert_eq!(
+        reopened.targets(&snapshot_id, "priority", 100).unwrap()[0]["regions"][0]["start"],
+        2
     );
     assert_eq!(
         reopened.file_coverage(&snapshot_id, "src/a.py").unwrap()["file_path"],
@@ -582,6 +647,11 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
     }
     let corrupted = CoverageStore::open(compacted_db.clone(), config()).unwrap();
     corrupted.ensure_project(directory.path()).unwrap();
+    assert!(
+        corrupted
+            .compare_regions(&snapshot_id, base["id"].as_str().unwrap(), None, false, 100)
+            .is_err()
+    );
     let corrupted_result = corrupted.files(&snapshot_id, 100);
     assert!(corrupted_result.is_err());
     corrupted.close().unwrap();
@@ -686,6 +756,8 @@ fn rust_managed_runs_keep_idempotency_logs_and_artifacts() {
     assert_eq!(run["status"], "passed");
     assert!(run["terminal"].as_bool().unwrap());
     assert_eq!(run["parsed_summary"]["counters"]["passed"], 1);
+    assert_eq!(run["parsed_summary"]["truncated"], false);
+    assert!(run["parsed_summary"]["stdout_bytes"].as_u64().unwrap() > 0);
     assert_eq!(run["coverage_ingest"]["status"], "ingested");
     let repeated = store
         .submit_command(
@@ -803,6 +875,8 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
     let current_id = current["id"].as_str().unwrap();
     let other_id = other["id"].as_str().unwrap();
 
+    assert!(store.targets(current_id, "priority", 100).unwrap().len() >= 2);
+
     assert_eq!(store.project_summary().unwrap()["snapshot_count"], 3);
     assert!(
         store
@@ -828,7 +902,7 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
         store.file_gaps(current_id, "missing.py", 10).unwrap()["ranges"],
         json!([])
     );
-    assert!(store.source_lines(current_id, "src/a.py", 0, 2).is_ok());
+    assert!(store.source_lines(current_id, "src/a.py", 0, 2).is_err());
     assert!(store.source_lines(current_id, ".", 1, 2).is_err());
     #[cfg(unix)]
     {
@@ -890,6 +964,11 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
             .changed_lines(current_id, other_id, None, false, 100)
             .is_err()
     );
+    assert!(
+        store
+            .changed_regions(current_id, other_id, None, false, 100)
+            .is_err()
+    );
     assert!(store.compare(current_id, base_id, 0, 0).is_ok());
     let initial_insights = store.insights(current_id, None, 100).unwrap();
     assert!(initial_insights["items"].is_array());
@@ -902,6 +981,30 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
     assert!(insight_categories.contains("zero-coverage-file"));
     assert!(insight_categories.contains("low-line-coverage"));
     assert!(insight_categories.contains("low-branch-coverage"));
+    let healthy_report = write_file(
+        directory.path(),
+        "healthy.lcov",
+        "TN:\nSF:src/healthy.py\nDA:1,1\nDA:2,1\nDA:3,1\nDA:4,1\nDA:5,1\nend_of_record\n",
+    );
+    let healthy_snapshot = store
+        .ingest_report(
+            &healthy_report,
+            "lcov",
+            Some(directory.path()),
+            Some("feature"),
+            Some("healthy"),
+            None,
+            "unit",
+        )
+        .unwrap();
+    assert!(
+        store
+            .insights(healthy_snapshot["id"].as_str().unwrap(), None, 10)
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let warning_report = write_file(directory.path(), "warning.lcov", "TN:\n");
     let warning_snapshot = store
         .ingest_report(
@@ -1556,6 +1659,54 @@ fn rust_service_worktree_comparison_views_match_storage_contract() {
     assert!(
         service
             .coverage_comparison(
+                "regions",
+                Some(current_id),
+                None,
+                Some(worktree_id),
+                Some("unit"),
+                Some("src/a.py"),
+                true,
+                None,
+                600,
+                false,
+            )
+            .is_ok()
+    );
+    assert!(
+        service
+            .coverage_comparison(
+                "regions",
+                None,
+                None,
+                Some("missing-worktree"),
+                Some("unit"),
+                None,
+                false,
+                None,
+                600,
+                false,
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .coverage_comparison(
+                "regions",
+                None,
+                None,
+                Some(worktree_id),
+                Some("unit"),
+                None,
+                false,
+                None,
+                600,
+                false,
+            )
+            .is_ok()
+    );
+    assert!(
+        service
+            .coverage_comparison(
                 "progress",
                 None,
                 None,
@@ -1772,6 +1923,143 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
         .unwrap();
     let second_id = second["data"]["id"].as_str().unwrap();
     let first_id = snapshot["id"].as_str().unwrap();
+    let other_suite_snapshot = service
+        .ingest(
+            "coverage.lcov",
+            "lcov",
+            "other-suite",
+            Some("main"),
+            Some("other-head"),
+            None,
+            false,
+        )
+        .unwrap();
+    let other_suite_id = other_suite_snapshot["data"]["id"].as_str().unwrap();
+    let targets = service
+        .coverage_query_ordered(
+            "targets",
+            Some(second_id),
+            None,
+            Some("unit"),
+            None,
+            None,
+            None,
+            None,
+            Some("uncovered_lines"),
+            None,
+            600,
+            false,
+        )
+        .unwrap();
+    assert_eq!(targets["data"]["order_by"], "uncovered_lines");
+    assert_eq!(targets["data"]["targets"][0]["regions"][0]["start"], 1);
+    let filtered_targets = service
+        .coverage_query_ordered(
+            "targets",
+            Some(second_id),
+            None,
+            Some("unit"),
+            None,
+            Some("a.py"),
+            None,
+            None,
+            None,
+            None,
+            600,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        filtered_targets["data"]["targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        service
+            .coverage_query_ordered(
+                "targets",
+                Some(second_id),
+                None,
+                Some("unit"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("invalid"),
+                600,
+                false,
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .coverage_query_ordered(
+                "targets",
+                Some(second_id),
+                None,
+                Some("unit"),
+                None,
+                None,
+                None,
+                None,
+                Some("invalid"),
+                None,
+                600,
+                false,
+            )
+            .is_err()
+    );
+    let compact_regions = service
+        .coverage_comparison(
+            "regions",
+            None,
+            None,
+            None,
+            Some("unit"),
+            None,
+            false,
+            None,
+            600,
+            false,
+        )
+        .unwrap();
+    assert!(compact_regions["data"]["regions"].is_array());
+    assert!(compact_regions["data"]["region_change_count"].is_number());
+    assert!(
+        service
+            .coverage_comparison(
+                "regions",
+                None,
+                None,
+                None,
+                Some("missing-suite"),
+                None,
+                false,
+                None,
+                600,
+                false,
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .coverage_comparison(
+                "regions",
+                Some(second_id),
+                Some(other_suite_id),
+                None,
+                None,
+                None,
+                false,
+                None,
+                600,
+                false,
+            )
+            .is_err()
+    );
     assert!(
         service
             .coverage_query(
@@ -1822,6 +2110,7 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
         )
         .unwrap();
     assert!(file_view["data"]["selected_lines"].is_array());
+    assert_eq!(file_view["data"]["red_regions"][0]["start"], 1);
     assert!(
         service
             .coverage_query(
@@ -2014,6 +2303,9 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
 
     let source = service.source(second_id, "a.py", 1, 2, None, 600).unwrap();
     assert_eq!(source["data"]["lines"].as_array().unwrap().len(), 2);
+    assert_eq!(source["data"]["lines"][0]["marker"], "red");
+    assert_eq!(source["data"]["lines"][1]["marker"], "green");
+    assert_eq!(source["data"]["red_regions"][0]["start"], 1);
     assert!(service.source(second_id, "a.py", 2, 1, None, 600).is_err());
     assert!(
         service
@@ -2542,12 +2834,35 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
     )
     .unwrap();
     let mcp_snapshot_id = mcp_ingest["data"]["id"].as_str().unwrap();
+    assert!(
+        service
+            .coverage_comparison(
+                "regions",
+                Some(mcp_snapshot_id),
+                None,
+                None,
+                Some("mcp"),
+                None,
+                false,
+                None,
+                600,
+                false,
+            )
+            .is_err()
+    );
     assert!(mcp::call_tool(
         &service,
         "coverage_query",
         &json!({"view":"file","snapshot_id":mcp_snapshot_id,"file_path":"a.py","line_ranges":[{"start":1,"end":2}]})
     )
     .is_ok());
+    let mcp_targets = mcp::call_tool(
+        &service,
+        "coverage_query",
+        &json!({"view":"targets","snapshot_id":mcp_snapshot_id,"order_by":"priority"}),
+    )
+    .unwrap();
+    assert!(mcp_targets["data"]["targets"].is_array());
     assert!(
         mcp::call_tool(
             &service,
@@ -2578,6 +2893,13 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
         &json!({"view":"lines","snapshot_id":second_id,"baseline_snapshot_id":first_id,"only_regressions":true})
     )
     .is_ok());
+    let mcp_regions = mcp::call_tool(
+        &service,
+        "coverage_compare",
+        &json!({"view":"regions","snapshot_id":second_id,"baseline_snapshot_id":first_id}),
+    )
+    .unwrap();
+    assert!(mcp_regions["data"]["regions"].is_array());
     let mcp_worktree = mcp::call_tool(
         &service,
         "register_worktree",
@@ -2977,7 +3299,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
-    let _run_state = http_exchange(
+    let run_state = http_exchange(
         address,
         "GET",
         &format!("/api/runs/{run_id}?detailed=true"),
@@ -2985,6 +3307,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
+    assert_eq!(run_state["data"]["parsed_summary"]["truncated"], false);
     let _logs = http_exchange(
         address,
         "GET",
@@ -3211,7 +3534,13 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     .await;
     let _mcp_context = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"project_context","arguments":{}}})), None).await;
     let _mcp_files = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"coverage_query","arguments":{"view":"files","snapshot_id":second_snapshot_id}}})), None).await;
+    let mcp_targets = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"coverage_query","arguments":{"view":"targets","snapshot_id":second_snapshot_id}}})), None).await;
+    assert_eq!(mcp_targets["result"]["isError"], false);
+    assert!(mcp_targets["result"]["structuredContent"]["data"]["targets"].is_array());
     let _mcp_compare = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"coverage_compare","arguments":{"view":"overview","snapshot_id":second_snapshot_id,"baseline_snapshot_id":snapshot_id}}})), None).await;
+    let mcp_regions = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"coverage_compare","arguments":{"view":"regions","snapshot_id":second_snapshot_id,"baseline_snapshot_id":snapshot_id}}})), None).await;
+    assert_eq!(mcp_regions["result"]["isError"], false);
+    assert!(mcp_regions["result"]["structuredContent"]["data"]["regions"].is_array());
     let _mcp_source = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"source_context","arguments":{"snapshot_id":second_snapshot_id,"file_path":"a.py","start":1,"end":2}}})), None).await;
     let _mcp_missing_uri = http_exchange(
         address,
@@ -3249,7 +3578,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     assert!(
         http_raw(address, "POST", "/mcp/", None, None)
             .await
-            .contains("200 OK")
+            .contains("400 Bad Request")
     );
     let mcp_summary = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"coverage_query","arguments":{"view":"summary","snapshot_id":snapshot_id}}})), None).await;
     assert_eq!(mcp_summary["result"]["isError"], false);

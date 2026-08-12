@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,15 +8,18 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use duckdb::{Connection, OptionalExt, params, types::ValueRef};
+use duckdb::{Connection, OptionalExt, Row, params, types::ValueRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::compaction::{CompactionPolicy, CompactionResult};
-use crate::config::ServerConfig;
+use crate::config::{MAX_RUN_LOG_MAX_BYTES, MIN_RUN_LOG_MAX_BYTES, ServerConfig};
 use crate::error::{AppError, AppResult};
 use crate::git::{GitInfo, inspect_git, merge_base};
 use crate::lock::{FileLease, database_lock_path};
@@ -37,6 +40,7 @@ const UPSERT_REPOSITORY_SQL: &str = "INSERT INTO repositories (id, repo_key, las
 const UPDATE_PROJECT_SETTINGS_SQL: &str = "UPDATE project_settings SET updated_at = ?, compaction_enabled = ?, compaction_after_days = ?, compaction_interval_seconds = ?, compaction_batch_size = ? WHERE repo_key = ?";
 const UPDATE_COMPACTION_STATUS_SQL: &str = "UPDATE project_settings SET compaction_last_run_at = ?, compaction_last_status = ?, compaction_last_snapshot_count = ?, compaction_last_bytes_before = ?, compaction_last_bytes_after = ?, updated_at = ? WHERE repo_key = ?";
 const INSERT_RUN_ARTIFACT_SQL: &str = "INSERT INTO run_artifacts (run_id, kind, path, exists, size_bytes, coverage_format, suite, modified_by_run, ingest_status, snapshot_id, ingest_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_COMPLETED_RUN_SQL: &str = "INSERT INTO runs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at) SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ?, ?, ?, ?, stdout_path, stderr_path, ?, ?, queued_at, date_diff('millisecond', queued_at, started_at), cancellation_requested_at FROM run_jobs WHERE id = ?";
 const INSERT_SNAPSHOT_SQL: &str = "INSERT INTO snapshots (id, created_at, minute_bucket, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_FILE_SQL: &str = "INSERT INTO files (snapshot_id, file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_LINE_SQL: &str = "INSERT INTO lines (snapshot_id, file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
@@ -88,12 +92,13 @@ pub struct ProjectSettings {
 impl ProjectSettings {
     /// Returns the policy used by the background worker.
     pub fn policy(&self) -> CompactionPolicy {
-        CompactionPolicy {
+        #[rustfmt::skip]
+        let policy = CompactionPolicy {
             enabled: self.compaction_enabled,
             older_than_days: self.compaction_after_days,
             interval_seconds: self.compaction_interval_seconds,
-            batch_size: self.compaction_batch_size,
-        }
+            batch_size: self.compaction_batch_size };
+        policy
     }
 }
 
@@ -112,6 +117,89 @@ struct StoreInner {
     run_threads: Mutex<Vec<JoinHandle<()>>>,
     compaction_thread: Mutex<Option<JoinHandle<()>>>,
     compaction_wakeup: Condvar,
+}
+
+struct LogCaptureResult {
+    bytes_written: u64,
+    truncated: bool,
+}
+
+struct LogCaptureHandles {
+    stdout: JoinHandle<std::io::Result<LogCaptureResult>>,
+    stderr: JoinHandle<std::io::Result<LogCaptureResult>>,
+}
+
+struct ManagedRunGuard {
+    inner: Arc<StoreInner>,
+    run_id: String,
+    control: Arc<Mutex<Option<Child>>>,
+    captures: Option<LogCaptureHandles>,
+    completed: bool,
+}
+
+impl ManagedRunGuard {
+    fn new(
+        inner: Arc<StoreInner>,
+        run_id: String,
+        control: Arc<Mutex<Option<Child>>>,
+        captures: LogCaptureHandles,
+    ) -> Self {
+        Self {
+            inner,
+            run_id,
+            control,
+            captures: Some(captures),
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self) -> AppResult<(LogCaptureResult, LogCaptureResult)> {
+        terminate_managed_process(&self.control)?;
+        let captures = self
+            .captures
+            .take()
+            .ok_or_else(|| AppError::Runtime("run log capture was already joined".to_owned()))?;
+        let result = join_log_capture_handles(captures);
+        self.inner
+            .active_processes
+            .lock()
+            .map_err(lock_error)?
+            .remove(&self.run_id);
+        let result = result?;
+        self.completed = true;
+        Ok(result)
+    }
+}
+
+impl Drop for ManagedRunGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Err(error) = terminate_managed_process(&self.control) {
+            eprintln!(
+                "coverage-mcp could not clean up failed run {}: {error}",
+                self.run_id
+            );
+        }
+        if let Some(captures) = self.captures.take() {
+            if let Err(error) = join_log_capture_handles(captures) {
+                eprintln!(
+                    "coverage-mcp could not join failed run {} log capture: {error}",
+                    self.run_id
+                );
+            }
+        }
+        match self.inner.active_processes.lock() {
+            Ok(mut active) => {
+                active.remove(&self.run_id);
+            }
+            Err(_) => eprintln!(
+                "coverage-mcp could not remove failed run {} from the active process registry",
+                self.run_id
+            ),
+        }
+    }
 }
 
 /// Thread-safe repository coverage store backed by the existing DuckDB schema.
@@ -136,17 +224,12 @@ fn ensure_db_parent(db_path: &Path) -> AppResult<()> {
     }
 }
 
-#[allow(clippy::single_match)]
 fn retain_compaction_thread(
     slot: &Mutex<Option<JoinHandle<()>>>,
     handle: std::io::Result<JoinHandle<()>>,
 ) -> AppResult<()> {
-    match handle {
-        Ok(handle) => {
-            *slot.lock().map_err(lock_error)? = Some(handle);
-        }
-        Err(_) => {}
-    }
+    let handle = handle.map_err(AppError::from)?;
+    *slot.lock().map_err(lock_error)? = Some(handle);
     Ok(())
 }
 
@@ -176,10 +259,16 @@ fn finish_transaction<T>(connection: &Connection, result: AppResult<T>) -> AppRe
             connection.execute_batch("COMMIT")?;
             Ok(value)
         }
-        Err(error) => {
-            let _ = connection.execute_batch("ROLLBACK");
-            Err(error)
-        }
+        Err(error) => Err(rollback_transaction(connection, error)),
+    }
+}
+
+fn rollback_transaction(connection: &Connection, error: AppError) -> AppError {
+    match connection.execute_batch("ROLLBACK") {
+        Ok(()) => error,
+        Err(rollback_error) => AppError::Runtime(format!(
+            "{error}; transaction rollback failed: {rollback_error}"
+        )),
     }
 }
 
@@ -196,6 +285,12 @@ impl CoverageStore {
                 "run_retention must be at least 1".to_owned(),
             ));
         }
+        if !(MIN_RUN_LOG_MAX_BYTES..=MAX_RUN_LOG_MAX_BYTES).contains(&config.run_log_max_bytes) {
+            return Err(AppError::Validation(format!(
+                "run_log_max_bytes must be between {MIN_RUN_LOG_MAX_BYTES} and {MAX_RUN_LOG_MAX_BYTES}"
+            )));
+        }
+        let database_preexisted = db_path.exists();
         ensure_db_parent(&db_path)?;
         let run_dir = db_path.parent().unwrap_or(Path::new(".")).join("runs");
         fs::create_dir_all(&run_dir)?;
@@ -221,8 +316,8 @@ impl CoverageStore {
             compaction_wakeup: Condvar::new(),
         });
         let store = Self { inner };
-        store.init_schema()?;
-        store.start_compaction_worker();
+        store.init_schema(database_preexisted)?;
+        store.start_compaction_worker()?;
         Ok(store)
     }
 
@@ -258,8 +353,13 @@ impl CoverageStore {
 
     /// Closes workers and the database connection.
     pub fn close(&self) -> AppResult<()> {
+        let mut worker_error = None;
         if !self.inner.closing.swap(true, Ordering::SeqCst) {
             self.inner.compaction_wakeup.notify_all();
+            self.inner.slots.1.notify_all();
+            if let Err(error) = self.terminate_active_processes() {
+                worker_error = Some(error);
+            }
             if let Some(thread) = self
                 .inner
                 .compaction_thread
@@ -267,13 +367,17 @@ impl CoverageStore {
                 .map_err(lock_error)?
                 .take()
             {
-                let _ = thread.join();
+                if let Err(error) = join_worker(thread, "compaction") {
+                    worker_error.get_or_insert(error);
+                }
             }
             let current = thread::current().id();
             let mut threads = self.inner.run_threads.lock().map_err(lock_error)?;
             for thread in threads.drain(..) {
                 if thread.thread().id() != current {
-                    let _ = thread.join();
+                    if let Err(error) = join_worker(thread, "run") {
+                        worker_error.get_or_insert(error);
+                    }
                 }
             }
             drop(threads);
@@ -291,7 +395,23 @@ impl CoverageStore {
         }
         self.inner.pool.lock().map_err(lock_error)?.take();
         self.inner.db_lease.lock().map_err(lock_error)?.take();
-        Ok(())
+        worker_error.map_or(Ok(()), Err)
+    }
+
+    fn terminate_active_processes(&self) -> AppResult<()> {
+        let controls = self
+            .inner
+            .active_processes
+            .lock()
+            .map_err(lock_error)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for control in controls {
+            record_first_process_error(&mut first_error, terminate_managed_process(&control));
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn with_connection<T>(
@@ -300,6 +420,13 @@ impl CoverageStore {
     ) -> AppResult<T> {
         let _write_gate = self.inner.write_gate.lock().map_err(lock_error)?;
         self.with_pooled_connection(operation)
+    }
+
+    fn checkpoint_connection(connection: &Connection) -> AppResult<bool> {
+        connection
+            .execute_batch("CHECKPOINT")
+            .map(|_| true)
+            .map_err(AppError::from)
     }
 
     fn with_connection_mut<T>(
@@ -322,6 +449,29 @@ impl CoverageStore {
         operation: impl FnOnce(&Connection) -> AppResult<T>,
     ) -> AppResult<T> {
         self.ensure_store_open()?;
+        self.with_pooled_connection_allow_closing(operation)
+    }
+
+    fn with_connection_allow_closing<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> AppResult<T>,
+    ) -> AppResult<T> {
+        let _write_gate = match self.inner.write_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!(
+                    "coverage-mcp recovering the poisoned write gate to finalize a failed run"
+                );
+                poisoned.into_inner()
+            }
+        };
+        self.with_pooled_connection_allow_closing(operation)
+    }
+
+    fn with_pooled_connection_allow_closing<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> AppResult<T>,
+    ) -> AppResult<T> {
         let connection = self.checkout_connection()?;
         let query_guard = self
             .inner
@@ -359,7 +509,7 @@ impl CoverageStore {
         )
     }
 
-    fn init_schema(&self) -> AppResult<()> {
+    fn init_schema(&self, migrate_existing: bool) -> AppResult<()> {
         let schema = r#"
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id VARCHAR PRIMARY KEY, created_at TIMESTAMP NOT NULL, minute_bucket TIMESTAMP NOT NULL,
@@ -445,7 +595,9 @@ impl CoverageStore {
                 "#;
         self.with_connection(|connection| {
             connection.execute_batch(schema)?;
-            migrate_schema(connection)?;
+            if migrate_existing {
+                migrate_schema(connection)?;
+            }
             Ok(())
         })
     }
@@ -476,14 +628,44 @@ impl CoverageStore {
         let project = self.project()?;
         self.with_read_connection(|connection| {
             let mut statement = connection.prepare("SELECT repo_key, repo_path, created_at, updated_at, compaction_enabled, compaction_after_days, compaction_interval_seconds, compaction_batch_size, compaction_last_run_at, compaction_last_status, compaction_last_snapshot_count, compaction_last_bytes_before, compaction_last_bytes_after FROM project_settings WHERE repo_key = ?")?;
-            statement.query_row(params![project.repo_key], |row| {
-                Ok(ProjectSettings {
-                    repo_key: row.get(0)?, repo_path: row.get(1)?, created_at: timestamp_string(row.get_ref(2)?), updated_at: timestamp_string(row.get_ref(3)?),
-                    compaction_enabled: row.get(4)?, compaction_after_days: row.get::<_, i64>(5)? as u32, compaction_interval_seconds: row.get::<_, i64>(6)? as u64,
-                    compaction_batch_size: row.get::<_, i64>(7)? as u32, compaction_last_run_at: optional_timestamp(row.get_ref(8)?), compaction_last_status: row.get(9)?,
-                    compaction_last_snapshot_count: row.get::<_, i64>(10)? as u64, compaction_last_bytes_before: row.get::<_, i64>(11)? as u64, compaction_last_bytes_after: row.get::<_, i64>(12)? as u64,
-                })
-            }).map_err(AppError::from)
+            let raw = statement.query_row(params![project.repo_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    timestamp_string(row.get_ref(2)?),
+                    timestamp_string(row.get_ref(3)?),
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    optional_timestamp(row.get_ref(8)?),
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                ))
+            })?;
+            Ok(ProjectSettings {
+                repo_key: raw.0,
+                repo_path: raw.1,
+                created_at: raw.2,
+                updated_at: raw.3,
+                compaction_enabled: raw.4,
+                compaction_after_days: checked_db_u32(raw.5, "compaction_after_days")?,
+                compaction_interval_seconds: checked_db_u64(
+                    raw.6,
+                    "compaction_interval_seconds",
+                )?,
+                compaction_batch_size: checked_db_u32(raw.7, "compaction_batch_size")?,
+                compaction_last_run_at: raw.8,
+                compaction_last_status: raw.9,
+                compaction_last_snapshot_count: checked_db_u64(
+                    raw.10,
+                    "compaction_last_snapshot_count",
+                )?,
+                compaction_last_bytes_before: checked_db_u64(raw.11, "compaction_last_bytes_before")?,
+                compaction_last_bytes_after: checked_db_u64(raw.12, "compaction_last_bytes_after")?,
+            })
         })
     }
 
@@ -538,27 +720,58 @@ impl CoverageStore {
             result.insert("branch_count".to_owned(), json!(connection.query_row("SELECT count(DISTINCT branch) FROM snapshots WHERE repo_key = ?", params![project.repo_key], |row| row.get::<_, i64>(0))?));
             result.insert("command_count".to_owned(), json!(command_count));
             result.insert("run_count".to_owned(), json!(run_count));
-            result.insert("latest_snapshot_id".to_owned(), latest.as_ref().and_then(|value| value.get("id")).cloned().unwrap_or(Value::Null));
+            let latest_id = latest
+                .as_ref()
+                .map(|value| required_field(value, "id", "latest snapshot").cloned())
+                .transpose()?;
+            result.insert(
+                "latest_snapshot_id".to_owned(),
+                latest_id.unwrap_or(Value::Null),
+            );
             if let Some(latest) = latest { for key in ["created_at", "branch", "commit_sha", "suite", "format", "total_lines", "covered_lines", "line_rate", "total_branches", "covered_branches", "branch_rate", "total_functions", "covered_functions", "function_rate", "total_regions", "covered_regions", "region_rate"] { if let Some(value) = latest.get(key) { result.insert(format!("latest_{key}"), value.clone()); } } }
             result.insert("compaction".to_owned(), serde_json::to_value(settings)?);
             Ok(Value::Object(result))
         })
     }
 
-    fn start_compaction_worker(&self) {
+    fn start_compaction_worker(&self) -> AppResult<()> {
         let store = self.clone();
         let handle = thread::Builder::new()
             .name("coverage-mcp-compactor".to_owned())
             .spawn(move || {
                 while !store.inner.closing.load(Ordering::SeqCst) {
-                    let settings = store.project_settings().ok();
+                    let settings = match store.project_settings() {
+                        Ok(settings) => Some(settings),
+                        Err(AppError::Validation(message))
+                            if message
+                                == "a repository must be selected before using coverage data" =>
+                        {
+                            None
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "coverage-mcp compaction worker could not read settings: {error}"
+                            );
+                            None
+                        }
+                    };
                     let wait_seconds = settings
                         .as_ref()
                         .map(|settings| settings.compaction_interval_seconds.clamp(1, 86_400))
                         .unwrap_or(1);
                     if let Some(settings) = settings {
-                        if settings.compaction_enabled && maintenance_due(&settings) {
-                            let _ = store.compact_now();
+                        if settings.compaction_enabled {
+                            match maintenance_due(&settings) {
+                                Ok(true) => {
+                                    if let Err(error) = store.compact_now() {
+                                        eprintln!("coverage-mcp background compaction failed: {error}");
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => eprintln!(
+                                    "coverage-mcp compaction worker rejected invalid maintenance state: {error}"
+                                ),
+                            }
                         }
                     }
                     for _ in 0..wait_seconds.min(5) {
@@ -569,7 +782,7 @@ impl CoverageStore {
                     }
                 }
             });
-        let _ = retain_compaction_thread(&self.inner.compaction_thread, handle);
+        retain_compaction_thread(&self.inner.compaction_thread, handle)
     }
 
     /// Compacts eligible older snapshots immediately, regardless of the enable flag.
@@ -577,13 +790,17 @@ impl CoverageStore {
         let project = self.project()?;
         let settings = self.project_settings()?;
         let result = self.compact_project(&project, &settings.policy())?;
+        let compacted_snapshots =
+            checked_duckdb_i64(result.compacted_snapshots, "compacted snapshot count")?;
+        let bytes_before = checked_duckdb_i64(result.bytes_before, "compacted byte count")?;
+        let bytes_after = checked_duckdb_i64(result.bytes_after, "compacted byte count")?;
         self.with_connection(|connection| {
             let values = params![
                 Utc::now(),
                 result.status,
-                result.compacted_snapshots as i64,
-                result.bytes_before as i64,
-                result.bytes_after as i64,
+                compacted_snapshots,
+                bytes_before,
+                bytes_after,
                 Utc::now(),
                 project.repo_key
             ];
@@ -614,19 +831,18 @@ impl CoverageStore {
             let (inserted, bytes_before, bytes_after) =
                 self.compact_snapshot_detail(&project.repo_key, &snapshot_id)?;
             let inserted = u64::from(inserted);
-            result.compacted_snapshots += inserted;
-            result.bytes_before += bytes_before * inserted;
-            result.bytes_after += bytes_after * inserted;
+            #[rustfmt::skip]
+            let compacted_snapshots = checked_add_u64(result.compacted_snapshots, inserted, "compacted snapshot count")?;
+            result.compacted_snapshots = compacted_snapshots;
+            #[rustfmt::skip]
+            let bytes_before = checked_add_u64(result.bytes_before, checked_mul_u64(bytes_before, inserted, "compacted byte count")?, "compacted byte count")?;
+            result.bytes_before = bytes_before;
+            #[rustfmt::skip]
+            let bytes_after = checked_add_u64(result.bytes_after, checked_mul_u64(bytes_after, inserted, "compacted byte count")?, "compacted byte count")?;
+            result.bytes_after = bytes_after;
         }
         if result.compacted_snapshots > 0 {
-            let checkpointed = self
-                .with_connection(|connection| {
-                    connection
-                        .execute_batch("CHECKPOINT")
-                        .map(|_| true)
-                        .map_err(AppError::from)
-                })
-                .unwrap_or(false);
+            let checkpointed = self.with_connection(Self::checkpoint_connection)?;
             result.checkpointed = checkpointed;
         }
         Ok(result)
@@ -641,23 +857,16 @@ impl CoverageStore {
         let encoded = serde_json::to_vec(&payload)?;
         let mut encoded_reader = encoded.as_slice();
         let compressed = compress_coverage_payload(&mut encoded_reader)?;
+        let original_bytes = checked_usize_i64(encoded.len(), "coverage payload")?;
+        let compressed_bytes = checked_usize_i64(compressed.len(), "compressed payload")?;
         let inserted = self.with_connection_mut(|connection| {
             connection.execute_batch("BEGIN TRANSACTION")?;
             let outcome = (|| {
-                let changed = connection.execute("INSERT INTO coverage_compacted_payloads (snapshot_id, repo_key, compacted_at, original_bytes, compressed_bytes, payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (snapshot_id) DO NOTHING", params![snapshot_id, repo_key, Utc::now(), encoded.len() as i64, compressed.len() as i64, compressed])?;
+                let changed = connection.execute("INSERT INTO coverage_compacted_payloads (snapshot_id, repo_key, compacted_at, original_bytes, compressed_bytes, payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (snapshot_id) DO NOTHING", params![snapshot_id, repo_key, Utc::now(), original_bytes, compressed_bytes, compressed])?;
                 remove_compacted_detail(connection, snapshot_id, changed == 1)?;
                 Ok::<bool, AppError>(changed == 1)
             })();
-            match outcome {
-                Ok(changed) => {
-                    connection.execute_batch("COMMIT")?;
-                    Ok(changed)
-                }
-                Err(error) => {
-                    let _ = connection.execute_batch("ROLLBACK");
-                    Err(error)
-                }
-            }
+            finish_transaction(connection, outcome)
         })?;
         Ok((inserted, encoded.len() as u64, compressed.len() as u64))
     }
@@ -766,11 +975,8 @@ impl CoverageStore {
             .and_then(Value::as_str)
             .map(|snapshot_id| self.snapshot(snapshot_id))
             .transpose()?;
-        let path = worktree
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let mut points = self.list_snapshots(Some(path), None, Some(suite), limit)?;
+        let path = required_string_field(&worktree, "path", "worktree")?;
+        let mut points = self.list_snapshots(Some(&path), None, Some(suite), limit)?;
         if let Some(file_path) = file_path {
             points = self.worktree_file_points(worktree_id, suite, file_path, limit)?;
         }
@@ -792,46 +998,39 @@ impl CoverageStore {
         let mut snapshots = self.list_snapshots(repo_path, branch, suite, limit)?;
         if let Some(worktree_id) = worktree_id {
             let worktree = self.worktree(worktree_id)?;
-            let path = worktree
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            snapshots
-                .retain(|snapshot| snapshot.get("repo_path").and_then(Value::as_str) == Some(path));
+            let path = required_string_field(&worktree, "path", "worktree")?;
+            snapshots.retain(|snapshot| {
+                snapshot.get("repo_path").and_then(Value::as_str) == Some(path.as_str())
+            });
         }
         if let Some(file_path) = file_path {
             let mut values = Vec::new();
             for snapshot in snapshots {
-                let id = snapshot
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let id = required_string_field(&snapshot, "id", "snapshot")?;
                 if let Some(file) = self
-                    .files(id, MAX_COLLECTION_RECORDS)?
+                    .files(&id, MAX_COLLECTION_RECORDS)?
                     .into_iter()
                     .find(|file| file.get("file_path").and_then(Value::as_str) == Some(file_path))
                 {
                     let mut point = file;
-                    #[allow(clippy::option_map_unit_fn)]
-                    point.as_object_mut().map(|object| {
-                        object.insert("id".to_owned(), json!(id));
-                        object.insert(
-                            "created_at".to_owned(),
-                            snapshot.get("created_at").cloned().unwrap_or(Value::Null),
-                        );
-                        object.insert(
-                            "branch".to_owned(),
-                            snapshot.get("branch").cloned().unwrap_or(Value::Null),
-                        );
-                        object.insert(
-                            "commit_sha".to_owned(),
-                            snapshot.get("commit_sha").cloned().unwrap_or(Value::Null),
-                        );
-                        object.insert(
-                            "suite".to_owned(),
-                            snapshot.get("suite").cloned().unwrap_or(Value::Null),
-                        );
-                    });
+                    let object = required_object_mut(&mut point, "file projection")?;
+                    object.insert("id".to_owned(), json!(id));
+                    object.insert(
+                        "created_at".to_owned(),
+                        required_field(&snapshot, "created_at", "snapshot")?.clone(),
+                    );
+                    object.insert(
+                        "branch".to_owned(),
+                        required_field(&snapshot, "branch", "snapshot")?.clone(),
+                    );
+                    object.insert(
+                        "commit_sha".to_owned(),
+                        required_field(&snapshot, "commit_sha", "snapshot")?.clone(),
+                    );
+                    object.insert(
+                        "suite".to_owned(),
+                        required_field(&snapshot, "suite", "snapshot")?.clone(),
+                    );
                     values.push(point);
                 }
             }
@@ -848,6 +1047,55 @@ impl CoverageStore {
         file_limit: usize,
         line_limit: usize,
     ) -> AppResult<Value> {
+        let (current, baseline) =
+            self.compatible_snapshot_pair(snapshot_id, baseline_snapshot_id)?;
+        let files = self.compare_files(snapshot_id, baseline_snapshot_id, file_limit)?;
+        let changed_lines =
+            self.changed_lines(snapshot_id, baseline_snapshot_id, None, false, line_limit)?;
+        Ok(
+            json!({"baseline": baseline, "current": current, "overall": overall_delta(&current, &baseline)?, "files": files, "changed_lines": changed_lines}),
+        )
+    }
+
+    /// Compares snapshots using grouped changed regions instead of line records.
+    pub fn compare_regions(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        only_regressions: bool,
+        limit: usize,
+    ) -> AppResult<Value> {
+        let (current, baseline) =
+            self.compatible_snapshot_pair(snapshot_id, baseline_snapshot_id)?;
+        let regions = self.changed_regions(
+            snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            only_regressions,
+            limit,
+        )?;
+        Ok(json!({
+            "baseline": baseline,
+            "current": current,
+            "overall": overall_delta(&current, &baseline)?,
+            "regions": regions,
+        }))
+    }
+
+    fn attach_worktree_to_comparison(result: &mut Value, worktree: Value) -> AppResult<()> {
+        let object = result.as_object_mut().ok_or_else(|| {
+            AppError::Runtime("comparison result must be a JSON object".to_owned())
+        })?;
+        object.insert("worktree".to_owned(), worktree);
+        Ok(())
+    }
+
+    fn compatible_snapshot_pair(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+    ) -> AppResult<(Value, Value)> {
         let current = self.snapshot(snapshot_id)?;
         let baseline = self.snapshot(baseline_snapshot_id)?;
         if current.get("repo_key") != baseline.get("repo_key") {
@@ -860,12 +1108,7 @@ impl CoverageStore {
                 "comparisons require snapshots from the same suite".to_owned(),
             ));
         }
-        let files = self.compare_files(snapshot_id, baseline_snapshot_id, file_limit)?;
-        let changed_lines =
-            self.changed_lines(snapshot_id, baseline_snapshot_id, None, false, line_limit)?;
-        Ok(
-            json!({"baseline": baseline, "current": current, "overall": overall_delta(&current, &baseline), "files": files, "changed_lines": changed_lines}),
-        )
+        Ok((current, baseline))
     }
 
     fn compare_files(
@@ -874,22 +1117,16 @@ impl CoverageStore {
         baseline_snapshot_id: &str,
         limit: usize,
     ) -> AppResult<Vec<Value>> {
-        let baseline: HashMap<String, Value> = self
-            .files(baseline_snapshot_id, MAX_COLLECTION_RECORDS)?
-            .into_iter()
-            .filter_map(|value| {
-                let key = value.get("file_path").and_then(Value::as_str)?.to_owned();
-                Some((key, value))
-            })
-            .collect();
-        let current: HashMap<String, Value> = self
-            .files(snapshot_id, MAX_COLLECTION_RECORDS)?
-            .into_iter()
-            .filter_map(|value| {
-                let key = value.get("file_path").and_then(Value::as_str)?.to_owned();
-                Some((key, value))
-            })
-            .collect();
+        let mut baseline = HashMap::new();
+        for value in self.files(baseline_snapshot_id, MAX_COLLECTION_RECORDS)? {
+            let key = required_string_field(&value, "file_path", "baseline file")?;
+            baseline.insert(key, value);
+        }
+        let mut current = HashMap::new();
+        for value in self.files(snapshot_id, MAX_COLLECTION_RECORDS)? {
+            let key = required_string_field(&value, "file_path", "current file")?;
+            current.insert(key, value);
+        }
         let mut paths: Vec<String> = baseline.keys().chain(current.keys()).cloned().collect();
         paths.sort();
         paths.dedup();
@@ -976,6 +1213,87 @@ impl CoverageStore {
         only_regressions: bool,
         limit: usize,
     ) -> AppResult<Vec<Value>> {
+        let mut values = self.changed_line_values(
+            snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            only_regressions,
+        )?;
+        values.sort_by(|left, right| {
+            status_order(left).cmp(&status_order(right)).then_with(|| {
+                left.get("file_path")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("file_path").and_then(Value::as_str))
+                    .then_with(|| {
+                        left.get("line_number")
+                            .and_then(Value::as_i64)
+                            .cmp(&right.get("line_number").and_then(Value::as_i64))
+                    })
+            })
+        });
+        values.truncate(collection_limit(limit));
+        Ok(values)
+    }
+
+    /// Computes grouped changed-line regions for compact agent responses.
+    pub fn changed_regions(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        only_regressions: bool,
+        limit: usize,
+    ) -> AppResult<Vec<Value>> {
+        let lines = self.changed_line_values(
+            snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            only_regressions,
+        )?;
+        let mut grouped: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
+        for line in lines {
+            let path = required_string_field(&line, "file_path", "changed line")?;
+            let status = required_string_field(&line, "status", "changed line")?;
+            let number = required_i64_field(&line, "line_number", "changed line")?;
+            grouped.entry((path, status)).or_default().push(number);
+        }
+        let mut regions = Vec::new();
+        for ((path, status), mut numbers) in grouped {
+            numbers.sort_unstable();
+            numbers.dedup();
+            for region in line_regions(&numbers)? {
+                regions.push(json!({
+                    "file_path": path,
+                    "status": status,
+                    "start": region["start"],
+                    "end": region["end"],
+                    "line_count": region["line_count"],
+                }));
+            }
+        }
+        regions.sort_by(|left, right| {
+            status_order(left).cmp(&status_order(right)).then_with(|| {
+                left.get("file_path")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("file_path").and_then(Value::as_str))
+                    .then_with(|| {
+                        left.get("start")
+                            .and_then(Value::as_i64)
+                            .cmp(&right.get("start").and_then(Value::as_i64))
+                    })
+            })
+        });
+        regions.truncate(collection_limit(limit));
+        Ok(regions)
+    }
+
+    fn changed_line_values(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        only_regressions: bool,
+    ) -> AppResult<Vec<Value>> {
         let current_snapshot = self.snapshot(snapshot_id)?;
         let baseline_snapshot = self.snapshot(baseline_snapshot_id)?;
         if current_snapshot.get("repo_key") != baseline_snapshot.get("repo_key") {
@@ -1001,25 +1319,23 @@ impl CoverageStore {
             let left = before.get(&(path.clone(), number));
             let right = after.get(&(path.clone(), number));
             let left_covered = left
-                .and_then(|value| value.get("covered"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .map(|value| required_bool_field(value, "covered", "baseline line"))
+                .transpose()?;
             let right_covered = right
-                .and_then(|value| value.get("covered"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+                .map(|value| required_bool_field(value, "covered", "current line"))
+                .transpose()?;
             let left_hits = left
-                .and_then(|value| value.get("hits"))
-                .and_then(Value::as_i64);
+                .map(|value| required_i64_field(value, "hits", "baseline line"))
+                .transpose()?;
             let right_hits = right
-                .and_then(|value| value.get("hits"))
-                .and_then(Value::as_i64);
+                .map(|value| required_i64_field(value, "hits", "current line"))
+                .transpose()?;
             let left_branches = left
-                .and_then(|value| value.get("covered_branches"))
-                .and_then(Value::as_i64);
+                .map(|value| required_i64_field(value, "covered_branches", "baseline line"))
+                .transpose()?;
             let right_branches = right
-                .and_then(|value| value.get("covered_branches"))
-                .and_then(Value::as_i64);
+                .map(|value| required_i64_field(value, "covered_branches", "current line"))
+                .transpose()?;
             if left_covered == right_covered
                 && left_hits == right_hits
                 && left_branches == right_branches
@@ -1030,9 +1346,9 @@ impl CoverageStore {
                 "new"
             } else if right.is_none() {
                 "removed"
-            } else if left_covered && !right_covered {
+            } else if left_covered == Some(true) && right_covered == Some(false) {
                 "regressed"
-            } else if !left_covered && right_covered {
+            } else if left_covered == Some(false) && right_covered == Some(true) {
                 "improved"
             } else {
                 "changed"
@@ -1040,36 +1356,97 @@ impl CoverageStore {
             if only_regressions && status != "regressed" {
                 continue;
             }
-            values.push(json!({"file_path": path, "line_number": number, "baseline_covered": left.map(|value| value.get("covered").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "current_covered": right.map(|value| value.get("covered").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "baseline_hits": left.map(|value| value.get("hits").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "current_hits": right.map(|value| value.get("hits").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "baseline_total_branches": left.map(|value| value.get("total_branches").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "current_total_branches": right.map(|value| value.get("total_branches").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "baseline_covered_branches": left.map(|value| value.get("covered_branches").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "current_covered_branches": right.map(|value| value.get("covered_branches").cloned().unwrap_or(Value::Null)).unwrap_or(Value::Null), "status": status}));
+            values.push(json!({"file_path": path, "line_number": number, "baseline_covered": left.map(|value| required_field(value, "covered", "baseline line")).transpose()?, "current_covered": right.map(|value| required_field(value, "covered", "current line")).transpose()?, "baseline_hits": left.map(|value| required_field(value, "hits", "baseline line")).transpose()?, "current_hits": right.map(|value| required_field(value, "hits", "current line")).transpose()?, "baseline_total_branches": left.map(|value| required_field(value, "total_branches", "baseline line")).transpose()?, "current_total_branches": right.map(|value| required_field(value, "total_branches", "current line")).transpose()?, "baseline_covered_branches": left.map(|value| required_field(value, "covered_branches", "baseline line")).transpose()?, "current_covered_branches": right.map(|value| required_field(value, "covered_branches", "current line")).transpose()?, "status": status}));
         }
-        values.sort_by(|left, right| {
-            status_order(left).cmp(&status_order(right)).then_with(|| {
-                left.get("file_path")
-                    .and_then(Value::as_str)
-                    .cmp(&right.get("file_path").and_then(Value::as_str))
-                    .then_with(|| {
-                        left.get("line_number")
-                            .and_then(Value::as_i64)
-                            .cmp(&right.get("line_number").and_then(Value::as_i64))
-                    })
-            })
-        });
-        values.truncate(collection_limit(limit));
         Ok(values)
     }
 
     fn lines_all(&self, snapshot_id: &str) -> AppResult<HashMap<(String, i64), Value>> {
+        let rows = self.with_connection(|connection| line_rows(connection, snapshot_id))?;
+        if !rows.is_empty() {
+            let mut values = HashMap::new();
+            for line in rows {
+                let path = required_string_field(&line, "file_path", "stored line")?;
+                append_line_with_path(&mut values, &path, line)?;
+            }
+            return Ok(values);
+        }
         let mut values = HashMap::new();
-        let files = self.files(snapshot_id, MAX_COLLECTION_RECORDS)?;
-        for path in files.into_iter().filter_map(|file| {
-            file.get("file_path")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }) {
-            for line in self.lines(snapshot_id, &path, MAX_COLLECTION_RECORDS)? {
-                append_line_with_path(&mut values, &path, line);
+        if let Some(payload) = self.compacted_detail(snapshot_id)? {
+            for line in payload
+                .get("lines")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+            {
+                let path = required_string_field(&line, "file_path", "compacted line")?;
+                append_line_with_path(&mut values, &path, line)?;
             }
         }
+        Ok(values)
+    }
+
+    /// Returns ranked file and uncovered-line targets without raw line JSON.
+    pub fn targets(
+        &self,
+        snapshot_id: &str,
+        order_by: &str,
+        limit: usize,
+    ) -> AppResult<Vec<Value>> {
+        if !matches!(
+            order_by,
+            "priority" | "uncovered_lines" | "line_rate" | "file_path"
+        ) {
+            return Err(AppError::Validation(
+                "order_by must be priority, uncovered_lines, line_rate, or file_path".to_owned(),
+            ));
+        }
+        let mut file_values = self.files(snapshot_id, MAX_COLLECTION_RECORDS)?;
+        let lines = self.lines_all(snapshot_id)?;
+        let mut uncovered_by_file: HashMap<String, Vec<i64>> = HashMap::new();
+        for ((path, number), line) in lines {
+            let count_line = required_bool_field(&line, "count_line", "coverage line")?;
+            let covered = required_bool_field(&line, "covered", "coverage line")?;
+            if count_line && !covered {
+                uncovered_by_file.entry(path).or_default().push(number);
+            }
+        }
+        let mut values = Vec::new();
+        for file in file_values.drain(..) {
+            let path = required_string_field(&file, "file_path", "coverage file")?;
+            let total_lines = required_i64_field(&file, "total_lines", "coverage file")?;
+            let covered_lines = required_i64_field(&file, "covered_lines", "coverage file")?;
+            let uncovered_lines = uncovered_metric(total_lines, covered_lines, "lines")?;
+            let total_branches = required_i64_field(&file, "total_branches", "coverage file")?;
+            let covered_branches = required_i64_field(&file, "covered_branches", "coverage file")?;
+            let uncovered_branches =
+                uncovered_metric(total_branches, covered_branches, "branches")?;
+            let total_functions = required_i64_field(&file, "total_functions", "coverage file")?;
+            let covered_functions =
+                required_i64_field(&file, "covered_functions", "coverage file")?;
+            let uncovered_functions =
+                uncovered_metric(total_functions, covered_functions, "functions")?;
+            if uncovered_lines == 0 && uncovered_branches == 0 && uncovered_functions == 0 {
+                continue;
+            }
+            let mut numbers = uncovered_by_file.remove(&path).unwrap_or_default();
+            numbers.sort_unstable();
+            numbers.dedup();
+            let priority =
+                coverage_target_priority(uncovered_lines, uncovered_branches, uncovered_functions)?;
+            values.push(json!({
+                "file_path": path,
+                "line_rate": required_field(&file, "line_rate", "coverage file")?,
+                "uncovered_lines": uncovered_lines,
+                "uncovered_branches": uncovered_branches,
+                "uncovered_functions": uncovered_functions,
+                "priority": priority,
+                "regions": line_regions(&numbers)?,
+            }));
+        }
+        values.sort_by(|left, right| target_order(left, right, order_by));
+        values.truncate(collection_limit(limit));
         Ok(values)
     }
 
@@ -1091,38 +1468,32 @@ impl CoverageStore {
             items.push(json!({"severity":"info","category":"parser-warning","title":"Coverage format has lossy detail","detail":warning,"snapshot_id":snapshot_id}));
         }
         for file in self.files(snapshot_id, MAX_COLLECTION_RECORDS)? {
-            let total = file
-                .get("total_lines")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            let covered = file
-                .get("covered_lines")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            let rate = file.get("line_rate").and_then(Value::as_f64);
+            let path = required_string_field(&file, "file_path", "coverage file")?;
+            let total = required_i64_field(&file, "total_lines", "coverage file")?;
+            let covered = required_i64_field(&file, "covered_lines", "coverage file")?;
+            let uncovered = uncovered_metric(total, covered, "lines")?;
+            let rate = required_field(&file, "line_rate", "coverage file")?.as_f64();
             if total > 0 && covered == 0 {
-                items.push(json!({"severity": if total >= 20 {"high"} else {"medium"},"category":"zero-coverage-file","title":"File has no covered lines","detail":format!("{} has 0/{total} covered lines.", file.get("file_path").and_then(Value::as_str).unwrap_or_default()),"file_path":file.get("file_path"),"uncovered_lines":total-covered,"line_rate":rate}));
+                items.push(json!({"severity": if total >= 20 {"high"} else {"medium"},"category":"zero-coverage-file","title":"File has no covered lines","detail":format!("{path} has 0/{total} covered lines."),"file_path":path,"uncovered_lines":uncovered,"line_rate":rate}));
             }
-            if total >= 5 && covered > 0 && rate.is_some_and(|value| value < 0.6) {
-                items.push(json!({"severity":"medium","category":"low-line-coverage","title":"File has low line coverage","detail":format!("{} is {:.1}% covered with {} uncovered lines.", file.get("file_path").and_then(Value::as_str).unwrap_or_default(), rate.unwrap_or_default()*100.0, total-covered),"file_path":file.get("file_path"),"uncovered_lines":total-covered,"line_rate":rate}));
+            if total >= 5 && covered > 0 {
+                if let Some(rate_value) = rate.filter(|value| *value < 0.6) {
+                    items.push(json!({"severity":"medium","category":"low-line-coverage","title":"File has low line coverage","detail":format!("{path} is {:.1}% covered with {uncovered} uncovered lines.", rate_value*100.0),"file_path":path,"uncovered_lines":uncovered,"line_rate":rate}));
+                }
             }
-            let total_branches = file
-                .get("total_branches")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            let covered_branches = file
-                .get("covered_branches")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            let branch_rate = file.get("branch_rate").and_then(Value::as_f64);
+            let total_branches = required_i64_field(&file, "total_branches", "coverage file")?;
+            let covered_branches = required_i64_field(&file, "covered_branches", "coverage file")?;
+            let uncovered_branches =
+                uncovered_metric(total_branches, covered_branches, "branches")?;
+            let branch_rate = required_field(&file, "branch_rate", "coverage file")?.as_f64();
             if total_branches >= 2 && branch_rate.is_none_or(|value| value < 0.7) {
-                items.push(json!({"severity":"medium","category":"low-branch-coverage","title":"Branch coverage needs attention","detail":format!("{} covers {covered_branches}/{total_branches} branches.", file.get("file_path").and_then(Value::as_str).unwrap_or_default()),"file_path":file.get("file_path"),"uncovered_branches":total_branches-covered_branches,"branch_rate":branch_rate}));
+                items.push(json!({"severity":"medium","category":"low-branch-coverage","title":"Branch coverage needs attention","detail":format!("{path} covers {covered_branches}/{total_branches} branches."),"file_path":path,"uncovered_branches":uncovered_branches,"branch_rate":branch_rate}));
             }
         }
         let baseline = if let Some(baseline) = baseline_snapshot_id {
             let comparison =
                 self.compare(snapshot_id, baseline, limit, limit.saturating_mul(20))?;
-            let overall = comparison.get("overall").cloned().unwrap_or(Value::Null);
+            let overall = required_field(&comparison, "overall", "comparison")?.clone();
             if overall
                 .get("line_rate_delta")
                 .and_then(Value::as_f64)
@@ -1130,30 +1501,27 @@ impl CoverageStore {
             {
                 items.push(json!({"severity":"high","category":"overall-regression","title":"Overall line coverage regressed","detail":"Overall line coverage decreased.","line_rate_delta":overall.get("line_rate_delta"),"covered_lines_delta":overall.get("covered_lines_delta")}));
             }
-            for file in comparison
-                .get("files")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .take(limit)
-            {
+            let files = required_array_field(&comparison, "files", "comparison")?;
+            for file in files.iter().take(limit) {
+                let path = required_string_field(file, "file_path", "comparison file")?;
+                let line_rate_delta = required_field(file, "line_rate_delta", "comparison file")?;
                 if file
                     .get("line_rate_delta")
                     .and_then(Value::as_f64)
                     .is_some_and(|value| value < 0.0)
                 {
-                    items.push(json!({"severity":"high","category":"file-regression","title":"File coverage regressed","detail":format!("{} changed coverage.", file.get("file_path").and_then(Value::as_str).unwrap_or_default()),"file_path":file.get("file_path"),"line_rate_delta":file.get("line_rate_delta")}));
+                    items.push(json!({"severity":"high","category":"file-regression","title":"File coverage regressed","detail":format!("{path} changed coverage."),"file_path":path,"line_rate_delta":line_rate_delta}));
                 }
             }
-            for line in comparison
-                .get("changed_lines")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
+            let changed_lines = required_array_field(&comparison, "changed_lines", "comparison")?;
+            for line in changed_lines
+                .iter()
                 .filter(|line| line.get("status").and_then(Value::as_str) == Some("regressed"))
                 .take(limit)
             {
-                items.push(json!({"severity":"high","category":"line-regression","title":"Line became uncovered","detail":format!("{}:{} was covered and is now missed.", line.get("file_path").and_then(Value::as_str).unwrap_or_default(), line.get("line_number").and_then(Value::as_i64).unwrap_or_default()),"file_path":line.get("file_path"),"line_number":line.get("line_number")}));
+                let path = required_string_field(line, "file_path", "changed line")?;
+                let number = required_i64_field(line, "line_number", "changed line")?;
+                items.push(json!({"severity":"high","category":"line-regression","title":"Line became uncovered","detail":format!("{path}:{number} was covered and is now missed."),"file_path":path,"line_number":number}));
             }
             Some(comparison)
         } else {
@@ -1185,44 +1553,69 @@ impl CoverageStore {
         file_limit: usize,
         line_limit: usize,
     ) -> AppResult<Value> {
+        let (worktree, current, baseline) =
+            self.worktree_snapshot_pair(worktree_id, snapshot_id)?;
+        let current_id = required_string_field(&current, "id", "snapshot")?;
+        let mut result = self.compare(&current_id, &baseline, file_limit, line_limit)?;
+        Self::attach_worktree_to_comparison(&mut result, worktree)?;
+        Ok(result)
+    }
+
+    /// Compares a worktree baseline with grouped changed regions.
+    pub fn compare_worktree_regions(
+        &self,
+        worktree_id: &str,
+        snapshot_id: Option<&str>,
+        file_path: Option<&str>,
+        only_regressions: bool,
+        limit: usize,
+    ) -> AppResult<Value> {
+        let (worktree, current, baseline) =
+            self.worktree_snapshot_pair(worktree_id, snapshot_id)?;
+        let current_id = required_string_field(&current, "id", "snapshot")?;
+        let mut result =
+            self.compare_regions(&current_id, &baseline, file_path, only_regressions, limit)?;
+        Self::attach_worktree_to_comparison(&mut result, worktree)?;
+        Ok(result)
+    }
+
+    fn worktree_snapshot_pair(
+        &self,
+        worktree_id: &str,
+        snapshot_id: Option<&str>,
+    ) -> AppResult<(Value, Value, String)> {
         let worktree = self.worktree(worktree_id)?;
         let current_id = if let Some(snapshot_id) = snapshot_id {
             snapshot_id.to_owned()
         } else {
-            let path = worktree.get("path").and_then(Value::as_str);
-            let snapshots = self.trend(path, None, None, None, Some(worktree_id), 1)?;
-            snapshots
+            let path = required_string_field(&worktree, "path", "worktree")?;
+            let current = self
+                .trend(Some(&path), None, None, None, Some(worktree_id), 1)?
                 .into_iter()
                 .next()
-                .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
                 .ok_or_else(|| {
                     AppError::NotFound(format!(
                         "no current snapshot found for worktree: {worktree_id}"
                     ))
-                })?
+                })?;
+            required_string_field(&current, "id", "worktree snapshot")?
         };
         let current = self.snapshot(&current_id)?;
-        if current.get("repo_key") != worktree.get("repo_key")
-            || current.get("repo_path") != worktree.get("path")
-        {
+        let current_repo_key = required_field(&current, "repo_key", "snapshot")?;
+        let worktree_repo_key = required_field(&worktree, "repo_key", "worktree")?;
+        let current_repo_path = required_field(&current, "repo_path", "snapshot")?;
+        let worktree_path = required_field(&worktree, "path", "worktree")?;
+        if current_repo_key != worktree_repo_key || current_repo_path != worktree_path {
             return Err(AppError::Validation(
                 "current snapshot does not belong to the selected worktree".to_owned(),
             ));
         }
-        let baseline = match worktree.get("baseline_snapshot_id").and_then(Value::as_str) {
-            Some(value) => value,
-            None => {
-                return Err(AppError::NotFound(
-                    "worktree has no baseline snapshot".to_owned(),
-                ));
-            }
-        };
-        let mut result = self.compare(&current_id, baseline, file_limit, line_limit)?;
-        #[allow(clippy::option_map_unit_fn)]
-        result.as_object_mut().map(|object| {
-            object.insert("worktree".to_owned(), worktree);
-        });
-        Ok(result)
+        let baseline = worktree
+            .get("baseline_snapshot_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::NotFound("worktree has no baseline snapshot".to_owned()))?
+            .to_owned();
+        Ok((worktree, current, baseline))
     }
 
     pub(crate) fn compare_worktree_default_limits(
@@ -1309,18 +1702,13 @@ impl CoverageStore {
         })
     }
 
-    #[allow(clippy::single_match)]
     fn retain_run_thread(&self, handle: std::io::Result<JoinHandle<()>>) -> AppResult<()> {
-        match handle {
-            Ok(handle) => {
-                self.inner
-                    .run_threads
-                    .lock()
-                    .map_err(lock_error)?
-                    .push(handle);
-            }
-            Err(_) => {}
-        }
+        let handle = handle.map_err(AppError::from)?;
+        self.inner
+            .run_threads
+            .lock()
+            .map_err(lock_error)?
+            .push(handle);
         Ok(())
     }
 
@@ -1343,11 +1731,7 @@ impl CoverageStore {
             ));
         }
         let command = self.registered_command(command_ref)?;
-        if !command
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        if !required_bool_field(&command, "enabled", "registered command")? {
             return Err(AppError::Validation(format!(
                 "registered command is disabled: {command_ref}"
             )));
@@ -1366,11 +1750,8 @@ impl CoverageStore {
                 "idempotency_key must not exceed 200 characters".to_owned(),
             ));
         }
-        let command_id = command
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if let Some(existing) = self.idempotent_run_id(command_id, key.as_deref())? {
+        let command_id = required_string_field(&command, "id", "registered command")?;
+        if let Some(existing) = self.idempotent_run_id(&command_id, key.as_deref())? {
             let mut value = self.run_result(&existing, max_summary_lines)?;
             #[allow(clippy::option_map_unit_fn)]
             value.as_object_mut().map(|object| {
@@ -1397,15 +1778,25 @@ impl CoverageStore {
         let handle = thread::Builder::new()
             .name(format!("coverage-mcp-run-{id}"))
             .spawn(move || {
-                let _ = store.execute_run(&run_id);
+                report_background_run_error(&store, &run_id);
             });
-        self.retain_run_thread(handle)?;
+        if let Err(error) = self.retain_run_thread(handle) {
+            self.finalize_failed_job_or_log(&id, &error, "finalize unretained run");
+            return Err(error);
+        }
         let mut result = self.run_result(&id, max_summary_lines)?;
         #[allow(clippy::option_map_unit_fn)]
         result.as_object_mut().map(|object| {
             object.insert("submission_reused".to_owned(), json!(false));
         });
         Ok(result)
+    }
+
+    fn submitted_run_id(submitted: &Value) -> AppResult<&str> {
+        submitted
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Runtime("run submission did not return an id".to_owned()))
     }
 
     /// Submits and waits for one command to reach a terminal state.
@@ -1424,22 +1815,17 @@ impl CoverageStore {
         );
         let submitted =
             self.submit_command(submission.0, submission.1, submission.2, submission.3)?;
-        let id = submitted
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        loop {
-            let result = self.run_result(&id, max_summary_lines)?;
-            if result
-                .get("terminal")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                return Ok(result);
-            }
+        let id = Self::submitted_run_id(&submitted)?.to_owned();
+        let mut result = self.run_result(&id, max_summary_lines)?;
+        while !result
+            .get("terminal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             thread::sleep(Duration::from_millis(20));
+            result = self.run_result(&id, max_summary_lines)?;
         }
+        Ok(result)
     }
 
     fn idempotent_run_id(&self, command_id: &str, key: Option<&str>) -> AppResult<Option<String>> {
@@ -1459,169 +1845,146 @@ impl CoverageStore {
             active = slot_cv.wait(active).map_err(lock_error)?;
         }
         if self.inner.closing.load(Ordering::SeqCst) {
-            return Ok(());
+            drop(active);
+            let error = AppError::Runtime("DuckDB store is closing".to_owned());
+            self.finalize_failed_job_or_log(run_id, &error, "finalize shutdown run");
+            return Err(error);
         }
         *active += 1;
         drop(active);
         let result = self.execute_run_with_slot(run_id);
-        let mut active = slot_lock.lock().map_err(lock_error)?;
-        *active = active.saturating_sub(1);
-        slot_cv.notify_one();
-        drop(active);
+        let release_result = release_run_slot(slot_lock, slot_cv);
+        let result = combine_run_results(result, release_result);
+        if let Err(error) = &result {
+            self.finalize_failed_job_or_log(run_id, error, "finalize failed run");
+        }
         result
     }
 
     fn execute_run_with_slot(&self, run_id: &str) -> AppResult<()> {
-        let job = match self.job(run_id)? {
-            Some(job) => job,
-            None => return Err(AppError::NotFound(format!("run not found: {run_id}"))),
-        };
-        if job.get("status").and_then(Value::as_str) != Some("queued") {
+        let job = self
+            .job(run_id)?
+            .ok_or_else(|| AppError::NotFound(format!("run not found: {run_id}")))?;
+        if required_string_field(&job, "status", "queued run")? != "queued" {
             return Ok(());
         }
         let started = Utc::now();
-        self.with_connection(|connection| { connection.execute("UPDATE run_jobs SET status = 'running', started_at = ?, error = '' WHERE id = ? AND status = 'queued'", params![started, run_id])?; Ok(()) })?;
-        let command = job
-            .get("command")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let cwd = job.get("cwd").and_then(Value::as_str).unwrap_or_default();
+        let claimed = self.with_connection(|connection| claim_run(connection, run_id, started))?;
+        claimed.then_some(()).map_or(Ok(()), |_| {
+        let command = required_string_field(&job, "command", "queued run")?;
+        let cwd = required_string_field(&job, "cwd", "queued run")?;
+        let command_id = required_string_field(&job, "command_id", "queued run")?;
         let shell = self
-            .registered_command(
-                job.get("command_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-            )?
-            .get("shell")
-            .and_then(Value::as_str)
-            .unwrap_or("/bin/bash")
-            .to_owned();
-        let stdout_path = PathBuf::from(
-            job.get("stdout_path")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        );
-        let stderr_path = PathBuf::from(
-            job.get("stderr_path")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        );
-        let stdout_file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&stdout_path)?;
-        let stderr_file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&stderr_path)?;
-        let child = Command::new(&shell)
+            .registered_command(&command_id)?;
+        let shell = required_string_field(&shell, "shell", "registered command")?;
+        let stdout_path = PathBuf::from(required_string_field(&job, "stdout_path", "queued run")?);
+        let stderr_path = PathBuf::from(required_string_field(&job, "stderr_path", "queued run")?);
+        let stdout_file = File::create(&stdout_path)?;
+        let stderr_file = File::create(&stderr_path)?;
+        let mut process = Command::new(&shell);
+        process
             .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()?;
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        process.process_group(0);
+        let mut child = process.spawn()?;
+        let stdout_pipe = child.stdout.take();
+        let stdout = take_child_stream(&mut child, stdout_pipe, "stdout")?;
+        let stderr_pipe = child.stderr.take();
+        let stderr = take_child_stream(&mut child, stderr_pipe, "stderr")?;
+        #[rustfmt::skip]
+        let stdout_capture = capture_handle_or_cleanup(&mut child, spawn_log_capture(stdout, stdout_file, self.inner.config.run_log_max_bytes, "stdout"))?;
+        #[rustfmt::skip]
+        let (stdout_capture, stderr_capture) = capture_second_handle_or_cleanup(&mut child, spawn_log_capture(stderr, stderr_file, self.inner.config.run_log_max_bytes, "stderr"), stdout_capture)?;
+        let captures = LogCaptureHandles {
+            stdout: stdout_capture,
+            stderr: stderr_capture,
+        };
         let control = Arc::new(Mutex::new(Some(child)));
-        self.inner
+        if let Err(error) = self
+            .inner
             .active_processes
             .lock()
-            .map_err(lock_error)?
-            .insert(run_id.to_owned(), control.clone());
-        let timeout = job
-            .get("timeout_seconds")
-            .and_then(Value::as_i64)
-            .map(|value| Duration::from_secs(value as u64));
+            .map_err(lock_error)
+            .map(|mut active| active.insert(run_id.to_owned(), control.clone()))
+        {
+            return cleanup_unregistered_run(run_id, &control, captures, error);
+        }
+        let mut resources = ManagedRunGuard::new(
+            Arc::clone(&self.inner),
+            run_id.to_owned(),
+            Arc::clone(&control),
+            captures,
+        );
+        let timeout = timeout_duration(optional_i64_field(&job, "timeout_seconds", "queued run")?)?;
         let started_instant = Instant::now();
-        let exit_code;
+        let mut exit_code = Option::<i32>::default();
         let mut status = "failed".to_owned();
-        loop {
+        let mut finished = false;
+        while !finished {
             let mut guard = control.lock().map_err(lock_error)?;
             let child = required_managed_child(&mut guard)?;
             if let Some(result) = child.try_wait()? {
                 exit_code = result.code();
                 status = if result.success() { "passed" } else { "failed" }.to_owned();
-                break;
+                finished = true;
+                continue;
             }
-            let cancelled = self.with_connection(|connection| {
-                Ok(connection
-                    .query_row(
-                        "SELECT cancellation_requested_at IS NOT NULL FROM run_jobs WHERE id = ?",
-                        params![run_id],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .unwrap_or(false))
-            })?;
+            let cancelled = cancellation_state(self, run_id)?;
             if cancelled {
-                let _ = child.kill();
+                terminate_child_group(child)?;
                 status = "cancelled".to_owned();
-            }
-            if timeout.is_some_and(|value| started_instant.elapsed() >= value) {
-                let _ = child.kill();
+            } else if timeout.is_some_and(|value| started_instant.elapsed() >= value) {
+                terminate_child_group(child)?;
                 status = "timeout".to_owned();
             }
             drop(guard);
             if status == "cancelled" || status == "timeout" {
                 let mut guard = control.lock().map_err(lock_error)?;
-                reap_child(&mut guard);
+                reap_child(&mut guard)?;
                 exit_code = None;
-                break;
+                finished = true;
+                continue;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        self.inner
-            .active_processes
-            .lock()
-            .map_err(lock_error)?
-            .remove(run_id);
+        let (stdout_capture, stderr_capture) = resources.finish()?;
         let ended = Utc::now();
         let duration_ms = ended
             .signed_duration_since(started)
             .num_milliseconds()
             .max(0);
         let exit_code = exit_code.map(i64::from);
-        let command_id = job
-            .get("command_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let command_row = self.registered_command(command_id)?;
-        let artifacts = self.collect_artifacts(&command_row, cwd, status == "passed")?;
-        let summary = summarize_logs(
-            &stdout_path,
-            &stderr_path,
-            &status,
-            exit_code,
-            duration_ms,
-            job.get("max_summary_lines")
-                .and_then(Value::as_i64)
-                .unwrap_or(20) as usize,
-        );
-        self.with_connection(|connection| {
-            connection.execute("INSERT INTO runs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at) SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ?, ?, ?, ?, stdout_path, stderr_path, ?, ?, queued_at, date_diff('millisecond', queued_at, started_at), cancellation_requested_at FROM run_jobs WHERE id = ?", params![ended, duration_ms, exit_code, status, serde_json::to_string(&summary)?, serde_json::to_string(&artifacts)?, run_id])?;
-            for artifact in &artifacts {
-                let values = params![
-                    run_id,
-                    artifact.get("kind").and_then(Value::as_str).unwrap_or_default(),
-                    artifact.get("path").and_then(Value::as_str).unwrap_or_default(),
-                    artifact.get("exists").and_then(Value::as_bool).unwrap_or(false),
-                    artifact.get("size_bytes").and_then(Value::as_i64),
-                    artifact.get("coverage_format").and_then(Value::as_str),
-                    artifact.get("suite").and_then(Value::as_str),
-                    artifact.get("modified_by_run").and_then(Value::as_bool).unwrap_or(false),
-                    artifact.get("ingest_status").and_then(Value::as_str),
-                    artifact.get("snapshot_id").and_then(Value::as_str),
-                    artifact.get("ingest_error").and_then(Value::as_str),
-                ];
-                connection.execute(INSERT_RUN_ARTIFACT_SQL, values)?;
-            }
-            connection.execute("DELETE FROM run_jobs WHERE id = ?", params![run_id])?;
-            Ok(())
-        })?;
-        let command_id = command_row
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.prune_runs(command_id)?;
+        let command_row = self.registered_command(&command_id)?;
+        let artifacts = self.collect_artifacts(&command_row, &cwd, status == "passed")?;
+        #[rustfmt::skip]
+        let summary = summarize_logs(&stdout_path, &stderr_path, &status, exit_code, duration_ms, summary_line_limit(job.get("max_summary_lines"))?, stdout_capture, stderr_capture)?;
+        #[rustfmt::skip]
+        self.with_connection(|connection| persist_completed_run(connection, run_id, ended, duration_ms, exit_code, &status, &summary, &artifacts))?;
+        let command_id = required_string_field(&command_row, "id", "registered command")?;
+        self.prune_runs(&command_id)?;
         Ok(())
+        })
+    }
+
+    fn finalize_failed_job(&self, run_id: &str, error: &AppError) -> AppResult<()> {
+        let message = error.to_string();
+        self.with_connection_allow_closing(|connection| {
+            connection.execute(
+                "UPDATE run_jobs SET status = 'failed', ended_at = ?, error = ? WHERE id = ? AND status IN ('queued', 'running')",
+                params![Utc::now(), message, run_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn finalize_failed_job_or_log(&self, run_id: &str, error: &AppError, context: &str) {
+        if let Err(recovery_error) = self.finalize_failed_job(run_id, error) {
+            eprintln!("coverage-mcp could not {context} {run_id}: {recovery_error}");
+        }
     }
 
     fn job(&self, run_id: &str) -> AppResult<Option<Value>> {
@@ -1634,60 +1997,75 @@ impl CoverageStore {
             job
         } else {
             let terminal = self.with_connection(|connection| Ok(connection.query_row("SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at FROM runs WHERE id = ?", params![run_id], run_from_row).optional()?))?;
-            if let Some(mut value) = terminal {
-                #[allow(clippy::option_map_unit_fn)]
-                value.as_object_mut().map(|object| {
-                    object.insert("terminal".to_owned(), json!(true));
-                    object.insert("poll_after_ms".to_owned(), Value::Null);
-                    object.insert("queue_position".to_owned(), Value::Null);
-                });
-                return Ok(value);
+            if let Some(value) = terminal {
+                return Self::decorate_terminal_run(value);
             }
             return Err(AppError::NotFound(format!("run not found: {run_id}")));
         };
-        let status = job
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("queued")
-            .to_owned();
+        let status = required_string_field(&job, "status", "queued run")?;
         let terminal = !matches!(status.as_str(), "queued" | "running");
         let queue_position = if status == "queued" {
             Some(self.with_connection(|connection| Ok(connection.query_row("SELECT count(*) FROM run_jobs WHERE status = 'queued' AND (queued_at < (SELECT queued_at FROM run_jobs WHERE id = ?) OR (queued_at = (SELECT queued_at FROM run_jobs WHERE id = ?) AND id <= ?))", params![run_id, run_id, run_id], |row| row.get::<_, i64>(0))?))?)
         } else {
             None
         };
-        let mut result = job;
-        #[allow(clippy::option_map_unit_fn)]
-        result.as_object_mut().map(|object| {
-            let duration_ms = run_duration_ms(object.get("started_at"), object.get("queued_at"));
-            let stdout_path = object.get("stdout_path").cloned().unwrap_or(Value::Null);
-            let stderr_path = object.get("stderr_path").cloned().unwrap_or(Value::Null);
-            let cancellation_requested = object
-                .get("cancellation_requested_at")
-                .is_some_and(|value| !value.is_null());
-            object.insert("terminal".to_owned(), json!(terminal));
-            object.insert("exit_code".to_owned(), Value::Null);
-            object.insert("duration_ms".to_owned(), json!(duration_ms));
-            object.insert("artifact_paths".to_owned(), json!([]));
-            object.insert("coverage_ingest".to_owned(), json!({"status":"pending","snapshot_ids":[],"configured":0,"ingested":0,"failed":0}));
-            object.insert(
-                "queue_position".to_owned(),
-                queue_position
-                    .map(|value| json!(value))
-                    .unwrap_or(Value::Null),
-            );
-            object.insert(
-                "poll_after_ms".to_owned(),
-                if terminal { Value::Null } else { json!(1000) },
-            );
-            object.insert("execution_mode".to_owned(), json!("background"));
-            object.insert(
-                "cancellation_requested".to_owned(),
-                json!(cancellation_requested),
-            );
-            object.insert("parsed_summary".to_owned(), json!({"status":status,"exit_code":null,"duration_ms":duration_ms,"stdout_line_count":null,"stderr_line_count":null,"counters":{},"excerpts":[],"truncated":false,"stdout_path":stdout_path,"stderr_path":stderr_path,"summary_deferred":true}));
-        });
         let _ = max_summary_lines;
+        Self::decorate_queued_run(job, status, terminal, queue_position)
+    }
+
+    fn decorate_terminal_run(mut value: Value) -> AppResult<Value> {
+        let object = value.as_object_mut().ok_or_else(|| {
+            AppError::Runtime("terminal run projection is not an object".to_owned())
+        })?;
+        object.insert("terminal".to_owned(), json!(true));
+        object.insert("poll_after_ms".to_owned(), Value::Null);
+        object.insert("queue_position".to_owned(), Value::Null);
+        Ok(value)
+    }
+
+    fn decorate_queued_run(
+        mut result: Value,
+        status: String,
+        terminal: bool,
+        queue_position: Option<i64>,
+    ) -> AppResult<Value> {
+        let object = result.as_object_mut().ok_or_else(|| {
+            AppError::Runtime("queued run projection is not an object".to_owned())
+        })?;
+        let duration_ms = run_duration_ms(object.get("started_at"), object.get("queued_at"))?;
+        let stdout_path = object
+            .get("stdout_path")
+            .cloned()
+            .ok_or_else(|| AppError::Runtime("queued run is missing stdout_path".to_owned()))?;
+        let stderr_path = object
+            .get("stderr_path")
+            .cloned()
+            .ok_or_else(|| AppError::Runtime("queued run is missing stderr_path".to_owned()))?;
+        let cancellation_requested = object
+            .get("cancellation_requested_at")
+            .is_some_and(|value| !value.is_null());
+        object.insert("terminal".to_owned(), json!(terminal));
+        object.insert("exit_code".to_owned(), Value::Null);
+        object.insert("duration_ms".to_owned(), json!(duration_ms));
+        object.insert("artifact_paths".to_owned(), json!([]));
+        object.insert(
+            "coverage_ingest".to_owned(),
+            json!({"status":"pending","snapshot_ids":[],"configured":0,"ingested":0,"failed":0}),
+        );
+        object.insert(
+            "queue_position".to_owned(),
+            queue_position.map_or(Value::Null, |value| json!(value)),
+        );
+        object.insert(
+            "poll_after_ms".to_owned(),
+            if terminal { Value::Null } else { json!(1000) },
+        );
+        object.insert("execution_mode".to_owned(), json!("background"));
+        object.insert(
+            "cancellation_requested".to_owned(),
+            json!(cancellation_requested),
+        );
+        object.insert("parsed_summary".to_owned(), json!({"status":status,"exit_code":null,"duration_ms":duration_ms,"stdout_line_count":null,"stderr_line_count":null,"counters":{},"excerpts":[],"truncated":false,"stdout_path":stdout_path,"stderr_path":stderr_path,"summary_deferred":true}));
         Ok(result)
     }
 
@@ -1775,15 +2153,7 @@ impl CoverageStore {
             if stream != "both" && stream != stream_name {
                 continue;
             }
-            let path = result
-                .get(path_key)
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let lines: Vec<String> = fs::read_to_string(path)
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_owned)
-                .collect();
+            let lines = read_log_lines(&result, run_id, stream_name, path_key)?;
             append_log_matches(
                 &mut matches,
                 stream_name,
@@ -1814,10 +2184,11 @@ impl CoverageStore {
         command_ref: Option<&str>,
     ) -> AppResult<Option<Value>> {
         let command_id = if let Some(reference) = command_ref {
-            self.registered_command(reference)?
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            Some(required_string_field(
+                &self.registered_command(reference)?,
+                "id",
+                "registered command",
+            )?)
         } else {
             None
         };
@@ -1832,24 +2203,42 @@ impl CoverageStore {
         cwd: &str,
         eligible: bool,
     ) -> AppResult<Vec<Value>> {
-        let specs = command
-            .get("artifact_specs")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let specs = required_array_field(command, "artifact_specs", "registered command")?.to_vec();
+        let command_repo_path = required_string_field(command, "repo_path", "registered command")?;
+        let command_name = required_string_field(command, "name", "registered command")?;
         let mut artifacts = Vec::new();
         for spec in specs {
-            let kind = spec.get("kind").and_then(Value::as_str).unwrap_or_default();
-            let raw_path = spec.get("path").and_then(Value::as_str).unwrap_or_default();
+            let kind = required_string_field(&spec, "kind", "artifact specification")?;
+            let raw_path = required_string_field(&spec, "path", "artifact specification")?;
             let path = PathBuf::from(raw_path);
             let path = if path.is_absolute() {
                 path
             } else {
                 PathBuf::from(cwd).join(path)
             };
-            let metadata = fs::metadata(&path).ok();
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
             let coverage_format = spec.get("coverage_format").and_then(Value::as_str);
-            let mut artifact = json!({"kind":kind,"path":path.to_string_lossy(),"exists":metadata.is_some(),"size_bytes":metadata.as_ref().map(|value| value.len()),"required":spec.get("required").and_then(Value::as_bool).unwrap_or(false),"coverage_format":coverage_format,"suite":spec.get("suite").and_then(Value::as_str),"modified_by_run":metadata.is_some(),"ingest_status":Value::Null,"snapshot_id":Value::Null,"ingest_error":Value::Null});
+            let required = required_bool_field(&spec, "required", "artifact specification")?;
+            let suite = spec.get("suite").and_then(Value::as_str);
+            let mut artifact = Map::new();
+            artifact.insert("kind".to_owned(), json!(kind));
+            artifact.insert("path".to_owned(), json!(path.to_string_lossy()));
+            artifact.insert("exists".to_owned(), json!(metadata.is_some()));
+            artifact.insert(
+                "size_bytes".to_owned(),
+                json!(metadata.as_ref().map(|value| value.len())),
+            );
+            artifact.insert("required".to_owned(), json!(required));
+            artifact.insert("coverage_format".to_owned(), json!(coverage_format));
+            artifact.insert("suite".to_owned(), json!(suite));
+            artifact.insert("modified_by_run".to_owned(), json!(metadata.is_some()));
+            artifact.insert("ingest_status".to_owned(), Value::Null);
+            artifact.insert("snapshot_id".to_owned(), Value::Null);
+            artifact.insert("ingest_error".to_owned(), Value::Null);
             if let Some(format) = coverage_format {
                 let status: (String, String) = if !eligible {
                     (
@@ -1865,44 +2254,28 @@ impl CoverageStore {
                     match self.ingest_report(
                         &path,
                         format,
-                        Some(Path::new(
-                            command
-                                .get("repo_path")
-                                .and_then(Value::as_str)
-                                .unwrap_or(cwd),
-                        )),
+                        Some(Path::new(&command_repo_path)),
                         command.get("branch").and_then(Value::as_str),
                         command.get("commit_sha").and_then(Value::as_str),
                         None,
-                        spec.get("suite").and_then(Value::as_str).unwrap_or(
-                            command
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("default"),
-                        ),
+                        suite.unwrap_or(&command_name),
                     ) {
                         Ok(snapshot) => {
-                            #[allow(clippy::option_map_unit_fn)]
-                            artifact.as_object_mut().map(|object| {
-                                object.insert(
-                                    "snapshot_id".to_owned(),
-                                    snapshot.get("id").cloned().unwrap_or(Value::Null),
-                                );
-                            });
+                            artifact.insert(
+                                "snapshot_id".to_owned(),
+                                required_field(&snapshot, "id", "ingested snapshot")?.clone(),
+                            );
                             ("ingested".to_owned(), String::new())
                         }
                         Err(error) => ("failed".to_owned(), error.to_string()),
                     }
                 };
-                #[allow(clippy::option_map_unit_fn)]
-                artifact.as_object_mut().map(|object| {
-                    object.insert("ingest_status".to_owned(), json!(status.0));
-                    if !status.1.is_empty() {
-                        object.insert("ingest_error".to_owned(), json!(status.1));
-                    }
-                });
+                artifact.insert("ingest_status".to_owned(), json!(status.0));
+                if !status.1.is_empty() {
+                    artifact.insert("ingest_error".to_owned(), json!(status.1));
+                }
             }
-            artifacts.push(artifact);
+            artifacts.push(Value::Object(artifact));
         }
         Ok(artifacts)
     }
@@ -1926,7 +2299,7 @@ impl CoverageStore {
             Ok(())
         })?;
         for id in ids {
-            let _ = fs::remove_dir_all(self.inner.run_dir.join(id));
+            remove_run_directory(&self.inner.run_dir, &id)?;
         }
         Ok(())
     }
@@ -2112,6 +2485,30 @@ impl CoverageStore {
             .next())
     }
 
+    /// Finds the snapshot immediately before one snapshot in the same suite.
+    pub fn previous_snapshot(&self, snapshot_id: &str) -> AppResult<Option<Value>> {
+        let current = self.snapshot(snapshot_id)?;
+        let branch = current.get("branch").and_then(Value::as_str);
+        let suite = required_string_field(&current, "suite", "snapshot")?;
+        let repo_path = required_string_field(&current, "repo_path", "snapshot")?;
+        let branch_value = required_field(&current, "branch", "snapshot")?.clone();
+        let mut snapshots = Vec::new();
+        for snapshot in self.list_snapshots(
+            Some(&repo_path),
+            branch,
+            Some(&suite),
+            MAX_COLLECTION_RECORDS,
+        )? {
+            if required_field(&snapshot, "branch", "snapshot")? == &branch_value {
+                snapshots.push(snapshot);
+            }
+        }
+        let position = snapshots
+            .iter()
+            .position(|snapshot| snapshot.get("id").and_then(Value::as_str) == Some(snapshot_id));
+        Ok(position.and_then(|position| snapshots.get(position + 1).cloned()))
+    }
+
     /// Returns file summaries, transparently restoring compacted detail payloads.
     pub fn files(&self, snapshot_id: &str, limit: usize) -> AppResult<Vec<Value>> {
         self.snapshot(snapshot_id)?;
@@ -2123,16 +2520,17 @@ impl CoverageStore {
         if !rows.is_empty() {
             return Ok(rows);
         }
-        Ok(self
-            .compacted_detail(snapshot_id)?
-            .map(|payload| {
-                payload
-                    .get("files")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default())
+        let Some(payload) = self.compacted_detail(snapshot_id)? else {
+            return Ok(Vec::new());
+        };
+        let files = payload
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::Runtime("compacted coverage is missing files".to_owned()))?;
+        for file in files {
+            required_string_field(file, "file_path", "compacted file")?;
+        }
+        Ok(files.clone())
     }
 
     /// Returns one file summary.
@@ -2142,16 +2540,17 @@ impl CoverageStore {
             return Ok(file);
         }
         if let Some(payload) = self.compacted_detail(snapshot_id)? {
-            if let Some(file) = payload
+            let files = payload
                 .get("files")
                 .and_then(Value::as_array)
-                .and_then(|files| {
-                    files.iter().find(|value| {
-                        value.get("file_path").and_then(Value::as_str) == Some(file_path)
-                    })
-                })
-            {
-                return Ok(file.clone());
+                .ok_or_else(|| {
+                    AppError::Runtime("compacted coverage is missing files".to_owned())
+                })?;
+            for file in files {
+                let path = required_string_field(file, "file_path", "compacted file")?;
+                if path == file_path {
+                    return Ok(file.clone());
+                }
             }
         }
         Err(AppError::NotFound(format!("file not found: {file_path}")))
@@ -2167,24 +2566,22 @@ impl CoverageStore {
         if !rows.is_empty() {
             return Ok(rows);
         }
-        Ok(self
-            .compacted_detail(snapshot_id)?
-            .map(|payload| {
-                payload
-                    .get("lines")
-                    .and_then(Value::as_array)
-                    .map(|lines| {
-                        lines
-                            .iter()
-                            .filter(|line| {
-                                line.get("file_path").and_then(Value::as_str) == Some(file_path)
-                            })
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default())
+        let Some(payload) = self.compacted_detail(snapshot_id)? else {
+            return Ok(Vec::new());
+        };
+        let lines = payload
+            .get("lines")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::Runtime("compacted coverage is missing lines".to_owned()))?;
+        let mut selected = Vec::new();
+        for line in lines {
+            let path = required_string_field(line, "file_path", "compacted line")?;
+            required_i64_field(line, "line_number", "compacted line")?;
+            if path == file_path {
+                selected.push(line.clone());
+            }
+        }
+        Ok(selected)
     }
 
     /// Returns exact line records in normalized inclusive ranges.
@@ -2196,18 +2593,16 @@ impl CoverageStore {
     ) -> AppResult<Value> {
         let ranges = normalize_line_ranges(ranges)?;
         let all = self.lines(snapshot_id, file_path, MAX_COLLECTION_RECORDS)?;
-        let selected: Vec<Value> = all
-            .into_iter()
-            .filter(|line| {
-                let number = line
-                    .get("line_number")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                ranges
-                    .iter()
-                    .any(|(start, end)| number >= *start && number <= *end)
-            })
-            .collect();
+        let mut selected = Vec::new();
+        for line in all {
+            let number = required_i64_field(&line, "line_number", "coverage line")?;
+            if ranges
+                .iter()
+                .any(|(start, end)| number >= *start && number <= *end)
+            {
+                selected.push(line);
+            }
+        }
         Ok(
             json!({"lines": selected, "requested_ranges": ranges.iter().map(|(start,end)| json!({"start":start,"end":end})).collect::<Vec<_>>(), "line_count": selected.len()}),
         )
@@ -2223,22 +2618,18 @@ impl CoverageStore {
         let lines = self.lines(snapshot_id, file_path, MAX_COLLECTION_RECORDS)?;
         let mut gaps = Vec::new();
         let mut current: Option<(i64, i64)> = None;
-        for line in lines.iter().filter(|line| {
-            line.get("count_line")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        }) {
-            let number = line
-                .get("line_number")
-                .and_then(Value::as_i64)
-                .unwrap_or_default();
-            let uncovered = !line
-                .get("covered")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+        let mut uncovered_line_count = 0usize;
+        for line in &lines {
+            let count_line = required_bool_field(line, "count_line", "coverage line")?;
+            let number = required_i64_field(line, "line_number", "coverage line")?;
+            let uncovered = !required_bool_field(line, "covered", "coverage line")?;
+            if !count_line {
+                continue;
+            }
             if uncovered {
+                uncovered_line_count = uncovered_line_count.saturating_add(1);
                 if let Some((start, end)) = current.as_mut() {
-                    if number <= *end + 1 {
+                    if number <= end.saturating_add(1) {
                         *end = number;
                         continue;
                     }
@@ -2256,7 +2647,7 @@ impl CoverageStore {
         gaps.truncate(max_ranges);
         let returned_range_count = gaps.len();
         Ok(
-            json!({"file_path": file_path, "uncovered_line_count": lines.iter().filter(|line| line.get("count_line").and_then(Value::as_bool).unwrap_or(false) && !line.get("covered").and_then(Value::as_bool).unwrap_or(false)).count(), "ranges": gaps, "returned_range_count": returned_range_count, "truncated": truncated}),
+            json!({"file_path": file_path, "uncovered_line_count": uncovered_line_count, "ranges": gaps, "returned_range_count": returned_range_count, "truncated": truncated}),
         )
     }
 
@@ -2273,12 +2664,9 @@ impl CoverageStore {
         let snapshots = self.list_snapshots(None, branch, suite, collection_limit(limit))?;
         let mut values = Vec::new();
         for snapshot in snapshots.into_iter().rev() {
-            let id = snapshot
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let id = required_string_field(&snapshot, "id", "snapshot")?;
             if let Some(line) = self
-                .lines(id, file_path, MAX_COLLECTION_RECORDS)?
+                .lines(&id, file_path, MAX_COLLECTION_RECORDS)?
                 .into_iter()
                 .find(|line| line.get("line_number").and_then(Value::as_i64) == Some(line_number))
             {
@@ -2286,30 +2674,25 @@ impl CoverageStore {
                 point.insert("snapshot_id".to_owned(), json!(id));
                 point.insert(
                     "created_at".to_owned(),
-                    snapshot.get("created_at").cloned().unwrap_or(Value::Null),
+                    required_field(&snapshot, "created_at", "snapshot")?.clone(),
                 );
                 point.insert(
                     "branch".to_owned(),
-                    snapshot.get("branch").cloned().unwrap_or(Value::Null),
+                    required_field(&snapshot, "branch", "snapshot")?.clone(),
                 );
                 point.insert(
                     "commit_sha".to_owned(),
-                    snapshot.get("commit_sha").cloned().unwrap_or(Value::Null),
+                    required_field(&snapshot, "commit_sha", "snapshot")?.clone(),
                 );
-                let suite_value = match suite {
-                    Some(value) => value,
-                    None => snapshot
-                        .get("suite")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                };
+                let snapshot_suite = required_string_field(&snapshot, "suite", "snapshot")?;
+                let suite_value = suite.unwrap_or(&snapshot_suite);
                 point.insert("suite".to_owned(), json!(suite_value));
                 point.insert("file_path".to_owned(), json!(file_path));
                 point.insert("line_number".to_owned(), json!(line_number));
                 for key in ["hits", "covered", "total_branches", "covered_branches"] {
                     point.insert(
                         key.to_owned(),
-                        line.get(key).cloned().unwrap_or(Value::Null),
+                        required_field(&line, key, "coverage line")?.clone(),
                     );
                 }
                 values.push(Value::Object(point));
@@ -2327,19 +2710,25 @@ impl CoverageStore {
         start: i64,
         end: i64,
     ) -> AppResult<Vec<Value>> {
+        if start < 1 {
+            return Err(AppError::Validation(
+                "start must be a positive line number".to_owned(),
+            ));
+        }
         if end < start {
             return Err(AppError::Validation(
                 "end must be greater than or equal to start".to_owned(),
             ));
         }
+        let line_count = end - start + 1;
+        if line_count > 200 {
+            return Err(AppError::Validation(
+                "source ranges may contain at most 200 lines".to_owned(),
+            ));
+        }
         let snapshot = self.snapshot(snapshot_id)?;
-        let root = PathBuf::from(
-            snapshot
-                .get("repo_path")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        )
-        .canonicalize()?;
+        let root = PathBuf::from(required_string_field(&snapshot, "repo_path", "snapshot")?)
+            .canonicalize()?;
         let source = root.join(file_path).canonicalize()?;
         if !source.starts_with(&root) {
             return Err(AppError::Validation(
@@ -2352,8 +2741,6 @@ impl CoverageStore {
                 return Err(AppError::NotFound(format!("file not found: {file_path}")));
             }
         };
-        let start = start.max(1);
-        let end = end.min(start + 199);
         let mut result = Vec::new();
         for (index, line) in BufReader::new(file).lines().enumerate() {
             let number = index as i64 + 1;
@@ -2396,6 +2783,20 @@ impl CoverageStore {
 pub type LineRange = (i64, i64);
 
 const SNAPSHOT_COLUMNS: &str = "id, created_at, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate";
+
+fn bool_column(row: &Row<'_>) -> duckdb::Result<bool> {
+    row.get::<_, bool>(0)
+}
+
+fn line_rows(connection: &Connection, snapshot_id: &str) -> AppResult<Vec<Value>> {
+    let mut statement = connection.prepare("SELECT file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details FROM lines WHERE snapshot_id = ? ORDER BY file_path, line_number")?;
+    let rows = statement.query_map(params![snapshot_id], line_from_row_with_file)?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row?);
+    }
+    Ok(values)
+}
 
 fn snapshot_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     let mut value = Map::new();
@@ -2530,6 +2931,77 @@ fn json_string(value: String) -> Value {
     }
 }
 
+fn required_field<'a>(value: &'a Value, key: &str, context: &str) -> AppResult<&'a Value> {
+    value
+        .get(key)
+        .ok_or_else(|| AppError::Runtime(format!("{context} is missing required field '{key}'")))
+}
+
+fn required_object_mut<'a>(
+    value: &'a mut Value,
+    context: &str,
+) -> AppResult<&'a mut Map<String, Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Runtime(format!("{context} must be an object")))
+}
+
+fn required_string_field(value: &Value, key: &str, context: &str) -> AppResult<String> {
+    required_field(value, key, context)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            AppError::Runtime(format!(
+                "{context} field '{key}' must be a non-empty string"
+            ))
+        })
+}
+
+fn required_i64_field(value: &Value, key: &str, context: &str) -> AppResult<i64> {
+    required_field(value, key, context)?
+        .as_i64()
+        .ok_or_else(|| AppError::Runtime(format!("{context} field '{key}' must be an integer")))
+}
+
+fn required_bool_field(value: &Value, key: &str, context: &str) -> AppResult<bool> {
+    required_field(value, key, context)?
+        .as_bool()
+        .ok_or_else(|| AppError::Runtime(format!("{context} field '{key}' must be a boolean")))
+}
+
+fn required_array_field<'a>(
+    value: &'a Value,
+    key: &str,
+    context: &str,
+) -> AppResult<&'a Vec<Value>> {
+    required_field(value, key, context)?
+        .as_array()
+        .ok_or_else(|| AppError::Runtime(format!("{context} field '{key}' must be an array")))
+}
+
+fn optional_i64_field(value: &Value, key: &str, context: &str) -> AppResult<Option<i64>> {
+    let field = required_field(value, key, context)?;
+    if field.is_null() {
+        Ok(None)
+    } else {
+        field.as_i64().map(Some).ok_or_else(|| {
+            AppError::Runtime(format!(
+                "{context} field '{key}' must be an integer or null"
+            ))
+        })
+    }
+}
+
+fn uncovered_metric(total: i64, covered: i64, metric: &str) -> AppResult<i64> {
+    if total < 0 || covered < 0 || covered > total {
+        return Err(AppError::Runtime(format!(
+            "coverage {metric} metrics are inconsistent: total={total}, covered={covered}"
+        )));
+    }
+    Ok(total - covered)
+}
+
 fn required_command_id(value: &Value, reference: &str) -> AppResult<String> {
     match value.get("id").and_then(Value::as_str) {
         Some(value) => Ok(value.to_owned()),
@@ -2620,10 +3092,20 @@ fn migrate_schema(connection: &Connection) -> AppResult<()> {
             }
         }
     }
-    let _ = connection.execute(
-        "ALTER TABLE lines ALTER COLUMN hits SET DATA TYPE BIGINT",
-        [],
-    );
+    let hits_type = connection
+        .query_row(
+            "SELECT data_type FROM information_schema.columns WHERE table_name = 'lines' AND column_name = 'hits'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if hits_type
+        .as_deref()
+        .is_some_and(|data_type| !data_type.eq_ignore_ascii_case("BIGINT"))
+    {
+        #[rustfmt::skip]
+        connection.execute("ALTER TABLE lines ALTER COLUMN hits SET DATA TYPE BIGINT", [])?;
+    }
     Ok(())
 }
 
@@ -2631,9 +3113,437 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> AppError {
     AppError::Runtime("coverage store lock was poisoned".to_owned())
 }
 
-fn reap_child(child: &mut Option<std::process::Child>) {
-    if let Some(child) = child {
+fn claim_run(connection: &Connection, run_id: &str, started: DateTime<Utc>) -> AppResult<bool> {
+    let changed = match connection.execute(
+        "UPDATE run_jobs SET status = 'running', started_at = ?, error = '' WHERE id = ? AND status = 'queued'",
+        params![started, run_id],
+    ) {
+        Ok(changed) => changed,
+        Err(error) => return Err(AppError::from(error)),
+    };
+    Ok(changed == 1)
+}
+
+fn record_first_process_error(first_error: &mut Option<AppError>, result: AppResult<()>) {
+    if let Err(error) = result {
+        if first_error.is_none() {
+            *first_error = Some(error);
+        }
+    }
+}
+
+fn cancellation_state(store: &CoverageStore, run_id: &str) -> AppResult<bool> {
+    if store.inner.closing.load(Ordering::SeqCst) {
+        Ok(true)
+    } else {
+        cancellation_requested(store, run_id)
+    }
+}
+
+fn combine_run_results(result: AppResult<()>, release_result: AppResult<()>) -> AppResult<()> {
+    match (result, release_result) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_completed_run(
+    connection: &Connection,
+    run_id: &str,
+    ended: DateTime<Utc>,
+    duration_ms: i64,
+    exit_code: Option<i64>,
+    status: &str,
+    summary: &Value,
+    artifacts: &[Value],
+) -> AppResult<()> {
+    let run_values = params![
+        ended,
+        duration_ms,
+        exit_code,
+        status,
+        serde_json::to_string(summary)?,
+        serde_json::to_string(artifacts)?,
+        run_id
+    ];
+    connection.execute(INSERT_COMPLETED_RUN_SQL, run_values)?;
+    for artifact in artifacts {
+        let values = params![
+            run_id,
+            required_string_field(artifact, "kind", "run artifact")?,
+            required_string_field(artifact, "path", "run artifact")?,
+            required_bool_field(artifact, "exists", "run artifact")?,
+            artifact.get("size_bytes").and_then(Value::as_i64),
+            artifact.get("coverage_format").and_then(Value::as_str),
+            artifact.get("suite").and_then(Value::as_str),
+            required_bool_field(artifact, "modified_by_run", "run artifact")?,
+            artifact.get("ingest_status").and_then(Value::as_str),
+            artifact.get("snapshot_id").and_then(Value::as_str),
+            artifact.get("ingest_error").and_then(Value::as_str),
+        ];
+        connection.execute(INSERT_RUN_ARTIFACT_SQL, values)?;
+    }
+    connection.execute("DELETE FROM run_jobs WHERE id = ?", params![run_id])?;
+    Ok(())
+}
+
+fn checked_db_u32(value: i64, field: &str) -> AppResult<u32> {
+    u32::try_from(value).map_err(|_| AppError::Runtime(persisted_value_out_of_range(field, value)))
+}
+
+fn checked_db_u64(value: i64, field: &str) -> AppResult<u64> {
+    u64::try_from(value).map_err(|_| AppError::Runtime(persisted_value_out_of_range(field, value)))
+}
+
+fn checked_duckdb_i64(value: u64, field: &str) -> AppResult<i64> {
+    i64::try_from(value).map_err(|_| AppError::Runtime(format!("{field} exceeds DuckDB BIGINT")))
+}
+
+fn checked_usize_i64(value: usize, field: &str) -> AppResult<i64> {
+    i64::try_from(value).map_err(|_| AppError::Runtime(format!("{field} exceeds DuckDB BIGINT")))
+}
+
+fn checked_add_u64(left: u64, right: u64, field: &str) -> AppResult<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| AppError::Runtime(format!("{field} overflowed")))
+}
+
+fn checked_mul_u64(left: u64, right: u64, field: &str) -> AppResult<u64> {
+    left.checked_mul(right)
+        .ok_or_else(|| AppError::Runtime(format!("{field} overflowed")))
+}
+
+fn persisted_value_out_of_range(field: &str, value: i64) -> String {
+    format!("persisted {field} value is out of range: {value}")
+}
+
+type LogCaptureHandle = JoinHandle<std::io::Result<LogCaptureResult>>;
+type LogCaptureTask = Box<dyn FnOnce() -> std::io::Result<LogCaptureResult> + Send + 'static>;
+
+fn release_run_slot(slot_lock: &Mutex<usize>, slot_cv: &Condvar) -> AppResult<()> {
+    let mut active = slot_lock.lock().map_err(lock_error)?;
+    *active = active.saturating_sub(1);
+    slot_cv.notify_one();
+    Ok(())
+}
+
+fn take_child_stream<R>(child: &mut Child, stream: Option<R>, name: &str) -> AppResult<R> {
+    stream.ok_or_else(|| {
+        let _ = terminate_child_group(child);
         let _ = child.wait();
+        AppError::Runtime(format!("managed run did not expose {name} capture"))
+    })
+}
+
+fn capture_handle_or_cleanup(
+    child: &mut Child,
+    result: AppResult<LogCaptureHandle>,
+) -> AppResult<LogCaptureHandle> {
+    match result {
+        Ok(handle) => Ok(handle),
+        Err(error) => {
+            let _ = terminate_child_group(child);
+            let _ = child.wait();
+            Err(error)
+        }
+    }
+}
+
+fn capture_second_handle_or_cleanup(
+    child: &mut Child,
+    result: AppResult<LogCaptureHandle>,
+    previous: LogCaptureHandle,
+) -> AppResult<(LogCaptureHandle, LogCaptureHandle)> {
+    match result {
+        Ok(handle) => Ok((previous, handle)),
+        Err(error) => {
+            let _ = terminate_child_group(child);
+            let _ = child.wait();
+            let _ = previous.join();
+            Err(error)
+        }
+    }
+}
+
+fn cleanup_unregistered_run(
+    run_id: &str,
+    control: &Arc<Mutex<Option<Child>>>,
+    captures: LogCaptureHandles,
+    registry_error: AppError,
+) -> AppResult<()> {
+    let terminate_error = terminate_managed_process(control).err();
+    let capture_error = join_log_capture_handles(captures).err();
+    if let Some(cleanup_error) = terminate_error.or(capture_error) {
+        return Err(AppError::Runtime(format!(
+            "run {run_id} registration failed: {registry_error}; cleanup failed: {cleanup_error}"
+        )));
+    }
+    Err(registry_error)
+}
+
+fn spawn_log_capture<R>(
+    reader: R,
+    output: File,
+    max_bytes: u64,
+    stream: &str,
+) -> AppResult<LogCaptureHandle>
+where
+    R: Read + Send + 'static,
+{
+    let name = format!("coverage-mcp-log-{stream}");
+    let task: LogCaptureTask = Box::new(move || capture_log(reader, output, max_bytes));
+    spawn_log_capture_task(name, task, |name, task| {
+        thread::Builder::new().name(name).spawn(task)
+    })
+}
+
+fn spawn_log_capture_task(
+    name: String,
+    task: LogCaptureTask,
+    spawn: impl FnOnce(String, LogCaptureTask) -> std::io::Result<LogCaptureHandle>,
+) -> AppResult<LogCaptureHandle> {
+    spawn(name, task).map_err(AppError::from)
+}
+
+fn capture_log<R>(
+    mut reader: R,
+    mut output: File,
+    max_bytes: u64,
+) -> std::io::Result<LogCaptureResult>
+where
+    R: Read,
+{
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut bytes_written = 0_u64;
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(bytes_written);
+        let write_len = remaining.min(read as u64) as usize;
+        write_capture_chunk(&mut output, &buffer, write_len, &mut bytes_written)?;
+        if write_len < read {
+            truncated = true;
+        }
+    }
+    Ok(LogCaptureResult {
+        bytes_written,
+        truncated,
+    })
+}
+
+fn write_capture_chunk(
+    output: &mut File,
+    buffer: &[u8],
+    write_len: usize,
+    bytes_written: &mut u64,
+) -> std::io::Result<()> {
+    if write_len > 0 {
+        output.write_all(&buffer[..write_len])?;
+        *bytes_written += write_len as u64;
+    }
+    Ok(())
+}
+
+fn join_log_capture(
+    handle: JoinHandle<std::io::Result<LogCaptureResult>>,
+    stream: &str,
+) -> AppResult<LogCaptureResult> {
+    handle
+        .join()
+        .map_err(|_| AppError::Runtime(format!("{stream} log capture thread panicked")))?
+        .map_err(AppError::from)
+}
+
+fn join_log_capture_handles(
+    handles: LogCaptureHandles,
+) -> AppResult<(LogCaptureResult, LogCaptureResult)> {
+    let stdout = join_log_capture(handles.stdout, "stdout");
+    let stderr = join_log_capture(handles.stderr, "stderr");
+    match (stdout, stderr) {
+        (Ok(stdout), Ok(stderr)) => Ok((stdout, stderr)),
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
+}
+
+fn terminate_managed_process(control: &Arc<Mutex<Option<Child>>>) -> AppResult<()> {
+    let mut guard = control.lock().map_err(lock_error)?;
+    if let Some(child) = guard.as_mut() {
+        terminate_child_group(child)?;
+    }
+    reap_child(&mut guard)
+}
+
+fn terminate_child_group(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        terminate_child_group_with(child, |pid| {
+            let group = format!("-{pid}");
+            Command::new("kill")
+                .args(["-KILL", group.as_str()])
+                .stderr(Stdio::null())
+                .status()
+        })
+    }
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let status = Command::new("taskkill")
+            .args(["/PID", pid.as_str(), "/T", "/F"])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "taskkill exited with {status}"
+            )))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        child.kill()
+    }
+}
+
+#[cfg(unix)]
+fn terminate_child_group_with(
+    child: &mut Child,
+    kill_group: impl FnOnce(u32) -> std::io::Result<std::process::ExitStatus>,
+) -> std::io::Result<()> {
+    terminate_child_group_result(child, kill_group(child.id()))
+}
+
+#[cfg(unix)]
+fn terminate_child_group_result(
+    child: &mut Child,
+    result: std::io::Result<std::process::ExitStatus>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            if child.try_wait()?.is_some() {
+                Ok(())
+            } else {
+                fallback_after_group_status(status, child.kill())
+            }
+        }
+        Err(error) => fallback_after_group_command(error, child.kill()),
+    }
+}
+
+#[cfg(unix)]
+fn fallback_after_group_status(
+    status: std::process::ExitStatus,
+    fallback: std::io::Result<()>,
+) -> std::io::Result<()> {
+    if fallback.is_ok() {
+        Err(std::io::Error::other(format!(
+            "process-group kill exited with {status}"
+        )))
+    } else {
+        fallback
+    }
+}
+
+#[cfg(unix)]
+fn fallback_after_group_command(
+    error: std::io::Error,
+    fallback: std::io::Result<()>,
+) -> std::io::Result<()> {
+    if fallback.is_ok() {
+        Err(error)
+    } else {
+        fallback
+    }
+}
+
+fn reap_child(child: &mut Option<std::process::Child>) -> AppResult<()> {
+    if let Some(child) = child {
+        child.wait()?;
+    }
+    Ok(())
+}
+
+fn join_worker(thread: JoinHandle<()>, worker: &str) -> AppResult<()> {
+    thread
+        .join()
+        .map_err(|_| AppError::Runtime(format!("coverage-mcp {worker} worker panicked")))
+}
+
+fn report_background_run_error(store: &CoverageStore, run_id: &str) {
+    if let Err(error) = store.execute_run(run_id) {
+        eprintln!("coverage-mcp background run {run_id} failed: {error}");
+    }
+}
+
+fn cancellation_requested(store: &CoverageStore, run_id: &str) -> AppResult<bool> {
+    store.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT cancellation_requested_at IS NOT NULL FROM run_jobs WHERE id = ?",
+                params![run_id],
+                bool_column,
+            )
+            .map_err(AppError::from)
+    })
+}
+
+fn summary_line_limit(value: Option<&Value>) -> AppResult<usize> {
+    let value = value
+        .ok_or_else(|| AppError::Runtime("queued run is missing max_summary_lines".to_owned()))?;
+    let value = value.as_u64().ok_or_else(|| {
+        AppError::Runtime("max_summary_lines must be an unsigned integer".to_owned())
+    })?;
+    if value == 0 || value > 500 {
+        return Err(AppError::Runtime(
+            "max_summary_lines is outside the allowed range".to_owned(),
+        ));
+    }
+    Ok(value as usize)
+}
+
+fn timeout_duration(value: Option<i64>) -> AppResult<Option<Duration>> {
+    value
+        .map(|value| {
+            u64::try_from(value).map(Duration::from_secs).map_err(|_| {
+                AppError::Runtime("queued run timeout_seconds must not be negative".to_owned())
+            })
+        })
+        .transpose()
+}
+
+fn read_log_lines(
+    result: &Value,
+    run_id: &str,
+    stream_name: &str,
+    path_key: &str,
+) -> AppResult<Vec<String>> {
+    let path = result
+        .get(path_key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::Runtime(format!(
+                "run {run_id} is missing its {stream_name} log path"
+            ))
+        })?;
+    let bytes = fs::read(path)?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn remove_run_directory(run_dir: &Path, run_id: &str) -> AppResult<()> {
+    let path = run_dir.join(run_id);
+    match fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -2689,14 +3599,22 @@ fn normalize_line_ranges(ranges: &[LineRange]) -> AppResult<Vec<LineRange>> {
     let mut normalized: Vec<LineRange> = Vec::new();
     for (start, end) in ordered {
         if let Some((_, previous_end)) = normalized.last_mut() {
-            if start <= *previous_end + 1 {
+            if start <= previous_end.saturating_add(1) {
                 *previous_end = (*previous_end).max(end);
                 continue;
             }
         }
         normalized.push((start, end));
     }
-    let count: i64 = normalized.iter().map(|(start, end)| end - start + 1).sum();
+    let count = normalized.iter().try_fold(0_i64, |count, (start, end)| {
+        let range_count = end - start + 1;
+        if range_count > 200 {
+            return Err(AppError::Validation(
+                "line_ranges combined unique span may contain at most 200 lines".to_owned(),
+            ));
+        }
+        Ok(count + range_count)
+    })?;
     if count > 200 {
         return Err(AppError::Validation(
             "line_ranges combined unique span may contain at most 200 lines".to_owned(),
@@ -2738,19 +3656,10 @@ fn artifact_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
 }
 
 fn line_from_row_with_file(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
-    #[allow(clippy::question_mark)]
-    let mut value = match line_from_row_offset(row) {
-        Ok(value) => value,
-        Err(error) => return Err(error),
-    };
-    #[allow(clippy::option_map_unit_fn)]
-    value.as_object_mut().map(|object| {
-        object.insert(
-            "file_path".to_owned(),
-            json!(row.get::<_, String>(0).unwrap_or_default()),
-        );
-    });
-    Ok(value)
+    let mut object = line_from_row_offset(row)?;
+    let file_path = row.get::<_, String>(0)?;
+    object.insert("file_path".to_owned(), json!(file_path));
+    Ok(Value::Object(object))
 }
 
 fn required_managed_child(guard: &mut Option<Child>) -> AppResult<&mut Child> {
@@ -2759,26 +3668,46 @@ fn required_managed_child(guard: &mut Option<Child>) -> AppResult<&mut Child> {
     })
 }
 
-fn append_line_with_path(values: &mut HashMap<(String, i64), Value>, path: &str, mut line: Value) {
-    let Some(object) = line.as_object_mut() else {
-        return;
-    };
-    let Some(number) = object.get("line_number").and_then(Value::as_i64) else {
-        return;
-    };
+fn append_line_with_path(
+    values: &mut HashMap<(String, i64), Value>,
+    path: &str,
+    mut line: Value,
+) -> AppResult<()> {
+    let object = line
+        .as_object_mut()
+        .ok_or_else(|| AppError::Runtime("coverage line must be an object".to_owned()))?;
+    let number = object
+        .get("line_number")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| AppError::Runtime("coverage line number must be an integer".to_owned()))?;
     object.insert("file_path".to_owned(), json!(path));
     values.insert((path.to_owned(), number), line);
+    Ok(())
 }
 
-fn line_from_row_offset(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
-    Ok(
-        json!({"line_number":row.get::<_, i64>(1)?,"hits":row.get::<_, i64>(2)?,"covered":row.get::<_, bool>(3)?,"count_line":row.get::<_, bool>(4)?,"total_branches":row.get::<_, i64>(5)?,"covered_branches":row.get::<_, i64>(6)?,"total_functions":row.get::<_, i64>(7)?,"covered_functions":row.get::<_, i64>(8)?,"details":json_string(row.get::<_, String>(9)?)}),
-    )
+fn line_from_row_offset(row: &duckdb::Row<'_>) -> duckdb::Result<Map<String, Value>> {
+    Ok(Map::from_iter([
+        ("line_number".to_owned(), json!(row.get::<_, i64>(1)?)),
+        ("hits".to_owned(), json!(row.get::<_, i64>(2)?)),
+        ("covered".to_owned(), json!(row.get::<_, bool>(3)?)),
+        ("count_line".to_owned(), json!(row.get::<_, bool>(4)?)),
+        ("total_branches".to_owned(), json!(row.get::<_, i64>(5)?)),
+        ("covered_branches".to_owned(), json!(row.get::<_, i64>(6)?)),
+        ("total_functions".to_owned(), json!(row.get::<_, i64>(7)?)),
+        ("covered_functions".to_owned(), json!(row.get::<_, i64>(8)?)),
+        ("details".to_owned(), json_string(row.get::<_, String>(9)?)),
+    ]))
 }
 
 fn normalize_artifact_specs(value: Value) -> AppResult<Vec<Value>> {
-    let Some(object) = value.as_object() else {
-        return Ok(Vec::new());
+    let object = match value {
+        Value::Null => return Ok(Vec::new()),
+        Value::Object(object) => object,
+        _ => {
+            return Err(AppError::Validation(
+                "artifact_specs must be an object keyed by artifact kind".to_owned(),
+            ));
+        }
     };
     let mut specs = Vec::new();
     for (kind, raw) in object {
@@ -2854,6 +3783,7 @@ fn coverage_ingest(artifacts: &Value) -> Value {
     json!({"status":status,"configured":configured,"ingested":ingested,"failed":failed,"snapshot_ids":snapshot_ids})
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize_logs(
     stdout_path: &Path,
     stderr_path: &Path,
@@ -2861,9 +3791,11 @@ fn summarize_logs(
     exit_code: Option<i64>,
     duration_ms: i64,
     max_lines: usize,
-) -> Value {
-    let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
-    let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+    stdout_capture: LogCaptureResult,
+    stderr_capture: LogCaptureResult,
+) -> AppResult<Value> {
+    let stdout = String::from_utf8_lossy(&fs::read(stdout_path)?).into_owned();
+    let stderr = String::from_utf8_lossy(&fs::read(stderr_path)?).into_owned();
     let mut counters = Map::new();
     for (name, needle) in [
         ("passed", "passed"),
@@ -2888,7 +3820,9 @@ fn summarize_logs(
             excerpts.push(json!({"stream":stream,"line_number":index+1,"text":line}));
         }
     }
-    json!({"status":status,"exit_code":exit_code,"duration_ms":duration_ms,"stdout_line_count":stdout.lines().count(),"stderr_line_count":stderr.lines().count(),"counters":counters,"excerpts":excerpts,"truncated":false,"stdout_path":stdout_path,"stderr_path":stderr_path})
+    Ok(
+        json!({"status":status,"exit_code":exit_code,"duration_ms":duration_ms,"stdout_line_count":stdout.lines().count(),"stderr_line_count":stderr.lines().count(),"stdout_bytes":stdout_capture.bytes_written,"stderr_bytes":stderr_capture.bytes_written,"counters":counters,"excerpts":excerpts,"truncated":stdout_capture.truncated || stderr_capture.truncated,"stdout_path":stdout_path,"stderr_path":stderr_path}),
+    )
 }
 
 fn context_window(lines: &[String], index: usize, context: usize) -> Vec<Value> {
@@ -2950,34 +3884,34 @@ fn query_pruned_run_ids(
     rows.map(|row| row.map_err(AppError::from)).collect()
 }
 
-fn run_duration_ms(started: Option<&Value>, queued: Option<&Value>) -> i64 {
+fn run_duration_ms(started: Option<&Value>, queued: Option<&Value>) -> AppResult<i64> {
     let selected = started
         .filter(|value| !value.is_null())
         .or(queued.filter(|value| !value.is_null()));
-    selected
-        .and_then(Value::as_str)
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| {
-            Utc::now()
-                .signed_duration_since(value.with_timezone(&Utc))
-                .num_milliseconds()
-                .max(0)
-        })
-        .unwrap_or(0)
+    let Some(selected) = selected else {
+        return Ok(0);
+    };
+    let value = selected
+        .as_str()
+        .ok_or_else(|| AppError::Runtime("run timestamp must be an RFC3339 string".to_owned()))?;
+    let value = DateTime::parse_from_rfc3339(value)
+        .map_err(|error| AppError::Runtime(format!("run timestamp is invalid: {error}")))?;
+    Ok(Utc::now()
+        .signed_duration_since(value.with_timezone(&Utc))
+        .num_milliseconds()
+        .max(0))
 }
 
-fn maintenance_due(settings: &ProjectSettings) -> bool {
-    settings
-        .compaction_last_run_at
-        .as_ref()
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|last| {
-            Utc::now()
-                .signed_duration_since(last.with_timezone(&Utc))
-                .num_seconds()
-                >= settings.compaction_interval_seconds as i64
-        })
-        .unwrap_or(true)
+fn maintenance_due(settings: &ProjectSettings) -> AppResult<bool> {
+    let Some(value) = settings.compaction_last_run_at.as_ref() else {
+        return Ok(true);
+    };
+    let last = DateTime::parse_from_rfc3339(value)
+        .map_err(|error| AppError::Runtime(format!("compaction timestamp is invalid: {error}")))?;
+    Ok(Utc::now()
+        .signed_duration_since(last.with_timezone(&Utc))
+        .num_seconds()
+        >= settings.compaction_interval_seconds as i64)
 }
 
 fn delta(current: Option<&Value>, baseline: Option<&Value>) -> Value {
@@ -2990,8 +3924,109 @@ fn delta(current: Option<&Value>, baseline: Option<&Value>) -> Value {
     }
 }
 
-fn overall_delta(current: &Value, baseline: &Value) -> Value {
-    json!({"line_rate_delta":delta(current.get("line_rate"), baseline.get("line_rate")),"covered_lines_delta":current.get("covered_lines").and_then(Value::as_i64).unwrap_or_default()-baseline.get("covered_lines").and_then(Value::as_i64).unwrap_or_default(),"total_lines_delta":current.get("total_lines").and_then(Value::as_i64).unwrap_or_default()-baseline.get("total_lines").and_then(Value::as_i64).unwrap_or_default(),"branch_rate_delta":delta(current.get("branch_rate"), baseline.get("branch_rate")),"covered_branches_delta":current.get("covered_branches").and_then(Value::as_i64).unwrap_or_default()-baseline.get("covered_branches").and_then(Value::as_i64).unwrap_or_default(),"total_branches_delta":current.get("total_branches").and_then(Value::as_i64).unwrap_or_default()-baseline.get("total_branches").and_then(Value::as_i64).unwrap_or_default(),"function_rate_delta":delta(current.get("function_rate"), baseline.get("function_rate")),"covered_functions_delta":current.get("covered_functions").and_then(Value::as_i64).unwrap_or_default()-baseline.get("covered_functions").and_then(Value::as_i64).unwrap_or_default(),"total_functions_delta":current.get("total_functions").and_then(Value::as_i64).unwrap_or_default()-baseline.get("total_functions").and_then(Value::as_i64).unwrap_or_default(),"region_rate_delta":delta(current.get("region_rate"), baseline.get("region_rate")),"covered_regions_delta":current.get("covered_regions").and_then(Value::as_i64).unwrap_or_default()-baseline.get("covered_regions").and_then(Value::as_i64).unwrap_or_default(),"total_regions_delta":current.get("total_regions").and_then(Value::as_i64).unwrap_or_default()-baseline.get("total_regions").and_then(Value::as_i64).unwrap_or_default()})
+fn overall_delta(current: &Value, baseline: &Value) -> AppResult<Value> {
+    let count_delta = |key: &str| -> AppResult<i64> {
+        required_i64_field(current, key, "current snapshot")?
+            .checked_sub(required_i64_field(baseline, key, "baseline snapshot")?)
+            .ok_or_else(|| AppError::Runtime(format!("snapshot metric {key} delta overflows")))
+    };
+    let current_line_rate = required_field(current, "line_rate", "current snapshot")?;
+    let baseline_line_rate = required_field(baseline, "line_rate", "baseline snapshot")?;
+    let current_branch_rate = required_field(current, "branch_rate", "current snapshot")?;
+    let baseline_branch_rate = required_field(baseline, "branch_rate", "baseline snapshot")?;
+    let current_function_rate = required_field(current, "function_rate", "current snapshot")?;
+    let baseline_function_rate = required_field(baseline, "function_rate", "baseline snapshot")?;
+    let current_region_rate = required_field(current, "region_rate", "current snapshot")?;
+    let baseline_region_rate = required_field(baseline, "region_rate", "baseline snapshot")?;
+    Ok(json!({
+        "line_rate_delta": delta(Some(current_line_rate), Some(baseline_line_rate)),
+        "covered_lines_delta": count_delta("covered_lines")?,
+        "total_lines_delta": count_delta("total_lines")?,
+        "branch_rate_delta": delta(Some(current_branch_rate), Some(baseline_branch_rate)),
+        "covered_branches_delta": count_delta("covered_branches")?,
+        "total_branches_delta": count_delta("total_branches")?,
+        "function_rate_delta": delta(Some(current_function_rate), Some(baseline_function_rate)),
+        "covered_functions_delta": count_delta("covered_functions")?,
+        "total_functions_delta": count_delta("total_functions")?,
+        "region_rate_delta": delta(Some(current_region_rate), Some(baseline_region_rate)),
+        "covered_regions_delta": count_delta("covered_regions")?,
+        "total_regions_delta": count_delta("total_regions")?,
+    }))
+}
+
+fn line_regions(numbers: &[i64]) -> AppResult<Vec<Value>> {
+    let mut numbers = numbers.to_vec();
+    numbers.sort_unstable();
+    numbers.dedup();
+    let mut regions = Vec::new();
+    let mut current: Option<(i64, i64)> = None;
+    for number in numbers {
+        if let Some((start, end)) = current.as_mut() {
+            if number <= end.saturating_add(1) {
+                *end = (*end).max(number);
+                continue;
+            }
+            let line_count = *end - *start + 1;
+            regions.push(json!({
+                "start": *start,
+                "end": *end,
+                "line_count": line_count,
+            }));
+        }
+        current = Some((number, number));
+    }
+    if let Some((start, end)) = current {
+        let line_count = end - start + 1;
+        regions.push(json!({
+            "start": start,
+            "end": end,
+            "line_count": line_count,
+        }));
+    }
+    Ok(regions)
+}
+
+fn target_order(left: &Value, right: &Value, order_by: &str) -> std::cmp::Ordering {
+    let path_order = || {
+        left.get("file_path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("file_path").and_then(Value::as_str))
+    };
+    let order = match order_by {
+        "uncovered_lines" => right
+            .get("uncovered_lines")
+            .and_then(Value::as_i64)
+            .cmp(&left.get("uncovered_lines").and_then(Value::as_i64)),
+        "line_rate" => match (
+            left.get("line_rate").and_then(Value::as_f64),
+            right.get("line_rate").and_then(Value::as_f64),
+        ) {
+            (Some(left), Some(right)) => left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+        },
+        "file_path" => path_order(),
+        _ => right
+            .get("priority")
+            .and_then(Value::as_i64)
+            .cmp(&left.get("priority").and_then(Value::as_i64)),
+    };
+    order.then_with(path_order)
+}
+
+fn coverage_target_priority(
+    uncovered_lines: i64,
+    uncovered_branches: i64,
+    uncovered_functions: i64,
+) -> AppResult<i64> {
+    uncovered_lines
+        .checked_mul(100)
+        .and_then(|value| value.checked_add(uncovered_branches.checked_mul(10)?))
+        .and_then(|value| value.checked_add(uncovered_functions.checked_mul(5)?))
+        .ok_or_else(|| AppError::Runtime("coverage target priority overflows".to_owned()))
 }
 
 fn status_order(value: &Value) -> u8 {
@@ -3092,6 +4127,7 @@ mod tests {
         assert!(normalize_line_ranges(&[(4, 3)]).is_err());
         assert!(normalize_line_ranges(&[(1, 1); 11]).is_err());
         assert!(normalize_line_ranges(&[(1, 201)]).is_err());
+        assert!(normalize_line_ranges(&[(1, 100), (300, 400)]).is_err());
     }
 
     #[test]
@@ -3132,10 +4168,205 @@ mod tests {
         let stderr_path = directory.path().join("stderr");
         std::fs::write(&stdout_path, "passed\nwarning\n").unwrap();
         std::fs::write(&stderr_path, "failed\nerror\n").unwrap();
-        let summary = summarize_logs(&stdout_path, &stderr_path, "failed", Some(1), 10, 1);
+        let bounded_path = directory.path().join("bounded");
+        let capture = capture_log(
+            b"0123456789".as_slice(),
+            File::create(&bounded_path).unwrap(),
+            4,
+        )
+        .unwrap();
+        let direct_write_path = directory.path().join("direct-write");
+        let mut direct_write_bytes = 0;
+        let mut direct_write_file = File::create(&direct_write_path).unwrap();
+        write_capture_chunk(
+            &mut direct_write_file,
+            b"direct",
+            6,
+            &mut direct_write_bytes,
+        )
+        .unwrap();
+        write_capture_chunk(
+            &mut direct_write_file,
+            b"direct",
+            0,
+            &mut direct_write_bytes,
+        )
+        .unwrap();
+        assert_eq!(direct_write_bytes, 6);
+        assert_eq!(capture.bytes_written, 4);
+        assert!(capture.truncated);
+        assert_eq!(std::fs::read(&bounded_path).unwrap(), b"0123");
+        let complete_path = directory.path().join("complete");
+        let complete_capture =
+            capture_log(b"x".as_slice(), File::create(&complete_path).unwrap(), 10).unwrap();
+        assert_eq!(complete_capture.bytes_written, 1);
+        assert!(!complete_capture.truncated);
+        #[cfg(unix)]
+        {
+            let stdout_capture_path = directory.path().join("child-stdout");
+            let mut stdout_child = Command::new("sh")
+                .args(["-c", "printf 012345"])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout_pipe = stdout_child.stdout.take().unwrap();
+            let stdout_capture =
+                capture_log(stdout_pipe, File::create(&stdout_capture_path).unwrap(), 1).unwrap();
+            assert!(stdout_capture.truncated);
+            stdout_child.wait().unwrap();
+
+            let stderr_capture_path = directory.path().join("child-stderr");
+            let mut stderr_child = Command::new("sh")
+                .args(["-c", "printf 012345 >&2"])
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stderr_pipe = stderr_child.stderr.take().unwrap();
+            let stderr_capture =
+                capture_log(stderr_pipe, File::create(&stderr_capture_path).unwrap(), 1).unwrap();
+            assert!(stderr_capture.truncated);
+            stderr_child.wait().unwrap();
+        }
+        let stdout_error = thread::spawn(|| Err(io::Error::other("stdout capture failure")));
+        let stderr_success = thread::spawn(|| {
+            Ok(LogCaptureResult {
+                bytes_written: 0,
+                truncated: false,
+            })
+        });
+        assert!(
+            join_log_capture_handles(LogCaptureHandles {
+                stdout: stdout_error,
+                stderr: stderr_success,
+            })
+            .is_err()
+        );
+        let stdout_success = thread::spawn(|| {
+            Ok(LogCaptureResult {
+                bytes_written: 0,
+                truncated: false,
+            })
+        });
+        let stderr_error = thread::spawn(|| Err(io::Error::other("stderr capture failure")));
+        assert!(
+            join_log_capture_handles(LogCaptureHandles {
+                stdout: stdout_success,
+                stderr: stderr_error,
+            })
+            .is_err()
+        );
+        let panicked_capture = thread::spawn(|| -> io::Result<LogCaptureResult> {
+            panic!("injected capture panic");
+        });
+        assert!(join_log_capture(panicked_capture, "stdout").is_err());
+        fn successful_capture_task() -> io::Result<LogCaptureResult> {
+            Ok(LogCaptureResult {
+                bytes_written: 0,
+                truncated: false,
+            })
+        }
+        let task: LogCaptureTask = Box::new(successful_capture_task);
+        assert!(
+            spawn_log_capture_task("spawn-error".to_owned(), task, |_, _| {
+                Err(io::Error::other("injected log thread spawn failure"))
+            })
+            .is_err()
+        );
+        let successful_task: LogCaptureTask = Box::new(successful_capture_task);
+        let successful_handle =
+            spawn_log_capture_task("spawn-success".to_owned(), successful_task, |_, task| {
+                Ok(thread::spawn(task))
+            })
+            .unwrap();
+        assert!(join_log_capture(successful_handle, "spawn-success").is_ok());
+        let mut missing_stdout = Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(
+            take_child_stream(
+                &mut missing_stdout,
+                None::<std::process::ChildStdout>,
+                "stdout"
+            )
+            .is_err()
+        );
+        let mut missing_stderr = Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(
+            take_child_stream(
+                &mut missing_stderr,
+                None::<std::process::ChildStderr>,
+                "stderr"
+            )
+            .is_err()
+        );
+        let mut first_capture_failure = Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(
+            capture_handle_or_cleanup(
+                &mut first_capture_failure,
+                Err(AppError::Runtime("first capture failure".to_owned())),
+            )
+            .is_err()
+        );
+        let mut second_capture_failure = Command::new("sleep").arg("5").spawn().unwrap();
+        let previous_capture = thread::spawn(|| {
+            Ok(LogCaptureResult {
+                bytes_written: 0,
+                truncated: false,
+            })
+        });
+        assert!(
+            capture_second_handle_or_cleanup(
+                &mut second_capture_failure,
+                Err(AppError::Runtime("second capture failure".to_owned())),
+                previous_capture,
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let mut fallback_child = Command::new("sleep").arg("5").spawn().unwrap();
+            let fallback_result =
+                terminate_child_group_with(&mut fallback_child, |_| Command::new("false").status());
+            assert!(fallback_result.is_err());
+            let _ = fallback_child.wait();
+            let mut command_error_child = Command::new("sleep").arg("5").spawn().unwrap();
+            let command_error = terminate_child_group_with(&mut command_error_child, |_| {
+                Err(io::Error::other("injected process-group command failure"))
+            });
+            assert!(command_error.is_err());
+            let _ = command_error_child.wait();
+            let status = Command::new("false").status().unwrap();
+            assert!(
+                fallback_after_group_status(status, Err(io::Error::other("fallback"))).is_err()
+            );
+            assert!(
+                fallback_after_group_command(
+                    io::Error::other("command"),
+                    Err(io::Error::other("fallback")),
+                )
+                .is_err()
+            );
+        }
+        let summary = summarize_logs(
+            &stdout_path,
+            &stderr_path,
+            "failed",
+            Some(1),
+            10,
+            1,
+            LogCaptureResult {
+                bytes_written: 15,
+                truncated: false,
+            },
+            LogCaptureResult {
+                bytes_written: 13,
+                truncated: false,
+            },
+        )
+        .unwrap();
         assert_eq!(summary["counters"]["passed"], 1);
         assert_eq!(summary["counters"]["failed"], 1);
         assert_eq!(summary["stdout_line_count"], 2);
+        assert_eq!(summary["stdout_bytes"], 15);
+        assert_eq!(summary["truncated"], false);
         assert_eq!(summary["excerpts"].as_array().unwrap().len(), 2);
         let lines = vec!["one".to_owned(), "two".to_owned(), "three".to_owned()];
         assert_eq!(context_window(&lines, 1, 1).len(), 3);
@@ -3160,19 +4391,184 @@ mod tests {
             None,
             0,
             0,
+            LogCaptureResult {
+                bytes_written: 0,
+                truncated: false,
+            },
+            LogCaptureResult {
+                bytes_written: 0,
+                truncated: false,
+            },
         );
-        assert_eq!(missing["stderr_line_count"], 0);
+        assert!(missing.is_err());
+
+        let cleanup_control = Arc::new(Mutex::new(None));
+        let cleanup_poison = Arc::clone(&cleanup_control);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = cleanup_poison.lock().unwrap();
+            panic!("injected unregistered-process lock poison");
+        }));
+        assert!(
+            cleanup_unregistered_run(
+                "unregistered",
+                &cleanup_control,
+                LogCaptureHandles {
+                    stdout: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                    stderr: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                },
+                AppError::Runtime("registry failure".to_owned()),
+            )
+            .is_err()
+        );
+
+        let guard_store =
+            CoverageStore::open(directory.path().join("guard-errors.duckdb"), test_config())
+                .unwrap();
+        stop_compaction_worker(&guard_store);
+        let poisoned_control = Arc::new(Mutex::new(None));
+        let control_for_poison = Arc::clone(&poisoned_control);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = control_for_poison.lock().unwrap();
+            panic!("injected managed-process lock poison");
+        }));
+        {
+            let _guard = ManagedRunGuard::new(
+                Arc::clone(&guard_store.inner),
+                "drop-terminate-error".to_owned(),
+                poisoned_control,
+                LogCaptureHandles {
+                    stdout: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                    stderr: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                },
+            );
+        }
+        let capture_failure_control = Arc::new(Mutex::new(None));
+        {
+            let _guard = ManagedRunGuard::new(
+                Arc::clone(&guard_store.inner),
+                "drop-capture-error".to_owned(),
+                capture_failure_control,
+                LogCaptureHandles {
+                    stdout: thread::spawn(|| Err(io::Error::other("drop stdout failure"))),
+                    stderr: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                },
+            );
+        }
+        let mut no_captures = ManagedRunGuard::new(
+            Arc::clone(&guard_store.inner),
+            "drop-without-captures".to_owned(),
+            Arc::new(Mutex::new(None)),
+            LogCaptureHandles {
+                stdout: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+                stderr: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+            },
+        );
+        no_captures.captures = None;
+        assert!(no_captures.finish().is_err());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard_store.inner.active_processes.lock().unwrap();
+            panic!("injected active-process lock poison");
+        }));
+        {
+            let _guard = ManagedRunGuard::new(
+                Arc::clone(&guard_store.inner),
+                "drop-registry-error".to_owned(),
+                Arc::new(Mutex::new(None)),
+                LogCaptureHandles {
+                    stdout: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                    stderr: thread::spawn(|| {
+                        Ok(LogCaptureResult {
+                            bytes_written: 0,
+                            truncated: false,
+                        })
+                    }),
+                },
+            );
+        }
+        guard_store.inner.active_processes.clear_poison();
+        guard_store.close().unwrap();
+        let active_error_store = CoverageStore::open(
+            directory.path().join("active-process-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&active_error_store);
+        let active_control = Arc::new(Mutex::new(None));
+        let active_control_poison = Arc::clone(&active_control);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = active_control_poison.lock().unwrap();
+            panic!("injected active child lock poison");
+        }));
+        active_error_store
+            .inner
+            .active_processes
+            .lock()
+            .unwrap()
+            .insert("poisoned".to_owned(), active_control);
+        assert!(active_error_store.close().is_err());
     }
 
     #[test]
     fn maintenance_helpers_cover_empty_and_error_arms() {
         assert!(ensure_db_parent(Path::new("coverage.duckdb")).is_ok());
         assert!(ensure_db_parent(Path::new("")).is_ok());
+        let mut invalid_log_config = test_config();
+        invalid_log_config.run_log_max_bytes = MIN_RUN_LOG_MAX_BYTES - 1;
+        assert!(
+            CoverageStore::open(
+                tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("invalid-log.duckdb"),
+                invalid_log_config,
+            )
+            .is_err()
+        );
 
         let mut values = HashMap::new();
-        append_line_with_path(&mut values, "a.py", json!({"line_number": 1}));
-        append_line_with_path(&mut values, "a.py", json!({"covered": true}));
-        append_line_with_path(&mut values, "a.py", json!("scalar"));
+        append_line_with_path(&mut values, "a.py", json!({"line_number": 1})).unwrap();
+        assert!(append_line_with_path(&mut values, "a.py", json!({"covered": true})).is_err());
+        assert!(append_line_with_path(&mut values, "a.py", json!("scalar")).is_err());
         assert_eq!(values.len(), 1);
 
         let connection = Connection::open_in_memory().unwrap();
@@ -3186,24 +4582,51 @@ mod tests {
             .is_err()
         );
         assert!(
+            finish_transaction(
+                &connection,
+                Err::<(), AppError>(AppError::Validation("rollback failure".to_owned()))
+            )
+            .is_err()
+        );
+        assert!(
             retain_compaction_thread(
                 &Mutex::new(None),
                 Err(std::io::Error::other("spawn failure")),
             )
-            .is_ok()
+            .is_err()
         );
 
         let directory = tempfile::tempdir().unwrap();
         let store =
             CoverageStore::open(directory.path().join("helpers.duckdb"), test_config()).unwrap();
+        assert!(CoverageStore::submitted_run_id(&json!({})).is_err());
+        assert_eq!(
+            CoverageStore::submitted_run_id(&json!({"id":"run-id"})).unwrap(),
+            "run-id"
+        );
+        report_background_run_error(&store, "missing-background-run");
+        assert!(summary_line_limit(None).is_err());
+        assert_eq!(summary_line_limit(Some(&json!(7))).unwrap(), 7);
+        assert!(summary_line_limit(Some(&json!(0))).is_err());
+        assert!(store.source_lines("missing", "a.py", 1, 201).is_err());
+        assert!(read_log_lines(&json!({}), "missing-run", "stdout", "stdout_path").is_err());
+        assert!(remove_run_directory(directory.path(), "missing-run-directory").is_ok());
+        let run_file = directory.path().join("run-file");
+        std::fs::write(&run_file, "not a directory").unwrap();
+        assert!(remove_run_directory(directory.path(), "run-file").is_err());
         assert!(
             store
                 .retain_run_thread(Err(std::io::Error::other("spawn failure")))
-                .is_ok()
+                .is_err()
         );
         let mut no_child = None;
-        reap_child(&mut no_child);
+        reap_child(&mut no_child).unwrap();
         assert!(required_managed_child(&mut no_child).is_err());
+        assert!(terminate_managed_process(&Arc::new(Mutex::new(None))).is_ok());
+
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let _ = terminate_child_group(&mut child);
+        let _ = child.wait();
         let command = store
             .register_command(
                 "close-join",
@@ -3234,6 +4657,39 @@ mod tests {
                 "unit",
             )
             .unwrap();
+        let gap_report = directory.path().join("gap.lcov");
+        std::fs::write(
+            &gap_report,
+            "TN:\nSF:src/a.py\nBRDA:2,0,0,-\nend_of_record\n",
+        )
+        .unwrap();
+        let gap_snapshot = store
+            .ingest_report(
+                &gap_report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "gap",
+            )
+            .unwrap();
+        let _other_branch_snapshot = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("other"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        assert!(
+            store
+                .file_gaps(gap_snapshot["id"].as_str().unwrap(), "src/a.py", 10)
+                .is_ok()
+        );
         let first = store
             .compact_snapshot_detail(&project.repo_key, snapshot["id"].as_str().unwrap())
             .unwrap();
@@ -3242,12 +4698,80 @@ mod tests {
             .compact_snapshot_detail(&project.repo_key, snapshot["id"].as_str().unwrap())
             .unwrap();
         assert!(!second.0);
+        let malformed_payload = {
+            let bytes = serde_json::to_vec(&json!({"lines":[]})).unwrap();
+            let mut reader = bytes.as_slice();
+            compress_coverage_payload(&mut reader).unwrap()
+        };
+        let update_malformed_payload = || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "UPDATE coverage_compacted_payloads SET payload = ? WHERE snapshot_id = ?",
+                    params![&malformed_payload, snapshot["id"].as_str().unwrap()],
+                )?;
+                Ok(())
+            })
+        };
+        update_malformed_payload().unwrap();
+        assert!(store.files(snapshot["id"].as_str().unwrap(), 10).is_err());
+        assert!(
+            store
+                .file_coverage(snapshot["id"].as_str().unwrap(), "src/a.py")
+                .is_err()
+        );
+        let missing_lines_payload = {
+            let bytes = serde_json::to_vec(&json!({"files":[]})).unwrap();
+            let mut reader = bytes.as_slice();
+            compress_coverage_payload(&mut reader).unwrap()
+        };
+        let update_missing_lines_payload = || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "UPDATE coverage_compacted_payloads SET payload = ? WHERE snapshot_id = ?",
+                    params![&missing_lines_payload, snapshot["id"].as_str().unwrap()],
+                )?;
+                Ok(())
+            })
+        };
+        update_missing_lines_payload().unwrap();
+        assert!(
+            store
+                .lines(snapshot["id"].as_str().unwrap(), "src/a.py", 10)
+                .is_err()
+        );
+        let unmatched_lines_payload = {
+            let bytes = serde_json::to_vec(&json!({
+                "lines": [{"file_path":"other.py","line_number":1}]
+            }))
+            .unwrap();
+            let mut reader = bytes.as_slice();
+            compress_coverage_payload(&mut reader).unwrap()
+        };
+        let update_unmatched_lines_payload = || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "UPDATE coverage_compacted_payloads SET payload = ? WHERE snapshot_id = ?",
+                    params![&unmatched_lines_payload, snapshot["id"].as_str().unwrap()],
+                )?;
+                Ok(())
+            })
+        };
+        update_unmatched_lines_payload().unwrap();
+        assert!(
+            store
+                .lines(snapshot["id"].as_str().unwrap(), "src/a.py", 10)
+                .unwrap()
+                .is_empty()
+        );
         store
             .with_connection(|connection| {
                 connection.execute_batch("DROP TABLE coverage_compacted_payloads")?;
                 Ok(())
             })
             .unwrap();
+        assert!(update_unmatched_lines_payload().is_err());
+        assert!(update_malformed_payload().is_err());
+        assert!(update_missing_lines_payload().is_err());
         assert!(
             store
                 .compact_snapshot_detail(&project.repo_key, snapshot["id"].as_str().unwrap())
@@ -3280,6 +4804,93 @@ mod tests {
                 .submit_command(malformed["id"].as_str().unwrap(), None, None, 20)
                 .is_err()
         );
+        assert!(
+            store
+                .collect_artifacts(
+                    &json!({"artifact_specs":[{"kind":"invalid","path":"\0","required":false}],"repo_path":directory.path().to_string_lossy(),"name":"invalid"}),
+                    &directory.path().to_string_lossy(),
+                    true,
+                )
+                .is_err()
+        );
+        let make_broken_command_view = || {
+            store.with_connection(|connection| {
+                connection.execute_batch(
+                    "DROP INDEX IF EXISTS idx_registered_commands_name;
+                     ALTER TABLE registered_commands RENAME TO registered_commands_base;
+                     CREATE VIEW registered_commands AS
+                     SELECT '' AS id, created_at, 'broken' AS name, command, cwd,
+                            repo_path, repo_key, branch, commit_sha, shell, approved_by,
+                            approval_note, artifact_specs, enabled, duration_estimate_ms,
+                            duration_p90_ms, duration_sample_count
+                     FROM registered_commands_base
+                     LIMIT 1;",
+                )?;
+                Ok(())
+            })
+        };
+        make_broken_command_view().unwrap();
+        assert!(make_broken_command_view().is_err());
+        assert!(store.latest_artifact("coverage", Some("broken")).is_err());
+
+        let current_snapshot_id = snapshot["id"].as_str().unwrap();
+        let clear_snapshot_branch = || {
+            store.with_connection(|connection| {
+                connection.execute(
+                    "UPDATE snapshots SET branch = NULL WHERE id = ?",
+                    params![current_snapshot_id],
+                )?;
+                Ok(())
+            })
+        };
+        clear_snapshot_branch().unwrap();
+        let broken_snapshot_view = format!(
+            "DROP INDEX IF EXISTS idx_snapshots_repo_time;
+             DROP INDEX IF EXISTS idx_snapshots_commit;
+             ALTER TABLE snapshots RENAME TO snapshots_base;
+             CREATE VIEW snapshots AS
+             SELECT {SNAPSHOT_COLUMNS} FROM snapshots_base
+             UNION ALL
+             SELECT CAST('broken-previous' AS VARCHAR) AS id, created_at, repo_path, repo_key,
+                    CAST('other' AS VARCHAR) AS branch,
+                    commit_sha, base_ref, suite, format, report_path, warnings, metadata,
+                    total_lines, covered_lines, total_branches, covered_branches,
+                    total_functions, covered_functions, total_regions, covered_regions,
+                    line_rate, branch_rate, function_rate, region_rate
+             FROM snapshots_base
+             WHERE id = '{current_snapshot_id}';",
+        );
+        store
+            .with_connection(|connection| {
+                connection.execute_batch(&broken_snapshot_view)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(clear_snapshot_branch().is_err());
+        assert!(store.previous_snapshot(current_snapshot_id).is_ok());
+        let install_malformed_snapshot_view = |sql: &str| {
+            store.with_connection(|connection| {
+                connection.execute_batch(sql)?;
+                Ok(())
+            })
+        };
+        let malformed_snapshot_sql = format!(
+            "DROP VIEW snapshots;
+             CREATE VIEW snapshots AS
+             SELECT {SNAPSHOT_COLUMNS} FROM snapshots_base
+             UNION ALL
+             SELECT CAST(NULL AS VARCHAR) AS id, created_at, repo_path, repo_key,
+                    CAST('other' AS VARCHAR) AS branch,
+                    commit_sha, base_ref, suite, format, report_path, warnings, metadata,
+                    total_lines, covered_lines, total_branches, covered_branches,
+                    total_functions, covered_functions, total_regions, covered_regions,
+                    line_rate, branch_rate, function_rate, region_rate
+             FROM snapshots_base
+             WHERE id = '{current_snapshot_id}';"
+        );
+        install_malformed_snapshot_view(&malformed_snapshot_sql).unwrap();
+        assert!(install_malformed_snapshot_view("THIS IS NOT VALID SQL").is_err());
+        assert!(store.previous_snapshot(current_snapshot_id).is_err());
         store.close().unwrap();
 
         let no_worker =
@@ -3301,43 +4912,398 @@ mod tests {
         self_closing.inner.run_threads.lock().unwrap().push(worker);
         start_sender.send(()).unwrap();
         done_receiver.recv().unwrap();
+
+        let panicking = CoverageStore::open(
+            directory.path().join("panicking-worker.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        panicking
+            .inner
+            .run_threads
+            .lock()
+            .unwrap()
+            .push(std::thread::spawn(|| panic!("injected worker panic")));
+        assert!(panicking.close().is_err());
+
+        let panicking_compaction = CoverageStore::open(
+            directory.path().join("panicking-compaction-worker.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&panicking_compaction);
+        *panicking_compaction.inner.compaction_thread.lock().unwrap() =
+            Some(std::thread::spawn(|| panic!("injected compaction panic")));
+        assert!(panicking_compaction.close().is_err());
+
+        let settings_error = CoverageStore::open(
+            directory.path().join("settings-worker-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        settings_error.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&settings_error);
+        make_broken_view(&settings_error, "project_settings");
+        settings_error.start_compaction_worker().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        settings_error.close().unwrap();
+
+        let invalid_maintenance = CoverageStore::open(
+            directory.path().join("invalid-maintenance-worker.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        invalid_maintenance
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&invalid_maintenance);
+        let rewrite_invalid_settings = || {
+            invalid_maintenance.with_connection(|connection| {
+                connection.execute_batch(
+                    "DROP INDEX IF EXISTS idx_project_settings_updated;
+                     ALTER TABLE project_settings RENAME TO project_settings_base;
+                     CREATE VIEW project_settings AS
+                     SELECT repo_key, repo_path, created_at, updated_at, compaction_enabled,
+                            compaction_after_days, compaction_interval_seconds, compaction_batch_size,
+                            CAST('bad' AS VARCHAR) AS compaction_last_run_at,
+                            compaction_last_status, compaction_last_snapshot_count,
+                            compaction_last_bytes_before,
+                            compaction_last_bytes_after
+                     FROM project_settings_base;",
+                )?;
+                Ok(())
+            })
+        };
+        rewrite_invalid_settings().unwrap();
+        assert!(rewrite_invalid_settings().is_err());
+        assert!(invalid_maintenance.project_settings().is_ok());
+        invalid_maintenance.start_compaction_worker().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stop_compaction_worker(&invalid_maintenance);
+        let rewrite_invalid_type_settings = |sql: &str| {
+            invalid_maintenance.with_connection(|connection| {
+                connection.execute_batch(sql)?;
+                Ok(())
+            })
+        };
+        rewrite_invalid_type_settings(
+            "DROP VIEW project_settings;
+             CREATE VIEW project_settings AS
+             SELECT repo_key, repo_path, created_at, updated_at,
+                    CAST('bad' AS VARCHAR) AS compaction_enabled,
+                    compaction_after_days, compaction_interval_seconds,
+                    compaction_batch_size, compaction_last_run_at,
+                    compaction_last_status, compaction_last_snapshot_count,
+                    compaction_last_bytes_before, compaction_last_bytes_after
+             FROM project_settings_base;",
+        )
+        .unwrap();
+        assert!(invalid_maintenance.project_settings().is_err());
+        assert!(rewrite_invalid_type_settings("CREATE VIEW project_settings AS SELECT 1").is_err());
+        invalid_maintenance.close().unwrap();
+
+        let compaction_error = CoverageStore::open(
+            directory.path().join("compaction-worker-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        compaction_error.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&compaction_error);
+        let report = directory.path().join("worker-error.lcov");
+        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        let snapshot = compaction_error
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        compaction_error
+            .with_connection(|connection| {
+                #[rustfmt::skip]
+                connection.execute("UPDATE snapshots SET created_at = ? WHERE id = ?", params![Utc::now() - ChronoDuration::days(31), snapshot["id"].as_str().unwrap()])?;
+                Ok(())
+            })
+            .unwrap();
+        make_broken_view(&compaction_error, "lines");
+        compaction_error.start_compaction_worker().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        compaction_error.close().unwrap();
     }
 
     #[test]
     fn time_and_delta_helpers_handle_missing_and_valid_values() {
         let old = (Utc::now() - ChronoDuration::seconds(5)).to_rfc3339();
-        assert!(run_duration_ms(Some(&json!(old)), None) >= 0);
-        assert!(run_duration_ms(Some(&Value::Null), Some(&json!(old))) >= 0);
-        assert_eq!(run_duration_ms(Some(&json!("bad")), None), 0);
-        assert!(maintenance_due(&ProjectSettings {
-            compaction_last_run_at: None,
-            ..test_settings()
-        }));
-        assert!(maintenance_due(&ProjectSettings {
-            compaction_last_run_at: Some(old.clone()),
-            compaction_interval_seconds: 1,
-            ..test_settings()
-        }));
+        assert!(run_duration_ms(Some(&json!(old)), None).unwrap() >= 0);
+        assert!(run_duration_ms(Some(&Value::Null), Some(&json!(old))).unwrap() >= 0);
+        assert!(run_duration_ms(Some(&json!("bad")), None).is_err());
+        assert!(run_duration_ms(Some(&json!(1)), None).is_err());
+        assert_eq!(run_duration_ms(None, None).unwrap(), 0);
+        assert!(
+            maintenance_due(&ProjectSettings {
+                compaction_last_run_at: None,
+                ..test_settings()
+            })
+            .unwrap()
+        );
+        assert!(
+            maintenance_due(&ProjectSettings {
+                compaction_last_run_at: Some(old.clone()),
+                compaction_interval_seconds: 1,
+                ..test_settings()
+            })
+            .unwrap()
+        );
         let future = (Utc::now() + ChronoDuration::hours(1)).to_rfc3339();
-        assert!(!maintenance_due(&ProjectSettings {
-            compaction_last_run_at: Some(future),
-            compaction_interval_seconds: 3600,
-            ..test_settings()
-        }));
+        assert!(
+            !maintenance_due(&ProjectSettings {
+                compaction_last_run_at: Some(future),
+                compaction_interval_seconds: 3600,
+                ..test_settings()
+            })
+            .unwrap()
+        );
+        assert!(
+            maintenance_due(&ProjectSettings {
+                compaction_last_run_at: Some("bad".to_owned()),
+                ..test_settings()
+            })
+            .is_err()
+        );
         assert_eq!(delta(Some(&json!(3.0)), Some(&json!(1.0))), json!(2.0));
         assert!(delta(Some(&Value::Null), Some(&json!(1.0))).is_null());
-        let current =
-            json!({"line_rate":0.75,"covered_lines":3,"total_lines":4,"branch_rate":null});
-        let baseline = json!({"line_rate":0.5,"covered_lines":2,"total_lines":4,"branch_rate":0.2});
-        assert_eq!(overall_delta(&current, &baseline)["covered_lines_delta"], 1);
+        let current = json!({"line_rate":0.75,"covered_lines":3,"total_lines":4,"branch_rate":null,"covered_branches":0,"total_branches":0,"function_rate":null,"covered_functions":0,"total_functions":0,"region_rate":null,"covered_regions":0,"total_regions":0});
+        let baseline = json!({"line_rate":0.5,"covered_lines":2,"total_lines":4,"branch_rate":0.2,"covered_branches":0,"total_branches":0,"function_rate":null,"covered_functions":0,"total_functions":0,"region_rate":null,"covered_regions":0,"total_regions":0});
+        assert_eq!(
+            overall_delta(&current, &baseline).unwrap()["covered_lines_delta"],
+            1
+        );
+        let mut overflowing_current = current.clone();
+        overflowing_current["covered_lines"] = json!(i64::MIN);
+        assert!(overall_delta(&overflowing_current, &baseline).is_err());
         assert_eq!(status_order(&json!({"status":"regressed"})), 0);
         assert_eq!(status_order(&json!({"status":"improved"})), 1);
         assert_eq!(status_order(&json!({"status":"same"})), 2);
+        assert_eq!(line_regions(&[5, 1, 2, 2, 4]).unwrap()[0]["start"], 1);
+        assert_eq!(line_regions(&[5, 1, 2, 2, 4]).unwrap()[1]["start"], 4);
+        assert!(line_regions(&[]).unwrap().is_empty());
+        let target_left =
+            json!({"file_path":"b.py","priority":20,"uncovered_lines":2,"line_rate":0.5});
+        let target_right =
+            json!({"file_path":"a.py","priority":10,"uncovered_lines":1,"line_rate":0.8});
+        assert_eq!(
+            target_order(&target_left, &target_right, "priority"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            target_order(&target_left, &target_right, "uncovered_lines"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            target_order(&target_left, &target_right, "line_rate"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            target_order(&target_left, &target_right, "file_path"),
+            std::cmp::Ordering::Greater
+        );
+        let missing_rate =
+            json!({"file_path":"c.py","priority":1,"uncovered_lines":0,"line_rate":null});
+        assert_eq!(
+            target_order(&missing_rate, &target_left, "line_rate"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            target_order(&target_left, &missing_rate, "line_rate"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            target_order(&missing_rate, &missing_rate, "line_rate"),
+            std::cmp::Ordering::Equal
+        );
         assert_eq!(insight_order(&json!({"severity":"high"})), 0);
         assert_eq!(insight_order(&json!({"severity":"medium"})), 1);
         assert_eq!(insight_order(&json!({"severity":"info"})), 2);
+        assert_eq!(coverage_target_priority(2, 3, 4).unwrap(), 250);
+        assert!(coverage_target_priority(i64::MAX, 0, 0).is_err());
         assert_eq!(json_string("{\"value\":1}".to_owned())["value"], 1);
         assert_eq!(json_string("not-json".to_owned()), json!("not-json"));
+        assert!(checked_db_u32(-1, "days").is_err());
+        assert!(checked_db_u64(-1, "seconds").is_err());
+        assert!(persisted_value_out_of_range("days", -1).contains("days"));
+        assert!(checked_duckdb_i64(i64::MAX as u64 + 1, "count").is_err());
+        assert!(checked_usize_i64(usize::MAX, "payload").is_err());
+        assert!(checked_add_u64(u64::MAX, 1, "count").is_err());
+        assert!(checked_mul_u64(u64::MAX, 2, "bytes").is_err());
+        assert!(combine_run_results(Ok(()), Err(AppError::Runtime("release".to_owned()))).is_err());
+        let mut first_process_error = None;
+        record_first_process_error(
+            &mut first_process_error,
+            Err(AppError::Runtime("first".to_owned())),
+        );
+        record_first_process_error(
+            &mut first_process_error,
+            Err(AppError::Runtime("second".to_owned())),
+        );
+        record_first_process_error(&mut first_process_error, Ok(()));
+        assert!(first_process_error.is_some());
+        let missing_claim_connection = Connection::open_in_memory().unwrap();
+        assert!(claim_run(&missing_claim_connection, "missing", Utc::now()).is_err());
+        let claim_schema = Connection::open_in_memory().unwrap();
+        claim_schema
+            .execute_batch(
+                "CREATE TABLE run_jobs (id VARCHAR, status VARCHAR, started_at TIMESTAMP, error VARCHAR)",
+            )
+            .unwrap();
+        assert!(!claim_run(&claim_schema, "missing", Utc::now()).unwrap());
+        let poisoned_slots = Mutex::new(0_usize);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned_slots.lock().unwrap();
+            panic!("injected slot lock poison");
+        }));
+        assert!(release_run_slot(&poisoned_slots, &Condvar::new()).is_err());
+
+        let settings_directory = tempfile::tempdir().unwrap();
+        let settings_store = CoverageStore::open(
+            settings_directory.path().join("corrupt-settings.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        settings_store
+            .ensure_project(settings_directory.path())
+            .unwrap();
+        stop_compaction_worker(&settings_store);
+        settings_store
+            .with_connection(|connection| {
+                #[rustfmt::skip]
+                connection.execute("UPDATE project_settings SET compaction_interval_seconds = -1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(settings_store.project_settings().is_err());
+        settings_store
+            .with_connection(|connection| {
+                #[rustfmt::skip]
+                connection.execute("UPDATE project_settings SET compaction_interval_seconds = 3600, compaction_last_snapshot_count = -1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(settings_store.project_settings().is_err());
+        settings_store.close().unwrap();
+
+        let recovery_store = CoverageStore::open(
+            settings_directory.path().join("recovery-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&recovery_store);
+        recovery_store.inner.pool.lock().unwrap().take();
+        recovery_store.finalize_failed_job_or_log(
+            "missing",
+            &AppError::Runtime("run failed".to_owned()),
+            "finalize test",
+        );
+        recovery_store.close().unwrap();
+        let finalize_error_store = CoverageStore::open(
+            settings_directory
+                .path()
+                .join("finalize-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&finalize_error_store);
+        make_broken_view(&finalize_error_store, "run_jobs");
+        assert!(
+            finalize_error_store
+                .finalize_failed_job("missing", &AppError::Runtime("failed".to_owned()))
+                .is_err()
+        );
+        finalize_error_store.close().unwrap();
+
+        let retain_store = CoverageStore::open(
+            settings_directory.path().join("retain-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        retain_store
+            .ensure_project(settings_directory.path())
+            .unwrap();
+        stop_compaction_worker(&retain_store);
+        let retain_command = retain_store
+            .register_command(
+                "retain-error",
+                "true",
+                Some(settings_directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let retain_threads = &retain_store.inner.run_threads;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = retain_threads.lock().unwrap();
+            panic!("injected run-thread registry poison");
+        }));
+        assert!(
+            retain_store
+                .submit_command(retain_command["id"].as_str().unwrap(), None, None, 20)
+                .is_err()
+        );
+        retain_store.inner.run_threads.clear_poison();
+        std::thread::sleep(Duration::from_millis(100));
+        retain_store.close().unwrap();
+        let compact_store = CoverageStore::open(
+            settings_directory.path().join("compact-project.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        compact_store
+            .ensure_project(settings_directory.path())
+            .unwrap();
+        stop_compaction_worker(&compact_store);
+        let compact_report = settings_directory.path().join("compact-project.lcov");
+        std::fs::write(&compact_report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        let compact_snapshot = compact_store
+            .ingest_report(
+                &compact_report,
+                "lcov",
+                Some(settings_directory.path()),
+                None,
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        compact_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE snapshots SET created_at = ? WHERE id = ?",
+                        params![
+                            Utc::now() - ChronoDuration::days(31),
+                            compact_snapshot["id"].as_str().unwrap(),
+                        ],
+                    )
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+            .unwrap();
+        let compact_project = compact_store.project().unwrap();
+        let compact_result = compact_store
+            .compact_project(
+                &compact_project,
+                &compact_store.project_settings().unwrap().policy(),
+            )
+            .unwrap();
+        assert_eq!(compact_result.compacted_snapshots, 1);
+        compact_store.close().unwrap();
         assert_eq!(short_hash("repo").len(), 16);
         assert_eq!(
             required_command_id(&json!({"id":"command"}), "command").unwrap(),
@@ -3353,6 +5319,78 @@ mod tests {
         }
         let mut failing_reader = FailingReader;
         assert!(compress_coverage_payload(&mut failing_reader).is_err());
+    }
+
+    #[test]
+    fn strict_projection_helpers_reject_malformed_values() {
+        assert!(required_field(&json!({}), "id", "projection").is_err());
+        assert!(required_string_field(&json!({"id":""}), "id", "projection").is_err());
+        assert!(required_i64_field(&json!({"count":"1"}), "count", "projection").is_err());
+        assert!(required_bool_field(&json!({"enabled":1}), "enabled", "projection").is_err());
+        assert!(required_array_field(&json!({"items":{}}), "items", "projection").is_err());
+        let mut scalar_projection = json!("scalar");
+        assert!(required_object_mut(&mut scalar_projection, "projection").is_err());
+        let mut object_projection = json!({"id":"projection"});
+        assert!(required_object_mut(&mut object_projection, "projection").is_ok());
+        let mut comparison = json!({});
+        assert!(CoverageStore::attach_worktree_to_comparison(
+            &mut comparison,
+            json!({"id":"worktree"}),
+        )
+        .is_ok());
+        assert_eq!(comparison["worktree"]["id"], "worktree");
+        let mut scalar_comparison = json!("scalar");
+        assert!(
+            CoverageStore::attach_worktree_to_comparison(&mut scalar_comparison, json!({}),)
+                .is_err()
+        );
+        assert!(optional_i64_field(&json!({}), "count", "projection").is_err());
+        assert_eq!(
+            optional_i64_field(&json!({"count":null}), "count", "projection").unwrap(),
+            None
+        );
+        assert!(optional_i64_field(&json!({"count":"1"}), "count", "projection").is_err());
+        assert_eq!(uncovered_metric(3, 1, "lines").unwrap(), 2);
+        assert!(uncovered_metric(-1, 0, "lines").is_err());
+        assert!(uncovered_metric(1, 2, "lines").is_err());
+        assert!(overall_delta(&json!({}), &json!({})).is_err());
+        assert!(CoverageStore::decorate_terminal_run(json!("scalar")).is_err());
+        assert!(
+            CoverageStore::decorate_queued_run(json!("scalar"), "queued".to_owned(), false, None)
+                .is_err()
+        );
+        assert!(
+            CoverageStore::decorate_queued_run(
+                json!({"queued_at":null,"started_at":null,"stderr_path":"stderr"}),
+                "queued".to_owned(),
+                false,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            CoverageStore::decorate_queued_run(
+                json!({"queued_at":null,"started_at":null,"stdout_path":"stdout"}),
+                "queued".to_owned(),
+                false,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            CoverageStore::decorate_queued_run(
+                json!({"queued_at":null,"started_at":null,"stdout_path":"stdout","stderr_path":"stderr"}),
+                "queued".to_owned(),
+                false,
+                Some(1),
+            )
+            .is_ok()
+        );
+        assert!(summary_line_limit(Some(&json!("1"))).is_err());
+        assert!(summary_line_limit(Some(&json!(501))).is_err());
+        assert!(timeout_duration(Some(-1)).is_err());
+        assert_eq!(timeout_duration(None).unwrap(), None);
+        assert!(normalize_artifact_specs(json!([])).is_err());
     }
 
     #[test]
@@ -3509,6 +5547,8 @@ mod tests {
             db_acquire_timeout_ms: 5_000,
             db_query_timeout_ms: 30_000,
             http_request_timeout_seconds: 60,
+            http_max_body_bytes: 1_048_576,
+            run_log_max_bytes: 10 * 1024 * 1024,
             default_compaction_after_days: 30,
             default_compaction_interval_seconds: 3_600,
             default_compaction_batch_size: 100,
@@ -3524,7 +5564,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         store.inner.closing.store(true, Ordering::SeqCst);
         store.inner.slots.1.notify_all();
-        assert!(waiting.join().unwrap().is_ok());
+        assert!(waiting.join().unwrap().is_err());
         store.inner.closing.store(false, Ordering::SeqCst);
 
         let project = store.project().unwrap();
@@ -3548,6 +5588,22 @@ mod tests {
                 Ok(())
             })
         };
+
+        let claim_id = Uuid::new_v4().to_string();
+        insert_job(&claim_id, "claim-command", "queued").unwrap();
+        assert!(
+            store
+                .with_connection(|connection| claim_run(connection, &claim_id, Utc::now()))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .with_connection(|connection| claim_run(connection, &claim_id, Utc::now()))
+                .unwrap()
+        );
+        store
+            .finalize_failed_job(&claim_id, &AppError::Runtime("claim failed".to_owned()))
+            .unwrap();
 
         let nonqueued = Uuid::new_v4().to_string();
         insert_job(&nonqueued, "missing-command", "running").unwrap();
@@ -3584,6 +5640,151 @@ mod tests {
             .unwrap();
         let mut child = control.lock().unwrap().take().unwrap();
         let _ = child.wait();
+        let command = store
+            .register_command(
+                "successful-managed-run",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let successful_run = Uuid::new_v4().to_string();
+        insert_job(&successful_run, command["id"].as_str().unwrap(), "queued").unwrap();
+        store.execute_run_with_slot(&successful_run).unwrap();
+        let successful_result = store.run_result(&successful_run, 20).unwrap();
+        assert_eq!(successful_result["terminal"], true);
+        assert_eq!(successful_result["status"], "passed");
+        let closing_store = CoverageStore::open(
+            directory.path().join("closing-managed-run.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        closing_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&closing_store);
+        let closing_project = closing_store.project().unwrap();
+        let closing_command = closing_store
+            .register_command(
+                "closing-managed-run",
+                "sleep 5",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let closing_run = Uuid::new_v4().to_string();
+        let closing_stdout = directory.path().join("closing.stdout");
+        let closing_stderr = directory.path().join("closing.stderr");
+        closing_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        INSERT_EDGE_JOB_SQL,
+                        params![
+                            closing_run,
+                            closing_command["id"].as_str().unwrap(),
+                            closing_project.repo_path,
+                            closing_project.repo_path,
+                            closing_project.repo_key,
+                            Utc::now(),
+                            "queued",
+                            closing_stdout.to_string_lossy().to_string(),
+                            closing_stderr.to_string_lossy().to_string(),
+                        ],
+                    )
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+            .unwrap();
+        let closing_runner_store = closing_store.clone();
+        let closing_runner_id = closing_run.clone();
+        let closing_runner =
+            thread::spawn(move || closing_runner_store.execute_run(&closing_runner_id));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !closing_store
+            .inner
+            .active_processes
+            .lock()
+            .unwrap()
+            .contains_key(&closing_run)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "closing managed process did not start"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        closing_store.inner.closing.store(true, Ordering::SeqCst);
+        assert!(cancellation_state(&closing_store, &closing_run).unwrap());
+        assert!(closing_runner.join().unwrap().is_err());
+        closing_store.close().unwrap();
+        let registry_error_store = CoverageStore::open(
+            directory.path().join("registry-error-managed-run.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        registry_error_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&registry_error_store);
+        let registry_project = registry_error_store.project().unwrap();
+        let registry_command = registry_error_store
+            .register_command(
+                "registry-error-managed-run",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let registry_run = Uuid::new_v4().to_string();
+        let registry_stdout = directory.path().join("registry.stdout");
+        let registry_stderr = directory.path().join("registry.stderr");
+        registry_error_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        INSERT_EDGE_JOB_SQL,
+                        params![
+                            registry_run,
+                            registry_command["id"].as_str().unwrap(),
+                            registry_project.repo_path,
+                            registry_project.repo_path,
+                            registry_project.repo_key,
+                            Utc::now(),
+                            "queued",
+                            registry_stdout.to_string_lossy().to_string(),
+                            registry_stderr.to_string_lossy().to_string(),
+                        ],
+                    )
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+            .unwrap();
+        let registry_processes = &registry_error_store.inner.active_processes;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry_processes.lock().unwrap();
+            panic!("injected active-process registry poison");
+        }));
+        assert!(
+            registry_error_store
+                .execute_run_with_slot(&registry_run)
+                .is_err()
+        );
+        registry_error_store.inner.active_processes.clear_poison();
+        registry_error_store.close().unwrap();
         store.close().unwrap();
     }
 
@@ -4071,7 +6272,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        make_readonly_view(&execute_store, "runs");
+        make_broken_view(&execute_store, "runs");
         assert!(execute_store.execute_run(&execute_run_id).is_err());
         execute_store.close().unwrap();
     }
@@ -4145,16 +6346,17 @@ mod tests {
         assert!(poisoned.is_err());
         assert!(runner.join().unwrap().is_err());
         store.inner.write_gate.clear_poison();
-        let control = store
-            .inner
-            .active_processes
-            .lock()
-            .unwrap()
-            .remove(&run_id)
-            .unwrap();
-        let mut child = control.lock().unwrap().take().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(
+            !store
+                .inner
+                .active_processes
+                .lock()
+                .unwrap()
+                .contains_key(&run_id)
+        );
+        let result = store.run_result(&run_id, 20).unwrap();
+        assert_eq!(result["terminal"], true);
+        assert_eq!(result["status"], "failed");
         store.close().unwrap();
     }
 
@@ -4189,6 +6391,8 @@ mod tests {
             db_acquire_timeout_ms: 5_000,
             db_query_timeout_ms: 30_000,
             http_request_timeout_seconds: 60,
+            http_max_body_bytes: 1_048_576,
+            run_log_max_bytes: 10 * 1024 * 1024,
             default_compaction_after_days: 30,
             default_compaction_interval_seconds: 3_600,
             default_compaction_batch_size: 100,

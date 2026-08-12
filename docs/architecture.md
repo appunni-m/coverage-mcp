@@ -53,8 +53,12 @@ HTTP daemon.
   data.
 - Comparisons require compatible repository, suite, and lineage identity.
   Unknown parents are errors.
-- Managed execution requires an immutable human-approved registration and
-  retains stdout/stderr as bounded evidence.
+- Managed execution requires an immutable human-approved registration. Each
+  stream is drained through a pipe and retained only up to the configured byte
+  cap; summaries expose byte counts and `truncated`. Commands run in a
+  dedicated process group so timeout, cancellation, and shutdown reach shell
+  descendants. Any setup, polling, capture, or persistence failure
+  terminalizes the durable job as `failed`.
 - HTTP and stdio MCP calls use the same `mcp::dispatch_json_rpc` function and
   therefore cannot diverge in tool behavior or error handling.
 
@@ -74,9 +78,10 @@ a bounded checkout wait. Every checked-out connection is registered with a
 query tracker. A watchdog interrupts the connection when the configured query
 deadline expires; shutdown interrupts all tracked operations, waits for them
 to release their leases, then closes the pool and database lock. HTTP requests
-have an independent deadline, MCP requests use a semaphore, and HTTP/1
-keep-alive is disabled so idle client connections cannot retain server tasks
-indefinitely.
+have an independent deadline and bounded JSON bodies, MCP requests use a
+semaphore, and HTTP/1 keep-alive is disabled so idle client connections cannot
+retain server tasks indefinitely. Coverage report parsing is capped at 64 MiB
+and numeric fields are validated before normalization.
 
 Database open and WAL replay errors fail closed. The runtime never removes a
 WAL, lock, or database file automatically; operators should stop competing
@@ -123,7 +128,9 @@ rejects non-loopback bind hosts, validates Host headers, emits restrictive
 browser headers, does not enable CORS, and serves no third-party assets.
 
 Coverage reports, source files, logs, command strings, and database contents
-must be treated as potentially hostile input. A deployment that exposes the
+must be treated as potentially hostile input. Request bodies, coverage reports,
+and retained command output are explicitly size-bounded; malformed coverage
+numbers are rejected. A deployment that exposes the
 HTTP port beyond the local user boundary requires an external authentication,
 authorization, and network-isolation design; that deployment is outside this
 project's supported scope.

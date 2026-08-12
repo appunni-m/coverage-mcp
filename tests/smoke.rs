@@ -25,6 +25,8 @@ fn config() -> ServerConfig {
         db_acquire_timeout_ms: 5_000,
         db_query_timeout_ms: 30_000,
         http_request_timeout_seconds: 60,
+        http_max_body_bytes: 1_048_576,
+        run_log_max_bytes: 10 * 1024 * 1024,
         default_compaction_after_days: 30,
         default_compaction_interval_seconds: 3600,
         default_compaction_batch_size: 100,

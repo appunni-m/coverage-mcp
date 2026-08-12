@@ -25,6 +25,8 @@ pub const SUPPORTED_FORMATS: &[&str] = &[
     "llvm",
     "llvm-json",
 ];
+/// Maximum coverage report size accepted by the parser.
+pub const MAX_COVERAGE_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Parses one supported coverage artifact into normalized rows.
 pub fn parse_coverage_report(
@@ -36,6 +38,13 @@ pub fn parse_coverage_report(
         return Err(parse_error(format!(
             "coverage report does not exist: {}",
             path.display()
+        )));
+    }
+    let report_size = fs::metadata(path)?.len();
+    if report_size > MAX_COVERAGE_REPORT_BYTES {
+        return Err(parse_error(format!(
+            "coverage report exceeds the {} byte limit",
+            MAX_COVERAGE_REPORT_BYTES
         )));
     }
     let selected = if format.trim().eq_ignore_ascii_case("auto") {
@@ -173,10 +182,18 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
         };
         if let Some(payload) = line.strip_prefix("DA:") {
             let mut parts = payload.split(',');
+            let line_number = parts
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| parse_error("LCOV DA record is missing a line number".to_owned()))?;
+            let hits = parts
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| parse_error("LCOV DA record is missing hit data".to_owned()))?;
             builder.add_line(
                 file,
-                safe_i64(parts.next()),
-                safe_i64(parts.next()),
+                safe_i64(Some(line_number))?,
+                safe_i64(Some(hits))?,
                 None,
                 true,
                 0,
@@ -186,28 +203,30 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                 json!({}),
             );
         } else if let Some(payload) = line.strip_prefix("FN:") {
-            if let Some((line_number, name)) = payload.split_once(',') {
-                function_lines.insert(name.to_owned(), safe_i64(Some(line_number)));
-            }
+            let (line_number, name) = payload
+                .split_once(',')
+                .ok_or_else(|| parse_error("LCOV FN record is malformed".to_owned()))?;
+            function_lines.insert(name.to_owned(), safe_i64(Some(line_number))?);
         } else if let Some(payload) = line.strip_prefix("FNDA:") {
-            if let Some((hits, name)) = payload.split_once(',') {
-                if let Some(line_number) = function_lines.get(name) {
-                    builder.add_line(
-                        file,
-                        *line_number,
-                        0,
-                        Some(false),
-                        false,
-                        0,
-                        0,
-                        1,
-                        i64::from(safe_i64(Some(hits)) > 0),
-                        json!({}),
-                    );
-                }
+            let (hits, name) = payload
+                .split_once(',')
+                .ok_or_else(|| parse_error("LCOV FNDA record is malformed".to_owned()))?;
+            if let Some(line_number) = function_lines.get(name) {
+                builder.add_line(
+                    file,
+                    *line_number,
+                    0,
+                    Some(false),
+                    false,
+                    0,
+                    0,
+                    1,
+                    i64::from(safe_i64(Some(hits))? > 0),
+                    json!({}),
+                );
             }
         } else if let Some(payload) = line.strip_prefix("BRDA:") {
-            add_lcov_branch(&mut builder, file, payload);
+            add_lcov_branch(&mut builder, file, payload)?;
         }
     }
     let mut report = builder.build("lcov", &path.to_string_lossy(), Vec::new(), json!({}));
@@ -219,20 +238,20 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
     Ok(report)
 }
 
-fn add_lcov_branch(builder: &mut CoverageBuilder, file: &str, payload: &str) {
+fn add_lcov_branch(builder: &mut CoverageBuilder, file: &str, payload: &str) -> AppResult<()> {
     let parts: Vec<&str> = payload.split(',').collect();
     if parts.len() < 4 {
-        return;
+        return Err(parse_error("LCOV BRDA record is malformed".to_owned()));
     }
     let taken = parts[3];
     let covered = if taken == "-" {
         0
     } else {
-        i64::from(safe_i64(Some(taken)) > 0)
+        i64::from(safe_i64(Some(taken))? > 0)
     };
     builder.add_line(
         file,
-        safe_i64(parts.first().copied()),
+        safe_i64(parts.first().copied())?,
         0,
         Some(false),
         false,
@@ -242,6 +261,7 @@ fn add_lcov_branch(builder: &mut CoverageBuilder, file: &str, payload: &str) {
         0,
         json!({}),
     );
+    Ok(())
 }
 
 fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
@@ -254,21 +274,22 @@ fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<Cove
         })?;
     let mut builder = CoverageBuilder::new(repo_path);
     for (file_path, payload) in files {
-        let Some(payload) = payload.as_object() else {
-            continue;
-        };
+        let payload = payload.as_object().ok_or_else(|| {
+            parse_error(format!(
+                "coverage.py file entry must be an object: {file_path}"
+            ))
+        })?;
         let mut line_numbers = Vec::new();
         for key in ["executed_lines", "missing_lines"] {
-            if let Some(lines) = payload.get(key).and_then(Value::as_array) {
-                line_numbers.extend(numeric_line_numbers(lines));
+            if let Some(lines) = coverage_array(payload, key)? {
+                line_numbers.extend(numeric_line_numbers(lines)?);
             }
         }
         line_numbers.sort_unstable();
         line_numbers.dedup();
-        let executed: std::collections::BTreeSet<i64> = payload
-            .get("executed_lines")
-            .and_then(Value::as_array)
-            .map(|lines| lines.iter().filter_map(Value::as_i64).collect())
+        let executed: std::collections::BTreeSet<i64> = coverage_array(payload, "executed_lines")?
+            .map(|lines| numeric_line_numbers(lines))
+            .transpose()?
             .unwrap_or_default();
         for line in line_numbers {
             let covered = executed.contains(&line);
@@ -287,19 +308,20 @@ fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<Cove
         }
         let mut branches: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
         for (key, covered) in [("executed_branches", true), ("missing_branches", false)] {
-            if let Some(values) = payload.get(key).and_then(Value::as_array) {
+            if let Some(values) = coverage_array(payload, key)? {
                 for value in values {
-                    if let Some(line) = value
-                        .as_array()
-                        .and_then(|items| items.first())
-                        .and_then(Value::as_i64)
-                    {
-                        let entry = branches.entry(line).or_default();
-                        if covered {
-                            entry.1 += 1;
-                        } else {
-                            entry.0 += 1;
-                        }
+                    let items = value.as_array().ok_or_else(|| {
+                        parse_error(format!("coverage.py {key} entry must be an array"))
+                    })?;
+                    let line = items.first().ok_or_else(|| {
+                        parse_error(format!("coverage.py {key} entry is missing a line number"))
+                    })?;
+                    let line = value_i64(line)?;
+                    let entry = branches.entry(line).or_default();
+                    if covered {
+                        entry.1 += 1;
+                    } else {
+                        entry.0 += 1;
                     }
                 }
             }
@@ -335,25 +357,37 @@ fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<Cove
     ))
 }
 
-fn numeric_line_numbers(values: &[Value]) -> impl Iterator<Item = i64> + '_ {
-    values.iter().filter_map(Value::as_i64)
+fn coverage_array<'a>(
+    object: &'a Map<String, Value>,
+    key: &str,
+) -> AppResult<Option<&'a Vec<Value>>> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_array()
+            .map(Some)
+            .ok_or_else(|| parse_error(format!("coverage.py {key} must be an array or null"))),
+    }
+}
+
+fn numeric_line_numbers(values: &[Value]) -> AppResult<std::collections::BTreeSet<i64>> {
+    values.iter().map(value_i64).collect()
 }
 
 fn parse_cobertura(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
     let root = parse_xml(path)?;
     let mut builder = CoverageBuilder::new(repo_path);
     for class_node in find_nodes(&root, "class") {
-        let Some(file_path) = class_node
+        let file_path = class_node
             .attrs
             .get("filename")
             .or_else(|| class_node.attrs.get("name"))
-        else {
-            continue;
-        };
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| parse_error("Cobertura class is missing a filename".to_owned()))?;
         for line_node in descendants(class_node, "line") {
-            let line_number = safe_i64(line_node.attrs.get("number").map(String::as_str));
-            let hits = safe_i64(line_node.attrs.get("hits").map(String::as_str));
-            let (total_branches, covered_branches) = cobertura_branch_counts(line_node);
+            let line_number = safe_i64(line_node.attrs.get("number").map(String::as_str))?;
+            let hits = safe_i64(line_node.attrs.get("hits").map(String::as_str))?;
+            let (total_branches, covered_branches) = cobertura_branch_counts(line_node)?;
             builder.add_line(
                 file_path,
                 line_number,
@@ -368,18 +402,12 @@ fn parse_cobertura(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRe
             );
         }
         let mut metrics = Map::new();
-        if let Some(value) = class_node
-            .attrs
-            .get("line-rate")
-            .and_then(|value| value.parse::<f64>().ok())
-        {
+        if let Some(value) = class_node.attrs.get("line-rate") {
+            let value = parse_f64(value)?;
             metrics.insert("line_rate".to_owned(), json!(value));
         }
-        if let Some(value) = class_node
-            .attrs
-            .get("branch-rate")
-            .and_then(|value| value.parse::<f64>().ok())
-        {
+        if let Some(value) = class_node.attrs.get("branch-rate") {
+            let value = parse_f64(value)?;
             metrics.insert("branch_rate".to_owned(), json!(value));
         }
         builder.add_file_metrics(file_path, metrics);
@@ -397,22 +425,24 @@ fn parse_jacoco(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRepor
             .map(|value| value.trim_matches('/'))
             .unwrap_or_default();
         for source in descendants(package, "sourcefile") {
-            let Some(name) = source.attrs.get("name") else {
-                continue;
-            };
+            let name = source
+                .attrs
+                .get("name")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| parse_error("JaCoCo sourcefile is missing a name".to_owned()))?;
             let file_path = if prefix.is_empty() {
                 name.clone()
             } else {
                 format!("{prefix}/{name}")
             };
             for line_node in descendants(source, "line") {
-                let missed_instructions = safe_i64(line_node.attrs.get("mi").map(String::as_str));
-                let covered_instructions = safe_i64(line_node.attrs.get("ci").map(String::as_str));
-                let missed_branches = safe_i64(line_node.attrs.get("mb").map(String::as_str));
-                let covered_branches = safe_i64(line_node.attrs.get("cb").map(String::as_str));
+                let missed_instructions = safe_i64(line_node.attrs.get("mi").map(String::as_str))?;
+                let covered_instructions = safe_i64(line_node.attrs.get("ci").map(String::as_str))?;
+                let missed_branches = safe_i64(line_node.attrs.get("mb").map(String::as_str))?;
+                let covered_branches = safe_i64(line_node.attrs.get("cb").map(String::as_str))?;
                 builder.add_line(
                     &file_path,
-                    safe_i64(line_node.attrs.get("nr").map(String::as_str)),
+                    safe_i64(line_node.attrs.get("nr").map(String::as_str))?,
                     covered_instructions,
                     Some(covered_instructions > 0),
                     true,
@@ -441,84 +471,135 @@ fn parse_istanbul(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRep
     }
     let mut builder = CoverageBuilder::new(repo_path);
     for (key, payload) in object {
-        let Some(payload) = payload.as_object() else {
-            continue;
-        };
-        let Some(statement_map) = payload.get("statementMap").and_then(Value::as_object) else {
-            continue;
-        };
-        let statement_hits = payload.get("s").and_then(Value::as_object);
-        let file_path = payload.get("path").and_then(Value::as_str).unwrap_or(key);
+        let payload = payload
+            .as_object()
+            .ok_or_else(|| parse_error(format!("Istanbul file entry must be an object: {key}")))?;
+        let statement_map = payload
+            .get("statementMap")
+            .and_then(Value::as_object)
+            .ok_or_else(|| parse_error(format!("Istanbul entry is missing statementMap: {key}")))?;
+        let statement_hits = payload.get("s").and_then(Value::as_object).ok_or_else(|| {
+            parse_error(format!("Istanbul entry is missing statement hits: {key}"))
+        })?;
+        let file_path = payload
+            .get("path")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| parse_error(format!("Istanbul path must be a string: {key}")))
+            })
+            .transpose()?
+            .unwrap_or(key);
         for (statement_id, location) in statement_map {
-            let Some(line) = location_line(location) else {
-                continue;
-            };
+            let line = location_line(location)?;
             let hits = statement_hits
-                .and_then(|values| values.get(statement_id))
-                .map(value_i64)
-                .unwrap_or(0);
+                .get(statement_id)
+                .ok_or_else(|| {
+                    parse_error(format!(
+                        "Istanbul statement is missing hit data: {key}:{statement_id}"
+                    ))
+                })
+                .and_then(value_i64)?;
             builder.add_line(file_path, line, hits, None, true, 0, 0, 0, 0, json!({}));
         }
-        let function_map = payload.get("fnMap").and_then(Value::as_object);
-        let function_hits = payload.get("f").and_then(Value::as_object);
-        if let Some(function_map) = function_map {
-            for (function_id, function) in function_map {
-                let line = function
-                    .get("loc")
-                    .and_then(location_line)
-                    .or_else(|| function.get("decl").and_then(location_line))
-                    .or_else(|| location_line(function));
-                let Some(line) = line else {
-                    continue;
-                };
-                let hits = function_hits
-                    .and_then(|values| values.get(function_id))
-                    .map(value_i64)
-                    .unwrap_or(0);
-                builder.add_line(
-                    file_path,
-                    line,
-                    0,
-                    Some(false),
-                    false,
-                    0,
-                    0,
-                    1,
-                    i64::from(hits > 0),
-                    json!({}),
-                );
+        match (payload.get("fnMap"), payload.get("f")) {
+            (None, None) => {}
+            (Some(function_map), Some(function_hits)) => {
+                let function_map = function_map.as_object().ok_or_else(|| {
+                    parse_error(format!("Istanbul fnMap must be an object: {key}"))
+                })?;
+                let function_hits = function_hits.as_object().ok_or_else(|| {
+                    parse_error(format!("Istanbul function hits must be an object: {key}"))
+                })?;
+                for (function_id, function) in function_map {
+                    let line = if let Some(location) = function.get("loc") {
+                        location_line(location)?
+                    } else if let Some(declaration) = function.get("decl") {
+                        location_line(declaration)?
+                    } else {
+                        location_line(function)?
+                    };
+                    let hits = function_hits
+                        .get(function_id)
+                        .ok_or_else(|| {
+                            parse_error(format!(
+                                "Istanbul function is missing hit data: {key}:{function_id}"
+                            ))
+                        })
+                        .and_then(value_i64)?;
+                    builder.add_line(
+                        file_path,
+                        line,
+                        0,
+                        Some(false),
+                        false,
+                        0,
+                        0,
+                        1,
+                        i64::from(hits > 0),
+                        json!({}),
+                    );
+                }
+            }
+            _ => {
+                return Err(parse_error(format!(
+                    "Istanbul fnMap and function hits must be provided together: {key}"
+                )));
             }
         }
-        let branch_map = payload.get("branchMap").and_then(Value::as_object);
-        let branch_hits = payload.get("b").and_then(Value::as_object);
-        if let Some(branch_map) = branch_map {
-            for (branch_id, branch) in branch_map {
-                let line = branch
-                    .get("loc")
-                    .and_then(location_line)
-                    .or_else(|| location_line(branch));
-                let Some(line) = line else {
-                    continue;
-                };
-                let counts = branch_hits
-                    .and_then(|values| values.get(branch_id))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let total = counts.len() as i64;
-                let covered = counts.iter().filter(|value| value_i64(value) > 0).count() as i64;
-                builder.add_line(
-                    file_path,
-                    line,
-                    0,
-                    Some(false),
-                    false,
-                    total,
-                    covered,
-                    0,
-                    0,
-                    json!({}),
-                );
+        match (payload.get("branchMap"), payload.get("b")) {
+            (None, None) => {}
+            (Some(branch_map), Some(branch_hits)) => {
+                let branch_map = branch_map.as_object().ok_or_else(|| {
+                    parse_error(format!("Istanbul branchMap must be an object: {key}"))
+                })?;
+                let branch_hits = branch_hits.as_object().ok_or_else(|| {
+                    parse_error(format!("Istanbul branch hits must be an object: {key}"))
+                })?;
+                for (branch_id, branch) in branch_map {
+                    let line = if let Some(location) = branch.get("loc") {
+                        location_line(location)?
+                    } else {
+                        location_line(branch)?
+                    };
+                    let counts = branch_hits
+                        .get(branch_id)
+                        .ok_or_else(|| {
+                            parse_error(format!(
+                                "Istanbul branch is missing hit data: {key}:{branch_id}"
+                            ))
+                        })?
+                        .as_array()
+                        .ok_or_else(|| {
+                            parse_error(format!(
+                                "Istanbul branch hit data must be an array: {key}:{branch_id}"
+                            ))
+                        })?;
+                    let total = checked_len_i64(counts.len(), "Istanbul branch count")?;
+                    let mut covered = 0_i64;
+                    for value in counts {
+                        if value_i64(value)? > 0 {
+                            covered += 1;
+                        }
+                    }
+                    builder.add_line(
+                        file_path,
+                        line,
+                        0,
+                        Some(false),
+                        false,
+                        total,
+                        covered,
+                        0,
+                        0,
+                        json!({}),
+                    );
+                }
+            }
+            _ => {
+                return Err(parse_error(format!(
+                    "Istanbul branchMap and branch hits must be provided together: {key}"
+                )));
             }
         }
     }
@@ -543,20 +624,37 @@ fn parse_go(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
     }
     let mut builder = CoverageBuilder::new(repo_path);
     for raw in iter {
-        let parts: Vec<&str> = raw.split_whitespace().collect();
-        if parts.len() < 3 {
+        if raw.trim().is_empty() {
             continue;
         }
-        let Some((file, range)) = parts[0].rsplit_once(':') else {
-            continue;
-        };
-        let Some((start, end)) = range.split_once(',') else {
-            continue;
-        };
-        let start_line = safe_i64(start.split('.').next());
-        let end_line = safe_i64(end.split('.').next());
-        let hits = safe_i64(parts.last().copied());
-        for line in start_line..=end_line.max(start_line) {
+        let parts: Vec<&str> = raw.split_whitespace().collect();
+        if parts.len() != 3 {
+            return Err(parse_error(format!(
+                "Go coverprofile record must contain exactly three fields: {raw}"
+            )));
+        }
+        let (file, range) = parts[0].rsplit_once(':').ok_or_else(|| {
+            parse_error(format!("Go coverprofile range is malformed: {}", parts[0]))
+        })?;
+        let (start, end) = range
+            .split_once(',')
+            .ok_or_else(|| parse_error(format!("Go coverprofile range is malformed: {range}")))?;
+        let start_line = go_position_line(start)?;
+        let end_line = go_position_line(end)?;
+        let statements = safe_i64(Some(parts[1]))?;
+        let hits = safe_i64(Some(parts[2]))?;
+        if statements < 0 || hits < 0 || end_line < start_line {
+            return Err(parse_error(format!(
+                "Go coverprofile record has invalid counts or range: {raw}"
+            )));
+        }
+        let line_count = end_line - start_line + 1;
+        if line_count > 1_000_000 {
+            return Err(parse_error(
+                "Go coverprofile range exceeds one million lines".to_owned(),
+            ));
+        }
+        for line in start_line..=end_line {
             builder.add_line(
                 file,
                 line,
@@ -582,64 +680,89 @@ fn parse_go(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
 fn parse_llvm(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
     let data: Value = serde_json::from_slice(&fs::read(path)?)?;
     let mut builder = CoverageBuilder::new(repo_path);
-    if let Some(units) = data.get("data").and_then(Value::as_array) {
-        for unit in units {
-            for file_payload in unit
-                .get("files")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let Some(file_path) = file_payload.get("filename").and_then(Value::as_str) else {
-                    continue;
-                };
-                if let Some(segments) = file_payload.get("segments").and_then(Value::as_array) {
-                    for segment in segments {
-                        let Some(values) = segment.as_array() else {
-                            continue;
-                        };
-                        if values.len() < 4 || !values[3].as_bool().unwrap_or(false) {
-                            continue;
-                        }
-                        let line = value_i64(values.first().unwrap_or(&Value::Null));
-                        let hits = value_i64(values.get(2).unwrap_or(&Value::Null));
-                        builder.add_line(
-                            file_path,
-                            line,
-                            hits,
-                            Some(hits > 0),
-                            true,
-                            0,
-                            0,
-                            0,
-                            0,
-                            json!({}),
-                        );
+    let units = data
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| parse_error("LLVM JSON must contain a data array".to_owned()))?;
+    for unit in units {
+        let unit = unit
+            .as_object()
+            .ok_or_else(|| parse_error("LLVM data entry must be an object".to_owned()))?;
+        let files = unit
+            .get("files")
+            .and_then(Value::as_array)
+            .ok_or_else(|| parse_error("LLVM data entry must contain a files array".to_owned()))?;
+        for file_payload in files {
+            let file_payload = file_payload
+                .as_object()
+                .ok_or_else(|| parse_error("LLVM file entry must be an object".to_owned()))?;
+            let file_path = file_payload
+                .get("filename")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| parse_error("LLVM file entry is missing filename".to_owned()))?;
+            if let Some(segments) = file_payload.get("segments") {
+                let segments = segments
+                    .as_array()
+                    .ok_or_else(|| parse_error("LLVM segments must be an array".to_owned()))?;
+                for segment in segments {
+                    let values = segment
+                        .as_array()
+                        .ok_or_else(|| parse_error("LLVM segment must be an array".to_owned()))?;
+                    if values.len() < 4 {
+                        return Err(parse_error(
+                            "LLVM segment must contain line, column, count, and flag".to_owned(),
+                        ));
                     }
-                }
-                if let Some(branches) = file_payload.get("branches").and_then(Value::as_array) {
-                    for branch in branches {
-                        let (line, true_count, false_count) = llvm_branch_counts(branch);
-                        let Some(line) = line else {
-                            continue;
-                        };
-                        builder.add_line(
-                            file_path,
-                            line,
-                            0,
-                            Some(false),
-                            false,
-                            2,
-                            i64::from(true_count > 0) + i64::from(false_count > 0),
-                            0,
-                            0,
-                            json!({}),
-                        );
+                    let line = value_i64(&values[0])?;
+                    let hits = value_i64(&values[2])?;
+                    let Some(has_count) = values[3].as_bool() else {
+                        return Err(parse_error(
+                            "LLVM segment count flag must be a boolean".to_owned(),
+                        ));
+                    };
+                    if !has_count {
+                        continue;
                     }
+                    builder.add_line(
+                        file_path,
+                        line,
+                        hits,
+                        Some(hits > 0),
+                        true,
+                        0,
+                        0,
+                        0,
+                        0,
+                        json!({}),
+                    );
                 }
-                if let Some(summary) = file_payload.get("summary").and_then(Value::as_object) {
-                    builder.add_file_metrics(file_path, llvm_summary_metrics(summary));
+            }
+            if let Some(branches) = file_payload.get("branches") {
+                let branches = branches
+                    .as_array()
+                    .ok_or_else(|| parse_error("LLVM branches must be an array".to_owned()))?;
+                for branch in branches {
+                    let (line, true_count, false_count) = llvm_branch_counts(branch)?;
+                    builder.add_line(
+                        file_path,
+                        line,
+                        0,
+                        Some(false),
+                        false,
+                        2,
+                        i64::from(true_count > 0) + i64::from(false_count > 0),
+                        0,
+                        0,
+                        json!({}),
+                    );
                 }
+            }
+            if let Some(summary) = file_payload.get("summary") {
+                let summary = summary
+                    .as_object()
+                    .ok_or_else(|| parse_error("LLVM summary must be an object".to_owned()))?;
+                builder.add_file_metrics(file_path, llvm_summary_metrics(summary)?);
             }
         }
     }
@@ -755,32 +878,36 @@ fn collect_nodes<'a>(node: &'a XmlNode, name: &str, matches: &mut Vec<&'a XmlNod
     }
 }
 
-fn cobertura_branch_counts(node: &XmlNode) -> (i64, i64) {
+fn cobertura_branch_counts(node: &XmlNode) -> AppResult<(i64, i64)> {
     if !node
         .attrs
         .get("branch")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     {
-        return (0, 0);
+        return Ok((0, 0));
     }
-    if let (Some(total), Some(covered)) = (
-        node.attrs.get("branches-valid"),
-        node.attrs.get("branches-covered"),
-    ) {
-        return (safe_i64(Some(total)), safe_i64(Some(covered)));
+    let explicit_total = node.attrs.get("branches-valid");
+    let explicit_covered = node.attrs.get("branches-covered");
+    if explicit_total.is_some() || explicit_covered.is_some() {
+        let (Some(total), Some(covered)) = (explicit_total, explicit_covered) else {
+            return Err(parse_error(
+                "Cobertura branch counts must include both total and covered values".to_owned(),
+            ));
+        };
+        return Ok((safe_i64(Some(total))?, safe_i64(Some(covered))?));
     }
-    let value = node
-        .attrs
-        .get("condition-coverage")
-        .cloned()
-        .unwrap_or_default();
+    let Some(value) = node.attrs.get("condition-coverage") else {
+        return Ok((0, 0));
+    };
     let value = value
         .trim_matches(|character| character != '(' && character != ')')
         .trim_matches(['(', ')']);
     if let Some((covered, total)) = value.split_once('/') {
-        return (safe_i64(Some(total)), safe_i64(Some(covered)));
+        return Ok((safe_i64(Some(total))?, safe_i64(Some(covered))?));
     }
-    (0, 0)
+    Err(parse_error(format!(
+        "invalid Cobertura condition-coverage value: {value}"
+    )))
 }
 
 fn looks_like_istanbul(object: &Map<String, Value>) -> bool {
@@ -789,82 +916,154 @@ fn looks_like_istanbul(object: &Map<String, Value>) -> bool {
         .any(|value| value.get("statementMap").is_some() && value.get("s").is_some())
 }
 
-fn location_line(value: &Value) -> Option<i64> {
-    let object = value.as_object()?;
-    if let Some(start) = object.get("start").and_then(Value::as_object) {
-        let line = value_i64(start.get("line").unwrap_or(&Value::Null));
-        return (line > 0).then_some(line);
+fn location_line(value: &Value) -> AppResult<i64> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| parse_error("Istanbul location must be an object".to_owned()))?;
+    let line_value = if let Some(start) = object.get("start") {
+        start
+            .as_object()
+            .and_then(|object| object.get("line"))
+            .ok_or_else(|| parse_error("Istanbul location is missing start.line".to_owned()))?
+    } else {
+        object
+            .get("line")
+            .ok_or_else(|| parse_error("Istanbul location is missing line".to_owned()))?
+    };
+    let line = value_i64(line_value)?;
+    if line < 1 {
+        return Err(parse_error(format!(
+            "Istanbul line must be positive: {line}"
+        )));
     }
-    let line = value_i64(object.get("line").unwrap_or(&Value::Null));
-    (line > 0).then_some(line)
+    Ok(line)
 }
 
-fn llvm_summary_metrics(summary: &Map<String, Value>) -> Map<String, Value> {
+fn llvm_summary_metrics(summary: &Map<String, Value>) -> AppResult<Map<String, Value>> {
     let mut metrics = Map::new();
     for name in ["lines", "branches", "functions", "regions"] {
         if let Some(payload) = summary.get(name).and_then(Value::as_object) {
             if let Some(count) = payload.get("count") {
-                metrics.insert(format!("total_{name}"), json!(value_i64(count)));
+                metrics.insert(format!("total_{name}"), json!(value_i64(count)?));
             }
             if let Some(covered) = payload.get("covered") {
-                metrics.insert(format!("covered_{name}"), json!(value_i64(covered)));
+                metrics.insert(format!("covered_{name}"), json!(value_i64(covered)?));
             }
         }
     }
     metrics.insert("llvm_summary".to_owned(), Value::Object(summary.clone()));
-    metrics
+    Ok(metrics)
 }
 
-fn llvm_branch_counts(value: &Value) -> (Option<i64>, i64, i64) {
+fn llvm_branch_counts(value: &Value) -> AppResult<(i64, i64, i64)> {
     if let Some(values) = value.as_array() {
-        if values.len() >= 6 {
-            return (
-                Some(value_i64(&values[0])),
-                value_i64(&values[4]),
-                value_i64(&values[5]),
-            );
+        if values.len() < 6 {
+            return Err(parse_error(
+                "LLVM branch array must contain at least six values".to_owned(),
+            ));
         }
+        let line = value_i64(&values[0])?;
+        if line < 1 {
+            return Err(parse_error(format!(
+                "LLVM branch line must be positive: {line}"
+            )));
+        }
+        return Ok((line, value_i64(&values[4])?, value_i64(&values[5])?));
     }
     if let Some(object) = value.as_object() {
-        return (
-            ["line", "line_start"]
-                .iter()
-                .find_map(|key| object.get(*key))
-                .map(value_i64)
-                .filter(|line| *line > 0),
-            ["true_count", "trueCount"]
-                .iter()
-                .find_map(|key| object.get(*key))
-                .map(value_i64)
-                .unwrap_or(0),
-            ["false_count", "falseCount"]
-                .iter()
-                .find_map(|key| object.get(*key))
-                .map(value_i64)
-                .unwrap_or(0),
-        );
+        let line = ["line", "line_start"]
+            .iter()
+            .find_map(|key| object.get(*key))
+            .ok_or_else(|| parse_error("LLVM branch object is missing line".to_owned()))
+            .and_then(value_i64)?;
+        if line < 1 {
+            return Err(parse_error(format!(
+                "LLVM branch line must be positive: {line}"
+            )));
+        }
+        let true_count = ["true_count", "trueCount"]
+            .iter()
+            .find_map(|key| object.get(*key))
+            .ok_or_else(|| parse_error("LLVM branch object is missing true count".to_owned()))
+            .and_then(value_i64)?;
+        let false_count = ["false_count", "falseCount"]
+            .iter()
+            .find_map(|key| object.get(*key))
+            .ok_or_else(|| parse_error("LLVM branch object is missing false count".to_owned()))
+            .and_then(value_i64)?;
+        return Ok((line, true_count, false_count));
     }
-    (None, 0, 0)
+    Err(parse_error(
+        "LLVM branch entry must be an array or object".to_owned(),
+    ))
 }
 
-fn value_i64(value: &Value) -> i64 {
-    value
-        .as_i64()
-        .or_else(|| value.as_f64().map(|number| number as i64))
-        .or_else(|| {
-            value
-                .as_str()
-                .and_then(|text| text.parse::<f64>().ok())
-                .map(|number| number as i64)
-        })
-        .unwrap_or(0)
+fn value_i64(value: &Value) -> AppResult<i64> {
+    match value {
+        Value::Null => Err(parse_error("coverage number must not be null".to_owned())),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                Ok(value)
+            } else {
+                let not_integer = Err(parse_error("coverage number is not an integer".to_owned()));
+                number.as_f64().map(numeric_i64).unwrap_or(not_integer)
+            }
+        }
+        Value::String(value) => parse_f64(value).and_then(numeric_i64),
+        _ => Err(parse_error("coverage number must be numeric".to_owned())),
+    }
 }
 
-fn safe_i64(value: Option<&str>) -> i64 {
-    value
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .map(|number| number as i64)
-        .unwrap_or(0)
+fn safe_i64(value: Option<&str>) -> AppResult<i64> {
+    let value = value.ok_or_else(|| parse_error("coverage number is missing".to_owned()))?;
+    parse_f64(value).and_then(numeric_i64)
+}
+
+fn parse_f64(value: &str) -> AppResult<f64> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| parse_error(format!("invalid coverage number: {value}")))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(parse_error(format!(
+            "coverage number must be finite: {value}"
+        )))
+    }
+}
+
+fn numeric_i64(value: f64) -> AppResult<i64> {
+    const I64_MIN_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+    const I64_MAX_EXCLUSIVE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+    if !(I64_MIN_AS_F64..I64_MAX_EXCLUSIVE_AS_F64).contains(&value) {
+        return Err(parse_error(format!(
+            "coverage number is outside the supported range: {value}"
+        )));
+    }
+    if value.fract() != 0.0 {
+        return Err(parse_error(format!(
+            "coverage number is not an integer: {value}"
+        )));
+    }
+    Ok(value as i64)
+}
+
+fn go_position_line(position: &str) -> AppResult<i64> {
+    let (line, column) = position
+        .split_once('.')
+        .ok_or_else(|| parse_error(format!("Go coverprofile position is malformed: {position}")))?;
+    let line = safe_i64(Some(line))?;
+    let _column = safe_i64(Some(column))?;
+    if line < 1 {
+        return Err(parse_error(format!(
+            "Go coverprofile line must be positive: {line}"
+        )));
+    }
+    Ok(line)
+}
+
+fn checked_len_i64(value: usize, field: &str) -> AppResult<i64> {
+    i64::try_from(value).map_err(|_| parse_error(format!("{field} exceeds the supported range")))
 }
 
 fn parse_error(message: String) -> AppError {
@@ -901,6 +1100,213 @@ mod tests {
     }
 
     #[test]
+    fn parser_strict_record_shapes_are_rejected_explicitly() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, content: &str| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, content).expect("write fixture");
+            path
+        };
+        let bad = |name: &str, format: &str, content: &str| {
+            assert!(
+                parse_coverage_report(&write(name, content), format, None).is_err(),
+                "{name} should be rejected"
+            );
+        };
+
+        bad("missing-da-line.info", "lcov", "SF:a.py\nDA:\n");
+        bad("missing-da-hits.info", "lcov", "SF:a.py\nDA:1,\n");
+        bad("malformed-fn.info", "lcov", "SF:a.py\nFN:1\n");
+        bad("malformed-fnda.info", "lcov", "SF:a.py\nFNDA:1\n");
+
+        bad(
+            "coveragepy-null-file.json",
+            "coveragepy",
+            r#"{"files":{"a.py":null}}"#,
+        );
+        let mut coverage_object = Map::new();
+        assert!(
+            coverage_array(&coverage_object, "missing")
+                .unwrap()
+                .is_none()
+        );
+        coverage_object.insert("null".to_owned(), Value::Null);
+        assert!(coverage_array(&coverage_object, "null").unwrap().is_none());
+        coverage_object.insert("bad".to_owned(), json!(true));
+        assert!(coverage_array(&coverage_object, "bad").is_err());
+
+        let statement_only = r#"{"a.js":{"statementMap":{"0":{"line":1}},"s":{"0":1}}}"#;
+        assert!(
+            parse_coverage_report(
+                &write("statement-only.json", statement_only),
+                "istanbul",
+                None
+            )
+            .is_ok()
+        );
+        bad(
+            "istanbul-missing-statement-map.json",
+            "istanbul",
+            r#"{"good.js":{"statementMap":{},"s":{}},"bad.js":{"s":{}}}"#,
+        );
+        bad(
+            "istanbul-missing-statement-hits.json",
+            "istanbul",
+            r#"{"good.js":{"statementMap":{},"s":{}},"bad.js":{"statementMap":{}}}"#,
+        );
+        bad(
+            "istanbul-null-file.json",
+            "istanbul",
+            r#"{"good.js":{"statementMap":{},"s":{}},"bad.js":null}"#,
+        );
+        bad(
+            "istanbul-path-type.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"path":1}}"#,
+        );
+        assert!(location_line(&json!({"start":{}})).is_err());
+        assert!(location_line(&json!({})).is_err());
+        bad(
+            "istanbul-missing-statement-hit.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{"0":{"line":1}},"s":{}}}"#,
+        );
+        bad(
+            "istanbul-fnmap-type.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"fnMap":[],"f":{}}}"#,
+        );
+        bad(
+            "istanbul-function-hits-type.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{},"f":[]}}"#,
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "istanbul-function-fallback.json",
+                    r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{"0":{"line":3}},"f":{"0":1}}}"#,
+                ),
+                "istanbul",
+                None,
+            )
+            .is_ok()
+        );
+        bad(
+            "istanbul-function-hit-missing.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{"0":{"line":3}},"f":{}}}"#,
+        );
+        bad(
+            "istanbul-function-pair.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{}}}"#,
+        );
+        bad(
+            "istanbul-branchmap-type.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"branchMap":[],"b":{}}}"#,
+        );
+        bad(
+            "istanbul-branch-hits-type.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{},"b":[]}}"#,
+        );
+        bad(
+            "istanbul-branch-hit-missing.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{"0":{"line":4}},"b":{}}}"#,
+        );
+        bad(
+            "istanbul-branch-count-type.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{"0":{"line":4}},"b":{"0":1}}}"#,
+        );
+        bad(
+            "istanbul-branch-pair.json",
+            "istanbul",
+            r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{}}}"#,
+        );
+
+        bad("go-range-file.out", "go", "mode: set\nnot-a-range 1 1\n");
+        bad(
+            "go-range-separator.out",
+            "go",
+            "mode: set\na.go:1.1-2.1 2 1\n",
+        );
+        bad(
+            "go-invalid-count.out",
+            "go",
+            "mode: set\na.go:2.1,1.1 -1 1\n",
+        );
+        bad(
+            "go-large-range.out",
+            "go",
+            "mode: set\na.go:1.1,1000002.1 1 1\n",
+        );
+        bad(
+            "go-position-format.out",
+            "go",
+            "mode: set\na.go:bad,1.1 1 1\n",
+        );
+        assert!(
+            parse_coverage_report(&write("go-blank-line.out", "mode: set\n\n"), "go", None).is_ok()
+        );
+        assert!(go_position_line("bad").is_err());
+        assert!(go_position_line("0.1").is_err());
+        assert!(safe_i64(None).is_err());
+
+        bad("llvm-unit-type.json", "llvm", r#"{"data":[1]}"#);
+        bad("llvm-files-missing.json", "llvm", r#"{"data":[{}]}"#);
+        bad("llvm-file-type.json", "llvm", r#"{"data":[{"files":[1]}]}"#);
+        bad(
+            "llvm-segments-type.json",
+            "llvm",
+            r#"{"data":[{"files":[{"filename":"a.c","segments":{}}]}]}"#,
+        );
+        bad(
+            "llvm-segment-type.json",
+            "llvm",
+            r#"{"data":[{"files":[{"filename":"a.c","segments":[1]}]}]}"#,
+        );
+        bad(
+            "llvm-short-segment.json",
+            "llvm",
+            r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0]]}]}]}"#,
+        );
+        bad(
+            "llvm-branches-type.json",
+            "llvm",
+            r#"{"data":[{"files":[{"filename":"a.c","branches":{}}]}]}"#,
+        );
+        bad(
+            "llvm-negative-branch.json",
+            "llvm",
+            r#"{"data":[{"files":[{"filename":"a.c","branches":[[0,0,0,0,1,0]]}]}]}"#,
+        );
+        bad(
+            "llvm-summary-type.json",
+            "llvm",
+            r#"{"data":[{"files":[{"filename":"a.c","summary":[]}]}]}"#,
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "llvm-no-optional-fields.json",
+                    r#"{"data":[{"files":[{"filename":"a.c"}]}]}"#
+                ),
+                "llvm",
+                None,
+            )
+            .is_ok()
+        );
+
+        let mut builder = CoverageBuilder::new(None);
+        builder.add_file_metrics("a.py", Map::new());
+        let _ = builder.build("test", "test", Vec::new(), Value::Null);
+    }
+
+    #[test]
     fn parser_edge_inputs_cover_detection_and_error_paths() {
         let directory = tempfile::tempdir().expect("tempdir");
         let write = |name: &str, content: &str| {
@@ -908,20 +1314,33 @@ mod tests {
             std::fs::write(&path, content).expect("write fixture");
             path
         };
+        let oversized = directory.path().join("oversized.lcov");
+        std::fs::File::create(&oversized)
+            .expect("create oversized fixture")
+            .set_len(MAX_COVERAGE_REPORT_BYTES + 1)
+            .expect("size oversized fixture");
+        assert!(parse_coverage_report(&oversized, "lcov", None).is_err());
         let empty_lcov = write("empty.lcov", "TN:\n\nignored\nend_of_record\n");
         let report = parse_coverage_report(&empty_lcov, "auto", None).expect("empty lcov");
         assert_eq!(report.warnings.len(), 1);
         let rich_lcov = write(
             "rich.info",
-            "ignored\nSF:a.py\nFN:bad\nFN:1,func\nUNKNOWN:ignored\nFNDA:2,func\nFNDA:bad\nFNDA:1,missing\nBRDA:1,0,0,-\nBRDA:1,0,1,2\nBRDA:1,2\nDA:1,2\nDA:not,a\nend_of_record\n",
+            "ignored\nSF:a.py\nFN:1,func\nUNKNOWN:ignored\nFNDA:2,func\nFNDA:1,missing\nBRDA:1,0,0,-\nBRDA:1,0,1,2\nDA:1,2\nend_of_record\n",
         );
         let report = parse_coverage_report(&rich_lcov, "lcov", None).expect("rich lcov");
         assert!(report.total_functions() >= 1);
         assert!(report.total_branches() >= 1);
+        let malformed_lcov = write("malformed.info", "SF:a.py\nDA:not,a\nend_of_record\n");
+        assert!(parse_coverage_report(&malformed_lcov, "lcov", None).is_err());
+        let malformed_branch_lcov = write(
+            "malformed-branch.info",
+            "SF:a.py\nBRDA:1,0\nend_of_record\n",
+        );
+        assert!(parse_coverage_report(&malformed_branch_lcov, "lcov", None).is_err());
 
         let coveragepy = write(
             "coverage.json",
-            r#"{"files":{"a.py":{"executed_lines":[1,"bad"],"missing_lines":[2,"bad"],"summary":{"covered_lines":1},"executed_branches":[[1,0],"bad"],"missing_branches":[[2,0],null]},"edge.py":{"executed_lines":[],"missing_lines":[],"executed_branches":{},"missing_branches":null},"non-numeric":{"executed_lines":[],"missing_lines":[{}]},"no-lines":{},"ignored":null},"meta":{"version":1}}"#,
+            r#"{"files":{"a.py":{"executed_lines":[1],"missing_lines":[2],"summary":{"covered_lines":1},"executed_branches":[[1,0]],"missing_branches":[[2,0]]},"edge.py":{"executed_lines":[],"missing_lines":[],"executed_branches":[],"missing_branches":null},"non-numeric":{"executed_lines":[],"missing_lines":null},"no-lines":{}},"meta":{"version":1}}"#,
         );
         let report = parse_coverage_report(&coveragepy, "auto", None).expect("coveragepy");
         assert_eq!(report.format, "coveragepy");
@@ -929,15 +1348,35 @@ mod tests {
         let bad_coveragepy = write("bad-coverage.json", "{}");
         assert!(parse_coverage_report(&bad_coveragepy, "coveragepy", None).is_err());
         assert!(parse_coverage_report(&bad_coveragepy, "auto", None).is_err());
+        let malformed_coveragepy = write(
+            "malformed-coverage.json",
+            r#"{"files":{"a.py":{"executed_lines":["bad"]}}}"#,
+        );
+        assert!(parse_coverage_report(&malformed_coveragepy, "coveragepy", None).is_err());
+        let malformed_branch_type = write(
+            "malformed-branch-type.json",
+            r#"{"files":{"a.py":{"executed_branches":[{}]}}}"#,
+        );
+        assert!(parse_coverage_report(&malformed_branch_type, "coveragepy", None).is_err());
+        let malformed_branch_line = write(
+            "malformed-branch-line.json",
+            r#"{"files":{"a.py":{"executed_branches":[[]]}}}"#,
+        );
+        assert!(parse_coverage_report(&malformed_branch_line, "coveragepy", None).is_err());
         let scalar_json = write("scalar.json", "[]");
         assert!(parse_coverage_report(&scalar_json, "auto", None).is_err());
 
         let cobertura = write(
             "branch.xml",
-            r#"<coverage><class name="fallback.py" line-rate="0.5" branch-rate="0.25"><lines><line number="1" hits="1" branch="true" branches-valid="4" branches-covered="3"/><line number="2" hits="0" branch="true" condition-coverage="50% (1/2)"/><line number="3" hits="0" branch="false"/></lines></class><class><lines><line number="4" hits="0"/></lines></class></coverage>"#,
+            r#"<coverage><class name="fallback.py" line-rate="0.5" branch-rate="0.25"><lines><line number="1" hits="1" branch="true" branches-valid="4" branches-covered="3"/><line number="2" hits="0" branch="true" condition-coverage="50% (1/2)"/><line number="3" hits="0" branch="false"/></lines></class></coverage>"#,
         );
         let report = parse_coverage_report(&cobertura, "auto", None).expect("cobertura");
         assert_eq!(report.format, "cobertura");
+        let malformed_cobertura = write(
+            "malformed-cobertura.xml",
+            r#"<coverage><class><lines><line number="1" hits="0"/></lines></class></coverage>"#,
+        );
+        assert!(parse_coverage_report(&malformed_cobertura, "cobertura", None).is_err());
         let jacoco = write(
             "plain.xml",
             r#"<report><package name=""><sourcefile name="A.java"><line nr="1" mi="1" ci="0" mb="0" cb="1"/></sourcefile></package><counter type="LINE" missed="0" covered="1"/></report>"#,
@@ -950,7 +1389,7 @@ mod tests {
             "missing-name.xml",
             r#"<report><package><sourcefile/></package></report>"#,
         );
-        assert!(parse_coverage_report(&jacoco_missing_name, "jacoco", None).is_ok());
+        assert!(parse_coverage_report(&jacoco_missing_name, "jacoco", None).is_err());
         let bad_xml = write("bad.xml", "<report>");
         assert!(parse_coverage_report(&bad_xml, "auto", None).is_err());
         let unknown_xml = write("unknown.xml", "<unknown/>");
@@ -958,7 +1397,7 @@ mod tests {
 
         let istanbul = write(
             "istanbul.json",
-            r#"{"a.js":{"statementMap":{"0":{"start":{"line":1}},"1":{"line":2},"2":{}},"s":{"0":1,"1":0},"fnMap":{"0":{"decl":{"line":2}},"1":{"line":3}},"f":{"0":1},"branchMap":{"0":{"line":1},"1":{}},"b":{"0":[1,0]}}}"#,
+            r#"{"a.js":{"statementMap":{"0":{"start":{"line":1}},"1":{"line":2}},"s":{"0":1,"1":0},"fnMap":{"0":{"decl":{"line":2}}},"f":{"0":1},"branchMap":{"0":{"line":1}},"b":{"0":[1,0]}}}"#,
         );
         let report = parse_coverage_report(&istanbul, "auto", None).expect("istanbul");
         assert_eq!(report.format, "istanbul");
@@ -968,12 +1407,12 @@ mod tests {
         assert!(parse_coverage_report(&not_istanbul, "istanbul", None).is_err());
         let mixed_istanbul = write(
             "mixed-istanbul.json",
-            r#"{"null.js":null,"missing-map":{"s":{"0":1}},"missing-location":{"statementMap":{"0":{}},"s":{"0":1}},"missing-function":{"statementMap":{},"s":{},"fnMap":{"0":{}},"f":{"0":1}},"missing-branch":{"statementMap":{},"s":{},"branchMap":{"0":{}},"b":{"0":[1]}}}"#,
+            r#"{"null.js":null,"missing-map":{"s":{"0":1}},"missing-location":{"statementMap":{"0":{}},"s":{"0":1}},"missing-start-line":{"statementMap":{"0":{"start":{}}},"s":{"0":1}},"bad-location":{"statementMap":{"0":null},"s":{}},"missing-statement-hit":{"statementMap":{"0":{"line":1},"1":{"line":2}},"s":{"0":1}},"missing-function":{"statementMap":{},"s":{},"fnMap":{"0":{}},"f":{"0":1}},"missing-branch":{"statementMap":{},"s":{},"branchMap":{"0":{}},"b":{"0":[1]}}}"#,
         );
-        assert!(parse_coverage_report(&mixed_istanbul, "istanbul", None).is_ok());
+        assert!(parse_coverage_report(&mixed_istanbul, "istanbul", None).is_err());
         let go = write(
             "cover.out",
-            "mode: set\nshort\nbad 1 2\na.go:bad 2 1\na.go:1.1,2.1 2 1\na.go:3.1 1 0\n",
+            "mode: set\na.go:1.1,2.1 2 1\na.go:3.1,3.1 1 0\n",
         );
         assert_eq!(
             parse_coverage_report(&go, "auto", None).unwrap().format,
@@ -981,9 +1420,11 @@ mod tests {
         );
         let bad_go = write("bad.out", "mode-nope\n");
         assert!(parse_coverage_report(&bad_go, "go", None).is_err());
+        let malformed_go = write("malformed-cover.out", "mode: set\nshort\n");
+        assert!(parse_coverage_report(&malformed_go, "go", None).is_err());
         let llvm = write(
             "llvm.json",
-            r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,2,true],[2,0,0,false],[3,0]],"branches":[[4,0,0,0,1,0],{"line_start":5,"trueCount":1,"falseCount":0},null],"summary":{"lines":{"count":2,"covered":1},"branches":{"count":2,"covered":1},"functions":{"covered":1},"regions":{"count":2}}},{"filename":"no-summary.c","segments":[]}]}]}"#,
+            r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,2,true],[2,0,0,false]],"branches":[[4,0,0,0,1,0],{"line_start":5,"trueCount":1,"falseCount":0}],"summary":{"lines":{"count":2,"covered":1},"branches":{"count":2,"covered":1},"functions":{"covered":1},"regions":{"count":2}}},{"filename":"no-summary.c","segments":[]}]}]}"#,
         );
         assert_eq!(
             parse_coverage_report(&llvm, "auto", None).unwrap().format,
@@ -993,10 +1434,15 @@ mod tests {
             "llvm-edges.json",
             r#"{"data":[{"files":[{}, {"filename":"edge.c","segments":[null,[1,0,1,true]],"branches":[],"summary":{}}, {"filename":"no-segments.c","branches":{},"summary":{}}]}]}"#,
         );
-        assert!(parse_coverage_report(&llvm_edges, "llvm", None).is_ok());
+        assert!(parse_coverage_report(&llvm_edges, "llvm", None).is_err());
+        let llvm_bad_flag = write(
+            "llvm-bad-flag.json",
+            r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,1,1]]}]}]}"#,
+        );
+        assert!(parse_coverage_report(&llvm_bad_flag, "llvm", None).is_err());
         let no_data = write("no-data.json", "{}");
         assert!(parse_coverage_report(&no_data, "auto", None).is_err());
-        assert!(parse_coverage_report(&no_data, "llvm", None).is_ok());
+        assert!(parse_coverage_report(&no_data, "llvm", None).is_err());
         let plain = write("plain.txt", "coverage");
         assert!(parse_coverage_report(&plain, "auto", None).is_err());
 
@@ -1043,7 +1489,7 @@ mod tests {
         assert_eq!(xml_name(b"{urn}line"), "line");
         assert_eq!(find_nodes(&node, "line").count(), 1);
         assert!(descendants(&node, "line").is_empty());
-        assert_eq!(cobertura_branch_counts(&node), (0, 0));
+        assert_eq!(cobertura_branch_counts(&node).unwrap(), (0, 0));
         let mut attrs = BTreeMap::new();
         attrs.insert("branch".to_owned(), "true".to_owned());
         attrs.insert("condition-coverage".to_owned(), "50% (1/2)".to_owned());
@@ -1051,7 +1497,7 @@ mod tests {
             attrs,
             ..node.clone()
         };
-        assert_eq!(cobertura_branch_counts(&branch), (2, 1));
+        assert_eq!(cobertura_branch_counts(&branch).unwrap(), (2, 1));
         let mut explicit = branch.clone();
         explicit
             .attrs
@@ -1059,43 +1505,66 @@ mod tests {
         explicit
             .attrs
             .insert("branches-covered".to_owned(), "3".to_owned());
-        assert_eq!(cobertura_branch_counts(&explicit), (4, 3));
+        assert_eq!(cobertura_branch_counts(&explicit).unwrap(), (4, 3));
         let mut malformed_branch = branch.clone();
         malformed_branch
             .attrs
             .insert("condition-coverage".to_owned(), "unknown".to_owned());
-        assert_eq!(cobertura_branch_counts(&malformed_branch), (0, 0));
-        assert_eq!(location_line(&json!({"start":{"line":3}})), Some(3));
-        assert_eq!(location_line(&json!({"line":4})), Some(4));
-        assert_eq!(location_line(&json!({"line":0})), None);
-        assert_eq!(value_i64(&json!(2.5)), 2);
-        assert_eq!(value_i64(&json!("3.5")), 3);
-        assert_eq!(value_i64(&json!(true)), 0);
-        assert_eq!(safe_i64(Some("4.5")), 4);
-        assert_eq!(safe_i64(Some("bad")), 0);
+        assert!(cobertura_branch_counts(&malformed_branch).is_err());
+        let mut incomplete_branch = branch.clone();
+        incomplete_branch
+            .attrs
+            .insert("branches-valid".to_owned(), "2".to_owned());
+        incomplete_branch.attrs.remove("condition-coverage");
+        assert!(cobertura_branch_counts(&incomplete_branch).is_err());
+        let mut branch_without_counts = node.clone();
+        branch_without_counts
+            .attrs
+            .insert("branch".to_owned(), "true".to_owned());
         assert_eq!(
-            numeric_line_numbers(&[json!(1), json!("bad"), json!(2)]).collect::<Vec<_>>(),
+            cobertura_branch_counts(&branch_without_counts).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(location_line(&json!({"start":{"line":3}})).unwrap(), 3);
+        assert_eq!(location_line(&json!({"line":4})).unwrap(), 4);
+        assert!(location_line(&json!({"line":0})).is_err());
+        assert!(value_i64(&json!(2.5)).is_err());
+        assert!(value_i64(&json!("3.5")).is_err());
+        assert!(value_i64(&json!(true)).is_err());
+        assert!(safe_i64(Some("4.5")).is_err());
+        assert!(safe_i64(Some("bad")).is_err());
+        assert_eq!(
+            numeric_line_numbers(&[json!(1), json!(2)])
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
+        assert!(numeric_line_numbers(&[json!(1), json!("bad")]).is_err());
         assert_eq!(
-            llvm_branch_counts(&json!([1, 0, 0, 0, 2, 3])),
-            (Some(1), 2, 3)
+            llvm_branch_counts(&json!([1, 0, 0, 0, 2, 3])).unwrap(),
+            (1, 2, 3)
         );
         assert_eq!(
-            llvm_branch_counts(&json!({"line":2,"true_count":1,"false_count":0})),
-            (Some(2), 1, 0)
+            llvm_branch_counts(&json!({"line":2,"true_count":1,"false_count":0})).unwrap(),
+            (2, 1, 0)
         );
-        assert_eq!(
-            llvm_branch_counts(&json!({"line_start":0,"trueCount":1,"falseCount":1})),
-            (None, 1, 1)
-        );
-        assert_eq!(llvm_branch_counts(&Value::Null), (None, 0, 0));
-        assert_eq!(llvm_branch_counts(&json!([1, 2])), (None, 0, 0));
+        assert!(llvm_branch_counts(&json!({"line_start":0,"trueCount":1,"falseCount":1})).is_err());
+        assert!(llvm_branch_counts(&Value::Null).is_err());
+        assert!(llvm_branch_counts(&json!([1, 2])).is_err());
+        assert!(llvm_branch_counts(&json!({"line": 2})).is_err());
+        assert!(llvm_branch_counts(&json!({"trueCount": 1})).is_err());
+        assert!(llvm_branch_counts(&json!({"line": 2, "trueCount": 1})).is_err());
+        assert!(value_i64(&Value::Null).is_err());
+        assert!(parse_f64("inf").is_err());
+        assert!(numeric_i64(9_223_372_036_854_775_808.0).is_err());
+        assert!(checked_len_i64(usize::MAX, "test count").is_err());
         let metrics = llvm_summary_metrics(
             json!({"lines":{"count":2,"covered":1},"branches":{"count":3,"covered":2},"functions":{"count":4,"covered":3},"regions":{"count":5,"covered":4},"other":{}})
                 .as_object()
                 .unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(metrics["total_lines"], 2);
         assert_eq!(metrics["covered_lines"], 1);
         assert_eq!(metrics["total_branches"], 3);
@@ -1109,7 +1578,8 @@ mod tests {
             json!({"functions":{"covered":3},"regions":{"count":5}})
                 .as_object()
                 .unwrap(),
-        );
+        )
+        .unwrap();
         assert!(partial_metrics.get("total_functions").is_none());
         assert!(partial_metrics.get("covered_regions").is_none());
         assert!(

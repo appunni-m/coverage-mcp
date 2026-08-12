@@ -20,6 +20,18 @@ pub const DEFAULT_DB_ACQUIRE_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = 30_000;
 /// Default maximum duration of one HTTP request, including body reads.
 pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+/// Default maximum HTTP request body size.
+pub const DEFAULT_HTTP_MAX_BODY_BYTES: usize = 1_048_576;
+/// Minimum accepted HTTP request body size.
+pub const MIN_HTTP_MAX_BODY_BYTES: usize = 1_024;
+/// Maximum accepted HTTP request body size.
+pub const MAX_HTTP_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Default maximum retained bytes per managed stdout/stderr stream.
+pub const DEFAULT_RUN_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Minimum accepted retained bytes per managed stdout/stderr stream.
+pub const MIN_RUN_LOG_MAX_BYTES: u64 = 1_024;
+/// Maximum accepted retained bytes per managed stdout/stderr stream.
+pub const MAX_RUN_LOG_MAX_BYTES: u64 = 1_024 * 1024 * 1024;
 /// Default age at which coverage detail becomes eligible for compression.
 pub const DEFAULT_COMPACTION_AFTER_DAYS: u32 = 30;
 /// Default background maintenance cadence.
@@ -52,6 +64,10 @@ pub struct ServerConfig {
     pub db_query_timeout_ms: u64,
     /// Maximum time allowed for one HTTP request.
     pub http_request_timeout_seconds: u64,
+    /// Maximum HTTP request body size.
+    pub http_max_body_bytes: usize,
+    /// Maximum retained bytes per managed stdout/stderr stream.
+    pub run_log_max_bytes: u64,
     /// Default policy for newly seen projects.
     pub default_compaction_after_days: u32,
     /// Default maintenance interval for newly seen projects.
@@ -83,9 +99,17 @@ impl ServerConfig {
         let host = host
             .or_else(|| lookup("COVERAGE_MCP_HOST"))
             .unwrap_or_else(|| "127.0.0.1".to_owned());
-        let port = port
-            .or_else(|| lookup("COVERAGE_MCP_PORT").and_then(|value| value.parse().ok()))
-            .unwrap_or(DEFAULT_PORT);
+        let port = match port {
+            Some(port) => port,
+            None => match lookup("COVERAGE_MCP_PORT") {
+                Some(raw) => raw.parse::<u16>().map_err(|_| {
+                    AppError::Validation(
+                        "COVERAGE_MCP_PORT must be an integer between 0 and 65535".to_owned(),
+                    )
+                })?,
+                None => DEFAULT_PORT,
+            },
+        };
         let common_db_path = common_db_path
             .or_else(|| lookup("COVERAGE_MCP_COMMON_DB").map(PathBuf::from))
             .unwrap_or_else(|| default_common_db_path_with_lookup(lookup));
@@ -138,6 +162,20 @@ impl ServerConfig {
             3_600,
             lookup,
         )?;
+        let http_max_body_bytes = env_usize(
+            "COVERAGE_MCP_HTTP_MAX_BODY_BYTES",
+            DEFAULT_HTTP_MAX_BODY_BYTES,
+            MIN_HTTP_MAX_BODY_BYTES,
+            MAX_HTTP_MAX_BODY_BYTES,
+            lookup,
+        )?;
+        let run_log_max_bytes = env_u64(
+            "COVERAGE_MCP_RUN_LOG_MAX_BYTES",
+            DEFAULT_RUN_LOG_MAX_BYTES,
+            MIN_RUN_LOG_MAX_BYTES,
+            MAX_RUN_LOG_MAX_BYTES,
+            lookup,
+        )?;
         if db_query_timeout_ms >= http_request_timeout_seconds.saturating_mul(1_000) {
             return Err(AppError::Validation(
                 "COVERAGE_MCP_DB_QUERY_TIMEOUT_MS must be shorter than the HTTP request timeout"
@@ -177,6 +215,8 @@ impl ServerConfig {
             db_acquire_timeout_ms,
             db_query_timeout_ms,
             http_request_timeout_seconds,
+            http_max_body_bytes,
+            run_log_max_bytes,
             default_compaction_after_days,
             default_compaction_interval_seconds,
             default_compaction_batch_size,
@@ -326,6 +366,8 @@ mod tests {
             defaults.http_request_timeout_seconds,
             DEFAULT_HTTP_REQUEST_TIMEOUT_SECONDS
         );
+        assert_eq!(defaults.http_max_body_bytes, DEFAULT_HTTP_MAX_BODY_BYTES);
+        assert_eq!(defaults.run_log_max_bytes, DEFAULT_RUN_LOG_MAX_BYTES);
         assert_eq!(
             defaults.default_compaction_interval_seconds,
             DEFAULT_COMPACTION_INTERVAL_SECONDS
@@ -402,6 +444,8 @@ mod tests {
                     "COVERAGE_MCP_DB_ACQUIRE_TIMEOUT_MS" => "250",
                     "COVERAGE_MCP_DB_QUERY_TIMEOUT_MS" => "2000",
                     "COVERAGE_MCP_HTTP_REQUEST_TIMEOUT_SECONDS" => "90",
+                    "COVERAGE_MCP_HTTP_MAX_BODY_BYTES" => "2048",
+                    "COVERAGE_MCP_RUN_LOG_MAX_BYTES" => "4096",
                     "COVERAGE_MCP_COMPACTION_AFTER_DAYS" => "9",
                     "COVERAGE_MCP_COMPACTION_INTERVAL_SECONDS" => "120",
                     "COVERAGE_MCP_COMPACTION_BATCH_SIZE" => "11",
@@ -422,6 +466,8 @@ mod tests {
         assert_eq!(configured.db_acquire_timeout_ms, 250);
         assert_eq!(configured.db_query_timeout_ms, 2000);
         assert_eq!(configured.http_request_timeout_seconds, 90);
+        assert_eq!(configured.http_max_body_bytes, 2048);
+        assert_eq!(configured.run_log_max_bytes, 4096);
         assert_eq!(configured.default_compaction_after_days, 9);
         assert_eq!(configured.default_compaction_interval_seconds, 120);
         assert_eq!(configured.default_compaction_batch_size, 11);
@@ -450,6 +496,8 @@ mod tests {
             "COVERAGE_MCP_DB_ACQUIRE_TIMEOUT_MS",
             "COVERAGE_MCP_DB_QUERY_TIMEOUT_MS",
             "COVERAGE_MCP_HTTP_REQUEST_TIMEOUT_SECONDS",
+            "COVERAGE_MCP_HTTP_MAX_BODY_BYTES",
+            "COVERAGE_MCP_RUN_LOG_MAX_BYTES",
             "COVERAGE_MCP_COMPACTION_AFTER_DAYS",
             "COVERAGE_MCP_COMPACTION_INTERVAL_SECONDS",
             "COVERAGE_MCP_COMPACTION_BATCH_SIZE",
@@ -463,15 +511,16 @@ mod tests {
 
         let invalid_port =
             |name: &str| (name == "COVERAGE_MCP_PORT").then(|| "not-an-integer".to_owned());
-        let fallback_port = ServerConfig::from_environment_with_lookup(
-            None,
-            None,
-            None,
-            Some(PathBuf::from("common")),
-            &invalid_port,
-        )
-        .unwrap();
-        assert_eq!(fallback_port.port, DEFAULT_PORT);
+        assert!(
+            ServerConfig::from_environment_with_lookup(
+                None,
+                None,
+                None,
+                Some(PathBuf::from("common")),
+                &invalid_port,
+            )
+            .is_err()
+        );
 
         let legacy_db =
             |name: &str| (name == "COVERAGE_MCP_DB").then(|| "legacy.duckdb".to_owned());
@@ -494,6 +543,8 @@ mod tests {
             "COVERAGE_MCP_RUN_RETENTION",
             "COVERAGE_MCP_RUN_CONCURRENCY",
             "COVERAGE_MCP_HTTP_CONCURRENCY",
+            "COVERAGE_MCP_HTTP_MAX_BODY_BYTES",
+            "COVERAGE_MCP_RUN_LOG_MAX_BYTES",
             "COVERAGE_MCP_COMPACTION_AFTER_DAYS",
             "COVERAGE_MCP_COMPACTION_INTERVAL_SECONDS",
             "COVERAGE_MCP_COMPACTION_BATCH_SIZE",
@@ -519,6 +570,8 @@ mod tests {
             ("COVERAGE_MCP_DB_ACQUIRE_TIMEOUT_MS", "49"),
             ("COVERAGE_MCP_DB_QUERY_TIMEOUT_MS", "99"),
             ("COVERAGE_MCP_HTTP_REQUEST_TIMEOUT_SECONDS", "0"),
+            ("COVERAGE_MCP_HTTP_MAX_BODY_BYTES", "1023"),
+            ("COVERAGE_MCP_RUN_LOG_MAX_BYTES", "1023"),
             ("COVERAGE_MCP_COMPACTION_AFTER_DAYS", "36501"),
             ("COVERAGE_MCP_COMPACTION_INTERVAL_SECONDS", "86401"),
             ("COVERAGE_MCP_COMPACTION_BATCH_SIZE", "10001"),

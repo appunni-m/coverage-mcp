@@ -66,6 +66,23 @@ fn fixture_repository() -> TempDir {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
     }
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {args:?}: {output:?}"
+        );
+    };
+    run_git(&["init", "--quiet"]);
+    run_git(&["config", "user.email", "coverage-mcp-tests@example.invalid"]);
+    run_git(&["config", "user.name", "Coverage MCP Tests"]);
+    run_git(&["add", "."]);
+    run_git(&["commit", "--quiet", "-m", "fixture"]);
     directory
 }
 

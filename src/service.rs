@@ -387,28 +387,57 @@ impl CoverageService {
         max_words: usize,
         detailed: bool,
     ) -> AppResult<Value> {
+        self.coverage_query_ordered(
+            view,
+            snapshot_id,
+            baseline_snapshot_id,
+            suite,
+            branch,
+            file_path,
+            line_number,
+            line_ranges,
+            None,
+            cursor,
+            max_words,
+            detailed,
+        )
+    }
+
+    /// Executes a coverage query with an optional target ordering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coverage_query_ordered(
+        &self,
+        view: &str,
+        snapshot_id: Option<&str>,
+        baseline_snapshot_id: Option<&str>,
+        suite: Option<&str>,
+        branch: Option<&str>,
+        file_path: Option<&str>,
+        line_number: Option<i64>,
+        line_ranges: Option<Vec<LineRange>>,
+        order_by: Option<&str>,
+        cursor: Option<&str>,
+        max_words: usize,
+        detailed: bool,
+    ) -> AppResult<Value> {
         let context = self.context(suite);
         let mut selected_snapshot = snapshot_id.map(|id| self.store.snapshot(id)).transpose()?;
         let mut selected_id = snapshot_id.map(str::to_owned);
         if selected_id.is_none() && view != "line_history" {
-            selected_snapshot =
-                self.store
-                    .latest_snapshot(Some(&context.checkout_path), branch, suite)?;
-            selected_id = selected_snapshot
-                .as_ref()
-                .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned));
-            if selected_snapshot.is_none() {
-                return Err(AppError::NotFound("no snapshots found".to_owned()));
-            }
+            let snapshot = self
+                .store
+                .latest_snapshot(Some(&context.checkout_path), branch, suite)?
+                .ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?;
+            selected_id = Some(required_string_field(&snapshot, "id", "latest snapshot")?);
+            selected_snapshot = Some(snapshot);
         }
-        let selected_suite = suite.map(str::to_owned).or_else(|| {
-            selected_snapshot.as_ref().and_then(|value| {
-                value
-                    .get("suite")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-        });
+        let selected_suite = match suite {
+            Some(value) => Some(value.to_owned()),
+            None => selected_snapshot
+                .as_ref()
+                .map(|value| required_string_field(value, "suite", "snapshot"))
+                .transpose()?,
+        };
         match view {
             "summary" => {
                 let snapshot = required_snapshot(selected_snapshot.as_ref(), "summary")?;
@@ -435,6 +464,33 @@ impl CoverageService {
                 )?;
                 Ok(self.envelope(Value::Array(values), selected_suite.as_deref(), Some(page)))
             }
+            "targets" => {
+                let id = required_snapshot_id(selected_id.as_deref(), "targets")?;
+                let snapshot = required_snapshot(selected_snapshot.as_ref(), "targets")?;
+                let order_by = order_by.unwrap_or("priority");
+                let mut values = self.store.targets(id, order_by, COLLECTION_FETCH_LIMIT)?;
+                if let Some(file_path) = file_path {
+                    values.retain(|value| {
+                        value.get("file_path").and_then(Value::as_str) == Some(file_path)
+                    });
+                }
+                let (values, page) = self.page(
+                    &values,
+                    cursor,
+                    max_words,
+                    &format!("coverage-targets:{id}:{order_by}:{file_path:?}"),
+                    None,
+                )?;
+                Ok(self.envelope(
+                    json!({
+                        "snapshot": compact_snapshot(snapshot, detailed),
+                        "order_by": order_by,
+                        "targets": values,
+                    }),
+                    selected_suite.as_deref(),
+                    Some(page),
+                ))
+            }
             "file" => {
                 let id = required_snapshot_id(selected_id.as_deref(), "file")?;
                 let file_path = file_path.ok_or_else(|| {
@@ -447,11 +503,7 @@ impl CoverageService {
                     self.store
                         .lines_in_ranges(id, file_path, &line_ranges.unwrap_or_default())?;
                 let mut gaps = self.store.file_gaps(id, file_path, 100)?;
-                let ranges = gaps
-                    .get("ranges")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
+                let ranges = required_array_field(&gaps, "ranges", "file gaps")?.to_vec();
                 let (ranges, page) = self.page(
                     &ranges,
                     cursor,
@@ -459,24 +511,24 @@ impl CoverageService {
                     &format!("coverage-file:{id}:{file_path}"),
                     None,
                 )?;
+                let mut red_regions = Vec::new();
+                for value in &ranges {
+                    let start = required_i64_field(value, "start", "file gap")?;
+                    let end = required_i64_field(value, "end", "file gap")?;
+                    let line_count = end - start + 1;
+                    red_regions.push(json!({"start": start, "end": end, "line_count": line_count}));
+                }
                 insert_paged_gaps(&mut gaps, ranges);
-                let selected_lines = selected.get("lines").cloned().unwrap_or(json!([]));
-                let mut line_selection = selected.clone();
-                line_selection
-                    .as_object_mut()
-                    .map(|object| object.remove("lines"));
-                Ok(self.envelope(json!({"file": compact_file(&file, detailed), "gaps": gaps, "selected_lines": selected_lines, "line_selection": line_selection}), selected_suite.as_deref(), Some(page)))
+                let selected_lines = required_value(&selected, "lines", "line selection")?.clone();
+                let line_selection = selection_without_lines(&selected)?;
+                Ok(self.envelope(json!({"file": compact_file(&file, detailed), "red_regions": red_regions, "gaps": gaps, "selected_lines": selected_lines, "line_selection": line_selection}), selected_suite.as_deref(), Some(page)))
             }
             "insights" => {
                 let id = required_snapshot_id(selected_id.as_deref(), "insights")?;
                 let result =
                     self.store
                         .insights(id, baseline_snapshot_id, COLLECTION_FETCH_LIMIT)?;
-                let items = result
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
+                let items = required_array_field(&result, "items", "insights")?.to_vec();
                 let (items, page) = self.page(
                     &items,
                     cursor,
@@ -530,7 +582,7 @@ impl CoverageService {
                 Ok(self.envelope(Value::Array(values), Some(suite), Some(page)))
             }
             _ => Err(AppError::Validation(
-                "view must be summary, files, file, insights, or line_history".to_owned(),
+                "view must be summary, files, targets, file, insights, or line_history".to_owned(),
             )),
         }
     }
@@ -567,11 +619,7 @@ impl CoverageService {
                 file_path,
                 COLLECTION_FETCH_LIMIT,
             )?;
-            let points = progress
-                .get("points")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let points = required_array_field(&progress, "points", "worktree progress")?.to_vec();
             let (points, page) = self.page(
                 &points,
                 cursor,
@@ -582,7 +630,48 @@ impl CoverageService {
             update_worktree_progress(&mut progress, points, detailed)?;
             return Ok(self.envelope(progress, Some(suite), Some(page)));
         }
-        let comparison = if let Some(worktree_id) = worktree_id {
+        let comparison = if view == "regions" {
+            if let Some(worktree_id) = worktree_id {
+                self.store.compare_worktree_regions(
+                    worktree_id,
+                    snapshot_id,
+                    file_path,
+                    only_regressions,
+                    COLLECTION_FETCH_LIMIT,
+                )?
+            } else {
+                let context = self.context(suite);
+                let current_id = if let Some(snapshot_id) = snapshot_id {
+                    snapshot_id.to_owned()
+                } else {
+                    self.store
+                        .latest_snapshot(Some(&context.checkout_path), None, suite)?
+                        .map(|value| required_string_field(&value, "id", "latest snapshot"))
+                        .transpose()?
+                        .ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?
+                };
+                let baseline_id = if let Some(baseline_snapshot_id) = baseline_snapshot_id {
+                    baseline_snapshot_id.to_owned()
+                } else {
+                    self.store
+                        .previous_snapshot(&current_id)?
+                        .map(|value| required_string_field(&value, "id", "previous snapshot"))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            AppError::NotFound(
+                                "no previous snapshot found for the selected coverage".to_owned(),
+                            )
+                        })?
+                };
+                self.store.compare_regions(
+                    &current_id,
+                    &baseline_id,
+                    file_path,
+                    only_regressions,
+                    COLLECTION_FETCH_LIMIT,
+                )?
+            }
+        } else if let Some(worktree_id) = worktree_id {
             self.store
                 .compare_worktree_default_limits(worktree_id, snapshot_id)?
         } else {
@@ -605,10 +694,7 @@ impl CoverageService {
                 COLLECTION_FETCH_LIMIT,
             )?
         };
-        let current_suite = comparison["current"]["suite"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+        let current_suite = comparison_current_suite(&comparison)?;
         if suite.is_some_and(|value| value != current_suite) {
             return Err(AppError::Validation(
                 "requested suite does not match the current snapshot".to_owned(),
@@ -616,26 +702,29 @@ impl CoverageService {
         }
         let mut base = json!({"baseline": compact_snapshot(&comparison["baseline"], detailed), "current": compact_snapshot(&comparison["current"], detailed), "overall": comparison["overall"]});
         if view == "overview" {
-            base["file_change_count"] = json!(comparison["files"].as_array().map_or(0, Vec::len));
+            base["file_change_count"] = json!(comparison_file_change_count(&comparison)?);
             base["line_change_count"] =
-                json!(comparison["changed_lines"].as_array().map_or(0, Vec::len));
+                json!(required_array_field(&comparison, "changed_lines", "comparison")?.len());
             return Ok(self.envelope(base, Some(&current_suite), None));
         }
         let mut values = match view {
-            "files" => comparison["files"].as_array().cloned().unwrap_or_default(),
-            "lines" => comparison["changed_lines"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
+            "files" => required_array_field(&comparison, "files", "comparison")?.to_vec(),
+            "lines" => required_array_field(&comparison, "changed_lines", "comparison")?
+                .to_vec()
                 .into_iter()
                 .filter(|value| {
                     !only_regressions
                         || value.get("status").and_then(Value::as_str) == Some("regressed")
                 })
                 .collect(),
+            "regions" => {
+                let regions = required_array_field(&comparison, "regions", "comparison")?;
+                base["region_change_count"] = json!(regions.len());
+                regions.to_vec()
+            }
             _ => {
                 return Err(AppError::Validation(
-                    "view must be overview, files, lines, or progress".to_owned(),
+                    "view must be overview, files, lines, regions, or progress".to_owned(),
                 ));
             }
         };
@@ -664,9 +753,20 @@ impl CoverageService {
         cursor: Option<&str>,
         max_words: usize,
     ) -> AppResult<Value> {
+        if start < 1 {
+            return Err(AppError::Validation(
+                "start must be a positive line number".to_owned(),
+            ));
+        }
         if end < start {
             return Err(AppError::Validation(
                 "end must be greater than or equal to start".to_owned(),
+            ));
+        }
+        let line_count = end - start + 1;
+        if line_count > 200 {
+            return Err(AppError::Validation(
+                "source ranges may contain at most 200 lines".to_owned(),
             ));
         }
         let snapshot = self.store.snapshot(snapshot_id)?;
@@ -674,6 +774,12 @@ impl CoverageService {
         let lines = self
             .store
             .source_lines(snapshot_id, file_path, start, end)?;
+        let line_range = (start, end);
+        let coverage = self
+            .store
+            .lines_in_ranges(snapshot_id, file_path, &[line_range])?;
+        let coverage_lines = required_array_field(&coverage, "lines", "line coverage")?;
+        let (lines, red_regions) = annotate_source_lines(lines, Some(coverage_lines))?;
         let (lines, page) = self.page(
             &lines,
             cursor,
@@ -682,8 +788,8 @@ impl CoverageService {
             None,
         )?;
         Ok(self.envelope(
-            json!({"snapshot_commit_sha": snapshot["commit_sha"], "lines": lines}),
-            snapshot["suite"].as_str(),
+            json!({"snapshot_commit_sha": required_value(&snapshot, "commit_sha", "snapshot")?, "file_path": file_path, "red_regions": red_regions, "lines": lines}),
+            Some(required_string_field(&snapshot, "suite", "snapshot")?.as_str()),
             Some(page),
         ))
     }
@@ -770,10 +876,18 @@ fn update_worktree_progress(
     };
     object.insert("points".to_owned(), Value::Array(points));
     if !detailed {
-        let worktree = object.get("worktree").cloned().unwrap_or(Value::Null);
+        let worktree = required_value(
+            &Value::Object(object.clone()),
+            "worktree",
+            "worktree progress",
+        )?
+        .clone();
+        let worktree_id = required_value(&worktree, "id", "worktree")?.clone();
+        let worktree_path = required_value(&worktree, "path", "worktree")?.clone();
+        let worktree_branch = required_value(&worktree, "branch", "worktree")?.clone();
         object.insert(
             "worktree".to_owned(),
-            json!({"id":worktree["id"],"path":worktree["path"],"branch":worktree["branch"]}),
+            json!({"id":worktree_id,"path":worktree_path,"branch":worktree_branch}),
         );
     }
     Ok(())
@@ -785,6 +899,61 @@ fn required_snapshot<'a>(snapshot: Option<&'a Value>, view: &str) -> AppResult<&
 
 fn required_snapshot_id<'a>(id: Option<&'a str>, view: &str) -> AppResult<&'a str> {
     id.ok_or_else(|| AppError::NotFound(format!("no snapshot is available for {view}")))
+}
+
+fn required_value<'a>(value: &'a Value, key: &str, context: &str) -> AppResult<&'a Value> {
+    value
+        .get(key)
+        .ok_or_else(|| AppError::Runtime(format!("{context} is missing required field '{key}'")))
+}
+
+fn selection_without_lines(value: &Value) -> AppResult<Value> {
+    let mut object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AppError::Runtime("line selection must be an object".to_owned()))?;
+    object.remove("lines");
+    Ok(Value::Object(object))
+}
+
+fn comparison_file_change_count(comparison: &Value) -> AppResult<usize> {
+    Ok(required_array_field(comparison, "files", "comparison")?.len())
+}
+
+fn comparison_current_suite(comparison: &Value) -> AppResult<String> {
+    required_string_field(
+        required_value(comparison, "current", "comparison")?,
+        "suite",
+        "current snapshot",
+    )
+}
+
+fn required_string_field(value: &Value, key: &str, context: &str) -> AppResult<String> {
+    required_value(value, key, context)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            AppError::Runtime(format!(
+                "{context} field '{key}' must be a non-empty string"
+            ))
+        })
+}
+
+fn required_i64_field(value: &Value, key: &str, context: &str) -> AppResult<i64> {
+    required_value(value, key, context)?
+        .as_i64()
+        .ok_or_else(|| AppError::Runtime(format!("{context} field '{key}' must be an integer")))
+}
+
+fn required_array_field<'a>(
+    value: &'a Value,
+    key: &str,
+    context: &str,
+) -> AppResult<&'a Vec<Value>> {
+    required_value(value, key, context)?
+        .as_array()
+        .ok_or_else(|| AppError::Runtime(format!("{context} field '{key}' must be an array")))
 }
 
 fn required_page_anchor(values: &[Value]) -> AppResult<String> {
@@ -822,18 +991,22 @@ pub fn decode_cursor(cursor: &str, scope: &str) -> AppResult<(String, usize)> {
         .map_err(|_| AppError::Validation("invalid pagination cursor".to_owned()))?;
     let payload: Value = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::Validation("invalid pagination cursor".to_owned()))?;
-    let anchor = payload
+    let object = payload
+        .as_object()
+        .ok_or_else(|| AppError::Validation("invalid pagination cursor".to_owned()))?;
+    let anchor = object
         .get("after")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let occurrence = payload
+        .ok_or_else(|| AppError::Validation("invalid pagination cursor anchor".to_owned()))?;
+    let occurrence = object
         .get("occurrence")
         .and_then(Value::as_u64)
-        .unwrap_or_default() as usize;
-    let scope_value = payload
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| AppError::Validation("invalid pagination cursor occurrence".to_owned()))?;
+    let scope_value = object
         .get("scope")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .ok_or_else(|| AppError::Validation("invalid pagination cursor scope".to_owned()))?;
     if anchor.len() != 64
         || !anchor
             .chars()
@@ -1117,9 +1290,96 @@ fn insert_paged_gaps(gaps: &mut Value, ranges: Vec<Value>) {
     }
 }
 
+fn annotate_source_lines(
+    source: Vec<Value>,
+    coverage: Option<&Vec<Value>>,
+) -> AppResult<(Vec<Value>, Vec<Value>)> {
+    let mut measurements = BTreeMap::new();
+    for line in coverage.into_iter().flatten() {
+        if let Some(number) = line.get("line_number").and_then(Value::as_i64) {
+            measurements.insert(number, line);
+        }
+    }
+    let mut red_lines = Vec::new();
+    let mut result = Vec::new();
+    for mut line in source {
+        let Some(object) = line.as_object_mut() else {
+            result.push(line);
+            continue;
+        };
+        let Some(number) = object.get("line_number").and_then(Value::as_i64) else {
+            result.push(line);
+            continue;
+        };
+        let measurement = measurements.get(&number).copied();
+        let count_line = measurement
+            .and_then(|value| value.get("count_line"))
+            .and_then(Value::as_bool);
+        let covered = measurement
+            .and_then(|value| value.get("covered"))
+            .and_then(Value::as_bool);
+        let branch_gap = measurement.and_then(|value| {
+            let total = value.get("total_branches").and_then(Value::as_i64)?;
+            let covered = value.get("covered_branches").and_then(Value::as_i64)?;
+            total.checked_sub(covered).map(|gap| gap.max(0))
+        });
+        let (status, marker) = match (count_line, covered, branch_gap) {
+            (Some(true), Some(false), _) => {
+                red_lines.push(number);
+                ("uncovered", "red")
+            }
+            (Some(true), Some(true), Some(gap)) if gap > 0 => ("branch_gap", "yellow"),
+            (Some(true), Some(true), _) => ("covered", "green"),
+            (Some(false), _, _) => ("non_executable", "gray"),
+            _ => ("unmeasured", "gray"),
+        };
+        object.insert("status".to_owned(), json!(status));
+        object.insert("marker".to_owned(), json!(marker));
+        if let Some(gap) = branch_gap.filter(|gap| *gap > 0) {
+            object.insert("uncovered_branches".to_owned(), json!(gap));
+        }
+        result.push(line);
+    }
+    Ok((result, line_regions(&red_lines)?))
+}
+
+fn line_regions(numbers: &[i64]) -> AppResult<Vec<Value>> {
+    let mut numbers = numbers.to_vec();
+    numbers.sort_unstable();
+    numbers.dedup();
+    let mut regions = Vec::new();
+    let mut current: Option<(i64, i64)> = None;
+    for number in numbers {
+        if let Some((start, end)) = current.as_mut() {
+            if number <= end.saturating_add(1) {
+                *end = (*end).max(number);
+                continue;
+            }
+            let line_count = *end - *start + 1;
+            regions.push(json!({
+                "start": *start,
+                "end": *end,
+                "line_count": line_count,
+            }));
+        }
+        current = Some((number, number));
+    }
+    if let Some((start, end)) = current {
+        let line_count = end - start + 1;
+        regions.push(json!({
+            "start": start,
+            "end": end,
+            "line_count": line_count,
+        }));
+    }
+    Ok(regions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerConfig;
+    use std::process::Command;
 
     #[test]
     fn cursor_and_budget_helpers_cover_valid_and_invalid_inputs() {
@@ -1134,6 +1394,22 @@ mod tests {
         assert!(decode_cursor("not-base64", "scope").is_err());
         let invalid_json = URL_SAFE_NO_PAD.encode(b"not-json");
         assert!(decode_cursor(&invalid_json, "scope").is_err());
+        let scalar_json = URL_SAFE_NO_PAD.encode(b"[]");
+        assert!(decode_cursor(&scalar_json, "scope").is_err());
+        let missing_anchor = URL_SAFE_NO_PAD.encode(br#"{"occurrence":1,"scope":"x"}"#);
+        assert!(decode_cursor(&missing_anchor, "scope").is_err());
+        let missing_occurrence = URL_SAFE_NO_PAD.encode(
+            format!(
+                r#"{{"after":"{}","scope":"{}"}}"#,
+                anchor,
+                cursor_scope("scope")
+            )
+            .as_bytes(),
+        );
+        assert!(decode_cursor(&missing_occurrence, "scope").is_err());
+        let missing_scope = URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"after":"{}","occurrence":1}}"#, anchor).as_bytes());
+        assert!(decode_cursor(&missing_scope, "scope").is_err());
         let wrong_scope = encode_cursor(&anchor, "other", 1).unwrap();
         assert!(decode_cursor(&wrong_scope, "scope").is_err());
         let short = encode_cursor(&"z".repeat(63), "scope", 1).unwrap();
@@ -1143,6 +1419,134 @@ mod tests {
         assert!(validate_max_words(49).is_err());
         assert!(validate_max_words(5001).is_err());
         assert!(validate_max_words(600).is_ok());
+    }
+
+    #[test]
+    fn strict_projection_validation_and_comparison_errors_are_explicit() {
+        assert!(required_value(&json!({}), "id", "projection").is_err());
+        assert!(required_string_field(&json!({"id":""}), "id", "projection").is_err());
+        assert!(required_i64_field(&json!({"count":"1"}), "count", "projection").is_err());
+        assert!(required_array_field(&json!({"items":{}}), "items", "projection").is_err());
+        assert!(selection_without_lines(&json!("scalar")).is_err());
+        assert_eq!(
+            selection_without_lines(&json!({"lines":[1],"selected":true})).unwrap(),
+            json!({"selected":true})
+        );
+        assert!(comparison_file_change_count(&json!({})).is_err());
+        assert_eq!(
+            comparison_file_change_count(&json!({"files":[]})).unwrap(),
+            0
+        );
+        assert!(comparison_current_suite(&json!({"current":{}})).is_err());
+        assert_eq!(
+            comparison_current_suite(&json!({"current":{"suite":"unit"}})).unwrap(),
+            "unit"
+        );
+        let mut missing_worktree = json!({});
+        assert!(update_worktree_progress(&mut missing_worktree, Vec::new(), false).is_err());
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(directory.path().join("src")).expect("source directory");
+        std::fs::write(directory.path().join("src/a.py"), "one\ntwo\n").expect("source file");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "rust@example.com"],
+            vec!["config", "user.name", "Rust Tests"],
+            vec!["add", "."],
+            vec!["commit", "-m", "base"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(args)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        let report = directory.path().join("coverage.lcov");
+        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n")
+            .expect("coverage report");
+        let config = ServerConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 59_471,
+            db_path: None,
+            common_db_path: directory.path().join("common.duckdb"),
+            run_retention: 100,
+            run_concurrency: 1,
+            mcp_http_concurrency: 16,
+            db_pool_size: 4,
+            db_acquire_timeout_ms: 5_000,
+            db_query_timeout_ms: 30_000,
+            http_request_timeout_seconds: 60,
+            http_max_body_bytes: 1_048_576,
+            run_log_max_bytes: 10 * 1024 * 1024,
+            default_compaction_after_days: 30,
+            default_compaction_interval_seconds: 3_600,
+            default_compaction_batch_size: 100,
+        };
+        let store =
+            CoverageStore::open(directory.path().join("coverage.duckdb"), config).expect("store");
+        let project = store.ensure_project(directory.path()).expect("project");
+        let baseline = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some(&"a".repeat(40)),
+                None,
+                "unit",
+            )
+            .expect("baseline");
+        let current = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some(&"b".repeat(40)),
+                None,
+                "unit",
+            )
+            .expect("current");
+        let service = CoverageService::new(
+            store.clone(),
+            RequestContext {
+                repo_key: project.repo_key,
+                checkout_path: project.repo_path,
+                suite: None,
+            },
+        );
+        assert!(service.source("missing", "a.py", 0, 1, None, 600).is_err());
+        assert!(
+            service
+                .source("missing", "a.py", 1, 201, None, 600)
+                .is_err()
+        );
+        assert!(
+            service
+                .source("missing", "a.py", i64::MIN, i64::MAX, None, 600)
+                .is_err()
+        );
+        assert!(
+            service
+                .coverage_comparison(
+                    "overview",
+                    current["id"].as_str(),
+                    baseline["id"].as_str(),
+                    None,
+                    Some("other"),
+                    None,
+                    false,
+                    None,
+                    600,
+                    false,
+                )
+                .is_err()
+        );
+        store.close().expect("close store");
     }
 
     #[test]
@@ -1204,5 +1608,37 @@ mod tests {
         assert!(required_snapshot(None, "summary").is_err());
         assert!(required_snapshot_id(None, "files").is_err());
         assert!(required_page_anchor(&[]).is_err());
+
+        let source = vec![
+            json!({"line_number":1,"text":"missed"}),
+            json!({"line_number":2,"text":"branch"}),
+            json!({"line_number":3,"text":"covered"}),
+            json!({"line_number":4,"text":"non-executable"}),
+            json!({"line_number":5,"text":"missing measurement"}),
+            json!({"line_number":6,"text":"unmeasured"}),
+            json!({"text":"missing number"}),
+            json!("no line number"),
+        ];
+        let coverage = vec![
+            json!({"line_number":1,"count_line":true,"covered":false,"total_branches":0,"covered_branches":0}),
+            json!({"line_number":2,"count_line":true,"covered":true,"total_branches":2,"covered_branches":1}),
+            json!({"line_number":3,"count_line":true,"covered":true}),
+            json!({"line_number":4,"count_line":false,"covered":false}),
+            json!({"line_number":5,"count_line":true}),
+        ];
+        let (annotated, red_regions) = annotate_source_lines(source, Some(&coverage)).unwrap();
+        assert_eq!(annotated[0]["marker"], "red");
+        assert_eq!(annotated[1]["marker"], "yellow");
+        assert_eq!(annotated[2]["marker"], "green");
+        assert_eq!(annotated[3]["marker"], "gray");
+        assert_eq!(annotated[4]["status"], "unmeasured");
+        assert_eq!(annotated[5]["status"], "unmeasured");
+        assert_eq!(red_regions[0]["line_count"], 1);
+        let (_, no_coverage_regions) =
+            annotate_source_lines(vec![json!({"line_number":8})], None).unwrap();
+        assert!(no_coverage_regions.is_empty());
+        assert_eq!(line_regions(&[5, 1, 2, 2, 4]).unwrap()[0]["start"], 1);
+        assert_eq!(line_regions(&[5, 1, 2, 2, 4]).unwrap()[1]["start"], 4);
+        assert!(line_regions(&[]).unwrap().is_empty());
     }
 }

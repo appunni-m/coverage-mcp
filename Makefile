@@ -1,3 +1,4 @@
+# Requires GNU Make 3.81 or newer.
 CARGO ?= cargo
 
 .DEFAULT_GOAL := help
@@ -44,7 +45,7 @@ test-ci:
 	mkdir -p target/migration; \
 	rm -f target/migration/test-*.log; \
 	$(CARGO) test --workspace --all-targets --all-features --locked --no-run; \
-	run_harness() { name=$$1; shift; log="target/migration/test-$$name.log"; if "$$@" >"$$log" 2>&1; then printf 'passed %s\n' "$$name"; else code=$$?; printf 'failed %s (exit %s)\n' "$$name" "$$code" >&2; tail -n 120 "$$log" >&2 || true; return "$$code"; fi; }; \
+	run_harness() { name=$$1; shift; log="target/migration/test-$$name.log"; if "$$@" >"$$log" 2>&1; then printf 'passed %s\n' "$$name"; else code=$$?; printf 'failed %s (exit %s)\n' "$$name" "$$code" >&2; if [ -f "$$log" ]; then tail -n 120 "$$log" >&2; fi; return "$$code"; fi; }; \
 	run_harness lib $(CARGO) test --workspace --lib --all-features --locked -- --test-threads=1 & p1=$$!; \
 	run_harness rust-migration env MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json $(CARGO) test --workspace --test rust_migration --all-features --locked -- --test-threads=1 & p2=$$!; \
 	run_harness migration-status $(CARGO) test --workspace --test migration_status --all-features --locked -- --test-threads=1 & p3=$$!; \

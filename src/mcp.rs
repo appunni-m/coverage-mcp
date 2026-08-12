@@ -13,7 +13,13 @@ use crate::service::{CoverageService, DEFAULT_MAX_WORDS};
 use crate::storage::LineRange;
 
 /// MCP stream endpoint instructions shown during initialization.
-pub const MCP_INSTRUCTIONS: &str = "Coverage MCP 0.8.0 schema 7 exposes a compact agent interface. Start with project_context, then run only exact approved registrations returned there or created with register_test_command after human approval. Submit with run_test(wait=false), save the run id, then fetch status with get_run_data(detailed=false). get_run_data is read-only: it only returns durable run data and never starts, advances, reruns, or cancels work. For every non-terminal response, wait at least the returned poll_after_ms before the next get_run_data call; do not poll immediately. Use cancel_run only when the user no longer wants the run. Use search_test_logs for targeted retained stdout/stderr evidence. Use coverage_query for snapshot reads, coverage_compare only for lineage-compatible snapshots or registered worktrees, and source_context only for bounded source ranges already identified by coverage data. Every response is {context,data,page}; max_words is the primary response budget and collections continue with page.next_cursor. Omit detailed or keep it false for normal work; set it true only when a tool description names required audit or raw-provenance fields. detailed never returns logs. The daemon uses stateless JSON responses, bounded MCP concurrency, and bounded HTTP/DuckDB deadlines; keep query fan-out bounded and retry an individual request with backoff after a transient 503/504 or interrupted connection.";
+pub const MCP_INSTRUCTIONS: &str = r#"Coverage MCP 0.8.0 schema 7 exposes a compact, composable agent interface.
+
+Start with project_context, then run only exact approved registrations returned there or created with register_test_command after human approval. Submit with run_test(wait=false), save the run id, then fetch status with get_run_data(detailed=false). get_run_data is read-only: it only returns durable run data and never starts, advances, reruns, or cancels work. For every non-terminal response, wait at least the returned poll_after_ms before the next get_run_data call; do not poll immediately. Use cancel_run only when the user no longer wants the run. Use search_test_logs for targeted retained stdout/stderr evidence; managed output is byte-capped and a terminal summary reports truncated=true when the cap was reached. Run setup, capture, polling, persistence, timeout, cancellation, and shutdown failures are terminalized as failed durable jobs, so never assume a non-terminal run is permanent.
+
+Coverage queries are deliberately narrow and composable. Each coverage_query, coverage_compare, or source_context call answers one projection or one bounded source range; it is expected and supported to make multiple calls for one user task. Use coverage_query view=targets for the ranked next work, coverage_compare view=regions for grouped previous-session impact, coverage_query view=file for one file's red regions, and source_context for the exact source text of a selected region. Chain calls by carrying forward snapshot_id, file_path, and start/end ranges from earlier results. Run independent calls separately or in parallel; run source follow-ups only after their target ranges are known. Use coverage_query view=file with line_ranges or coverage_compare view=lines only when exact per-line audit data is needed.
+
+Every successful response is {context,data,page}; max_words is the per-call response budget (50–5000, default 600) and collections continue with page.next_cursor. Omit detailed or keep it false for normal work; set it true only when a tool description names required audit or raw-provenance fields. detailed never returns logs. The daemon uses stateless JSON responses, bounded MCP concurrency, bounded HTTP/DuckDB deadlines, and bounded HTTP bodies; keep query fan-out bounded and retry an individual request with backoff after a transient 503/504 or interrupted connection. Coverage ingestion is capped at 64 MiB and malformed numeric report fields are validation errors, never silent zeroes."#;
 
 /// Returns the MCP initialize result.
 pub fn initialize_result() -> Value {
@@ -83,7 +89,7 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "run_test",
-            "Submit one approved command. Prefer wait=false with a stable idempotency_key; returns durable run id, queue/ETA, poll_after_ms, counters when known, and coverage_ingest. Use get_run_data only after waiting the returned poll_after_ms.",
+            "Submit one approved command. Prefer wait=false with a stable idempotency_key; returns durable run id, queue/ETA, poll_after_ms, counters when known, and coverage_ingest. Managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use get_run_data only after waiting the returned poll_after_ms.",
             command_execution(),
             object_schema(
                 &[
@@ -135,7 +141,7 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "search_test_logs",
-            "Search retained stdout/stderr literally for one query string or a list of query strings matched with OR. Returns word-bounded merged context windows; no matches is a successful empty result and full logs are never embedded.",
+            "Search retained stdout/stderr literally for one query string or a list of query strings matched with OR. Returns word-bounded merged context windows; no matches is a successful empty result and full logs are never embedded. Retained output is capped per stream, and run summaries report truncation.",
             read_only(),
             object_schema(
                 &[
@@ -158,7 +164,7 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "ingest_coverage",
-            "Ingest one external or historical coverage report. Relative report_path resolves inside the selected checkout; returns immutable snapshot summary, parser warnings, and provenance compactly.",
+            "Ingest one external or historical coverage report. Relative report_path resolves inside the selected checkout; returns immutable snapshot summary, parser warnings, and provenance compactly. Reports larger than 64 MiB and malformed numeric fields are explicit validation errors.",
             local_write(),
             object_schema(
                 &[
@@ -194,34 +200,75 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "coverage_query",
-            "Read one coverage projection: summary, files, file gaps, insights, or line_history. Use snapshot_id/suite/branch/file_path/line_number/line_ranges as required by the view; continue collections with cursor. Use detailed only for report/parser provenance, raw file metrics, or unabridged line-history records.",
+            "Read exactly one compact coverage projection per call. Compose multiple narrow calls when a task needs more than one answer. Use targets for ranked next work (red uncovered regions; order_by=priority, uncovered_lines, line_rate, or file_path), file for one file's red regions, summary/files/insights for summaries, or line_history for one line over time. Omit snapshot_id to use the latest snapshot for the selected checkout; continue collections with the returned cursor. Use detailed only for report/parser provenance, raw file metrics, or unabridged line-history records. Use coverage_compare view=regions for grouped previous-session impact and source_context for the follow-up source range.",
             read_only(),
             object_schema(
                 &[
                     (
                         "view",
                         enum_schema(
-                            &["summary", "files", "file", "insights", "line_history"],
-                            "Coverage projection.",
+                            &[
+                                "summary",
+                                "files",
+                                "targets",
+                                "file",
+                                "insights",
+                                "line_history",
+                            ],
+                            "Exactly one projection per call: targets, file, summary, files, insights, or line_history.",
                         ),
                     ),
-                    ("snapshot_id", nullable_string("Snapshot UUID.")),
+                    (
+                        "snapshot_id",
+                        nullable_string(
+                            "Snapshot UUID. Optional except line_history; omitted selects the latest snapshot for the selected checkout.",
+                        ),
+                    ),
                     (
                         "baseline_snapshot_id",
-                        nullable_string("Optional baseline UUID for insights."),
+                        nullable_string(
+                            "Optional baseline UUID for insights; use coverage_compare for snapshot comparisons.",
+                        ),
                     ),
-                    ("suite", nullable_string("Suite selector.")),
-                    ("branch", nullable_string("Branch selector.")),
+                    (
+                        "suite",
+                        nullable_string("Suite selector; omitted uses the request context."),
+                    ),
+                    (
+                        "branch",
+                        nullable_string("Branch selector for snapshot selection or line_history."),
+                    ),
                     (
                         "file_path",
-                        nullable_string("Repository-relative file path."),
+                        nullable_string(
+                            "Repository-relative file path. Required for file and line_history; optional filter for targets.",
+                        ),
                     ),
-                    ("line_number", integer("One-based line for line_history.")),
+                    (
+                        "line_number",
+                        integer(
+                            "One-based line number; required with file_path and suite for line_history.",
+                        ),
+                    ),
                     (
                         "line_ranges",
-                        json_schema("Inclusive line ranges with start and end."),
+                        json_schema(
+                            "Optional array of inclusive {start,end} ranges for exact selected lines in file view; multiple disjoint ranges are allowed.",
+                        ),
                     ),
-                    ("cursor", nullable_string("Opaque page cursor.")),
+                    (
+                        "order_by",
+                        enum_schema(
+                            &["priority", "uncovered_lines", "line_rate", "file_path"],
+                            "Ordering for targets only; priority is the default, followed by uncovered_lines, line_rate, or file_path.",
+                        ),
+                    ),
+                    (
+                        "cursor",
+                        nullable_string(
+                            "Opaque cursor from the same view, filters, and order; pass page.next_cursor unchanged.",
+                        ),
+                    ),
                     ("max_words", budget_schema()),
                     ("detailed", detailed_schema()),
                 ],
@@ -230,27 +277,53 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "coverage_compare",
-            "Compare compatible coverage lineage. Direct mode uses snapshot_id plus baseline_snapshot_id; worktree mode uses worktree_id. Views are overview, files, lines, and progress. Use detailed only for raw baseline/current snapshot provenance.",
+            "Read exactly one comparison projection per call. Compose overview, regions, and source_context calls when you need both a summary and code context. regions returns grouped changed ranges and is the token-efficient default for previous-session impact; when direct ids are omitted it compares the latest snapshot in the selected checkout with its previous matching snapshot. Direct mode accepts snapshot_id plus baseline_snapshot_id; worktree mode uses worktree_id. Views are overview, files, lines, regions, and progress. Use detailed only for raw baseline/current snapshot provenance.",
             read_only(),
             object_schema(
                 &[
                     (
                         "view",
                         enum_schema(
-                            &["overview", "files", "lines", "progress"],
-                            "Comparison projection.",
+                            &["overview", "files", "lines", "regions", "progress"],
+                            "Exactly one comparison projection per call: overview, files, lines, regions, or progress.",
                         ),
                     ),
-                    ("snapshot_id", nullable_string("Current snapshot UUID.")),
+                    (
+                        "snapshot_id",
+                        nullable_string(
+                            "Current snapshot UUID; required with baseline_snapshot_id for direct overview/files/lines mode, optional for regions auto-selection.",
+                        ),
+                    ),
                     (
                         "baseline_snapshot_id",
-                        nullable_string("Baseline snapshot UUID."),
+                        nullable_string(
+                            "Baseline snapshot UUID; direct comparison partner for snapshot_id.",
+                        ),
                     ),
-                    ("worktree_id", nullable_string("Registered worktree UUID.")),
-                    ("suite", nullable_string("Suite selector.")),
-                    ("file_path", nullable_string("Optional file filter.")),
-                    ("only_regressions", boolean("Keep only regressed lines.")),
-                    ("cursor", nullable_string("Opaque page cursor.")),
+                    (
+                        "worktree_id",
+                        nullable_string("Registered worktree UUID; uses its frozen baseline."),
+                    ),
+                    (
+                        "suite",
+                        nullable_string(
+                            "Suite selector for automatic regions selection or progress.",
+                        ),
+                    ),
+                    (
+                        "file_path",
+                        nullable_string(
+                            "Optional repository-relative file filter for files/lines/regions.",
+                        ),
+                    ),
+                    (
+                        "only_regressions",
+                        boolean("For lines or regions, keep only status=regressed changes."),
+                    ),
+                    (
+                        "cursor",
+                        nullable_string("Opaque cursor from the same comparison view and filters."),
+                    ),
                     ("max_words", budget_schema()),
                     ("detailed", detailed_schema()),
                 ],
@@ -259,15 +332,32 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "source_context",
-            "Read numbered source lines for one snapshot and repository-relative file_path. Request bounded one-based start/end ranges, usually after coverage_query identifies gaps or lines of interest.",
+            "Read exactly one bounded, contiguous source range per call. Make separate calls for disjoint ranges. Each line includes a compact coverage status and red/green/yellow/gray marker; red_regions groups missed executable lines. Request one-based start/end ranges after coverage_query or coverage_compare identifies the file and lines; ranges are capped at 200 lines.",
             read_only(),
             object_schema(
                 &[
-                    ("snapshot_id", string("Snapshot UUID.")),
-                    ("file_path", string("Repository-relative source file.")),
-                    ("start", integer("One-based inclusive start line.")),
-                    ("end", integer("One-based inclusive end line.")),
-                    ("cursor", nullable_string("Opaque page cursor.")),
+                    (
+                        "snapshot_id",
+                        string("Snapshot UUID returned by a coverage projection."),
+                    ),
+                    (
+                        "file_path",
+                        string(
+                            "Repository-relative source file returned by a coverage projection.",
+                        ),
+                    ),
+                    (
+                        "start",
+                        integer("One-based inclusive start line from a red or changed region."),
+                    ),
+                    (
+                        "end",
+                        integer("One-based inclusive end line; maximum 200 lines per call."),
+                    ),
+                    (
+                        "cursor",
+                        nullable_string("Opaque cursor for the same source range and budget."),
+                    ),
                     ("max_words", budget_schema()),
                 ],
                 &["snapshot_id", "file_path", "start", "end"],
@@ -380,10 +470,8 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
         .as_object()
         .ok_or_else(|| AppError::Validation("tool arguments must be an object".to_owned()))?;
     let get = |key: &str| args.get(key);
-    let max_words = get("max_words")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MAX_WORDS as u64) as usize;
-    let detailed = get("detailed").and_then(Value::as_bool).unwrap_or(false);
+    let max_words = optional_usize(args, "max_words")?.unwrap_or(DEFAULT_MAX_WORDS);
+    let detailed = optional_bool(args, "detailed")?.unwrap_or(false);
     match name {
         "project_context" => {
             service.project_context(get("cursor").and_then(Value::as_str), max_words, detailed)
@@ -392,13 +480,11 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             .command_registration(
                 required_string(args, "name")?,
                 required_string(args, "command")?,
-                get("human_approved")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                optional_bool(args, "human_approved")?.unwrap_or(false),
                 required_string(args, "approved_by")?,
                 required_string(args, "approval_note")?,
-                get("cwd").and_then(Value::as_str),
-                get("shell").and_then(Value::as_str).unwrap_or("/bin/bash"),
+                optional_string(args, "cwd")?,
+                optional_string(args, "shell")?.unwrap_or("/bin/bash"),
                 get("artifact_paths").cloned(),
                 detailed,
             )
@@ -406,9 +492,9 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
         "run_test" => service
             .run_submission(
                 required_string(args, "command_ref")?,
-                get("timeout_seconds").and_then(Value::as_u64),
-                get("idempotency_key").and_then(Value::as_str),
-                get("wait").and_then(Value::as_bool).unwrap_or(false),
+                optional_u64(args, "timeout_seconds")?,
+                optional_string(args, "idempotency_key")?,
+                optional_bool(args, "wait")?.unwrap_or(false),
                 false,
             )
             .and_then(|value| service.apply_budget(value, max_words)),
@@ -421,22 +507,20 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
         "search_test_logs" => service.search_logs(
             required_string(args, "run_id")?,
             query_values(get("query"))?,
-            get("stream").and_then(Value::as_str).unwrap_or("both"),
-            get("context_lines").and_then(Value::as_u64).unwrap_or(3) as usize,
-            get("max_matches").and_then(Value::as_u64).unwrap_or(5) as usize,
+            optional_string(args, "stream")?.unwrap_or("both"),
+            optional_usize(args, "context_lines")?.unwrap_or(3),
+            optional_usize(args, "max_matches")?.unwrap_or(5),
             max_words,
-            get("case_sensitive")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            optional_bool(args, "case_sensitive")?.unwrap_or(false),
         ),
         "ingest_coverage" => service
             .ingest(
                 required_string(args, "report_path")?,
-                get("format").and_then(Value::as_str).unwrap_or("auto"),
-                get("suite").and_then(Value::as_str).unwrap_or("default"),
-                get("branch").and_then(Value::as_str),
-                get("commit_sha").and_then(Value::as_str),
-                get("base_ref").and_then(Value::as_str),
+                optional_string(args, "format")?.unwrap_or("auto"),
+                optional_string(args, "suite")?.unwrap_or("default"),
+                optional_string(args, "branch")?,
+                optional_string(args, "commit_sha")?,
+                optional_string(args, "base_ref")?,
                 false,
             )
             .and_then(|value| service.apply_budget(value, max_words)),
@@ -444,33 +528,32 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             .worktree_registration(
                 required_string(args, "path")?,
                 required_string(args, "base_ref")?,
-                get("name").and_then(Value::as_str),
+                optional_string(args, "name")?,
             )
             .and_then(|value| service.apply_budget(value, max_words)),
-        "coverage_query" => service.coverage_query(
-            get("view").and_then(Value::as_str).unwrap_or(""),
-            get("snapshot_id").and_then(Value::as_str),
-            get("baseline_snapshot_id").and_then(Value::as_str),
-            get("suite").and_then(Value::as_str),
-            get("branch").and_then(Value::as_str),
-            get("file_path").and_then(Value::as_str),
-            get("line_number").and_then(Value::as_i64),
+        "coverage_query" => service.coverage_query_ordered(
+            optional_string(args, "view")?.unwrap_or(""),
+            optional_string(args, "snapshot_id")?,
+            optional_string(args, "baseline_snapshot_id")?,
+            optional_string(args, "suite")?,
+            optional_string(args, "branch")?,
+            optional_string(args, "file_path")?,
+            optional_i64(args, "line_number")?,
             parse_ranges(get("line_ranges"))?,
-            get("cursor").and_then(Value::as_str),
+            optional_string(args, "order_by")?,
+            optional_string(args, "cursor")?,
             max_words,
             detailed,
         ),
         "coverage_compare" => service.coverage_comparison(
-            get("view").and_then(Value::as_str).unwrap_or("overview"),
-            get("snapshot_id").and_then(Value::as_str),
-            get("baseline_snapshot_id").and_then(Value::as_str),
-            get("worktree_id").and_then(Value::as_str),
-            get("suite").and_then(Value::as_str),
-            get("file_path").and_then(Value::as_str),
-            get("only_regressions")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            get("cursor").and_then(Value::as_str),
+            optional_string(args, "view")?.unwrap_or("overview"),
+            optional_string(args, "snapshot_id")?,
+            optional_string(args, "baseline_snapshot_id")?,
+            optional_string(args, "worktree_id")?,
+            optional_string(args, "suite")?,
+            optional_string(args, "file_path")?,
+            optional_bool(args, "only_regressions")?.unwrap_or(false),
+            optional_string(args, "cursor")?,
             max_words,
             detailed,
         ),
@@ -479,7 +562,7 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             required_string(args, "file_path")?,
             required_i64(args, "start")?,
             required_i64(args, "end")?,
-            get("cursor").and_then(Value::as_str),
+            optional_string(args, "cursor")?,
             max_words,
         ),
         _ => Err(AppError::NotFound(format!("unknown MCP tool: {name}"))),
@@ -514,40 +597,100 @@ pub fn read_resource(service: &CoverageService, uri: &str) -> AppResult<Value> {
 }
 
 fn required_string<'a>(args: &'a Map<String, Value>, key: &str) -> AppResult<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
+    optional_string(args, key)?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::Validation(format!("{key} is required")))
 }
 fn required_i64(args: &Map<String, Value>, key: &str) -> AppResult<i64> {
-    args.get(key)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| AppError::Validation(format!("{key} is required")))
+    optional_i64(args, key)?.ok_or_else(|| AppError::Validation(format!("{key} is required")))
+}
+fn optional_string<'a>(args: &'a Map<String, Value>, key: &str) -> AppResult<Option<&'a str>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| AppError::Validation(format!("{key} must be a string"))),
+    }
+}
+fn optional_bool(args: &Map<String, Value>, key: &str) -> AppResult<Option<bool>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| AppError::Validation(format!("{key} must be a boolean"))),
+    }
+}
+fn optional_u64(args: &Map<String, Value>, key: &str) -> AppResult<Option<u64>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| AppError::Validation(format!("{key} must be an unsigned integer"))),
+    }
+}
+fn optional_usize(args: &Map<String, Value>, key: &str) -> AppResult<Option<usize>> {
+    optional_u64(args, key)?
+        .map(|value| checked_usize(value, key))
+        .transpose()
+}
+#[cfg(target_pointer_width = "32")]
+fn checked_usize(value: u64, key: &str) -> AppResult<usize> {
+    if value > usize::MAX as u64 {
+        return Err(AppError::Validation(format!(
+            "{key} is too large for this platform"
+        )));
+    }
+    Ok(value as usize)
+}
+#[cfg(target_pointer_width = "64")]
+fn checked_usize(value: u64, _key: &str) -> AppResult<usize> {
+    Ok(value as usize)
+}
+fn optional_i64(args: &Map<String, Value>, key: &str) -> AppResult<Option<i64>> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| AppError::Validation(format!("{key} must be an integer"))),
+    }
 }
 fn query_values(value: Option<&Value>) -> AppResult<Vec<String>> {
     match value {
         Some(Value::String(value)) => Ok(vec![value.clone()]),
-        Some(Value::Array(values)) => Ok(values
+        Some(Value::Array(values)) => values
             .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()),
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    AppError::Validation("query array items must be strings".to_owned())
+                })
+            })
+            .collect(),
         _ => Err(AppError::Validation(
             "query must be a string or array of strings".to_owned(),
         )),
     }
 }
 fn parse_ranges(value: Option<&Value>) -> AppResult<Option<Vec<LineRange>>> {
-    let Some(Value::Array(values)) = value else {
+    let Some(value) = value else {
         return Ok(None);
     };
+    let values = value
+        .as_array()
+        .ok_or_else(|| AppError::Validation("line_ranges must be an array".to_owned()))?;
     let mut result = Vec::new();
     for value in values {
-        let start = value
+        let object = value
+            .as_object()
+            .ok_or_else(|| AppError::Validation("line range must be an object".to_owned()))?;
+        let start = object
             .get("start")
             .and_then(Value::as_i64)
             .ok_or_else(|| AppError::Validation("line range start is required".to_owned()))?;
-        let end = value
+        let end = object
             .get("end")
             .and_then(Value::as_i64)
             .ok_or_else(|| AppError::Validation("line range end is required".to_owned()))?;
@@ -566,7 +709,7 @@ fn json_rpc_error(id: Value, error: AppError) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})
 }
 fn output_schema() -> Value {
-    json!({"type":"object","properties":{"context":{"type":"object","description":"Request repository and schema context."},"data":{"description":"Tool data payload."},"page":{"type":["object","null"],"description":"Pagination and response-budget metadata."}},"required":["context","data","page"]})
+    json!({"type":"object","properties":{"context":{"type":"object","description":"Request repository, checkout, suite, and schema context."},"data":{"description":"Projection-specific tool data; request one narrow projection at a time and compose multiple responses by carrying ids and ranges forward."},"page":{"type":["object","null"],"description":"Per-call pagination and response-budget metadata, including returned, total, word_count, max_words, truncated, and next_cursor."}},"required":["context","data","page"]})
 }
 fn object_schema(properties: &[(&str, Value)], required: &[&str]) -> Value {
     let mut map = Map::new();
@@ -594,13 +737,13 @@ fn enum_schema(values: &[&str], description: &str) -> Value {
     json!({"type":"string","enum":values,"description":description})
 }
 fn budget_schema() -> Value {
-    json!({"type":"integer","minimum":20,"maximum":5000,"default":600,"description":"Primary response word budget; use pagination when truncated."})
+    json!({"type":"integer","minimum":50,"maximum":5000,"default":600,"description":"Per-call response word budget, 50–5000, default 600; use page.next_cursor for more collection items."})
 }
 fn detailed_schema() -> Value {
-    json!({"type":"boolean","default":false,"description":"Keep false for normal work; true only for explicitly requested audit or provenance fields."})
+    json!({"type":"boolean","default":false,"description":"Keep false for normal work; true only for explicitly requested audit, raw-metric, or provenance fields."})
 }
 fn query_schema() -> Value {
-    json!({"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"One query string or a list of query strings; any term is present uses OR matching."})
+    json!({"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"One query string or an array of query strings; matches use OR semantics and return bounded context windows."})
 }
 fn annotations(read_only: bool, destructive: bool, idempotent: bool, open_world: bool) -> Value {
     json!({"readOnlyHint":read_only,"destructiveHint":destructive,"idempotentHint":idempotent,"openWorldHint":open_world})
@@ -629,15 +772,14 @@ mod tests {
         assert!(required_string(&args, "missing").is_err());
         args.insert("name".to_owned(), json!(" "));
         assert!(required_string(&args, "name").is_err());
+        args.insert("name".to_owned(), json!(7));
+        assert!(optional_string(&args, "name").is_err());
         assert!(required_i64(&args, "missing").is_err());
         args.insert("number".to_owned(), json!("7"));
         assert!(required_i64(&args, "number").is_err());
 
         assert_eq!(query_values(Some(&json!("one"))).unwrap(), vec!["one"]);
-        assert_eq!(
-            query_values(Some(&json!(["one", 2, "two"]))).unwrap(),
-            vec!["one", "two"]
-        );
+        assert!(query_values(Some(&json!(["one", 2, "two"]))).is_err());
         assert!(query_values(None).is_err());
         assert!(query_values(Some(&json!(true))).is_err());
 
@@ -648,7 +790,12 @@ mod tests {
         );
         assert!(parse_ranges(Some(&json!([{ "end": 4 }]))).is_err());
         assert!(parse_ranges(Some(&json!([{ "start": 2 }]))).is_err());
-        assert!(parse_ranges(Some(&json!("bad"))).unwrap().is_none());
+        assert!(parse_ranges(Some(&json!([3]))).is_err());
+        assert!(parse_ranges(Some(&json!("bad"))).is_err());
+        assert!(optional_bool(&args, "number").is_err());
+        assert!(optional_usize(&args, "number").is_err());
+        args.insert("number".to_owned(), json!(7));
+        assert_eq!(optional_usize(&args, "number").unwrap(), Some(7));
     }
 
     #[test]
@@ -661,6 +808,7 @@ mod tests {
         assert_eq!(json_schema("json")["description"], "json");
         assert_eq!(enum_schema(&["a", "b"], "enum")["enum"][1], "b");
         assert_eq!(budget_schema()["default"], 600);
+        assert_eq!(budget_schema()["minimum"], 50);
         assert!(!detailed_schema()["default"].as_bool().unwrap());
         assert!(query_schema()["anyOf"].is_array());
         assert_eq!(read_only()["readOnlyHint"], true);
@@ -668,6 +816,28 @@ mod tests {
         assert_eq!(command_execution()["openWorldHint"], true);
         assert!(output_schema()["required"].as_array().unwrap().len() == 3);
         assert!(tool("name", "description", read_only(), schema)["outputSchema"].is_object());
+
+        let initialize = initialize_result();
+        let instructions = initialize["instructions"].as_str().unwrap();
+        assert!(instructions.contains("multiple calls"));
+        assert!(instructions.contains("snapshot_id, file_path, and start/end ranges"));
+        let tools = tools_list();
+        let coverage_query = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "coverage_query")
+            .unwrap();
+        assert!(
+            coverage_query["description"]
+                .as_str()
+                .unwrap()
+                .contains("exactly one compact coverage projection per call")
+        );
+        assert_eq!(
+            coverage_query["inputSchema"]["properties"]["order_by"]["enum"][0],
+            "priority"
+        );
     }
 
     #[test]

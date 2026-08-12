@@ -86,14 +86,20 @@ fn main() -> StatusResult<()> {
     };
     let dirty = target["dirty"].as_bool().unwrap_or(true);
 
-    let coverage_artifact = coverage.as_ref().map(|value| {
-        let bytes = serde_json::to_vec(value).unwrap_or_default();
-        format!("local-{}", &sha256_hex(&bytes)[..16])
-    });
-    let benchmark_artifact = benchmark.as_ref().map(|value| {
-        let bytes = serde_json::to_vec(value).unwrap_or_default();
-        format!("local-{}", &sha256_hex(&bytes)[..16])
-    });
+    let coverage_artifact = coverage
+        .as_ref()
+        .map(|value| {
+            let bytes = serde_json::to_vec(value)?;
+            Ok::<_, Box<dyn Error>>(format!("local-{}", &sha256_hex(&bytes)[..16]))
+        })
+        .transpose()?;
+    let benchmark_artifact = benchmark
+        .as_ref()
+        .map(|value| {
+            let bytes = serde_json::to_vec(value)?;
+            Ok::<_, Box<dyn Error>>(format!("local-{}", &sha256_hex(&bytes)[..16]))
+        })
+        .transpose()?;
     let parity_artifact = if parity_marker.is_some() {
         let artifact_id = format!("local-parity-{}", &manifest_sha256[..16]);
         let result = parity_result(&cases, &input_paths, &lane_context)?;
@@ -376,17 +382,14 @@ fn hex_prefix(bytes: &[u8], max_bytes: usize) -> String {
 }
 
 fn target_identity(repository: &Path) -> StatusResult<Value> {
-    let revision = command_output(repository, "git", &["rev-parse", "HEAD"])
-        .unwrap_or_else(|| "unknown".to_owned());
-    let dirty = command_output(
+    let revision = command_output(repository, "git", &["rev-parse", "HEAD"])?;
+    let dirty = !command_output(
         repository,
         "git",
         &["status", "--porcelain", "--untracked-files=all"],
-    )
-    .map(|output| !output.is_empty())
-    .unwrap_or(true);
-    let runtime = command_output(repository, "rustc", &["--version"])
-        .unwrap_or_else(|| "rustc unknown".to_owned());
+    )?
+    .is_empty();
+    let runtime = command_output(repository, "rustc", &["--version"])?;
     Ok(json!({
         "target_profile":TARGET_PROFILE,
         "target_id":"rust",
@@ -469,21 +472,25 @@ fn load_parity_marker(
     }
 }
 
-fn command_output(repository: &Path, command: &str, args: &[&str]) -> Option<String> {
+fn command_output(repository: &Path, command: &str, args: &[&str]) -> StatusResult<String> {
     let output = if command == "git" {
         Command::new(command)
             .arg("-C")
             .arg(repository)
             .args(args)
-            .output()
-            .ok()?
+            .output()?
     } else {
-        Command::new(command).args(args).output().ok()?
+        Command::new(command).args(args).output()?
     };
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    if !output.status.success() {
+        return Err(format!(
+            "{command} {} failed with status {}",
+            args.join(" "),
+            output.status
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
 fn coverage_result(
@@ -591,7 +598,7 @@ fn parity_result(
         .filter(|path| path.starts_with("inputs/parity/"))
         .map(|path| {
             let input = read_json(&context.fixture_root.join(path))?;
-            Ok(input_identity(context, path, &input))
+            input_identity(context, path, &input)
         })
         .collect::<StatusResult<Vec<_>>>()?;
     let comparisons = cases
@@ -711,7 +718,7 @@ fn lane_identity(
         "started_at":now,
         "finished_at":now,
         "manifest":{"path":MANIFEST_RELATIVE,"schema":"migration-parity/manifest@2","sha256":context.manifest_sha256},
-        "inputs":[input_identity(context, input_path, input)],
+        "inputs":[input_identity(context, input_path, input)?],
         "assets":[],
         "oracles":[],
         "targets":[context.target],
@@ -719,13 +726,17 @@ fn lane_identity(
     }))
 }
 
-fn input_identity(context: &LaneContext<'_>, input_path: &str, input: &Value) -> Value {
-    let input_bytes = fs::read(context.fixture_root.join(input_path)).unwrap_or_default();
-    json!({
+fn input_identity(
+    context: &LaneContext<'_>,
+    input_path: &str,
+    input: &Value,
+) -> StatusResult<Value> {
+    let input_bytes = fs::read(context.fixture_root.join(input_path))?;
+    Ok(json!({
         "path":format!("tests/fixtures/{input_path}"),
         "schema":input["schema"],
         "sha256":sha256_hex(&input_bytes)
-    })
+    }))
 }
 
 fn statistics(values: &[f64]) -> Value {

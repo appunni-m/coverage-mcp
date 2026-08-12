@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use coverage_mcp::config::default_db_path;
+use coverage_mcp::error::AppResult;
 use coverage_mcp::mcp;
 use coverage_mcp::service::{CoverageService, RequestContext};
 use coverage_mcp::{CoverageServer, CoverageStore, ServerConfig};
@@ -62,7 +63,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> AppResult<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve {
         host: None,
@@ -102,10 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn run_stdio(
-    repo: PathBuf,
-    db: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_stdio(repo: PathBuf, db: Option<PathBuf>) -> AppResult<()> {
     let mut config = ServerConfig::for_repository(repo.clone())?;
     if let Some(db) = db {
         config.db_path = Some(db);
@@ -152,11 +150,12 @@ fn json_rpc_error(id: Option<Value>, error: coverage_mcp::AppError) -> Value {
     })
 }
 
-fn standalone_db_path(config: &ServerConfig) -> Result<PathBuf, &'static str> {
-    config
-        .db_path
-        .clone()
-        .ok_or("standalone compaction requires a repository database path")
+fn standalone_db_path(config: &ServerConfig) -> AppResult<PathBuf> {
+    config.db_path.clone().ok_or_else(|| {
+        coverage_mcp::AppError::Validation(
+            "standalone compaction requires a repository database path".to_owned(),
+        )
+    })
 }
 
 #[cfg(test)]

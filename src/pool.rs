@@ -398,6 +398,16 @@ mod tests {
         )
         .expect_err("watchdog creation failure");
         assert!(matches!(error, AppError::Runtime(_)));
+        assert!(
+            run_with_timeout_using(
+                &connection,
+                Duration::from_secs(1),
+                "successful function item",
+                successful_operation,
+                spawn_watchdog,
+            )
+            .is_ok()
+        );
 
         let result = run_with_timeout(
             &connection,

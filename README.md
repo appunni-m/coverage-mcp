@@ -88,15 +88,90 @@ Set `COVERAGE_MCP_COMMON_DB` to relocate the registry and project directory.
 The HTTP transport and stdio transport call the same Rust dispatcher, tool
 schemas, service projections, validation, and storage implementation.
 
+Every present argument is type-checked. An omitted optional argument receives
+the documented default; a present argument with the wrong JSON type is a
+validation error and is never silently treated as omitted. The HTTP MCP route
+also requires a JSON object with a string \`method\`; malformed JSON, malformed
+headers, and missing required fields return an explicit error response.
+HTTP JSON bodies are capped by `COVERAGE_MCP_HTTP_MAX_BODY_BYTES` (1 MiB by
+default). Coverage ingestion rejects reports larger than 64 MiB and rejects
+malformed numeric fields instead of converting them to zero or silently
+dropping them.
+
 ## MCP Usage Guide
+
+Coverage MCP is a query interface, not a request for the full raw coverage
+report. Each `tools/call` chooses one projection and returns only the fields
+needed for that projection. It is expected—and usually more efficient—to make
+several narrow calls for one task instead of asking one call to return every
+file, line, branch, and parser detail.
 
 Initialization instructions plus `tools/list` are intended to be sufficient
 for an agent without reading this README. Start with `project_context`, use
 only an exact approved command, submit asynchronously, wait for the returned
-`poll_after_ms`, and then inspect the durable result. Every successful tool
-response is `{context,data,page}`. `max_words` is the primary response budget;
-collection results continue with `page.next_cursor`. `detailed` is false by
-default and never returns logs.
+`poll_after_ms`, and then inspect the durable result. Coverage reads are
+read-only and can be composed by carrying `snapshot_id`, `file_path`, and line
+ranges from one response into the next request.
+
+### Choose the smallest projection
+
+| Question | First call | Minimum selection | Follow-up when needed |
+| --- | --- | --- | --- |
+| What should I attack next? | `coverage_query` with `view="targets"` | Optional `order_by`; default is `priority` | Call `source_context` only for the returned file/range. |
+| What changed since the previous session? | `coverage_compare` with `view="regions"` | No ids required for automatic latest/previous selection; use `only_regressions=true` for red impact only | Call `source_context` for a regressed range. |
+| Where are the red portions in one file? | `coverage_query` with `view="file"` | `snapshot_id`, `file_path` | Add `line_ranges` with one or more exact ranges to receive selected line records. |
+| What does the code around a gap look like? | `source_context` | `snapshot_id`, `file_path`, contiguous `start`/`end` | Make another call for each disjoint range; each call is capped at 200 lines. |
+| Which exact lines changed? | `coverage_compare` with `view="lines"` | `snapshot_id` and `baseline_snapshot_id`, or a `worktree_id` | Use only for an audit; `regions` is smaller for normal reasoning. |
+| How did one line behave over time? | `coverage_query` with `view="line_history"` | `file_path`, `line_number`, and `suite` | Keep `detailed=false` unless raw history fields are required. |
+| Do I need parser or provenance detail? | `coverage_query` with `view="summary"` or `view="files"` | The relevant snapshot selector | Set `detailed=true` only for that audit. |
+
+The `targets` priority score is deterministic: `uncovered_lines × 100 +
+uncovered_branches × 10 + uncovered_functions × 5`; ties are ordered by
+`file_path`. This makes `order_by="priority"` a useful default while still
+allowing `uncovered_lines`, `line_rate`, or `file_path` when the question calls
+for a different ordering.
+
+### Compose multiple narrow calls
+
+MCP requests are stateless, so the client should retain ids and feed exact
+results into the next call. Independent calls may be issued separately or in
+parallel; dependent calls should wait for the earlier result. A typical
+coverage investigation is:
+
+1. Call `project_context` once and keep the selected repository context.
+2. Call `coverage_query(view="targets", order_by="priority")` to get a short
+   ranked list and its `snapshot.id`.
+3. Call `coverage_compare(view="regions", only_regressions=true)` separately
+   if the user also asked what got worse. This call can auto-select the latest
+   and previous matching snapshots.
+4. For the one or two regions worth inspecting, call `source_context` with the
+   exact `file_path`, `start`, and `end` returned by `targets` or `regions`.
+5. Use `coverage_query(view="file", line_ranges=[...])` or
+   `coverage_compare(view="lines")` only if the user asks for exact line
+   records or an audit trail.
+
+For example, these are separate `tools/call` argument objects, not one large
+request:
+
+```json
+{"view":"targets","order_by":"priority","max_words":400}
+```
+
+```json
+{"view":"file","snapshot_id":"<snapshot-id-from-targets>","file_path":"src/parser.rs","line_ranges":[{"start":120,"end":127},{"start":201,"end":206}],"max_words":500}
+```
+
+```json
+{"snapshot_id":"<snapshot-id-from-file>","file_path":"src/parser.rs","start":120,"end":127,"max_words":350}
+```
+
+The second call can select multiple disjoint ranges in one file request. The
+third call is intentionally one contiguous source window; repeat it for the
+next range rather than expanding it to the whole file. A response's
+`data.targets[].regions[]` and `data.regions[]` are designed to be passed
+directly into these follow-up calls.
+
+### Tool reference
 
 All tool failures are returned as an MCP tool error payload with a stable
 human-readable message. Invalid required fields, unknown names, invalid
@@ -107,15 +182,89 @@ an empty log search is a successful empty result.
 | --- | --- | --- |
 | `project_context` | `cursor`, `max_words`, `detailed` | Project identity including the stable project `id`, compaction policy, approved commands, latest run, active runs, and page metadata. Call first. |
 | `register_test_command` | `name`, `command`, `human_approved`, `approved_by`, `approval_note`, optional `cwd`, `shell`, `artifact_paths`, `max_words` | Immutable approval record. Human approval must be true; pass its id or name to `run_test`. |
-| `run_test` | `command_ref`, optional `timeout_seconds`, `idempotency_key`, `wait`, `max_words` | Durable run id, queue/ETA, process counters, and coverage-ingest status. Prefer `wait=false`. |
+| `run_test` | `command_ref`, optional `timeout_seconds`, `idempotency_key`, `wait`, `max_words` | Durable run id, queue/ETA, process counters, and coverage-ingest status. Prefer `wait=false`; failed setup and shutdown paths are terminalized rather than left running. |
 | `get_run_data` | `run_id`, `max_words`, `detailed` | Read-only durable run state. When `terminal=false`, wait at least `poll_after_ms` before calling again. |
 | `cancel_run` | `run_id`, `max_words`, `detailed` | Cancellation request and terminal state. Use only when the user no longer wants the run. |
-| `search_test_logs` | `run_id`, `query` string or array, optional `stream`, `context_lines`, `max_matches`, `max_words`, `case_sensitive` | Word-bounded stdout/stderr matches. Queries in an array use OR matching. |
-| `ingest_coverage` | `report_path`, optional `format`, `suite`, `branch`, `commit_sha`, `base_ref`, `max_words` | Immutable snapshot summary, parser warnings, and provenance. Supported formats include LCOV, coverage JSON, Cobertura, JaCoCo, Istanbul, Go, and LLVM. |
+| `search_test_logs` | `run_id`, `query` string or array, optional `stream`, `context_lines`, `max_matches`, `max_words`, `case_sensitive` | Word-bounded stdout/stderr matches. Queries in an array use OR matching. Retained output is capped per stream; ask for matches or small context windows rather than full logs. |
+| `ingest_coverage` | `report_path`, optional `format`, `suite`, `branch`, `commit_sha`, `base_ref`, `max_words` | Immutable snapshot summary, parser warnings, and provenance. Supported formats include LCOV, coverage JSON, Cobertura, JaCoCo, Istanbul, Go, and LLVM. Reports are size-bounded and malformed numeric fields are explicit validation errors. |
 | `register_worktree` | `path`, `base_ref`, optional `name`, `max_words` | Worktree identity and frozen baseline snapshot for `coverage_compare`. |
-| `coverage_query` | `view`, optional snapshot/baseline selectors, `suite`, `branch`, `file_path`, `line_number`, `line_ranges`, `cursor`, `max_words`, `detailed` | `summary`, `files`, `file`, `insights`, or `line_history` projection. Continue bounded collections with the cursor. |
-| `coverage_compare` | `view`, optional `snapshot_id`, `baseline_snapshot_id`, `worktree_id`, `suite`, `file_path`, `only_regressions`, `cursor`, `max_words`, `detailed` | `overview`, `files`, `lines`, or `progress` comparison. Select compatible lineage or a registered worktree. |
-| `source_context` | `snapshot_id`, `file_path`, `start`, `end`, optional `cursor`, `max_words` | Numbered source lines for a bounded range already identified by coverage data. |
+| `coverage_query` | One `view` per call; optional snapshot/baseline selectors, `suite`, `branch`, `file_path`, `line_number`, `line_ranges`, `order_by`, `cursor`, `max_words`, `detailed` | `summary`, `files`, `targets`, `file`, `insights`, or `line_history` projection. `targets` returns ranked files with compact uncovered red regions; `order_by` is `priority` (default), `uncovered_lines`, `line_rate`, or `file_path`. Continue bounded collections with the cursor. Make another narrow call for source or history. |
+| `coverage_compare` | One `view` per call; optional `snapshot_id`, `baseline_snapshot_id`, `worktree_id`, `suite`, `file_path`, `only_regressions`, `cursor`, `max_words`, `detailed` | `overview`, `files`, `lines`, `regions`, or `progress` comparison. `regions` groups improved/regressed/new/removed line ranges and, without ids, compares the latest snapshot with its previous matching snapshot. Select compatible lineage or a registered worktree; compose with `source_context` for code. |
+| `source_context` | One contiguous `snapshot_id`, `file_path`, `start`, `end`, optional `cursor`, `max_words` | Numbered source lines for a bounded range already identified by coverage data, each marked `red`, `green`, `yellow`, or `gray`, plus grouped `red_regions`. Make separate calls for disjoint ranges. |
+
+Every successful tool uses this envelope:
+
+```json
+{
+  "context": {
+    "repo_key": "…",
+    "checkout_path": "…",
+    "suite": "…",
+    "schema_revision": 7
+  },
+  "data": {},
+  "page": null
+}
+```
+
+Coverage projection shapes are intentionally small:
+
+| Projection | `data` shape and important fields |
+| --- | --- |
+| `coverage_query:summary` | One compact snapshot object: id, commit, suite, rates, and metric counts. |
+| `coverage_query:files` | An array of compact file summaries; use only when you actually need the file list. |
+| `coverage_query:targets` | `{snapshot, order_by, targets[]}`. Each target has `file_path`, uncovered counts, `priority`, and contiguous `regions`. |
+| `coverage_query:file` | `{file, red_regions, gaps, selected_lines, line_selection}`. `selected_lines` is populated only for requested `line_ranges`; `red_regions` remains the compact GitHub-like gap map. |
+| `coverage_query:insights` | `{snapshot, baseline, summary, items[]}` with prioritized findings. |
+| `coverage_query:line_history` | An array of compact points for one `file_path` and `line_number`; `suite` is required. |
+| `coverage_compare:overview` | `{baseline, current, overall, file_change_count, line_change_count}`. |
+| `coverage_compare:files` | Baseline/current file metrics and deltas, ordered by change. |
+| `coverage_compare:lines` | Exact changed line records; larger than regions and intended for audits. |
+| `coverage_compare:regions` | `{baseline, current, overall, region_change_count, regions[]}` where each region has `file_path`, `status`, `start`, `end`, and `line_count`. |
+| `coverage_compare:progress` | Worktree baseline plus paged progress points; requires `worktree_id` and `suite`. |
+| `source_context` | `{snapshot_commit_sha, file_path, red_regions, lines[]}`. Each line has source text, line number, `status`, and `marker`. |
+
+### Response budgets, pagination, and selection
+
+- `max_words` is per call, not a budget shared across a sequence. It accepts
+  `50`–`5000` and defaults to `600`. Use a smaller budget for a ranked first
+  pass and a larger budget only for the exact follow-up you need.
+- Collection pages report `returned`, `total`, `word_count`, `max_words`,
+  `truncated`, and `next_cursor`. If `truncated` is true, repeat the identical
+  view, filters, ordering, and budget with `cursor=page.next_cursor`.
+- Cursors are opaque and query-scoped. Keep the view, selectors, filters,
+  ordering, `detailed`, and `max_words` unchanged while continuing a page; if
+  you change the query, start a new cursor instead of reusing the old one.
+- `snapshot_id` is optional for normal snapshot reads and selects the latest
+  snapshot for the selected checkout. `coverage_compare(view="regions")` can
+  select the latest snapshot and its previous matching snapshot automatically.
+- `line_ranges` accepts multiple inclusive `{start,end}` objects for one file.
+  `source_context` accepts one contiguous range per call and caps the range at
+  200 lines.
+- `detailed=false` is the normal mode. It suppresses raw report paths,
+  parser metadata, raw file metrics, and other audit-only fields; it never
+  returns logs.
+- Collections have a defensive 5,000-record cap. Refine the query with a
+  snapshot, file, range, ordering, or regression filter instead of requesting
+  an unbounded report.
+
+### Errors and retry behavior
+
+MCP returns a JSON-RPC error with a stable message; the same error classes are
+used by the HTTP and stdio transports. Treat these classes differently:
+
+| Class | Typical cause | Client action |
+| --- | --- | --- |
+| Validation (HTTP 400) | Missing/invalid view, range, ordering, budget, or cursor | Fix the request; do not retry unchanged. |
+| Not found (HTTP 404) | No matching snapshot, previous snapshot, worktree, or source file | Narrow or correct the selector; an empty search is not an error. |
+| Storage/runtime (HTTP 500) | Database, filesystem, parser, or process failure | Report the stable message and investigate the retained evidence. |
+| Busy (HTTP 503) | Another daemon/store owns the resource or capacity is saturated | Retry the individual call with backoff. |
+| Timeout (HTTP 504) | HTTP, pool checkout, or DuckDB deadline exceeded | Retry the individual read with backoff and a narrower query if possible. |
+
+Coverage projections are read-only. `ingest_coverage`,
+`register_test_command`, `run_test`, `cancel_run`, and `register_worktree` are
+the state-changing or execution tools; use their explicit workflow and safety
+annotations.
 
 Resources:
 
@@ -127,6 +276,28 @@ Resources:
 The server advertises read-only safety annotations for query tools and
 explicit mutation/execution annotations for registration, run, cancellation,
 ingest, and worktree operations.
+
+For normal agent work, use the compact projections in this order:
+
+- `coverage_query(view="targets", order_by="priority")` answers what to attack
+  next. Each item is one file with only its uncovered counts, a priority score,
+  and contiguous `regions` such as `12-16`; it does not return every covered
+  line or parser-specific detail.
+- `coverage_compare(view="regions")` answers what changed since the previous
+  session. It returns grouped ranges with `status` values `improved`,
+  `regressed`, `new`, `removed`, or `changed`; pass `only_regressions=true` to
+  narrow it to red impact. If both snapshot ids are omitted, the latest and
+  previous matching snapshots are selected automatically.
+- `source_context` is the follow-up when the actual file text is needed. Its
+  bounded lines carry a coverage `status` and display `marker`, while
+  `red_regions` identifies the missed executable portions without shipping a
+  full raw coverage report.
+
+Use `coverage_query(view="file", line_ranges=[...])` or
+`coverage_compare(view="lines")` only when an exact per-line audit is needed;
+the compact views intentionally avoid repeating covered-line JSON. Multiple
+small calls are the intended way to answer multiple related questions while
+keeping each response focused.
 
 ## Coverage storage and compaction
 
@@ -209,7 +380,11 @@ remaining pool capacity. Connection checkout has a deadline, and each DuckDB
 operation has a watchdog that calls DuckDB's interrupt handle. HTTP requests
 also have a deadline, MCP requests are capped by the configured concurrency
 limit, keep-alive is disabled, and SIGINT/SIGTERM interrupts active queries
-before stores and leases are closed. Timeout and pool saturation errors are
+before stores and leases are closed. Managed commands capture stdout/stderr
+through draining pipes with a per-stream byte cap, start in their own process
+group, and terminate that group on timeout, cancellation, or shutdown. If
+setup, polling, capture, or persistence fails, the durable job is marked
+`failed` before the error is returned. Timeout and pool saturation errors are
 reported explicitly; the server never deletes a WAL or lock file to recover.
 
 ## Configuration
@@ -226,6 +401,8 @@ reported explicitly; the server never deletes a WAL or lock file to recover.
 | `COVERAGE_MCP_DB_ACQUIRE_TIMEOUT_MS` | `5000` | Maximum pool checkout wait (50–120000 ms). |
 | `COVERAGE_MCP_DB_QUERY_TIMEOUT_MS` | `30000` | Maximum one DuckDB operation (100–3600000 ms); must be shorter than the HTTP deadline. |
 | `COVERAGE_MCP_HTTP_REQUEST_TIMEOUT_SECONDS` | `60` | Maximum HTTP request duration (1–3600 s). |
+| `COVERAGE_MCP_HTTP_MAX_BODY_BYTES` | `1048576` | Maximum JSON HTTP request body (1024–16777216 bytes). |
+| `COVERAGE_MCP_RUN_LOG_MAX_BYTES` | `10485760` | Maximum retained stdout or stderr bytes per managed run (1024–1073741824 bytes); excess output is drained and reported as `truncated=true`. |
 | `COVERAGE_MCP_COMPACTION_AFTER_DAYS` | `30` | Default age threshold for new projects. |
 | `COVERAGE_MCP_COMPACTION_INTERVAL_SECONDS` | `3600` | Default maintenance cadence for new projects. |
 | `COVERAGE_MCP_COMPACTION_BATCH_SIZE` | `100` | Default maintenance batch for new projects. |
