@@ -17,10 +17,10 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  verify:
-    name: Rust verification
+  quality:
+    name: Rust quality
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -28,28 +28,70 @@ jobs:
           toolchain: 1.85.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep the four Rust lanes on one MSRV/lockfile cache. `verify`
+          # also reuses the cache produced by the previous serial workflow.
+          shared-key: verify
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Rustdoc
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+
+  verify:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile and run test targets
+        # Compile all targets once. Each harness is isolated by process id and
+        # runs in parallel; its internal tests remain serialized for DuckDB
+        # and signal safety. This preserves the all-targets test set without
+        # making unrelated harnesses wait for one another.
+        run: make test-ci
+      - name: Record migration parity marker
+        run: ./target/debug/migration-status --record-parity .
+      - name: Prepare test evidence
+        run: |
+          mkdir -p ci-evidence/target/debug ci-evidence/target/migration
+          test -x target/debug/migration-status
+          test -s target/migration/benchmark-result.json
+          test -s target/migration/parity-run.json
+          cp target/debug/migration-status ci-evidence/target/debug/migration-status
+          cp target/migration/benchmark-result.json ci-evidence/target/migration/benchmark-result.json
+          cp target/migration/parity-run.json ci-evidence/target/migration/parity-run.json
+      - name: Upload test evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-test-evidence
+          path: ci-evidence/
+          if-no-files-found: error
+
+  coverage:
+    name: Rust coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
       - name: Install coverage tool
         # cargo-llvm-cov currently requires Rust 1.87+ to build. Keep the
         # project gate on its declared 1.85 MSRV and use stable only for this
         # developer tool.
         run: |
           rustup toolchain install stable --profile minimal
-          cargo +stable install cargo-llvm-cov --locked
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Tests
-        # Several integration lanes exercise process-wide DuckDB and signal
-        # state; serialize the harness so hosted runs are deterministic.
-        run: cargo test --workspace --all-targets --all-features --locked -- --test-threads=1
-      - name: Migration parity
-        # The Tests step already executes the complete rust_migration suite.
-        # Record its manifest-bound evidence without launching that suite a
-        # second time on a fresh hosted runner.
-        run: ./target/debug/migration-status --record-parity .
-      - name: Migration benchmark
-        run: make migration-benchmark
+          cargo +stable install cargo-llvm-cov --locked --version 0.8.7
       - name: Coverage
         run: make coverage
       - name: Coverage diagnostics
@@ -69,12 +111,62 @@ jobs:
           name: coverage-diagnostics
           path: target/migration/coverage-raw.json
           if-no-files-found: ignore
-      - name: Migration status
-        run: make migration-status
-      - name: Rustdoc
-        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+      - name: Prepare coverage evidence
+        run: |
+          mkdir -p ci-evidence/target/migration
+          test -s target/migration/coverage-raw.json
+          cp target/migration/coverage-raw.json ci-evidence/target/migration/coverage-raw.json
+      - name: Upload coverage evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-coverage-evidence
+          path: ci-evidence/
+          if-no-files-found: error
+
+  release:
+    name: Release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
       - name: Release build
         run: cargo build --release --locked
+
+  migration-evidence:
+    name: Migration evidence
+    needs: [verify, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - name: Download test evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ci-test-evidence
+          path: target/incoming/test
+      - name: Download coverage evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ci-coverage-evidence
+          path: target/incoming/coverage
+      - name: Assemble and render migration evidence
+        run: |
+          mkdir -p target/debug target/migration
+          cp target/incoming/test/target/debug/migration-status target/debug/migration-status
+          cp target/incoming/test/target/migration/benchmark-result.json target/migration/benchmark-result.json
+          cp target/incoming/test/target/migration/parity-run.json target/migration/parity-run.json
+          cp target/incoming/coverage/target/migration/coverage-raw.json target/migration/coverage-raw.json
+          chmod +x target/debug/migration-status
+          ./target/debug/migration-status .
       - name: Upload migration evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

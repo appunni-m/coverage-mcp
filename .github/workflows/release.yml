@@ -22,6 +22,9 @@ jobs:
           toolchain: 1.85.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Reuse the MSRV cache populated by the main CI workflow.
+          shared-key: verify
       - name: Verify tag version
         shell: bash
         run: test "${GITHUB_REF_NAME#v}" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
@@ -31,14 +34,13 @@ jobs:
         # developer tool.
         run: |
           rustup toolchain install stable --profile minimal
-          cargo +stable install cargo-llvm-cov --locked
+          cargo +stable install cargo-llvm-cov --locked --version 0.8.7
       - name: Run release gate
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo test --workspace --all-targets --all-features --locked
-          make migration-parity
-          make migration-benchmark
+          make test-ci
+          ./target/debug/migration-status --record-parity .
           make coverage
           make migration-status
           RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked

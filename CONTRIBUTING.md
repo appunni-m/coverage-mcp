@@ -14,7 +14,7 @@ when changing behavior.
 
   ```sh
   rustup toolchain install stable --profile minimal
-  cargo +stable install cargo-llvm-cov --locked
+  cargo +stable install cargo-llvm-cov --locked --version 0.8.7
   ```
 - optional `cargo-deny` and `cargo-audit` for supply-chain checks.
 
@@ -60,6 +60,12 @@ Convenience aliases are available through `make lint`, `make test`,
 `make coverage`, `make migration-parity`, `make migration-benchmark`,
 `make migration-status`, and `make docs`. `make ci` runs the complete gate,
 including the fixture-backed migration lanes and generated evidence status.
+
+GitHub Actions runs quality, tests, coverage, and the release build as
+independent lanes. The test lane compiles all targets once, then runs each
+test harness with one thread per harness; this keeps DuckDB and signal state
+isolated while avoiding a serial wall-clock bottleneck. Migration evidence is
+assembled after the test and coverage artifacts are uploaded.
 
 The coverage threshold is a line-coverage gate. The report also displays
 function and region data; do not describe a percentage without naming its
