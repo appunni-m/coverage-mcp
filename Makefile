@@ -42,13 +42,15 @@ test:
 test-ci:
 	@set -eu; \
 	mkdir -p target/migration; \
+	rm -f target/migration/test-*.log; \
 	$(CARGO) test --workspace --all-targets --all-features --locked --no-run; \
-	$(CARGO) test --workspace --lib --all-features --locked -- --test-threads=1 & p1=$$!; \
-	MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json $(CARGO) test --workspace --test rust_migration --all-features --locked -- --test-threads=1 & p2=$$!; \
-	$(CARGO) test --workspace --test migration_status --all-features --locked -- --test-threads=1 & p3=$$!; \
-	$(CARGO) test --workspace --test smoke --all-features --locked -- --test-threads=1 & p4=$$!; \
-	$(CARGO) test --workspace --bin coverage-mcp --all-features --locked -- --test-threads=1 & p5=$$!; \
-	$(CARGO) test --workspace --bin migration-status --all-features --locked -- --test-threads=1 & p6=$$!; \
+	run_harness() { name=$$1; shift; log="target/migration/test-$$name.log"; if "$$@" >"$$log" 2>&1; then printf 'passed %s\n' "$$name"; else code=$$?; printf 'failed %s (exit %s)\n' "$$name" "$$code" >&2; tail -n 120 "$$log" >&2 || true; return "$$code"; fi; }; \
+	run_harness lib $(CARGO) test --workspace --lib --all-features --locked -- --test-threads=1 & p1=$$!; \
+	run_harness rust-migration env MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json $(CARGO) test --workspace --test rust_migration --all-features --locked -- --test-threads=1 & p2=$$!; \
+	run_harness migration-status $(CARGO) test --workspace --test migration_status --all-features --locked -- --test-threads=1 & p3=$$!; \
+	run_harness smoke $(CARGO) test --workspace --test smoke --all-features --locked -- --test-threads=1 & p4=$$!; \
+	run_harness coverage-mcp $(CARGO) test --workspace --bin coverage-mcp --all-features --locked -- --test-threads=1 & p5=$$!; \
+	run_harness migration-status-bin $(CARGO) test --workspace --bin migration-status --all-features --locked -- --test-threads=1 & p6=$$!; \
 	status=0; \
 	if ! wait "$$p1"; then status=1; fi; \
 	if ! wait "$$p2"; then status=1; fi; \

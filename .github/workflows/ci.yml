@@ -57,6 +57,13 @@ jobs:
         run: make test-ci
       - name: Record migration parity marker
         run: ./target/debug/migration-status --record-parity .
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-test-diagnostics
+          path: target/migration/test-*.log
+          if-no-files-found: ignore
       - name: Prepare test evidence
         run: |
           mkdir -p ci-evidence/target/debug ci-evidence/target/migration
