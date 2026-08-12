@@ -30,7 +30,7 @@ pub fn tools_list() -> Value {
     Value::Array(vec![
         tool(
             "project_context",
-            "Discover project state before work: metrics/freshness, exact approved commands, latest run, active runs, and page metadata. Use detailed only for approval audit fields and full project chronology.",
+            "Discover project state before work: stable project id, metrics/freshness, exact approved commands, latest run, active runs, and page metadata. Use detailed only for approval audit fields and full project chronology.",
             read_only(),
             object_schema(
                 &[

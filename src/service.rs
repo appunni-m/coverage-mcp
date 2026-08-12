@@ -902,6 +902,7 @@ fn canonical_json(value: &Value) -> String {
 
 fn compact_project(value: &Value) -> Value {
     let keys = [
+        "id",
         "snapshot_count",
         "branch_count",
         "command_count",
@@ -1150,8 +1151,10 @@ mod tests {
 
     #[test]
     fn compact_projections_keep_public_keys_and_hide_detail_by_default() {
-        let project =
-            compact_project(&json!({"snapshot_count": 2, "compaction": {"enabled": true}}));
+        let project = compact_project(
+            &json!({"id":"project-id","snapshot_count": 2, "compaction": {"enabled": true}}),
+        );
+        assert_eq!(project["id"], "project-id");
         assert_eq!(project["snapshot_count"], 2);
         assert!(project["line_rate"].is_null());
         assert!(project["compaction"].is_object());

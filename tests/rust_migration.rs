@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use coverage_mcp::config::ServerConfig;
 use coverage_mcp::http::CoverageServer;
@@ -151,6 +152,170 @@ fn rust_migrates_all_parser_formats_and_aliases() {
     assert_eq!(normalize_format("go-coverprofile").unwrap(), "go");
     assert!(normalize_format("unknown").is_err());
     assert!(parse_coverage_report(&directory.path().join("missing"), "lcov", None).is_err());
+}
+
+#[test]
+fn rust_migration_fixture_inputs_drive_registered_lanes() {
+    let parser: Value =
+        serde_json::from_str(include_str!("fixtures/inputs/parity/parser_formats.json")).unwrap();
+    assert_eq!(parser["schema"], "migration-parity/parity-input@1");
+    for format in parser["cases"][0]["steps"][0]["arguments"]["input"]["value"]["formats"]
+        .as_array()
+        .unwrap()
+    {
+        assert!(normalize_format(format.as_str().unwrap()).is_ok());
+    }
+
+    let storage: Value = serde_json::from_str(include_str!(
+        "fixtures/inputs/parity/storage_compaction.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        storage["cases"][0]["steps"][0]["arguments"]["input"]["value"]["default_after_days"],
+        config().default_compaction_after_days
+    );
+    assert_eq!(
+        storage["cases"][0]["steps"][0]["arguments"]["input"]["value"]["batch_size"],
+        config().default_compaction_batch_size
+    );
+
+    let transport: Value = serde_json::from_str(include_str!(
+        "fixtures/inputs/parity/transport_contract.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        transport["cases"][0]["steps"][0]["arguments"]["input"]["value"]["schema_revision"],
+        SCHEMA_REVISION
+    );
+    assert_eq!(
+        transport["cases"][0]["steps"][0]["arguments"]["input"]["value"]["tools"],
+        mcp::tools_list().as_array().unwrap().len()
+    );
+
+    let coverage: Value =
+        serde_json::from_str(include_str!("fixtures/inputs/coverage/rust_source.json")).unwrap();
+    assert_eq!(coverage["schema"], "migration-parity/coverage-input@1");
+    assert_eq!(coverage["plans"][0]["component_ids"][0], "rust-source");
+    assert_eq!(
+        coverage["plans"][0]["selectors"]["parity_case_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let benchmark: Value = serde_json::from_str(include_str!(
+        "fixtures/inputs/benchmark/compaction_workload.json"
+    ))
+    .unwrap();
+    let measurement = &benchmark["workloads"][0]["measurement"];
+    assert_eq!(benchmark["schema"], "migration-parity/benchmark-input@1");
+    assert_eq!(measurement["boundary"], "observed_steps");
+    assert_eq!(measurement["correctness_gate"], "parity_pass");
+    assert_eq!(measurement["metrics"], json!(["latency"]));
+    assert!(measurement["warmup_iterations"].as_u64().unwrap() >= 1);
+    assert!(measurement["measurement_iterations"].as_u64().unwrap() >= 1);
+    assert!(measurement["samples"].as_u64().unwrap() >= 1);
+
+    let manifest = include_str!("fixtures/manifest.yaml");
+    for input in [
+        "inputs/parity/parser_formats.json",
+        "inputs/parity/storage_compaction.json",
+        "inputs/parity/transport_contract.json",
+        "inputs/coverage/rust_source.json",
+        "inputs/benchmark/compaction_workload.json",
+    ] {
+        assert!(
+            manifest.contains(&format!("- {input}")),
+            "fixture is not indexed: {input}"
+        );
+    }
+}
+
+fn run_compaction_benchmark_sample() -> (Duration, Value) {
+    let directory = tempfile::tempdir().unwrap();
+    write_file(directory.path(), "src/a.py", "one\ntwo\nthree\n");
+    let report = write_file(
+        directory.path(),
+        "benchmark.lcov",
+        "TN:\nSF:src/a.py\nDA:1,1\nDA:2,0\nDA:3,1\nend_of_record\n",
+    );
+    let store = store(directory.path());
+    let snapshot = ingest(&store, &report, "main", "benchmark");
+    let snapshot_id = snapshot["id"].as_str().unwrap().to_owned();
+    let db_path = store.db_path().to_owned();
+    store.close().unwrap();
+    {
+        let connection = duckdb::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE snapshots SET created_at = CAST(current_timestamp AS TIMESTAMP) - INTERVAL '60 days', minute_bucket = CAST(current_timestamp AS TIMESTAMP) - INTERVAL '60 days' WHERE id = ?",
+                duckdb::params![snapshot_id],
+            )
+            .unwrap();
+    }
+    let reopened = CoverageStore::open(db_path, config()).unwrap();
+    reopened.ensure_project(directory.path()).unwrap();
+    let started = Instant::now();
+    let result = reopened.compact_now().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["compacted_snapshots"], 1);
+    reopened.close().unwrap();
+    (elapsed, result)
+}
+
+#[test]
+fn rust_compaction_benchmark_workload() {
+    let workload: Value = serde_json::from_str(include_str!(
+        "fixtures/inputs/benchmark/compaction_workload.json"
+    ))
+    .unwrap();
+    let measurement = &workload["workloads"][0]["measurement"];
+    let warmup_iterations = measurement["warmup_iterations"].as_u64().unwrap() as usize;
+    let measurement_iterations = measurement["measurement_iterations"].as_u64().unwrap() as usize;
+    let samples_requested = measurement["samples"].as_u64().unwrap() as usize;
+    assert_eq!(measurement["concurrency"], 1);
+    assert_eq!(measurement["correctness_gate"], "parity_pass");
+    for _ in 0..warmup_iterations {
+        let _ = run_compaction_benchmark_sample();
+    }
+    let mut samples = Vec::with_capacity(samples_requested * measurement_iterations);
+    for _ in 0..samples_requested {
+        for _ in 0..measurement_iterations {
+            samples.push(run_compaction_benchmark_sample().0);
+        }
+    }
+    samples.sort_unstable();
+    let median = samples[samples.len() / 2];
+    assert!(
+        median <= Duration::from_secs(5),
+        "compaction median exceeded the manifest budget: {median:?}"
+    );
+    if let Some(report_path) = std::env::var_os("MIGRATION_BENCHMARK_REPORT") {
+        let report_path = PathBuf::from(report_path);
+        if let Some(parent) = report_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let sample_ms = samples
+            .iter()
+            .map(|sample| sample.as_secs_f64() * 1_000.0)
+            .collect::<Vec<_>>();
+        std::fs::write(
+            report_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema":"migration-parity/benchmark-result@1",
+                "workload_id":"coverage-mcp.storage.compact.benchmark",
+                "target_profile":"rust-default",
+                "correctness_gate":"parity_pass",
+                "samples_latency_ms":sample_ms,
+                "median_latency_ms":median.as_secs_f64() * 1_000.0,
+                "budget":{"operator":"less_than_or_equal","value":5000,"unit":"milliseconds","outcome":"pass"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -1180,7 +1345,7 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
     let _pending_state = store
         .run_result(pending["id"].as_str().unwrap(), 20)
         .unwrap();
-    for _ in 0..50 {
+    for _ in 0..200 {
         if store
             .run_result(pending["id"].as_str().unwrap(), 20)
             .unwrap()["status"]
@@ -2455,35 +2620,19 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
         Err(error) => panic!("could not bind probe listener: {error}"),
     };
-    let probe_port = probe_listener.local_addr().unwrap().port();
-    drop(probe_listener);
-    let mut run_config = config();
-    run_config.port = probe_port;
-    let run_server = CoverageServer::new(run_config).unwrap();
-    let run_task = tokio::spawn(run_server.run());
+    let probe_address = probe_listener.local_addr().unwrap();
+    let run_server = CoverageServer::new(config()).unwrap();
+    let run_task = tokio::spawn(run_server.serve_listener(probe_listener));
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let _run_health = http_exchange(
-        std::net::SocketAddr::from(([127, 0, 0, 1], probe_port)),
-        "GET",
-        "/health",
-        None,
-        None,
-    )
-    .await;
+    let _run_health = http_exchange(probe_address, "GET", "/health", None, None).await;
     assert!(
-        http_raw(
-            std::net::SocketAddr::from(([127, 0, 0, 1], probe_port)),
-            "GET",
-            "/api/snapshots",
-            None,
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
+        http_raw(probe_address, "GET", "/api/snapshots", None, None,)
+            .await
+            .contains("400 Bad Request")
     );
     assert!(
         http_raw(
-            std::net::SocketAddr::from(([127, 0, 0, 1], probe_port)),
+            probe_address,
             "GET",
             "/api/snapshots?repo_path=%00",
             None,
@@ -2605,6 +2754,11 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         http_raw(address, "GET", "/api/projects?cursor=invalid", None, None).await;
     let _projects = http_exchange(address, "GET", "/api/projects?max_words=5000", None, None).await;
     let _project = http_exchange(address, "GET", "/api/projects/project", None, None).await;
+    assert!(
+        http_raw(address, "GET", "/api/projects/unknown-project", None, None)
+            .await
+            .contains("404 Not Found")
+    );
     let _latest = http_exchange(
         address,
         "GET",
@@ -3118,7 +3272,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         Some(repo_header),
     )
     .await;
-    let _selected = http_exchange(
+    let selected = http_exchange(
         common_address,
         "GET",
         "/api/projects",
@@ -3126,6 +3280,45 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         Some(repo_header),
     )
     .await;
+    let project_id = selected["data"][0]["id"].as_str().unwrap().to_owned();
+    let selected_by_id = http_exchange(
+        common_address,
+        "GET",
+        &format!("/api/projects/{project_id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(selected_by_id["data"]["id"], project_id);
+    let updated_by_id = http_exchange(
+        common_address,
+        "PATCH",
+        &format!("/api/projects/{project_id}"),
+        Some(&json!({"compaction":{"compaction_batch_size":5}})),
+        None,
+    )
+    .await;
+    assert_eq!(updated_by_id["data"]["compaction_batch_size"], 5);
+    let compacted_by_id = http_exchange(
+        common_address,
+        "POST",
+        &format!("/api/projects/{project_id}/compact"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(compacted_by_id["data"]["status"], "completed");
+    assert!(
+        http_raw(
+            common_address,
+            "GET",
+            "/api/projects/unknown-project",
+            None,
+            None,
+        )
+        .await
+        .contains("404 Not Found")
+    );
     let _unscoped_with_store =
         http_exchange(common_address, "GET", "/api/projects", None, None).await;
     assert!(

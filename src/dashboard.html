@@ -1130,6 +1130,10 @@
       return state.projects.find(project => project.repo_key === state.projectKey || project.repo_path === state.projectKey) || null;
     }
 
+    function currentProjectId() {
+      return currentProject()?.id || 'project';
+    }
+
     function projectSnapshots() {
       return state.snapshots;
     }
@@ -1801,7 +1805,7 @@
           compaction_batch_size: Number(document.getElementById('compactionBatchSize').value)
         }
       };
-      const settings = await getJSON('/api/projects/project', {
+      const settings = await getJSON(`/api/projects/${encodeURIComponent(currentProjectId())}`, {
         method: 'PATCH',
         headers: {'content-type': 'application/json'},
         body: JSON.stringify(body)
@@ -1814,7 +1818,7 @@
 
     async function compactNow() {
       if (!state.projectKey) return;
-      const result = await getJSON('/api/projects/project/compact', {method: 'POST'});
+      const result = await getJSON(`/api/projects/${encodeURIComponent(currentProjectId())}/compact`, {method: 'POST'});
       document.getElementById('maintenanceMessage').textContent =
         `${result.status || 'completed'} · ${result.compacted_snapshots || 0} snapshots · ${result.bytes_after || 0} compressed bytes`;
       await refresh();

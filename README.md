@@ -105,7 +105,7 @@ an empty log search is a successful empty result.
 
 | Tool | Inputs | Returns and next step |
 | --- | --- | --- |
-| `project_context` | `cursor`, `max_words`, `detailed` | Project identity, compaction policy, approved commands, latest run, active runs, and page metadata. Call first. |
+| `project_context` | `cursor`, `max_words`, `detailed` | Project identity including the stable project `id`, compaction policy, approved commands, latest run, active runs, and page metadata. Call first. |
 | `register_test_command` | `name`, `command`, `human_approved`, `approved_by`, `approval_note`, optional `cwd`, `shell`, `artifact_paths`, `max_words` | Immutable approval record. Human approval must be true; pass its id or name to `run_test`. |
 | `run_test` | `command_ref`, optional `timeout_seconds`, `idempotency_key`, `wait`, `max_words` | Durable run id, queue/ETA, process counters, and coverage-ingest status. Prefer `wait=false`. |
 | `get_run_data` | `run_id`, `max_words`, `detailed` | Read-only durable run state. When `terminal=false`, wait at least `poll_after_ms` before calling again. |
@@ -156,6 +156,10 @@ At project creation, `POST /api/projects` accepts `repo_path` and the same
 `compaction_interval_seconds`, and `compaction_batch_size` fields. Existing
 projects can be edited with `PATCH /api/projects/{project}` or from the
 dashboard. `POST /api/projects/{project}/compact` runs one immediate pass.
+Project summaries expose `{project}` as a stable short SHA-256 identifier
+derived from the canonical repository key. In common-daemon mode, these
+project-specific routes can use that identifier without a repository header;
+the header and `repo_path` query parameter remain supported for compatibility.
 Project settings are applied per canonical repository, not per checkout.
 
 The command-line one-shot pass is useful for maintenance jobs:
@@ -182,9 +186,10 @@ MCP. Important routes are:
   approved execution, retained evidence, and baselines;
 - `POST /mcp/` — stateless JSON-RPC MCP over HTTP.
 
-In common-daemon mode, select a repository with the
-`x-coverage-mcp-repo` header or the documented `repo_path` query/body field.
-The daemon rejects non-loopback bind hosts and untrusted Host headers.
+In common-daemon mode, select a repository with a project ID from
+`GET /api/projects`, the `x-coverage-mcp-repo` header, or the documented
+`repo_path` query/body field. The daemon rejects non-loopback bind hosts and
+untrusted Host headers.
 
 ### Ownership, pooling, and deadlines
 
@@ -238,6 +243,9 @@ make fmt
 make clippy
 make test
 make coverage
+make migration-parity
+make migration-benchmark
+make migration-status
 make docs
 make lint
 ```
@@ -252,13 +260,18 @@ cargo llvm-cov --offline --lib --all-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+git diff --check
 ```
 
 The migration fixture manifest and input-only cases in
 [`tests/fixtures`](tests/fixtures) record the public surface carried into
 Rust. [`docs/rust-migration-parity.md`](docs/rust-migration-parity.md) records
-the mapping and evidence state; it is not an alternate runtime.
+the mapping and evidence state; it is not an alternate runtime. After the
+lanes and coverage gate, `make migration-status` emits the fixed aggregate at
+`target/migration/status-report.json` plus generated contract and status pages
+under `docs/generated/`. Missing, dirty, or incompatible evidence is reported
+as `not_proven`.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the review workflow,
 [`docs/architecture.md`](docs/architecture.md) for ownership boundaries, and

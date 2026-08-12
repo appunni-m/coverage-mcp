@@ -42,6 +42,36 @@ The manifest is a migration specification, not a second runtime. The Rust
 tests are the executable authority. Any percentage in a release or review
 must name its dimension, target set, numerator, denominator, and command.
 
+Run the fixture-backed migration lanes with:
+
+```sh
+make migration-parity
+make migration-benchmark
+```
+
+The benchmark command performs the declared warmup and measurement iterations
+against fresh DuckDB stores, gates correctness before timing, checks the
+manifest's five-second median latency budget, and writes its machine-readable
+result to `target/migration/benchmark-result.json`.
+
+`make migration-parity` records a Rust-generated, manifest- and revision-bound
+marker after the conformance test completes. `migration-status` ignores a
+missing, malformed, or stale marker and records the lane as `not_proven`; a
+bare timestamp or an old worktree result can never be treated as current proof.
+
+After the parity, benchmark, and coverage lanes have completed, render the
+fixed aggregate and generated pages with:
+
+```sh
+make migration-status
+```
+
+The command writes `target/migration/status-report.json` and the manifest's
+generated pages under `docs/generated/`. Those paths are build artifacts and
+are intentionally ignored by Git. Missing artifacts, a dirty target, and the
+removed legacy Python oracle are rendered as `not_proven`; the generator never
+turns a passing Rust conformance test into cross-runtime parity evidence.
+
 ## Verification
 
 ```sh

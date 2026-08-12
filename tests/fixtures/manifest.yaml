@@ -27,7 +27,7 @@ target_profiles:
     features: [bundled-duckdb]
 commands:
   - id: inventory
-    argv: [cargo, test, --offline, --all-targets]
+    argv: [cargo, test, --offline, --workspace, --all-targets, --all-features, --locked]
     cwd: .
     timeout_seconds: 900
   - id: frozen-contract-identity
@@ -39,23 +39,27 @@ commands:
     cwd: .
     timeout_seconds: 30
   - id: parity
-    argv: [cargo, test, --offline, --test, rust_migration]
+    argv: [cargo, test, --offline, --test, rust_migration, --all-features, --locked]
     cwd: .
     timeout_seconds: 900
   - id: coverage
-    argv: [cargo, llvm-cov, --offline, --lib, --all-features, --locked, '--ignore-filename-regex=/src/main\.rs$', '--fail-under-lines=100', '--fail-under-functions=100', '--fail-uncovered-lines=0', '--fail-uncovered-functions=0', --summary-only]
+    argv: [cargo, llvm-cov, --offline, --lib, --all-features, --locked, '--ignore-filename-regex=/src/main\.rs$', --json, --summary-only, '--output-path=target/migration/coverage-raw.json', '--fail-under-lines=100', '--fail-under-functions=100', '--fail-uncovered-lines=0', '--fail-uncovered-functions=0']
     cwd: .
     timeout_seconds: 900
   - id: benchmark
-    argv: [cargo, test, --offline, --test, rust_migration, rust_storage_queries_compare_and_compacts_old_detail]
+    argv: [cargo, test, --offline, --test, rust_migration, rust_compaction_benchmark_workload, --, --exact, --test-threads=1]
     cwd: .
     timeout_seconds: 300
   - id: aggregate
-    argv: [cargo, test, --offline, --workspace, --all-targets]
+    argv: [cargo, run, --offline, --locked, --bin, migration-status, --, .]
+    cwd: .
+    timeout_seconds: 900
+  - id: migration-status
+    argv: [cargo, run, --offline, --locked, --bin, migration-status, --, .]
     cwd: .
     timeout_seconds: 900
   - id: docs
-    argv: [cargo, doc, --offline, --workspace, --no-deps]
+    argv: [cargo, doc, --offline, --workspace, --all-features, --no-deps, --locked]
     cwd: .
     timeout_seconds: 300
 interfaces:
@@ -230,6 +234,6 @@ surfaces:
         coverage: {applicability: required, target_profiles: [rust-default], component_ids: [rust-source]}
         benchmark: {applicability: not_applicable, reason: Transport correctness is validated by live wire and stdio tests.}
 documentation:
-  command_id: docs
-  specification_outputs: [docs/rust-migration-parity.md]
-  evidence_outputs: [docs/generated/parity-status.md, docs/generated/coverage-status.md]
+  command_id: migration-status
+  specification_outputs: [docs/generated/public-contract.md]
+  evidence_outputs: [docs/generated/parity-status.md, docs/generated/coverage-status.md, docs/generated/benchmark-status.md]

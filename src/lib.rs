@@ -11,6 +11,8 @@
     allow(clippy::expect_used, clippy::unwrap_in_result, clippy::unwrap_used)
 )]
 
+use sha2::{Digest, Sha256};
+
 pub mod compaction;
 /// Runtime configuration and defaults.
 pub mod config;
@@ -39,6 +41,15 @@ pub use config::ServerConfig;
 pub use error::{AppError, AppResult};
 pub use http::CoverageServer;
 pub use storage::{CoverageStore, ProjectSettings, ProjectSettingsPatch};
+
+/// Returns the stable short identifier used to address a canonical project.
+pub(crate) fn stable_project_id(repo_key: &str) -> String {
+    Sha256::digest(repo_key.as_bytes())
+        .iter()
+        .take(12)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 // The migration suite remains an integration test target, but compiling the
 // same cases inside the library is intentional: Rust does not attribute

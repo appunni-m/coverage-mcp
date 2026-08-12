@@ -28,7 +28,7 @@ use crate::lock::{FileLease, daemon_lock_path};
 use crate::mcp;
 use crate::service::{CoverageService, DEFAULT_MAX_WORDS, RequestContext};
 use crate::storage::{COLLECTION_FETCH_LIMIT, CoverageStore, ProjectSettingsPatch};
-use crate::{SCHEMA_REVISION, VERSION};
+use crate::{SCHEMA_REVISION, VERSION, stable_project_id};
 
 /// Header selecting a repository in daemon-wide mode.
 pub const REPOSITORY_HEADER: &str = "x-coverage-mcp-repo";
@@ -270,10 +270,29 @@ impl CoverageServer {
         }
         let creating_project =
             matches!(method, Method::POST) && path.as_slice() == ["api", "projects"];
+        let project_reference = match path.as_slice() {
+            ["api", "projects", project_id] | ["api", "projects", project_id, "compact"] => {
+                Some(*project_id)
+            }
+            _ => None,
+        };
         let repository = if creating_project {
             body.get("repo_path")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
+        } else if let Some(project_id) = project_reference {
+            if project_id == "project" {
+                repository_header
+                    .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
+                    .or_else(|| {
+                        self.config
+                            .db_path
+                            .as_ref()
+                            .map(|path| database_repository(path))
+                    })
+            } else {
+                Some(self.repository_for_project_id(project_id)?)
+            }
         } else {
             repository_header
                 .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
@@ -387,6 +406,18 @@ impl CoverageServer {
         std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .map_err(AppError::from)
+    }
+
+    fn repository_for_project_id(&self, project_id: &str) -> AppResult<String> {
+        let repository = if let Some(path) = &self.config.db_path {
+            let repository = database_repository(path);
+            (key_hash(&repository) == project_id).then_some(repository)
+        } else {
+            self.registry_repositories()?
+                .into_iter()
+                .find(|repo_key| key_hash(repo_key) == project_id)
+        };
+        repository.ok_or_else(|| AppError::NotFound(format!("project not found: {project_id}")))
     }
 
     fn service_for_repository_path(&self, repo_path: &str) -> AppResult<CoverageService> {
@@ -694,12 +725,7 @@ fn project_database_path(common_db_path: &Path, repo_key: &str) -> PathBuf {
 }
 
 fn key_hash(value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(value.as_bytes())
-        .iter()
-        .take(12)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    stable_project_id(value)
 }
 fn query_params(uri: &Uri) -> HashMap<String, Vec<String>> {
     url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
@@ -1204,6 +1230,18 @@ mod tests {
                 .await
                 .is_ok()
         );
+
+        let server = CoverageServer::new(config()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(
+            server
+                .process_listener_result(Ok((stream, address)))
+                .is_ok()
+        );
+        drop(client);
     }
 
     #[tokio::test]

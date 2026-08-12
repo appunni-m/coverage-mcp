@@ -36,12 +36,26 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-targets --all-features --locked
+      - name: Migration parity
+        run: make migration-parity
+      - name: Migration benchmark
+        run: make migration-benchmark
       - name: Coverage
-        run: cargo llvm-cov --lib --all-features --locked --ignore-filename-regex '/src/main\.rs$' --fail-under-lines 100 --fail-under-functions 100 --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+        run: make coverage
+      - name: Migration status
+        run: make migration-status
       - name: Rustdoc
         run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
       - name: Release build
         run: cargo build --release --locked
+      - name: Upload migration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-evidence
+          path: |
+            target/migration/
+            docs/generated/
+          if-no-files-found: error
 
   supply-chain:
     name: Supply-chain policy

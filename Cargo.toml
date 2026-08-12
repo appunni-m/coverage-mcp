@@ -7,10 +7,19 @@ description = "Local-first coverage time-series dashboard and MCP server"
 license = "MIT"
 repository = "https://github.com/appunni-m/coverage-mcp"
 homepage = "https://github.com/appunni-m/coverage-mcp"
+documentation = "https://docs.rs/coverage-mcp"
 readme = "README.md"
 keywords = ["coverage", "mcp", "duckdb", "testing", "rust"]
 categories = ["development-tools", "command-line-utilities", "database"]
 default-run = "coverage-mcp"
+exclude = [
+    "/.coverage-mcp/",
+    "/.github/",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/docs/generated/",
+    "/scripts/",
+]
 
 [lib]
 name = "coverage_mcp"
@@ -19,6 +28,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "coverage-mcp"
 path = "src/main.rs"
+
+[[bin]]
+name = "migration-status"
+path = "src/bin/migration_status.rs"
 
 [dependencies]
 base64 = "0.22.1"

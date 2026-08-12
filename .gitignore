@@ -4,6 +4,7 @@ __pycache__/
 *.duckdb.lock
 daemon.lock
 /target/
+/docs/generated/
 .DS_Store
 .idea/
 .vscode/

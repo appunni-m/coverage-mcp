@@ -42,7 +42,7 @@ minor versions may contain breaking public-contract changes.
 
 - Contributor, governance, support, conduct, and security policies.
 - Reproducible token-savings benchmark inputs, connector verification, release documentation, and Trusted Publishing.
-- PEP 561 metadata for downstream type checkers.
+- PEP 561 metadata for downstream type checkers of the legacy Python package.
 
 ## 0.7.0 - 2026-07-18
 

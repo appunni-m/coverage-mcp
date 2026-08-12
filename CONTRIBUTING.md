@@ -50,7 +50,9 @@ git diff --check
 ```
 
 Convenience aliases are available through `make lint`, `make test`,
-`make coverage`, and `make docs`.
+`make coverage`, `make migration-parity`, `make migration-benchmark`,
+`make migration-status`, and `make docs`. `make ci` runs the complete gate,
+including the fixture-backed migration lanes and generated evidence status.
 
 The coverage threshold is a line-coverage gate. The report also displays
 function and region data; do not describe a percentage without naming its

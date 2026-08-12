@@ -10,8 +10,11 @@ artifact.
    required checks pass.
 2. Update `Cargo.toml` and `Cargo.lock` to the release version. Move the
    corresponding `CHANGELOG.md` entries into a dated release section.
-3. Run `make ci`, including strict clippy, all-target tests, line coverage, and
+3. Run `make ci`, including strict clippy, all-target tests, fixture-backed
+   migration lanes, line/function coverage, generated migration status, and
    rustdoc warnings.
+   Retain `target/migration/status-report.json` and the generated pages as
+   release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect
    `coverage-mcp --version`.
 5. Verify the binary in a clean checkout: `/health`, dashboard, native stdio

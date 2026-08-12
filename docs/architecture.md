@@ -95,7 +95,10 @@ Settings are inserted with validated server defaults when a project is first
 seen. REST `POST /api/projects` can provide project-creation overrides;
 `PATCH /api/projects/{id}`, the dashboard, and the one-shot CLI pass handle
 later changes. Manual passes update durable status and byte counters so the
-dashboard and MCP context can show maintenance evidence.
+dashboard and MCP context can show maintenance evidence. Project summaries
+expose a stable short SHA-256 ID derived from the canonical repository key,
+so common-daemon project routes can resolve the project without a repository
+selection header.
 
 ## Storage layout
 

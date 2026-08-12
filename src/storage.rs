@@ -23,6 +23,7 @@ use crate::lock::{FileLease, database_lock_path};
 use crate::models::CoverageReport;
 use crate::parser::parse_coverage_report;
 use crate::pool::{DbConnection, DbPool, QueryTracker, checkout, open_pool, run_with_timeout};
+use crate::stable_project_id;
 
 /// Defensive collection ceiling shared by all public projections.
 pub const MAX_COLLECTION_RECORDS: usize = 5_000;
@@ -530,6 +531,7 @@ impl CoverageStore {
             let run_count: i64 = connection.query_row("SELECT count(*) FROM runs WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
             let latest = connection.query_row(&format!("SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE repo_key = ? ORDER BY created_at DESC LIMIT 1"), params![project.repo_key], |row| snapshot_from_row(row)).optional()?;
             let mut result = Map::new();
+            result.insert("id".to_owned(), json!(stable_project_id(&project.repo_key)));
             result.insert("repo_key".to_owned(), json!(project.repo_key));
             result.insert("repo_path".to_owned(), json!(project.repo_path));
             result.insert("snapshot_count".to_owned(), json!(snapshot_count));
@@ -3391,7 +3393,10 @@ mod tests {
         closed_pool_store.close().unwrap();
 
         let mut timeout_config = test_config();
-        timeout_config.db_query_timeout_ms = 50;
+        // Schema bootstrap is intentionally exercised under coverage
+        // instrumentation; keep this deadline above startup variance while
+        // retaining a bounded shutdown assertion below.
+        timeout_config.db_query_timeout_ms = 1_000;
         let timeout_store = CoverageStore::open(
             directory.path().join("shutdown-timeout.duckdb"),
             timeout_config,
