@@ -45,7 +45,7 @@ jobs:
         # The Tests step already executes the complete rust_migration suite.
         # Record its manifest-bound evidence without launching that suite a
         # second time on a fresh hosted runner.
-        run: cargo run --offline --locked --bin migration-status -- --record-parity .
+        run: ./target/debug/migration-status --record-parity .
       - name: Migration benchmark
         run: make migration-benchmark
       - name: Coverage
