@@ -34,7 +34,7 @@ name = "migration-status"
 path = "src/bin/migration_status.rs"
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 chrono = { version = "0.4.44", features = ["serde", "clock"] }
 clap = { version = "4.6.4", features = ["derive", "env"] }
 duckdb = { version = "1.10505.0", features = ["bundled", "chrono", "r2d2", "serde_json"] }
