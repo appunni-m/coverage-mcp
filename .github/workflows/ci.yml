@@ -40,7 +40,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        # Several integration lanes exercise process-wide DuckDB and signal
+        # state; serialize the harness so hosted runs are deterministic.
+        run: cargo test --workspace --all-targets --all-features --locked -- --test-threads=1
       - name: Migration parity
         # The Tests step already executes the complete rust_migration suite.
         # Record its manifest-bound evidence without launching that suite a
