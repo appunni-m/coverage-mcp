@@ -1,5 +1,15 @@
 # Coverage MCP
 
+[![CI](https://github.com/appunni-m/coverage-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/appunni-m/coverage-mcp/actions/workflows/ci.yml)
+[![Release workflow](https://github.com/appunni-m/coverage-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/appunni-m/coverage-mcp/actions/workflows/release.yml)
+[![Coverage policy](https://img.shields.io/badge/coverage-policy%20enforced-brightgreen.svg)](CONTRIBUTING.md#required-local-gate)
+[![MSRV: 1.85+](https://img.shields.io/badge/MSRV-1.85%2B-orange.svg)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Open issues](https://img.shields.io/github/issues/appunni-m/coverage-mcp.svg)](https://github.com/appunni-m/coverage-mcp/issues)
+[![Open pull requests](https://img.shields.io/github/issues-pr/appunni-m/coverage-mcp.svg)](https://github.com/appunni-m/coverage-mcp/pulls)
+[![Contributors](https://img.shields.io/github/contributors/appunni-m/coverage-mcp.svg)](https://github.com/appunni-m/coverage-mcp/graphs/contributors)
+[![Last commit](https://img.shields.io/github/last-commit/appunni-m/coverage-mcp.svg)](https://github.com/appunni-m/coverage-mcp/commits/main)
+
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
 dashboard and REST API, and provides the same schema-7 projections over
