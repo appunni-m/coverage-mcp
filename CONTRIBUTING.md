@@ -8,7 +8,14 @@ when changing behavior.
 
 - Rust 1.85 or newer and Cargo;
 - Git;
-- `cargo-llvm-cov` for the required coverage gate;
+- `cargo-llvm-cov` for the required coverage gate. Install it with a current
+  stable toolchain because recent releases require Rust newer than the
+  project's 1.85 MSRV:
+
+  ```sh
+  rustup toolchain install stable --profile minimal
+  cargo +stable install cargo-llvm-cov --locked
+  ```
 - optional `cargo-deny` and `cargo-audit` for supply-chain checks.
 
 Build from a checkout:

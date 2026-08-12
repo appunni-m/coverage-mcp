@@ -29,7 +29,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install coverage tool
-        run: cargo install cargo-llvm-cov --locked
+        # cargo-llvm-cov currently requires Rust 1.87+ to build. Keep the
+        # project gate on its declared 1.85 MSRV and use stable only for this
+        # developer tool.
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-llvm-cov --locked
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
