@@ -1,0 +1,76 @@
+{
+  "schema": "coverage-mcp/eval-cases@1",
+  "purpose": "Golden, outcome-oriented MCP tasks used by the opt-in local evaluation runner.",
+  "cases": [
+    {
+      "id": "next-coverage",
+      "category": "outcome",
+      "prompt": "What should I attack next?",
+      "first_tool": "coverage_query",
+      "view": "targets",
+      "outcome": "A ranked list of uncovered red regions with exact file and range follow-ups.",
+      "required_terms": ["ranked", "red", "regions"],
+      "follow_up_tools": ["source_context"]
+    },
+    {
+      "id": "previous-impact",
+      "category": "outcome",
+      "prompt": "What got impacted since the previous session?",
+      "first_tool": "coverage_compare",
+      "view": "regions",
+      "outcome": "Grouped regressions and improvements without returning every covered line.",
+      "required_terms": ["grouped", "token-efficient", "source_context"],
+      "follow_up_tools": ["source_context", "coverage_compare"]
+    },
+    {
+      "id": "red-file",
+      "category": "outcome",
+      "prompt": "Show the red portions in one file.",
+      "first_tool": "coverage_query",
+      "view": "file",
+      "outcome": "GitHub-like red ranges first, with exact selected lines only when requested.",
+      "required_terms": ["one file", "red", "line_ranges"],
+      "follow_up_tools": ["source_context"]
+    },
+    {
+      "id": "source-range",
+      "category": "outcome",
+      "prompt": "Show the source around this uncovered range.",
+      "first_tool": "source_context",
+      "view": "bounded source range",
+      "outcome": "Numbered source lines annotated red, green, yellow, or gray for one contiguous range.",
+      "required_terms": ["bounded", "contiguous", "red/green/yellow/gray"],
+      "follow_up_tools": []
+    },
+    {
+      "id": "line-history",
+      "category": "outcome",
+      "prompt": "How has this line behaved over time?",
+      "first_tool": "coverage_query",
+      "view": "line_history",
+      "outcome": "A compact history for one file and line, with detailed mode reserved for an audit.",
+      "required_terms": ["line over time", "detailed"],
+      "follow_up_tools": []
+    },
+    {
+      "id": "approved-run",
+      "category": "workflow",
+      "prompt": "Run the approved test and show the relevant failure evidence.",
+      "first_tool": "project_context",
+      "view": "approved asynchronous run",
+      "outcome": "Discover approved commands, submit asynchronously, respect polling, then search targeted logs.",
+      "required_terms": ["approved", "poll", "targeted"],
+      "follow_up_tools": ["register_test_command", "run_test", "get_run_data", "search_test_logs"]
+    },
+    {
+      "id": "latest-run-selector",
+      "category": "confusion",
+      "prompt": "Do I need a run_id to read the last run, or can get_run_data select it automatically?",
+      "first_tool": "project_context",
+      "view": "latest_run.id → get_run_data(run_id)",
+      "outcome": "The agent understands that project_context exposes latest_run.id and get_run_data requires that explicit id.",
+      "required_terms": ["latest_run", "run_id", "get_run_data", "no implicit latest"],
+      "follow_up_tools": ["get_run_data"]
+    }
+  ]
+}

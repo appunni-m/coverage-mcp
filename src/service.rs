@@ -420,6 +420,7 @@ impl CoverageService {
         max_words: usize,
         detailed: bool,
     ) -> AppResult<Value> {
+        validate_max_words(max_words)?;
         let context = self.context(suite);
         let mut selected_snapshot = snapshot_id.map(|id| self.store.snapshot(id)).transpose()?;
         let mut selected_id = snapshot_id.map(str::to_owned);
@@ -602,6 +603,7 @@ impl CoverageService {
         max_words: usize,
         detailed: bool,
     ) -> AppResult<Value> {
+        validate_max_words(max_words)?;
         if view == "progress" {
             let worktree_id = worktree_id.ok_or_else(|| {
                 AppError::Validation(

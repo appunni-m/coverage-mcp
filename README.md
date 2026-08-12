@@ -190,10 +190,10 @@ an empty log search is a successful empty result.
 
 | Tool | Inputs | Returns and next step |
 | --- | --- | --- |
-| `project_context` | `cursor`, `max_words`, `detailed` | Project identity including the stable project `id`, compaction policy, approved commands, latest run, active runs, and page metadata. Call first. |
+| `project_context` | `cursor`, `max_words`, `detailed` | Project identity including the stable project `id`, compaction policy, approved commands, `latest_run`, active runs, and page metadata. Call first; use `data.latest_run.id` as the `run_id` for `get_run_data`. |
 | `register_test_command` | `name`, `command`, `human_approved`, `approved_by`, `approval_note`, optional `cwd`, `shell`, `artifact_paths`, `max_words` | Immutable approval record. Human approval must be true; pass its id or name to `run_test`. |
 | `run_test` | `command_ref`, optional `timeout_seconds`, `idempotency_key`, `wait`, `max_words` | Durable run id, queue/ETA, process counters, and coverage-ingest status. Prefer `wait=false`; failed setup and shutdown paths are terminalized rather than left running. |
-| `get_run_data` | `run_id`, `max_words`, `detailed` | Read-only durable run state. When `terminal=false`, wait at least `poll_after_ms` before calling again. |
+| `get_run_data` | required `run_id`, `max_words`, `detailed` | Read-only durable state for exactly one run. It does not select the latest run implicitly; use `project_context.data.latest_run.id`. When `terminal=false`, wait at least `poll_after_ms` before calling again. |
 | `cancel_run` | `run_id`, `max_words`, `detailed` | Cancellation request and terminal state. Use only when the user no longer wants the run. |
 | `search_test_logs` | `run_id`, `query` string or array, optional `stream`, `context_lines`, `max_matches`, `max_words`, `case_sensitive` | Word-bounded stdout/stderr matches. Queries in an array use OR matching. Retained output is capped per stream; ask for matches or small context windows rather than full logs. |
 | `ingest_coverage` | `report_path`, optional `format`, `suite`, `branch`, `commit_sha`, `base_ref`, `max_words` | Immutable snapshot summary, parser warnings, and provenance. Supported formats include LCOV, coverage JSON, Cobertura, JaCoCo, Istanbul, Go, and LLVM. Reports are size-bounded and malformed numeric fields are explicit validation errors. |
@@ -433,6 +433,7 @@ make coverage
 make migration-parity
 make migration-benchmark
 make migration-status
+make mcp-evals  # opt-in; not part of CI
 make docs
 make lint
 ```
@@ -459,6 +460,15 @@ lanes and coverage gate, `make migration-status` emits the fixed aggregate at
 `target/migration/status-report.json` plus generated contract and status pages
 under `docs/generated/`. Missing, dirty, or incompatible evidence is reported
 as `not_proven`.
+
+### MCP evaluation suite
+
+The opt-in [`evals/README.md`](evals/README.md) describes the comprehensive
+agent-facing evaluation suite. It covers independent usability, confusion,
+token and compute efficiency, outcome-driven tool selection, compact coverage
+workflows, protocol behavior, safety, validation, idempotent runs, pagination,
+and retained evidence. Run it with `make mcp-evals`; it intentionally does not
+run in CI or in the default workspace test commands.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the review workflow,
 [`docs/architecture.md`](docs/architecture.md) for ownership boundaries, and

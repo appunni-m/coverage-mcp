@@ -1923,6 +1923,39 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
         .unwrap();
     let second_id = second["data"]["id"].as_str().unwrap();
     let first_id = snapshot["id"].as_str().unwrap();
+    assert!(
+        service
+            .coverage_query(
+                "summary",
+                Some(second_id),
+                None,
+                Some("unit"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                49,
+                false,
+            )
+            .is_err()
+    );
+    assert!(
+        service
+            .coverage_comparison(
+                "overview",
+                Some(second_id),
+                Some(first_id),
+                None,
+                Some("unit"),
+                None,
+                false,
+                None,
+                49,
+                false,
+            )
+            .is_err()
+    );
     let other_suite_snapshot = service
         .ingest(
             "coverage.lcov",

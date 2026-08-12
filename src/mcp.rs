@@ -36,7 +36,7 @@ pub fn tools_list() -> Value {
     Value::Array(vec![
         tool(
             "project_context",
-            "Discover project state before work: stable project id, metrics/freshness, exact approved commands, latest run, active runs, and page metadata. Use detailed only for approval audit fields and full project chronology.",
+            "Discover project state before work: stable project id, metrics/freshness, exact approved commands, latest_run, active runs, and page metadata. The returned latest_run.id is the run_id for get_run_data; get_run_data has no implicit latest-run selection. Use detailed only for approval audit fields and full project chronology.",
             read_only(),
             object_schema(
                 &[
@@ -115,11 +115,16 @@ pub fn tools_list() -> Value {
         ),
         tool(
             "get_run_data",
-            "Fetch durable run data. This tool is read-only: it only returns current state and never starts, advances, reruns, or cancels a run. terminal=false means wait at least poll_after_ms before the next get_run_data call; do not immediately call again. Use detailed only for artifact paths, exact timestamps, or execution audit.",
+            "Fetch durable run data for one required run_id. There is no implicit latest-run selection: call project_context, read data.latest_run.id, then pass that id here. This tool is read-only: it only returns current state and never starts, advances, reruns, or cancels a run. terminal=false means wait at least poll_after_ms before the next get_run_data call; do not immediately call again. Use detailed only for artifact paths, exact timestamps, or execution audit.",
             read_only(),
             object_schema(
                 &[
-                    ("run_id", string("Durable run UUID.")),
+                    (
+                        "run_id",
+                        string(
+                            "Required durable run UUID. To inspect the latest run, use data.latest_run.id from project_context; this tool does not infer it.",
+                        ),
+                    ),
                     ("max_words", budget_schema()),
                     ("detailed", detailed_schema()),
                 ],
@@ -833,6 +838,30 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("exactly one compact coverage projection per call")
+        );
+        let project_context = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "project_context")
+            .unwrap();
+        assert!(
+            project_context["description"]
+                .as_str()
+                .unwrap()
+                .contains("latest_run.id is the run_id")
+        );
+        let get_run_data = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_run_data")
+            .unwrap();
+        assert!(
+            get_run_data["description"]
+                .as_str()
+                .unwrap()
+                .contains("no implicit latest-run selection")
         );
         assert_eq!(
             coverage_query["inputSchema"]["properties"]["order_by"]["enum"][0],

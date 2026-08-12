@@ -3,7 +3,7 @@ CARGO ?= cargo
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release fmt fmt-fix check check-diff clippy test test-ci coverage docs migration-parity migration-benchmark migration-status lint ci clean
+.PHONY: help build release fmt fmt-fix check check-diff clippy test test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
 
 help:
 	@printf '%s\n' 'Coverage MCP Rust workspace'
@@ -12,7 +12,7 @@ help:
 	@printf '%s\n' '' 'Quality:'
 	@printf '%s\n' '  make fmt         check rustfmt' '  make fmt-fix     apply rustfmt' '  make clippy      strict clippy with warnings denied' '  make lint        format + clippy'
 	@printf '%s\n' '' 'Verification:'
-	@printf '%s\n' '  make test        all workspace tests' '  make test-ci     compile all targets once, then run test targets concurrently' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
+	@printf '%s\n' '  make test        all workspace tests' '  make test-ci     compile all targets once, then run test targets concurrently' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
 	@printf '%s\n' '' 'Runtime:'
 	@printf '%s\n' '  cargo run -- serve' '  cargo run -- connect --repo .' '  cargo run -- compact --repo .'
 
@@ -84,6 +84,10 @@ migration-benchmark:
 migration-status:
 	$(CARGO) build --offline --locked --bin migration-status
 	./target/debug/migration-status .
+
+mcp-evals:
+	mkdir -p target/evals
+	$(CARGO) run --offline --locked --bin mcp-evals -- --report target/evals/mcp-eval-report.json
 
 lint: fmt clippy
 
