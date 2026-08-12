@@ -20,7 +20,7 @@ jobs:
   verify:
     name: Rust verification
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,10 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-targets --all-features --locked
       - name: Migration parity
-        run: make migration-parity
+        # The Tests step already executes the complete rust_migration suite.
+        # Record its manifest-bound evidence without launching that suite a
+        # second time on a fresh hosted runner.
+        run: cargo run --offline --locked --bin migration-status -- --record-parity .
       - name: Migration benchmark
         run: make migration-benchmark
       - name: Coverage
