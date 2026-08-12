@@ -44,11 +44,19 @@ pub use storage::{CoverageStore, ProjectSettings, ProjectSettingsPatch};
 
 /// Returns the stable short identifier used to address a canonical project.
 pub(crate) fn stable_project_id(repo_key: &str) -> String {
-    Sha256::digest(repo_key.as_bytes())
-        .iter()
-        .take(12)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = Sha256::digest(repo_key.as_bytes());
+    hex_prefix(&digest, 12)
+}
+
+/// Encodes up to `max_bytes` of a digest as lowercase hexadecimal.
+pub(crate) fn hex_prefix(bytes: &[u8], max_bytes: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().min(max_bytes) * 2);
+    for &byte in bytes.iter().take(max_bytes) {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 // The migration suite remains an integration test target, but compiling the

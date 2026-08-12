@@ -13,12 +13,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::SCHEMA_REVISION;
 use crate::error::{AppError, AppResult};
 use crate::git::inspect_git;
 use crate::storage::{
     COLLECTION_FETCH_LIMIT, CoverageStore, LineRange, MAX_COLLECTION_RECORDS, ProjectSettingsPatch,
 };
+use crate::{SCHEMA_REVISION, hex_prefix};
 
 /// Default response word budget used by compact agent-facing calls.
 pub const DEFAULT_MAX_WORDS: usize = 600;
@@ -859,17 +859,13 @@ fn validate_max_words(max_words: usize) -> AppResult<()> {
 
 fn cursor_scope(scope: &str) -> String {
     let digest = Sha256::digest(scope.as_bytes());
-    digest
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_prefix(&digest, 8)
 }
 
 fn cursor_anchor(value: &Value) -> String {
     let canonical = canonical_json(value);
     let digest = Sha256::digest(canonical.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex_prefix(&digest, digest.len())
 }
 
 fn canonical_json(value: &Value) -> String {

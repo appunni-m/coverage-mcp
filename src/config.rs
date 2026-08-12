@@ -360,6 +360,7 @@ mod tests {
                 .is_err()
         );
         let no_environment = |_: &str| None;
+        assert!(no_environment("HOME").is_none());
         assert!(
             ServerConfig::for_repository_with_lookup(PathBuf::from("\0"), &no_environment).is_err()
         );
@@ -456,8 +457,7 @@ mod tests {
             let invalid = |name: &str| (name == invalid_name).then(|| "not-an-integer".to_owned());
             assert!(
                 ServerConfig::from_environment_with_lookup(None, None, None, None, &invalid)
-                    .is_err(),
-                "{invalid_name} should reject malformed values"
+                    .is_err()
             );
         }
 
@@ -507,8 +507,7 @@ mod tests {
                     Some(PathBuf::from("common")),
                     &lookup,
                 )
-                .is_err(),
-                "invalid environment value should fail: {invalid}"
+                .is_err()
             );
         }
 
@@ -533,8 +532,7 @@ mod tests {
                     Some(PathBuf::from("common")),
                     &lookup,
                 )
-                .is_err(),
-                "out-of-range environment value should fail: {name}"
+                .is_err()
             );
         }
     }

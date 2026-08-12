@@ -361,10 +361,18 @@ fn read_json(path: &Path) -> StatusResult<Value> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = Sha256::digest(bytes);
+    hex_prefix(&digest, digest.len())
+}
+
+fn hex_prefix(bytes: &[u8], max_bytes: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().min(max_bytes) * 2);
+    for &byte in bytes.iter().take(max_bytes) {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn target_identity(repository: &Path) -> StatusResult<Value> {

@@ -23,7 +23,7 @@ use crate::lock::{FileLease, database_lock_path};
 use crate::models::CoverageReport;
 use crate::parser::parse_coverage_report;
 use crate::pool::{DbConnection, DbPool, QueryTracker, checkout, open_pool, run_with_timeout};
-use crate::stable_project_id;
+use crate::{hex_prefix, stable_project_id};
 
 /// Defensive collection ceiling shared by all public projections.
 pub const MAX_COLLECTION_RECORDS: usize = 5_000;
@@ -2550,11 +2550,7 @@ fn compress_coverage_payload(reader: &mut dyn Read) -> AppResult<Vec<u8>> {
 
 fn short_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
-    digest
-        .iter()
-        .take(8)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hex_prefix(&digest, 8)
 }
 
 fn migrate_schema(connection: &Connection) -> AppResult<()> {

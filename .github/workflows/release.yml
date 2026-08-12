@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: 1.85.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Verify tag version
@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: 1.85.1
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
       - name: Publish crate

@@ -9,9 +9,28 @@ use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
 fn status_binary() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_migration-status")
-        .map(PathBuf::from)
-        .expect("Cargo must provide the migration-status binary to integration tests")
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_migration-status") {
+        return PathBuf::from(path);
+    }
+
+    // Cargo 1.85 does not expose CARGO_BIN_EXE_* for every binary when
+    // running `--all-targets`, but it still builds the binary beside `deps`.
+    let current_exe =
+        std::env::current_exe().expect("Cargo must provide the integration-test path");
+    let target_debug = current_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("integration tests must run below target/debug/deps");
+    let mut binary = target_debug.join("migration-status");
+    if cfg!(windows) {
+        binary.set_extension("exe");
+    }
+    assert!(
+        binary.is_file(),
+        "Cargo must build the migration-status binary at {}",
+        binary.display()
+    );
+    binary
 }
 
 fn fixture_repository() -> TempDir {
