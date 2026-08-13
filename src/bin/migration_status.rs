@@ -624,7 +624,7 @@ fn parity_result(
             "manifest":{"path":MANIFEST_RELATIVE,"schema":"migration-parity/manifest@2","sha256":context.manifest_sha256},
             "inputs":parity_inputs,
             "assets":[],
-            "oracles":[{"oracle_id":"frozen-contract","name":"Frozen schema-7 behavior contract","version":"1","runtime":"specification"}],
+            "oracles":[{"oracle_id":"frozen-contract","name":"Frozen schema-8 behavior contract","version":"1","runtime":"specification"}],
             "targets":[context.target],
             "command":{"command_id":"parity","argv":["cargo","test","rust_migration"],"cwd":".","timeout_seconds":900}
         },

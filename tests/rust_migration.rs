@@ -157,6 +157,101 @@ fn rust_migrates_all_parser_formats_and_aliases() {
 }
 
 #[test]
+fn rust_duplicate_coverage_tests_group_exact_line_sets() {
+    let directory = tempfile::tempdir().unwrap();
+    git_repo(directory.path());
+    let report = write_file(
+        directory.path(),
+        "named-tests.lcov",
+        "TN:alpha\nSF:src/a.py\nDA:1,1\nDA:2,1\nend_of_record\nTN:beta\nSF:src/a.py\nDA:1,9\nDA:2,4\nend_of_record\nTN:gamma\nSF:src/a.py\nDA:1,1\nDA:3,1\nend_of_record\nTN:empty\nSF:src/a.py\nDA:1,0\nend_of_record\n",
+    );
+    let store = store(directory.path());
+    let snapshot = store
+        .ingest_report(
+            &report,
+            "lcov",
+            Some(directory.path()),
+            Some("main"),
+            Some("named-head"),
+            None,
+            "unit",
+        )
+        .unwrap();
+    let snapshot_id = snapshot["id"].as_str().unwrap();
+    let expected = vec![vec!["alpha".to_owned(), "beta".to_owned()]];
+    assert_eq!(
+        store.duplicate_coverage_test_groups(snapshot_id).unwrap(),
+        expected
+    );
+    let project = store.project().unwrap();
+    let service = CoverageService::new(
+        store.clone(),
+        RequestContext {
+            repo_key: project.repo_key,
+            checkout_path: project.repo_path,
+            suite: None,
+        },
+    );
+    let latest = service
+        .find_duplicate_coverage_tests(None, Some("unit"))
+        .unwrap();
+    assert_eq!(latest["data"]["duplicate_test_groups"], json!(expected));
+    assert_eq!(latest["context"]["suite"], "unit");
+    assert!(
+        service
+            .find_duplicate_coverage_tests(None, Some("missing"))
+            .is_err()
+    );
+    let explicit = service
+        .find_duplicate_coverage_tests(Some(snapshot_id), None)
+        .unwrap();
+    assert_eq!(explicit["data"]["duplicate_test_groups"], json!(expected));
+    assert!(
+        service
+            .find_duplicate_coverage_tests(Some(snapshot_id), Some("other"))
+            .is_err()
+    );
+
+    let aggregate_report = write_file(
+        directory.path(),
+        "aggregate-only.lcov",
+        "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+    );
+    let aggregate = store
+        .ingest_report(
+            &aggregate_report,
+            "lcov",
+            Some(directory.path()),
+            Some("main"),
+            Some("aggregate-head"),
+            None,
+            "aggregate",
+        )
+        .unwrap();
+    let empty = service
+        .find_duplicate_coverage_tests(aggregate["id"].as_str(), None)
+        .unwrap();
+    assert_eq!(empty["data"]["duplicate_test_groups"], json!([]));
+    assert!(
+        mcp::call_tool(
+            &service,
+            "find_duplicate_coverage_tests",
+            &json!({"snapshot_id":snapshot_id,"suite":"unit"}),
+        )
+        .is_ok()
+    );
+    assert!(
+        mcp::call_tool(
+            &service,
+            "find_duplicate_coverage_tests",
+            &json!({"suite":7})
+        )
+        .is_err()
+    );
+    store.close().unwrap();
+}
+
+#[test]
 fn rust_migration_fixture_inputs_drive_registered_lanes() {
     let parser: Value =
         serde_json::from_str(include_str!("fixtures/inputs/parity/parser_formats.json")).unwrap();
@@ -395,6 +490,11 @@ fn rust_models_merge_metrics_and_path_normalization() {
         1,
         json!({"second":true}),
     );
+    builder.add_test_line(" duplicate-test ", "src/a.py", 1);
+    builder.add_test_line("duplicate-test", "src/a.py", 1);
+    builder.add_test_line("new-file-test", "src/new.py", 1);
+    builder.add_test_line("", "src/a.py", 2);
+    builder.add_test_line("invalid-line", "src/a.py", 0);
     builder.add_line("src/a.py", 0, 3, Some(true), true, 0, 0, 0, 0, json!({}));
     let mut metrics = serde_json::Map::new();
     metrics.insert("total_lines".to_owned(), json!(4));
@@ -410,6 +510,25 @@ fn rust_models_merge_metrics_and_path_normalization() {
     assert_eq!(report.lines[0].hits, 3);
     assert_eq!(report.files[0].total_lines, 4);
     assert_eq!(report.files[0].covered_lines, 3);
+    assert_eq!(report.test_coverage.len(), 2);
+    assert!(
+        report
+            .test_coverage
+            .contains(&coverage_mcp::models::TestCoverageLine {
+                test_name: "duplicate-test".to_owned(),
+                file_path: "src/a.py".to_owned(),
+                line_number: 1,
+            })
+    );
+    assert!(
+        report
+            .test_coverage
+            .contains(&coverage_mcp::models::TestCoverageLine {
+                test_name: "new-file-test".to_owned(),
+                file_path: "src/new.py".to_owned(),
+                line_number: 1,
+            })
+    );
     assert_eq!(report.warnings.len(), 1);
 
     let mut scalar = LineCoverage {
@@ -2762,7 +2881,7 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
     );
     let tools = mcp::tools_list();
     let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
     let names = tools
         .iter()
         .filter_map(|tool| tool["name"].as_str())
@@ -2968,7 +3087,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let report = write_file(
         directory.path(),
         "coverage.lcov",
-        "TN:\nSF:a.py\nDA:1,1\nend_of_record\n",
+        "TN:alpha\nSF:a.py\nDA:1,1\nend_of_record\nTN:beta\nSF:a.py\nDA:1,5\nend_of_record\n",
     );
     let probe_listener = match TcpListener::bind(("127.0.0.1", 0)).await {
         Ok(listener) => listener,
@@ -3037,7 +3156,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     drop(malformed);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let health = http_exchange(address, "GET", "/health", None, None).await;
-    assert_eq!(health["schema_revision"], 7);
+    assert_eq!(health["schema_revision"], SCHEMA_REVISION);
     assert!(
         http_raw(address, "GET", "/mcp/", None, None)
             .await
@@ -3074,6 +3193,18 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let body = json!({"report_path":report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head"});
     let ingested = http_exchange(address, "POST", "/api/ingest", Some(&body), None).await;
     let snapshot_id = ingested["data"]["id"].as_str().unwrap().to_owned();
+    let duplicate_tests = http_exchange(
+        address,
+        "GET",
+        &format!("/api/duplicate-coverage-tests?snapshot_id={snapshot_id}&suite=unit"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        duplicate_tests["data"]["duplicate_test_groups"],
+        json!([["alpha", "beta"]])
+    );
     assert!(
         http_raw_payload(address, "POST", "/api/ingest", "not-json", None)
             .await
@@ -3530,7 +3661,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 12);
     let _resources = http_exchange(
         address,
         "POST",

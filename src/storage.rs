@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,7 @@ const INSERT_COMPLETED_RUN_SQL: &str = "INSERT INTO runs (id, command_id, comman
 const INSERT_SNAPSHOT_SQL: &str = "INSERT INTO snapshots (id, created_at, minute_bucket, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_FILE_SQL: &str = "INSERT INTO files (snapshot_id, file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_LINE_SQL: &str = "INSERT INTO lines (snapshot_id, file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_TEST_COVERAGE_LINE_SQL: &str = "INSERT INTO test_coverage_lines (snapshot_id, test_name, file_path, line_number) VALUES (?, ?, ?, ?)";
 
 /// Mutable project-settings fields accepted by REST and the CLI.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -241,6 +242,7 @@ fn remove_compacted_detail(
     if inserted {
         delete_snapshot_rows(connection, snapshot_id, "files")?;
         delete_snapshot_rows(connection, snapshot_id, "lines")?;
+        delete_snapshot_rows(connection, snapshot_id, "test_coverage_lines")?;
     }
     Ok(())
 }
@@ -534,6 +536,10 @@ impl CoverageStore {
                     total_branches INTEGER NOT NULL, covered_branches INTEGER NOT NULL, total_functions INTEGER NOT NULL,
                     covered_functions INTEGER NOT NULL, details VARCHAR NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS test_coverage_lines (
+                    snapshot_id VARCHAR NOT NULL, test_name VARCHAR NOT NULL, file_path VARCHAR NOT NULL,
+                    line_number INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS worktrees (
                     id VARCHAR PRIMARY KEY, created_at TIMESTAMP NOT NULL, name VARCHAR, path VARCHAR NOT NULL,
                     repo_path VARCHAR NOT NULL, repo_key VARCHAR NOT NULL, branch VARCHAR, head_sha VARCHAR,
@@ -585,6 +591,7 @@ impl CoverageStore {
                 CREATE INDEX IF NOT EXISTS idx_snapshots_commit ON snapshots(repo_key, commit_sha);
                 CREATE INDEX IF NOT EXISTS idx_files_snapshot ON files(snapshot_id);
                 CREATE INDEX IF NOT EXISTS idx_lines_lookup ON lines(snapshot_id, file_path, line_number);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_test_coverage_unique ON test_coverage_lines(snapshot_id, test_name, file_path, line_number);
                 CREATE INDEX IF NOT EXISTS idx_worktrees_repo ON worktrees(repo_key, created_at);
                 CREATE INDEX IF NOT EXISTS idx_registered_commands_name ON registered_commands(name, created_at);
                 CREATE INDEX IF NOT EXISTS idx_runs_command_time ON runs(command_id, started_at);
@@ -881,7 +888,22 @@ impl CoverageStore {
             let mut statement = connection.prepare("SELECT file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details FROM lines WHERE snapshot_id = ? ORDER BY file_path, line_number")?;
             Self::query_detail_lines(&mut statement, params![snapshot_id])
         })?;
-        Ok(json!({"files": files, "lines": lines}))
+        let test_coverage = self.with_read_connection(|connection| {
+            let mut statement = connection.prepare("SELECT test_name, file_path, line_number FROM test_coverage_lines WHERE snapshot_id = ? ORDER BY test_name, file_path, line_number")?;
+            let rows = statement.query_map(params![snapshot_id], |row| {
+                Ok(json!({
+                    "test_name": row.get::<_, String>(0)?,
+                    "file_path": row.get::<_, String>(1)?,
+                    "line_number": row.get::<_, i64>(2)?,
+                }))
+            })?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
+        })?;
+        Ok(json!({"files": files, "lines": lines, "test_coverage": test_coverage}))
     }
 
     fn query_detail_lines<P: duckdb::Params>(
@@ -2418,6 +2440,15 @@ impl CoverageStore {
                     ];
                     connection.execute(INSERT_LINE_SQL, line_values)?;
                 }
+                for line in &report.test_coverage {
+                    let test_line_values = params![
+                        snapshot_id,
+                        line.test_name,
+                        line.file_path,
+                        line.line_number
+                    ];
+                    connection.execute(INSERT_TEST_COVERAGE_LINE_SQL, test_line_values)?;
+                }
                 Ok::<(), AppError>(())
             })();
             finish_transaction(connection, result)
@@ -2582,6 +2613,47 @@ impl CoverageStore {
             }
         }
         Ok(selected)
+    }
+
+    /// Returns groups of named tests with exactly equal covered source lines.
+    pub fn duplicate_coverage_test_groups(&self, snapshot_id: &str) -> AppResult<Vec<Vec<String>>> {
+        self.snapshot(snapshot_id)?;
+        let mut rows = self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT test_name, file_path, line_number FROM test_coverage_lines WHERE snapshot_id = ? ORDER BY test_name, file_path, line_number",
+            )?;
+            let mapped = statement.query_map(params![snapshot_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                rows.push(row?);
+            }
+            Ok(rows)
+        })?;
+        if rows.is_empty() {
+            if let Some(payload) = self.compacted_detail(snapshot_id)? {
+                if let Some(test_coverage) = payload.get("test_coverage") {
+                    let test_coverage = test_coverage.as_array().ok_or_else(|| {
+                        AppError::Runtime(
+                            "compacted coverage test_coverage must be an array".to_owned(),
+                        )
+                    })?;
+                    for line in test_coverage {
+                        rows.push((
+                            required_string_field(line, "test_name", "compacted test coverage")?,
+                            required_string_field(line, "file_path", "compacted test coverage")?,
+                            required_i64_field(line, "line_number", "compacted test coverage")?,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(duplicate_test_groups(rows))
     }
 
     /// Returns exact line records in normalized inclusive ranges.
@@ -2896,6 +2968,30 @@ fn line_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     }
     value.insert("details".to_owned(), json_string(row.get::<_, String>(8)?));
     Ok(Value::Object(value))
+}
+
+fn duplicate_test_groups(rows: Vec<(String, String, i64)>) -> Vec<Vec<String>> {
+    let mut coverage_by_test: BTreeMap<String, BTreeSet<(String, i64)>> = BTreeMap::new();
+    for (test_name, file_path, line_number) in rows {
+        coverage_by_test
+            .entry(test_name)
+            .or_default()
+            .insert((file_path, line_number));
+    }
+
+    let mut tests_by_coverage: BTreeMap<Vec<(String, i64)>, Vec<String>> = BTreeMap::new();
+    for (test_name, lines) in coverage_by_test {
+        tests_by_coverage
+            .entry(lines.into_iter().collect())
+            .or_default()
+            .push(test_name);
+    }
+    let mut groups = tests_by_coverage
+        .into_values()
+        .filter(|tests| tests.len() > 1)
+        .collect::<Vec<_>>();
+    groups.sort();
+    groups
 }
 
 fn timestamp_string(value: ValueRef<'_>) -> String {
@@ -4644,7 +4740,11 @@ mod tests {
             .submit_command(command["id"].as_str().unwrap(), None, None, 20)
             .unwrap();
         let report = directory.path().join("compact.lcov");
-        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        std::fs::write(
+            &report,
+            "TN:duplicate-a\nSF:src/a.py\nDA:1,1\nDA:2,0\nend_of_record\nTN:duplicate-b\nSF:src/a.py\nDA:1,5\nDA:2,0\nend_of_record\n",
+        )
+        .unwrap();
         let project = store.ensure_project(directory.path()).unwrap();
         let snapshot = store
             .ingest_report(
@@ -4690,16 +4790,28 @@ mod tests {
                 .file_gaps(gap_snapshot["id"].as_str().unwrap(), "src/a.py", 10)
                 .is_ok()
         );
+        assert_eq!(
+            store
+                .duplicate_coverage_test_groups(snapshot["id"].as_str().unwrap())
+                .unwrap(),
+            vec![vec!["duplicate-a".to_owned(), "duplicate-b".to_owned()]]
+        );
         let first = store
             .compact_snapshot_detail(&project.repo_key, snapshot["id"].as_str().unwrap())
             .unwrap();
         assert!(first.0);
+        assert_eq!(
+            store
+                .duplicate_coverage_test_groups(snapshot["id"].as_str().unwrap())
+                .unwrap(),
+            vec![vec!["duplicate-a".to_owned(), "duplicate-b".to_owned()]]
+        );
         let second = store
             .compact_snapshot_detail(&project.repo_key, snapshot["id"].as_str().unwrap())
             .unwrap();
         assert!(!second.0);
         let malformed_payload = {
-            let bytes = serde_json::to_vec(&json!({"lines":[]})).unwrap();
+            let bytes = serde_json::to_vec(&json!({"lines":[],"test_coverage":{}})).unwrap();
             let mut reader = bytes.as_slice();
             compress_coverage_payload(&mut reader).unwrap()
         };
@@ -4713,6 +4825,11 @@ mod tests {
             })
         };
         update_malformed_payload().unwrap();
+        assert!(
+            store
+                .duplicate_coverage_test_groups(snapshot["id"].as_str().unwrap())
+                .is_err()
+        );
         assert!(store.files(snapshot["id"].as_str().unwrap(), 10).is_err());
         assert!(
             store
@@ -4738,6 +4855,12 @@ mod tests {
             store
                 .lines(snapshot["id"].as_str().unwrap(), "src/a.py", 10)
                 .is_err()
+        );
+        assert!(
+            store
+                .duplicate_coverage_test_groups(snapshot["id"].as_str().unwrap())
+                .unwrap()
+                .is_empty()
         );
         let unmatched_lines_payload = {
             let bytes = serde_json::to_vec(&json!({
@@ -4892,6 +5015,42 @@ mod tests {
         assert!(install_malformed_snapshot_view("THIS IS NOT VALID SQL").is_err());
         assert!(store.previous_snapshot(current_snapshot_id).is_err());
         store.close().unwrap();
+
+        let query_error_store = CoverageStore::open(
+            directory.path().join("duplicate-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        query_error_store.ensure_project(directory.path()).unwrap();
+        let query_error_report = directory.path().join("duplicate-query-error.lcov");
+        std::fs::write(
+            &query_error_report,
+            "TN:query-error\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let query_error_snapshot = query_error_store
+            .ingest_report(
+                &query_error_report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        query_error_store
+            .with_connection(|connection| {
+                connection.execute_batch("DROP TABLE test_coverage_lines")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            query_error_store
+                .duplicate_coverage_test_groups(query_error_snapshot["id"].as_str().unwrap())
+                .is_err()
+        );
+        query_error_store.close().unwrap();
 
         let no_worker =
             CoverageStore::open(directory.path().join("no-worker.duckdb"), test_config()).unwrap();
@@ -5854,6 +6013,7 @@ mod tests {
             report_path: "missing.lcov".to_owned(),
             files: Vec::new(),
             lines: Vec::new(),
+            test_coverage: Vec::new(),
             warnings: Vec::new(),
             metadata: Value::Null,
         };
@@ -6046,6 +6206,78 @@ mod tests {
             .unwrap();
         assert!(query_map_store.detail_payload("missing").is_err());
         query_map_store.close().unwrap();
+
+        let detail_test_coverage_store = CoverageStore::open(
+            directory.path().join("detail-test-coverage-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        detail_test_coverage_store
+            .ensure_project(directory.path())
+            .unwrap();
+        let detail_test_coverage_report = directory.path().join("detail-test-coverage.lcov");
+        std::fs::write(
+            &detail_test_coverage_report,
+            "TN:detail-test\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let detail_test_coverage_snapshot = detail_test_coverage_store
+            .ingest_report(
+                &detail_test_coverage_report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        stop_compaction_worker(&detail_test_coverage_store);
+        let test_coverage_snapshot_id = detail_test_coverage_snapshot["id"].as_str().unwrap();
+        detail_test_coverage_store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("DROP TABLE test_coverage_lines")
+                    .unwrap();
+                connection
+                    .execute_batch(
+                        &format!(
+                            "CREATE VIEW test_coverage_lines AS
+                             SELECT '{test_coverage_snapshot_id}' AS snapshot_id, 'detail-test' AS test_name, 'src/a.py' AS file_path, CAST(error('query failure') AS BIGINT) AS line_number;"
+                        ),
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let set_test_coverage_view = |line_expression: &str| {
+            detail_test_coverage_store
+                .with_connection(|connection| {
+                    connection
+                        .execute_batch(&format!(
+                            "DROP VIEW test_coverage_lines;
+                             CREATE VIEW test_coverage_lines AS
+                             SELECT '{test_coverage_snapshot_id}' AS snapshot_id, 'detail-test' AS test_name, 'src/a.py' AS file_path, {line_expression} AS line_number;"
+                        ))
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let first_detail_result = detail_test_coverage_store
+            .detail_payload(detail_test_coverage_snapshot["id"].as_str().unwrap());
+        assert!(first_detail_result.is_err());
+        let first_duplicate_result = detail_test_coverage_store
+            .duplicate_coverage_test_groups(detail_test_coverage_snapshot["id"].as_str().unwrap());
+        assert!(first_duplicate_result.is_err());
+        set_test_coverage_view("'bad'");
+        let second_detail_result = detail_test_coverage_store
+            .detail_payload(detail_test_coverage_snapshot["id"].as_str().unwrap());
+        assert!(second_detail_result.is_err());
+        let second_duplicate_result = detail_test_coverage_store
+            .duplicate_coverage_test_groups(detail_test_coverage_snapshot["id"].as_str().unwrap());
+        assert!(second_duplicate_result.is_err());
+        detail_test_coverage_store.close().unwrap();
 
         let settings_store = CoverageStore::open(
             directory.path().join("settings-error.duckdb"),

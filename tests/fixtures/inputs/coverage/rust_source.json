@@ -6,14 +6,14 @@
       "covers": [
         "coverage-mcp.parser.parse.formats",
         "coverage-mcp.storage.compact.project-policy",
-        "coverage-mcp.transport.contract.schema7"
+        "coverage-mcp.transport.contract.schema8"
       ],
       "target_profile": "rust-default",
       "selectors": {
         "parity_case_ids": [
           "coverage-mcp.parser.parse.formats",
           "coverage-mcp.storage.compact.project-policy",
-          "coverage-mcp.transport.contract.schema7"
+          "coverage-mcp.transport.contract.schema8"
         ],
         "command_ids": []
       },

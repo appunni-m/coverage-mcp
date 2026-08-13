@@ -610,6 +610,7 @@ fn evaluate_usability(section: &mut SectionBuilder, cases: &CaseCorpus) -> Resul
         "register_worktree",
         "coverage_query",
         "coverage_compare",
+        "find_duplicate_coverage_tests",
         "source_context",
     ];
     section.check(
@@ -1013,7 +1014,7 @@ fn evaluate_protocol(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         "json-rpc-tools-list",
         tools["result"]["tools"]
             .as_array()
-            .is_some_and(|items| items.len() == 11),
+            .is_some_and(|items| items.len() == 12),
         "tools/list returns the complete public inventory",
     );
     let resources = dispatch(

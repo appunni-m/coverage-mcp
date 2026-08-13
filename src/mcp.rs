@@ -13,11 +13,13 @@ use crate::service::{CoverageService, DEFAULT_MAX_WORDS};
 use crate::storage::LineRange;
 
 /// MCP stream endpoint instructions shown during initialization.
-pub const MCP_INSTRUCTIONS: &str = r#"Coverage MCP 0.8.0 schema 7 exposes a compact, composable agent interface.
+pub const MCP_INSTRUCTIONS: &str = r#"Coverage MCP 0.8.0 schema 8 exposes a compact, composable agent interface.
 
 Start with project_context, then run only exact approved registrations returned there or created with register_test_command after human approval. Submit with run_test(wait=false), save the run id, then fetch status with get_run_data(detailed=false). get_run_data is read-only: it only returns durable run data and never starts, advances, reruns, or cancels work. For every non-terminal response, wait at least the returned poll_after_ms before the next get_run_data call; do not poll immediately. Use cancel_run only when the user no longer wants the run. Use search_test_logs for targeted retained stdout/stderr evidence; managed output is byte-capped and a terminal summary reports truncated=true when the cap was reached. Run setup, capture, polling, persistence, timeout, cancellation, and shutdown failures are terminalized as failed durable jobs, so never assume a non-terminal run is permanent.
 
 Coverage queries are deliberately narrow and composable. Each coverage_query, coverage_compare, or source_context call answers one projection or one bounded source range; it is expected and supported to make multiple calls for one user task. Use coverage_query view=targets for the ranked next work, coverage_compare view=regions for grouped previous-session impact, coverage_query view=file for one file's red regions, and source_context for the exact source text of a selected region. Chain calls by carrying forward snapshot_id, file_path, and start/end ranges from earlier results. Run independent calls separately or in parallel; run source follow-ups only after their target ranges are known. Use coverage_query view=file with line_ranges or coverage_compare view=lines only when exact per-line audit data is needed.
+
+Use find_duplicate_coverage_tests to return all groups of named tests with exactly equal covered (file_path, line_number) sets. It has no pagination or detailed mode; snapshot_id and suite are optional, and reports without named test coverage return an empty group list. LCOV TN records are preserved as test names during ingestion.
 
 Every successful response is {context,data,page}; max_words is the per-call response budget (50–5000, default 600) and collections continue with page.next_cursor. Omit detailed or keep it false for normal work; set it true only when a tool description names required audit or raw-provenance fields. detailed never returns logs. The daemon uses stateless JSON responses, bounded MCP concurrency, bounded HTTP/DuckDB deadlines, and bounded HTTP bodies; keep query fan-out bounded and retry an individual request with backoff after a transient 503/504 or interrupted connection. Coverage ingestion is capped at 64 MiB and malformed numeric report fields are validation errors, never silent zeroes."#;
 
@@ -336,6 +338,28 @@ pub fn tools_list() -> Value {
             ),
         ),
         tool(
+            "find_duplicate_coverage_tests",
+            "Find all groups of named tests with exactly identical covered source-line sets in one snapshot. Equality uses canonical repository-relative file paths and one-based line numbers; hit counts are ignored. snapshot_id and suite are optional and default to the latest matching snapshot. There is no pagination, max_words, or detailed mode. Reports without named per-test coverage return an empty duplicate_test_groups array.",
+            read_only(),
+            object_schema(
+                &[
+                    (
+                        "snapshot_id",
+                        nullable_string(
+                            "Optional snapshot UUID; omitted selects the latest snapshot for the selected checkout and suite.",
+                        ),
+                    ),
+                    (
+                        "suite",
+                        nullable_string(
+                            "Optional suite selector used when choosing the latest snapshot.",
+                        ),
+                    ),
+                ],
+                &[],
+            ),
+        ),
+        tool(
             "source_context",
             "Read exactly one bounded, contiguous source range per call. Make separate calls for disjoint ranges. Each line includes a compact coverage status and red/green/yellow/gray marker; red_regions groups missed executable lines. Request one-based start/end ranges after coverage_query or coverage_compare identifies the file and lines; ranges are capped at 200 lines.",
             read_only(),
@@ -561,6 +585,10 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             optional_string(args, "cursor")?,
             max_words,
             detailed,
+        ),
+        "find_duplicate_coverage_tests" => service.find_duplicate_coverage_tests(
+            optional_string(args, "snapshot_id")?,
+            optional_string(args, "suite")?,
         ),
         "source_context" => service.source(
             required_string(args, "snapshot_id")?,
@@ -878,7 +906,7 @@ mod tests {
 
         let tools = dispatch_json_rpc(None, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
             .unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 12);
 
         assert!(
             dispatch_json_rpc(

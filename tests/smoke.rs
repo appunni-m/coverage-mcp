@@ -168,7 +168,7 @@ fn native_stdio_mcp_smoke() {
     assert_eq!(responses[0]["result"]["serverInfo"]["name"], "coverage-mcp");
     assert_eq!(
         responses[1]["result"]["tools"].as_array().unwrap().len(),
-        11
+        12
     );
     assert!(responses[2]["result"]["resources"].is_array());
     assert_eq!(responses[3]["error"]["code"], -32000);

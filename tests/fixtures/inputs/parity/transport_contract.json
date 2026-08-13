@@ -2,10 +2,10 @@
   "schema": "migration-parity/parity-input@1",
   "cases": [
     {
-      "case_id": "coverage-mcp.transport.contract.schema7",
+      "case_id": "coverage-mcp.transport.contract.schema8",
       "surface": "coverage-mcp.transport",
       "operation": "contract",
-      "covers": ["coverage-mcp.transport.contract.schema7"],
+      "covers": ["coverage-mcp.transport.contract.schema8"],
       "target_profiles": ["rust-default"],
       "assets": [],
       "steps": [
@@ -14,7 +14,7 @@
           "surface": "coverage-mcp.transport",
           "operation": "contract",
           "receiver": null,
-          "arguments": {"input": {"kind": "literal", "value": {"schema_revision": 7, "tools": 11, "resources": 2}}}
+          "arguments": {"input": {"kind": "literal", "value": {"schema_revision": 8, "tools": 12, "resources": 2}}}
         }
       ],
       "observations": ["contract"]

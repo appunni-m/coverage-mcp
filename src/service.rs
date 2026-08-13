@@ -350,6 +350,45 @@ impl CoverageService {
         Ok(self.envelope(compact_snapshot(&snapshot, detailed), Some(suite), None))
     }
 
+    /// Finds named tests whose exact covered source-line sets are duplicates.
+    pub fn find_duplicate_coverage_tests(
+        &self,
+        snapshot_id: Option<&str>,
+        suite: Option<&str>,
+    ) -> AppResult<Value> {
+        let context = self.context(suite);
+        let (selected_id, selected_suite) = if let Some(snapshot_id) = snapshot_id {
+            let snapshot = self.store.snapshot(snapshot_id)?;
+            if snapshot.get("repo_key").and_then(Value::as_str) != Some(context.repo_key.as_str()) {
+                return Err(AppError::Validation(
+                    "snapshot does not belong to the selected repository".to_owned(),
+                ));
+            }
+            let snapshot_suite = required_string_field(&snapshot, "suite", "snapshot")?;
+            if suite.is_some_and(|value| value != snapshot_suite) {
+                return Err(AppError::Validation(
+                    "suite does not match the selected snapshot".to_owned(),
+                ));
+            }
+            (snapshot_id.to_owned(), snapshot_suite)
+        } else {
+            let snapshot = self
+                .store
+                .latest_snapshot(Some(&context.checkout_path), None, suite)?
+                .ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?;
+            (
+                required_string_field(&snapshot, "id", "latest snapshot")?,
+                required_string_field(&snapshot, "suite", "latest snapshot")?,
+            )
+        };
+        let groups = self.store.duplicate_coverage_test_groups(&selected_id)?;
+        Ok(self.envelope(
+            json!({"duplicate_test_groups": groups}),
+            Some(&selected_suite),
+            None,
+        ))
+    }
+
     /// Registers a Git worktree against the selected repository.
     pub fn worktree_registration(
         &self,
@@ -1516,8 +1555,8 @@ mod tests {
         let service = CoverageService::new(
             store.clone(),
             RequestContext {
-                repo_key: project.repo_key,
-                checkout_path: project.repo_path,
+                repo_key: project.repo_key.clone(),
+                checkout_path: project.repo_path.clone(),
                 suite: None,
             },
         );
@@ -1546,6 +1585,19 @@ mod tests {
                     600,
                     false,
                 )
+                .is_err()
+        );
+        let foreign_service = CoverageService::new(
+            store.clone(),
+            RequestContext {
+                repo_key: "foreign-repository".to_owned(),
+                checkout_path: project.repo_path,
+                suite: None,
+            },
+        );
+        assert!(
+            foreign_service
+                .find_duplicate_coverage_tests(Some(current["id"].as_str().unwrap()), None)
                 .is_err()
         );
         store.close().expect("close store");

@@ -12,7 +12,7 @@
 
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
-dashboard and REST API, and provides the same schema-7 projections over
+dashboard and REST API, and provides the same schema-8 projections over
 loopback HTTP and native MCP stdio.
 
 The project is designed for one user-level daemon shared by agents and Git
@@ -22,7 +22,7 @@ frontend build or a separate language runtime.
 ## Status
 
 The Rust implementation is the only runtime and the checked-in Rust test suite
-is the source of truth. The public contract is schema revision 7. The local
+is the source of truth. The public contract is schema revision 8. The local
 gate proves 100% function and line coverage for the measured Rust
 library/runtime targets; `src/main.rs` is exercised by child-process smoke
 tests and excluded from aggregate LLVM counters. LLVM region coverage remains
@@ -200,6 +200,7 @@ an empty log search is a successful empty result.
 | `register_worktree` | `path`, `base_ref`, optional `name`, `max_words` | Worktree identity and frozen baseline snapshot for `coverage_compare`. |
 | `coverage_query` | One `view` per call; optional snapshot/baseline selectors, `suite`, `branch`, `file_path`, `line_number`, `line_ranges`, `order_by`, `cursor`, `max_words`, `detailed` | `summary`, `files`, `targets`, `file`, `insights`, or `line_history` projection. `targets` returns ranked files with compact uncovered red regions; `order_by` is `priority` (default), `uncovered_lines`, `line_rate`, or `file_path`. Continue bounded collections with the cursor. Make another narrow call for source or history. |
 | `coverage_compare` | One `view` per call; optional `snapshot_id`, `baseline_snapshot_id`, `worktree_id`, `suite`, `file_path`, `only_regressions`, `cursor`, `max_words`, `detailed` | `overview`, `files`, `lines`, `regions`, or `progress` comparison. `regions` groups improved/regressed/new/removed line ranges and, without ids, compares the latest snapshot with its previous matching snapshot. Select compatible lineage or a registered worktree; compose with `source_context` for code. |
+| `find_duplicate_coverage_tests` | optional `snapshot_id`, `suite` | `{duplicate_test_groups: [[test_name, ...], ...]}` in one unpaginated read-only response. Groups use exact covered file/line sets; reports without named per-test coverage return an empty array. LCOV `TN:` records provide the test names. |
 | `source_context` | One contiguous `snapshot_id`, `file_path`, `start`, `end`, optional `cursor`, `max_words` | Numbered source lines for a bounded range already identified by coverage data, each marked `red`, `green`, `yellow`, or `gray`, plus grouped `red_regions`. Make separate calls for disjoint ranges. |
 
 Every successful tool uses this envelope:
@@ -210,7 +211,7 @@ Every successful tool uses this envelope:
     "repo_key": "…",
     "checkout_path": "…",
     "suite": "…",
-    "schema_revision": 7
+    "schema_revision": 8
   },
   "data": {},
   "page": null
@@ -363,6 +364,8 @@ MCP. Important routes are:
 - `GET /api/snapshots`, `/api/snapshots/{id}`, and snapshot file/insight routes;
 - `/api/compare`, `/api/changed-lines`, `/api/line-history`, and
   `/api/source-lines` — comparisons and bounded source views;
+- `GET /api/duplicate-coverage-tests?snapshot_id=...&suite=...` — all groups of
+  named tests with exactly equal covered `(file_path, line_number)` sets;
 - `/api/commands`, `/api/runs`, `/api/artifacts`, and `/api/worktrees` —
   approved execution, retained evidence, and baselines;
 - `POST /mcp/` — stateless JSON-RPC MCP over HTTP.

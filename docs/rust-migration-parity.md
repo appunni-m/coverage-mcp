@@ -20,7 +20,7 @@ changes can be reviewed against the contract that was carried forward.
 
 ## Compatibility invariants
 
-- The public MCP inventory contains eleven tools and schema revision 7.
+- The public MCP inventory contains twelve tools and schema revision 8.
 - Every successful public projection uses the `{context,data,page}` envelope.
 - Word budgets, opaque query-scoped cursors, defensive collection caps, and
   compact-by-default detailed fields remain enforced at the service boundary.
@@ -33,7 +33,7 @@ changes can be reviewed against the contract that was carried forward.
 ## Fixture and evidence contract
 
 The machine-readable manifest at `tests/fixtures/manifest.yaml` identifies the
-frozen schema-7 contract, Rust target profile, public surfaces, input-only
+frozen schema-8 contract, Rust target profile, public surfaces, input-only
 parity cases, coverage plan, and compaction benchmark workload. Inputs contain
 no expected outputs; generated reports, logs, and coverage artifacts are
 runtime evidence and are never checked in as claimed results.

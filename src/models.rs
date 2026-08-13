@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,17 @@ pub struct LineCoverage {
     pub covered_functions: i64,
     /// Parser-specific detail.
     pub details: Value,
+}
+
+/// One covered source line attributed to a named test.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct TestCoverageLine {
+    /// Test name as recorded by the coverage format.
+    pub test_name: String,
+    /// Repository-relative path.
+    pub file_path: String,
+    /// One-based line number.
+    pub line_number: i64,
 }
 
 impl LineCoverage {
@@ -126,6 +137,8 @@ pub struct CoverageReport {
     pub files: Vec<FileCoverage>,
     /// Normalized line rows.
     pub lines: Vec<LineCoverage>,
+    /// Covered source lines attributed to named tests.
+    pub test_coverage: Vec<TestCoverageLine>,
     /// Parser warnings.
     pub warnings: Vec<String>,
     /// Parser metadata.
@@ -188,6 +201,7 @@ impl CoverageReport {
 pub struct CoverageBuilder {
     repo_path: Option<String>,
     lines: BTreeMap<(String, i64), LineCoverage>,
+    test_coverage: BTreeSet<(String, String, i64)>,
     file_metrics: BTreeMap<String, serde_json::Map<String, Value>>,
     normalized_paths: BTreeMap<String, String>,
 }
@@ -198,6 +212,7 @@ impl CoverageBuilder {
         Self {
             repo_path: repo_path.map(str::to_owned),
             lines: BTreeMap::new(),
+            test_coverage: BTreeSet::new(),
             file_metrics: BTreeMap::new(),
             normalized_paths: BTreeMap::new(),
         }
@@ -251,6 +266,21 @@ impl CoverageBuilder {
         }
     }
 
+    /// Adds one covered source line attributed to a named test.
+    pub fn add_test_line(&mut self, test_name: &str, file_path: &str, line_number: i64) {
+        let test_name = test_name.trim();
+        if test_name.is_empty() || line_number <= 0 {
+            return;
+        }
+        let normalized = self
+            .normalized_paths
+            .entry(file_path.to_owned())
+            .or_insert_with(|| normalize_report_path(file_path, self.repo_path.as_deref()))
+            .clone();
+        self.test_coverage
+            .insert((test_name.to_owned(), normalized, line_number));
+    }
+
     /// Adds format-specific file metrics.
     pub fn add_file_metrics(&mut self, file_path: &str, metrics: serde_json::Map<String, Value>) {
         let normalized = self
@@ -273,6 +303,15 @@ impl CoverageBuilder {
         metadata: Value,
     ) -> CoverageReport {
         let lines: Vec<LineCoverage> = self.lines.into_values().collect();
+        let test_coverage = self
+            .test_coverage
+            .into_iter()
+            .map(|(test_name, file_path, line_number)| TestCoverageLine {
+                test_name,
+                file_path,
+                line_number,
+            })
+            .collect();
         let mut by_file: BTreeMap<String, Vec<LineCoverage>> = BTreeMap::new();
         for line in &lines {
             by_file
@@ -339,6 +378,7 @@ impl CoverageBuilder {
             report_path: report_path.to_owned(),
             files,
             lines,
+            test_coverage,
             warnings,
             metadata,
         }

@@ -4,11 +4,11 @@ scope:
   mode: full
   inventory:
     authority: README.md-and-src-mcp.rs
-    revision: schema-7
+    revision: schema-8
     command_id: inventory
 oracles:
   - id: frozen-contract
-    name: Frozen schema-7 behavior contract
+    name: Frozen schema-8 behavior contract
     version: "1"
     runtime: specification
     identity_command_id: frozen-contract-identity
@@ -204,7 +204,7 @@ surfaces:
         source:
           oracle_id: frozen-contract
           path: docs/rust-migration-parity.md#compatibility-invariants
-          signature: schema-7 REST and MCP protocol surface
+          signature: schema-8 REST and MCP protocol surface
           parameters:
             - id: input
               style: positional
@@ -225,9 +225,9 @@ surfaces:
             signature: shared HTTP and native stdio JSON-RPC dispatcher
             support: {status: supported}
         requirements:
-          - id: coverage-mcp.transport.contract.schema7
+          - id: coverage-mcp.transport.contract.schema8
             dimension: protocol_variant
-            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-7 compatible.
+            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-8 compatible.
             lanes: [parity, coverage]
             target_profiles: [rust-default]
         parity: {applicability: required, target_profiles: [rust-default]}

@@ -28,7 +28,7 @@ HTTP daemon.
 | --- | --- |
 | `src/main.rs` | CLI, `serve`, `connect`/`stdio`, and one-shot `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
-| `src/mcp.rs` | Explicit schema-7 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
+| `src/mcp.rs` | Explicit schema-8 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
 | `src/storage.rs` | DuckDB schema, immutable snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
 | `src/lock.rs` | Process-lifetime daemon and per-database OS-backed exclusive leases. |
@@ -46,7 +46,7 @@ HTTP daemon.
 - Queue state is mutable only while a managed run is queued or active.
 - Project settings are scoped to the canonical repository key, so linked
   worktrees use the same compaction policy and coverage history.
-- Every public schema-7 response carries `repo_key`, `checkout_path`,
+- Every public schema-8 response carries `repo_key`, `checkout_path`,
   `suite`, and `schema_revision` context.
 - Collections use bounded fetches, word budgets, and opaque query-scoped
   cursors. A defensive record cap fails explicitly instead of silently losing
