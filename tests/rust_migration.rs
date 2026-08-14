@@ -193,6 +193,17 @@ fn rust_migration_fixture_inputs_drive_registered_lanes() {
         transport["cases"][0]["steps"][0]["arguments"]["input"]["value"]["tools"],
         mcp::tools_list().as_array().unwrap().len()
     );
+    assert_eq!(
+        transport["cases"][1]["steps"][0]["arguments"]["input"]["value"]["concurrent_connectors"],
+        2
+    );
+    assert_eq!(
+        transport["cases"][1]["steps"][0]["arguments"]["input"]["value"]["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 
     let coverage: Value =
         serde_json::from_str(include_str!("fixtures/inputs/coverage/rust_source.json")).unwrap();
@@ -203,7 +214,7 @@ fn rust_migration_fixture_inputs_drive_registered_lanes() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        4
     );
 
     let benchmark: Value = serde_json::from_str(include_str!(

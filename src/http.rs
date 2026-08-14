@@ -22,7 +22,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration as TokioDuration, timeout};
 
-use crate::config::{MAX_HTTP_MAX_BODY_BYTES, MIN_HTTP_MAX_BODY_BYTES, ServerConfig};
+use crate::config::{
+    MAX_HTTP_MAX_BODY_BYTES, MIN_HTTP_MAX_BODY_BYTES, ServerConfig, default_db_path,
+};
 use crate::error::{AppError, AppResult};
 use crate::git::inspect_git;
 use crate::lock::{FileLease, daemon_lock_path};
@@ -778,11 +780,17 @@ fn registry_project_unavailable(repo_key: &str, error: &AppError) -> Value {
 }
 
 fn project_database_path(common_db_path: &Path, repo_key: &str) -> PathBuf {
-    common_db_path
+    let repository_local = default_db_path(Path::new(repo_key));
+    let centralized = common_db_path
         .parent()
         .unwrap_or(Path::new("."))
         .join("projects")
-        .join(format!("{}.duckdb", key_hash(repo_key)))
+        .join(format!("{}.duckdb", key_hash(repo_key)));
+    if repository_local.exists() || !centralized.exists() {
+        repository_local
+    } else {
+        centralized
+    }
 }
 
 fn key_hash(value: &str) -> String {
@@ -1128,11 +1136,31 @@ mod tests {
         assert!(project_db.ends_with("/tmp/project"));
         assert_eq!(key_hash("repo").len(), 24);
         assert!(database_repository(Path::new("")).ends_with("."));
-        assert!(
-            project_database_path(Path::new(""), "repo")
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".duckdb"))
+        let database_directory = tempfile::tempdir().unwrap();
+        let repository = database_directory.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let common = database_directory.path().join("common.duckdb");
+        let repository_local = default_db_path(&repository);
+        let centralized = common
+            .parent()
+            .unwrap()
+            .join("projects")
+            .join(format!("{}.duckdb", key_hash(repository.to_str().unwrap())));
+        assert_eq!(
+            project_database_path(&common, repository.to_str().unwrap()),
+            repository_local
+        );
+        std::fs::create_dir_all(centralized.parent().unwrap()).unwrap();
+        std::fs::write(&centralized, []).unwrap();
+        assert_eq!(
+            project_database_path(&common, repository.to_str().unwrap()),
+            centralized
+        );
+        std::fs::create_dir_all(repository_local.parent().unwrap()).unwrap();
+        std::fs::write(&repository_local, []).unwrap();
+        assert_eq!(
+            project_database_path(&common, repository.to_str().unwrap()),
+            repository_local
         );
         assert!(error_string(AppError::Validation("test".to_owned())).contains("test"));
         assert!(matches!(

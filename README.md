@@ -43,7 +43,9 @@ cargo install --path . --locked
 coverage-mcp --version
 ```
 
-For development, run the binary without installing it:
+Normal MCP clients should launch `connect`; they do not need a separately
+started daemon. For direct HTTP or dashboard development, run the daemon
+without installing it:
 
 ```sh
 cargo run --locked -- serve
@@ -66,15 +68,88 @@ artifacts, and the project compaction policy.
 
 Use `connect` when an MCP client expects a child process. Messages are
 newline-delimited JSON-RPC on stdin and stdout; diagnostics never go to
-stdout.
+stdout. The child is a lightweight bridge: it starts or reuses the locked
+loopback daemon, selects its repository with `x-coverage-mcp-repo`, and keeps
+DuckDB ownership in that one daemon even when several agents connect at once.
+The daemon remains available when an individual stdio bridge exits, so later
+sessions reuse the same owner and port.
+
+For checkout-local development, run the binary through Cargo. This
+incrementally compiles the current source and does not require a separate
+install or release build:
+
+```sh
+cargo run --locked -- connect --repo /absolute/path/to/repository
+```
+
+The first Cargo invocation may compile bundled DuckDB and take longer than an
+MCP client's startup timeout. Warm the target before connecting if needed:
+
+```sh
+cargo run --locked -- --version
+```
+
+The installed-binary form is also supported:
 
 ```sh
 coverage-mcp connect --repo /absolute/path/to/repository
 ```
 
+Coverage MCP is a native Rust executable, not a Python package. Do not launch
+it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
+`pyproject.toml` or `setup.py`, so those launchers exit before the MCP
+`initialize` response. Install the exact published crate when the MCP host is
+not running from a checkout:
+
+```sh
+cargo install coverage-mcp --version '=0.8.0' --locked
+```
+
+### Marketplace bootstrap contract
+
+The matching `testing@codegen-marketplace` Codex plugin uses a plugin-relative
+POSIX launcher instead of assuming `coverage-mcp` is already on `PATH`. The
+launcher pins an exact published crate version, takes a versioned installer
+lock, runs `cargo install` once into `~/.coverage-mcp/runtime/<version>`, and
+then releases that install lock before executing `coverage-mcp connect`.
+Concurrent first sessions share that one installation. At runtime, only the
+daemon process holds `daemon.lock` to exclude another daemon owner; HTTP clients
+and stdio bridges do not acquire it or lock one another. Both transports can
+connect concurrently, subject to the daemon's configured resource limits.
+
+This bootstrap requires an existing Rust/Cargo toolchain and network access to
+crates.io. It does not install Rust, execute Python or Node, follow a moving Git
+branch, or write diagnostics to MCP stdout. A downstream plugin version must
+not be released until its exact Coverage MCP crate version is published and a
+clean-cache bootstrap has passed. Checkout development should continue to use
+the explicit Cargo registration above.
+
+The marketplace launcher is POSIX `sh` and targets macOS, Linux, and WSL.
+Native Windows bootstrap is not currently claimed; install the pinned crate
+manually and configure the MCP host with the absolute
+`coverage-mcp.exe connect` command.
+
+For a checkout-local MCP registration, point the client at Cargo explicitly:
+
+```json
+{
+  "mcpServers": {
+    "coverage-mcp": {
+      "command": "cargo",
+      "args": [
+        "run", "--locked", "--manifest-path",
+        "/absolute/path/to/coverage-mcp/Cargo.toml", "--", "connect",
+        "--repo", "/absolute/path/to/repository"
+      ]
+    }
+  }
+}
+```
+
 The `stdio` subcommand is an alias. A project database is created at
-`<repository>/.coverage-mcp/coverage.duckdb` unless `--db` or
-`COVERAGE_MCP_DB` selects another path. A typical client entry is:
+`<repository>/.coverage-mcp/coverage.duckdb`. Supplying `--db` or
+`COVERAGE_MCP_DB` explicitly selects standalone stdio mode instead of the
+shared daemon. A typical client entry is:
 
 ```json
 {
@@ -89,14 +164,42 @@ The `stdio` subcommand is an alias. A project database is created at
 
 ### Loopback HTTP
 
-Run `coverage-mcp serve` once per user session and point an MCP client at
+Normal stdio clients should use `connect`, which starts or reuses the daemon
+automatically. When a client connects to HTTP directly instead of using the
+stdio bridge, run `cargo run --locked -- serve` for a checkout or
+`coverage-mcp serve` for an installed binary, then point the client at
 `http://127.0.0.1:59471/mcp/`. The daemon maintains one common registry at
-`~/.coverage-mcp/common.duckdb` by default and lazily creates one project
-database under `~/.coverage-mcp/projects/` for each canonical Git repository.
-Set `COVERAGE_MCP_COMMON_DB` to relocate the registry and project directory.
+`~/.coverage-mcp/common.duckdb` by default and lazily opens each canonical Git
+repository's `.coverage-mcp/coverage.duckdb`. Rust-era centralized project
+databases under `~/.coverage-mcp/projects/` remain readable as a compatibility
+fallback when no repository-local database exists. Set
+`COVERAGE_MCP_COMMON_DB` to relocate the registry and daemon lock.
 
 The HTTP transport and stdio transport call the same Rust dispatcher, tool
 schemas, service projections, validation, and storage implementation.
+
+To verify the launcher before opening an MCP client, send one complete
+newline-delimited `initialize` request and check that the first response has
+`result.serverInfo.name` equal to `coverage-mcp`:
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  | cargo run --locked --manifest-path /absolute/path/to/coverage-mcp/Cargo.toml \
+      -- connect --repo /absolute/path/to/repository
+```
+
+If the client reports `connection closed: initialize response`, run this
+probe directly and inspect the launcher's stderr. That message means the
+child process exited or emitted an invalid transport stream before the
+handshake; it is not a coverage-query error. Check that the command is either
+the native `coverage-mcp` executable or an explicit Cargo launcher with an
+existing `Cargo.toml`, that `connect` is present, that `--repo` points to a Git
+checkout, and that the daemon version/schema matches the connector. The bridge
+writes startup diagnostics to `~/.coverage-mcp/daemon.log` by default. A
+database lock in shared mode means a standalone connector or other process
+already owns that repository store; stop the competing owner instead of
+deleting the lock file.
 
 Every present argument is type-checked. An omitted optional argument receives
 the documented default; a present argument with the wrong JSON type is a
@@ -379,10 +482,12 @@ The daemon acquires an OS-backed exclusive lease at
 using the same common database fails with a 503-style `resource busy` error and
 the lock file includes best-effort PID, executable, and resource metadata for
 diagnostics. The operating system releases the lease when the owner exits, so
-recovery does not depend on guessing whether a PID is stale. Each project
+recovery does not depend on guessing whether a PID is stale. Clients never take
+this lease: direct HTTP connections and any number of stdio bridges can use the
+daemon concurrently, subject to configured resource limits. Each project
 database has the same protection at `<database>.lock`; this prevents a daemon,
-stdio process, and compaction process from opening the same DuckDB file at the
-same time.
+standalone stdio process, and compaction process from opening the same DuckDB
+file at the same time.
 
 Every project store uses a bounded DuckDB connection pool. Writes are
 serialized through the store write gate, while read-only paths can use the
@@ -404,6 +509,7 @@ reported explicitly; the server never deletes a WAL or lock file to recover.
 | `COVERAGE_MCP_HOST` | `127.0.0.1` | Loopback bind host; public binding is rejected. |
 | `COVERAGE_MCP_PORT` | `59471` | HTTP port. |
 | `COVERAGE_MCP_COMMON_DB` | `~/.coverage-mcp/common.duckdb` | Common registry database. |
+| `COVERAGE_MCP_DB` | unset | Explicit database for standalone `connect`; normal shared-daemon connectors must leave it unset. |
 | `COVERAGE_MCP_RUN_RETENTION` | `100` | Terminal runs retained per command. |
 | `COVERAGE_MCP_RUN_CONCURRENCY` | `4` | Managed command workers. |
 | `COVERAGE_MCP_HTTP_CONCURRENCY` | `16` | Concurrent HTTP MCP requests. |

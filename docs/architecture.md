@@ -8,19 +8,28 @@ maintenance worker.
 ## Runtime topology
 
 ```text
-MCP client ── native stdio ──┐
-                             ├── Rust service ── DuckDB project store
-MCP client ── loopback HTTP ─┤       │
-dashboard ── loopback HTTP ──┘       ├── zstd compacted detail payloads
-                                     ├── managed command workers
-                                     └── Git identity / worktree lineage
+MCP client ── stdio bridge ──┐
+MCP client ── stdio bridge ──┼── loopback HTTP daemon ── repository DuckDB stores
+MCP client ── loopback HTTP ─┤              │
+dashboard ── loopback HTTP ──┘              ├── zstd compacted detail payloads
+                                            ├── managed command workers
+                                            └── Git identity / worktree lineage
 ```
 
 The HTTP daemon owns a common registry and lazily opens one project database
 for each canonical Git repository. Linked worktrees resolve through Git's
 common directory and share the repository store. A stdio process selects one
-repository and opens its repository-local database; it does not start another
-HTTP daemon.
+repository and forwards newline-delimited JSON-RPC to the daemon with a bounded
+loopback HTTP request. The first connector starts the daemon on demand; racing
+connectors using the same host, port, and common database discover the same
+owner, which alone holds `daemon.lock`. Connectors and direct HTTP clients never
+take this lease and may connect concurrently. The defaults are
+`127.0.0.1:59471`, `~/.coverage-mcp/common.duckdb`, and
+`~/.coverage-mcp/daemon.lock`. Before forwarding a request, a connector
+requires the daemon health response to match its binary version, schema
+revision, and common database. It reports an incompatible daemon instead of
+silently starting a second instance. The daemon is independent of any one
+stdio bridge and remains available after bridges disconnect.
 
 ## Module ownership
 
@@ -59,8 +68,9 @@ HTTP daemon.
   dedicated process group so timeout, cancellation, and shutdown reach shell
   descendants. Any setup, polling, capture, or persistence failure
   terminalizes the durable job as `failed`.
-- HTTP and stdio MCP calls use the same `mcp::dispatch_json_rpc` function and
-  therefore cannot diverge in tool behavior or error handling.
+- HTTP and stdio MCP calls use the same daemon-side
+  `mcp::dispatch_json_rpc` function and therefore cannot diverge in tool
+  behavior or error handling.
 
 ## Ownership, concurrency, and shutdown
 
@@ -70,7 +80,9 @@ advisory OS file leases held by live file descriptors; a crashed process does
 not leave an unrecoverable stale lock, and the metadata file is never treated
 as proof of ownership by itself. A duplicate daemon or database owner fails
 fast with holder metadata instead of deleting a lock or attempting concurrent
-DuckDB access.
+DuckDB access. These leases protect process and database ownership, not client
+connections: HTTP and stdio requests can execute concurrently within the
+configured MCP, pool, and deadline limits.
 
 Each project store owns a bounded `r2d2` pool. The write gate preserves
 DuckDB's single-writer semantics, while read-only operations use the pool with
@@ -107,12 +119,14 @@ selection header.
 
 ## Storage layout
 
-In standalone mode, `connect` and `compact` use
-`<repository>/.coverage-mcp/coverage.duckdb` unless a database path is
-provided. In common-daemon mode, the registry defaults to
-`~/.coverage-mcp/common.duckdb` and project stores live beside it under
-`projects/<stable-key>.duckdb`. All parent directories are created by the
-Rust storage layer.
+The shared daemon registry defaults to `~/.coverage-mcp/common.duckdb`, while
+project stores live at `<repository>/.coverage-mcp/coverage.duckdb`. This
+preserves coverage history and approvals across stdio client restarts without
+allowing each client to own DuckDB. A centralized Rust-era
+`projects/<stable-key>.duckdb` is reused only when it already exists and the
+repository-local database does not. Explicit `connect --db <path>` and
+`compact` remain standalone operations. All parent directories are created by
+the Rust storage layer.
 
 The database contains project settings, repository registry rows, snapshots,
 files, lines, compacted payloads, worktrees, registered commands, runs, jobs,

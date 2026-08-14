@@ -52,7 +52,7 @@ cargo llvm-cov --offline --lib --all-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
 git diff --check
 ```
 

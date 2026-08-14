@@ -18,6 +18,32 @@
         }
       ],
       "observations": ["contract"]
+    },
+    {
+      "case_id": "coverage-mcp.transport.contract.shared-daemon-stdio",
+      "surface": "coverage-mcp.transport",
+      "operation": "contract",
+      "covers": ["coverage-mcp.transport.contract.shared-daemon-stdio"],
+      "target_profiles": ["rust-default"],
+      "assets": [],
+      "steps": [
+        {
+          "step_id": "contract",
+          "surface": "coverage-mcp.transport",
+          "operation": "contract",
+          "receiver": null,
+          "arguments": {
+            "input": {
+              "kind": "literal",
+              "value": {
+                "repositories": ["repository-a", "repository-b"],
+                "concurrent_connectors": 2
+              }
+            }
+          }
+        }
+      ],
+      "observations": ["contract"]
     }
   ]
 }

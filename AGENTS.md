@@ -53,14 +53,14 @@ cargo llvm-cov --offline --lib --all-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
 git diff --check
 ```
 
 After a release or installed-binary change, rebuild with
-`cargo install --path . --locked`, restart `coverage-mcp serve` or the native
-`coverage-mcp connect` process, verify `/health`, and make a live `tools/list`
-call over both transports.
+`cargo install --path . --locked`, stop the old shared daemon so the first new
+`coverage-mcp connect` starts the rebuilt binary, verify `/health`, and make a
+live `tools/list` call over both transports.
 
 When external marketplace/plugin guidance changes, update the corresponding
 documentation in the marketplace checkout only after the Rust contract and

@@ -230,6 +230,11 @@ surfaces:
             description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-7 compatible.
             lanes: [parity, coverage]
             target_profiles: [rust-default]
+          - id: coverage-mcp.transport.contract.shared-daemon-stdio
+            dimension: protocol_variant
+            description: Concurrent repository-selecting stdio connectors start or reuse one locked loopback daemon and keep coverage state in repository-local databases.
+            lanes: [parity, coverage]
+            target_profiles: [rust-default]
         parity: {applicability: required, target_profiles: [rust-default]}
         coverage: {applicability: required, target_profiles: [rust-default], component_ids: [rust-source]}
         benchmark: {applicability: not_applicable, reason: Transport correctness is validated by live wire and stdio tests.}

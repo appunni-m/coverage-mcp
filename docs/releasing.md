@@ -17,21 +17,37 @@ artifact.
    release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect
    `coverage-mcp --version`.
-5. Verify the binary in a clean checkout: `/health`, dashboard, native stdio
-   `initialize`/`tools/list`, report ingest, a project policy edit, a manual
+5. Verify the binary in clean checkouts: start two default `connect` processes
+   for different repositories, confirm they return stdio
+   `initialize`/`tools/list` through one daemon PID on port `59471`, and confirm
+   the daemon remains healthy after both bridges exit. Also verify HTTP
+   `tools/list`, the dashboard, report ingest, a project policy edit, a manual
    compaction pass, and a database reopen.
 6. Verify lifecycle hardening: start two daemons against one common database
    and confirm the second exits with `resource busy`; open one project database
-   twice and confirm the second owner is rejected; exercise a bounded query,
-   pool saturation, and SIGTERM shutdown; verify that the database and WAL are
-   left untouched after each failure.
+   twice and confirm the second owner is rejected; exercise an incompatible
+   connector/daemon health check, a bounded query, pool saturation, and SIGTERM
+   shutdown; verify that the database and WAL are left untouched after each
+   failure.
 7. Run `cargo package --locked --allow-dirty --no-verify` only when a dirty
    package inspection is intentional; release packaging should use a clean
    tree.
 8. Create an annotated immutable `v<version>` tag and publish through the
    configured crates.io/asset workflow. Never move a published tag.
-9. Record the artifact checksums and update downstream plugin/tooling guidance
-   only after the artifact has passed the clean-install smoke test.
+9. After registry propagation, install the exact crate into an empty temporary
+   root with `cargo install coverage-mcp --version =<version> --locked --bin
+   coverage-mcp --root <temporary-root>`. Verify its version and both MCP
+   transports; a local checkout or Git install is not registry evidence.
+10. Update the downstream testing plugin's pinned version only after the
+    published crate passes that clean install. Run two plugin launchers against
+    one empty runtime cache, confirm one Cargo install under the versioned
+    installer lock, then confirm both stdio bridges and a direct HTTP client
+    connect concurrently while only the daemon process holds its ownership
+    lock.
+    Exercise each claimed launcher platform; record native Windows as
+    unsupported until a Windows bootstrap and its clean-machine test exist.
+11. Record the artifact checksums and release evidence. Do not publish a
+    marketplace pin for an absent, yanked, or moving runtime source.
 
 ## Release evidence
 

@@ -3,7 +3,7 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
-## Unreleased
+## 0.8.0 - 2026-08-14
 
 ### Changed
 
@@ -12,6 +12,16 @@ minor versions may contain breaking public-contract changes.
   compaction.
 - Unified HTTP and stdio MCP JSON-RPC dispatch so inventory, safety behavior,
   resource reads, tool calls, notifications, and errors share one contract.
+- Restored `connect` as a repository-selecting stdio bridge that starts or
+  reuses one locked loopback daemon, preventing concurrent Codex clients from
+  becoming competing DuckDB owners. Explicit `--db` remains standalone.
+- Restored repository-local project databases in shared-daemon mode, with a
+  compatibility fallback for centralized Rust-era project stores.
+- Synchronized startup, direct-HTTP, ownership, configuration, release, and
+  generated migration documentation around the schema-7 shared-daemon flow.
+- Documented the downstream Cargo bootstrap contract: exact published version,
+  one short-lived installer lock, cached binary reuse, and a daemon-only
+  process-ownership lease that never serializes HTTP or stdio clients.
 - Added per-project background compaction of older coverage detail with
   project-creation defaults, dashboard/API edits, manual passes, and durable
   byte/status metrics.
