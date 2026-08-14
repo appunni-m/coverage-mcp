@@ -13,7 +13,7 @@ use crate::service::{CoverageService, DEFAULT_MAX_WORDS};
 use crate::storage::LineRange;
 
 /// MCP stream endpoint instructions shown during initialization.
-pub const MCP_INSTRUCTIONS: &str = r#"Coverage MCP 0.8.3 schema 7 exposes a compact, composable agent interface.
+pub const MCP_INSTRUCTIONS: &str = r#"Coverage MCP 0.8.4 schema 7 exposes a compact, composable agent interface.
 
 Start with project_context, then run only exact approved registrations returned there or created with register_test_command after human approval. Submit with run_test(wait=false), save the run id, then fetch status with get_run_data(detailed=false). get_run_data is read-only: it only returns durable run data and never starts, advances, reruns, or cancels work. For every non-terminal response, wait at least the returned poll_after_ms before the next get_run_data call; do not poll immediately. Use cancel_run only when the user no longer wants the run. Use search_test_logs for targeted retained stdout/stderr evidence; managed output is byte-capped and a terminal summary reports truncated=true when the cap was reached. Run setup, capture, polling, persistence, timeout, cancellation, and shutdown failures are terminalized as failed durable jobs, so never assume a non-terminal run is permanent.
 

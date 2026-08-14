@@ -3,6 +3,16 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.4 - 2026-08-15
+
+### Fixed
+
+- Fetch locked project dependencies before the intentionally offline coverage
+  command in both CI and release workflows, so an isolated tag runner does not
+  depend on the contents of a previously restored Cargo cache.
+- Added the same public coverage totals, file, and exact-line diagnostics to
+  release jobs that are already emitted by main-branch CI.
+
 ## 0.8.3 - 2026-08-15
 
 ### Fixed

@@ -100,6 +100,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install cargo-llvm-cov --locked --version 0.8.7
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
       - name: Coverage
         run: make coverage
       - name: Coverage diagnostics
