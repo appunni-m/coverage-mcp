@@ -3,6 +3,16 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.2 - 2026-08-15
+
+### Fixed
+
+- Made the Unix completed-child fallback use the same non-generic wait-probe
+  function body in production and injected tests, eliminating a Linux-only
+  coverage mapping divergence without changing process-group termination.
+- Added failure-only CI annotations and text evidence for the exact source
+  files and lines behind a coverage-gate failure.
+
 ## 0.8.1 - 2026-08-14
 
 ### Fixed

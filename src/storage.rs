@@ -3426,7 +3426,7 @@ fn terminate_child_group_with(
 fn terminate_child_group_result(
     child: &mut Child,
     result: std::io::Result<std::process::ExitStatus>,
-    try_wait: impl FnOnce(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
+    try_wait: fn(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
 ) -> std::io::Result<()> {
     match result {
         Ok(status) if status.success() => Ok(()),
@@ -4327,6 +4327,14 @@ mod tests {
         );
         #[cfg(unix)]
         {
+            fn completed_child_status(
+                _: &mut Child,
+            ) -> io::Result<Option<std::process::ExitStatus>> {
+                use std::os::unix::process::ExitStatusExt;
+
+                Ok(Some(std::process::ExitStatus::from_raw(0)))
+            }
+
             let mut fallback_child = Command::new("sleep").arg("5").spawn().unwrap();
             let fallback_result =
                 terminate_child_group_with(&mut fallback_child, |_| Command::new("false").status());
@@ -4339,11 +4347,12 @@ mod tests {
             assert!(command_error.is_err());
             let _ = command_error_child.wait();
             let status = Command::new("false").status().unwrap();
-            let completed = Command::new("true").status().unwrap();
             assert!(
-                terminate_child_group_result(&mut command_error_child, Ok(status), |_| {
-                    Ok(Some(completed))
-                })
+                terminate_child_group_result(
+                    &mut command_error_child,
+                    Ok(status),
+                    completed_child_status,
+                )
                 .is_ok()
             );
             let status = Command::new("false").status().unwrap();
