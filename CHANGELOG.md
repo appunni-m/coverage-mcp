@@ -3,6 +3,18 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.3 - 2026-08-15
+
+### Fixed
+
+- Split release quality, tests, coverage, package verification, binary builds,
+  and evidence assembly across isolated hosted runners. This preserves every
+  release gate without combining multiple bundled-DuckDB build profiles in one
+  runner and starving the GitHub Actions agent.
+- Publish only after the isolated clean package-verification job succeeds, and
+  avoid recompiling bundled DuckDB after minting the short-lived crates.io
+  trusted-publishing token.
+
 ## 0.8.2 - 2026-08-15
 
 ### Fixed

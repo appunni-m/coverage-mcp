@@ -11,10 +11,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build release artifacts
+  quality:
+    name: Rust quality
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -23,11 +23,61 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          # Reuse the MSRV cache populated by the main CI workflow.
           shared-key: verify
       - name: Verify tag version
         shell: bash
         run: test "${GITHUB_REF_NAME#v}" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Rustdoc
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+
+  tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
+      - name: Compile and run test targets
+        run: make test-ci
+      - name: Record migration parity marker
+        run: ./target/debug/migration-status --record-parity .
+      - name: Prepare test evidence
+        run: |
+          test -x target/debug/migration-status
+          test -s target/migration/benchmark-result.json
+          test -s target/migration/parity-run.json
+          mkdir -p release-test-evidence/target/debug release-test-evidence/target/migration
+          cp target/debug/migration-status release-test-evidence/target/debug/migration-status
+          cp target/migration/benchmark-result.json release-test-evidence/target/migration/benchmark-result.json
+          cp target/migration/parity-run.json release-test-evidence/target/migration/parity-run.json
+      - name: Upload test evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-test-evidence
+          path: release-test-evidence/
+          if-no-files-found: error
+
+  coverage:
+    name: Rust coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
       - name: Install coverage tool
         # cargo-llvm-cov currently requires Rust 1.87+ to build. Keep the
         # project gate on its declared 1.85 MSRV and use stable only for this
@@ -35,35 +85,142 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           cargo +stable install cargo-llvm-cov --locked --version 0.8.7
-      - name: Run release gate
+      - name: Coverage
+        run: make coverage
+      - name: Prepare coverage evidence
         run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          make test-ci
-          ./target/debug/migration-status --record-parity .
-          make coverage
-          make migration-status
-          RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
-      - name: Build binary and package
+          test -s target/migration/coverage-raw.json
+          mkdir -p release-coverage-evidence/target/migration
+          cp target/migration/coverage-raw.json release-coverage-evidence/target/migration/coverage-raw.json
+      - name: Upload coverage evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-coverage-evidence
+          path: release-coverage-evidence/
+          if-no-files-found: error
+
+  package:
+    name: Verify crate package
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
+      - name: Package and verify crate
+        run: cargo package --locked
+      - name: Prepare crate artifact
         run: |
-          cargo build --release --locked
-          cargo package --locked --allow-dirty --no-verify
-          sha256sum target/release/coverage-mcp target/package/*.crate > SHA256SUMS
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+          mkdir -p release-package
+          cp "target/package/coverage-mcp-${GITHUB_REF_NAME#v}.crate" release-package/
+      - name: Upload crate artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-package
+          path: release-package/
+          if-no-files-found: error
+
+  binary:
+    name: Build release binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: verify
+      - name: Build binary
+        run: cargo build --release --locked
+      - name: Prepare binary artifact
+        run: |
+          mkdir -p release-binary
+          cp target/release/coverage-mcp release-binary/coverage-mcp
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-binary
+          path: release-binary/
+          if-no-files-found: error
+
+  evidence:
+    name: Assemble migration evidence
+    needs: [tests, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download test evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-test-evidence
+          path: target/incoming/test
+      - name: Download coverage evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-coverage-evidence
+          path: target/incoming/coverage
+      - name: Assemble and validate evidence
+        run: |
+          mkdir -p target/debug target/migration
+          cp target/incoming/test/target/debug/migration-status target/debug/migration-status
+          cp target/incoming/test/target/migration/benchmark-result.json target/migration/benchmark-result.json
+          cp target/incoming/test/target/migration/parity-run.json target/migration/parity-run.json
+          cp target/incoming/coverage/target/migration/coverage-raw.json target/migration/coverage-raw.json
+          chmod +x target/debug/migration-status
+          ./target/debug/migration-status .
+          mkdir -p release-evidence/target release-evidence/docs
+          cp -R target/migration release-evidence/target/migration
+          cp -R docs/generated release-evidence/docs/generated
+      - name: Upload migration evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-evidence
+          path: release-evidence/
+          if-no-files-found: error
+
+  artifacts:
+    name: Bundle release artifacts
+    needs: [quality, tests, coverage, package, binary, evidence]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download release binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-binary
+          path: bundle/
+      - name: Download crate package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-package
+          path: bundle/
+      - name: Download migration evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-evidence
+          path: bundle/
+      - name: Generate checksums
+        working-directory: bundle
+        run: sha256sum coverage-mcp "coverage-mcp-${GITHUB_REF_NAME#v}.crate" > SHA256SUMS
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage-mcp-${{ github.ref_name }}
-          path: |
-            target/release/coverage-mcp
-            target/package/*.crate
-            target/migration/
-            docs/generated/
-            SHA256SUMS
+          path: bundle/
           if-no-files-found: error
 
   publish:
     name: Publish release
-    needs: build
+    needs: artifacts
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: crates-io
     permissions:
       contents: read
@@ -75,7 +232,10 @@ jobs:
           toolchain: 1.85.1
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
-      - name: Publish crate
-        run: cargo publish --locked
+      - name: Publish verified crate
+        # The package job already ran Cargo's clean package verification on an
+        # isolated runner. Avoid recompiling bundled DuckDB after minting the
+        # short-lived trusted-publishing token.
+        run: cargo publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}

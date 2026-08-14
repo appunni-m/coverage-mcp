@@ -33,7 +33,10 @@ artifact.
    package inspection is intentional; release packaging should use a clean
    tree.
 8. Create an annotated immutable `v<version>` tag and publish through the
-   configured crates.io/asset workflow. Never move a published tag.
+   configured crates.io/asset workflow. The workflow reproduces quality,
+   all-target tests, coverage, clean package verification, release compilation,
+   and migration-evidence validation on isolated hosted runners before it
+   mints the trusted-publishing token. Never move a published tag.
 9. After registry propagation, install the exact crate into an empty temporary
    root with `cargo install coverage-mcp --version =<version> --locked --bin
    coverage-mcp --root <temporary-root>`. Verify its version and both MCP
