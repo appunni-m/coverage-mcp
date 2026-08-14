@@ -68,8 +68,56 @@ Use `connect` when an MCP client expects a child process. Messages are
 newline-delimited JSON-RPC on stdin and stdout; diagnostics never go to
 stdout.
 
+For checkout-local development, run the binary through Cargo. This incrementally
+compiles the current source and does not require a separate install or release
+build:
+
+```sh
+cargo run --locked -- connect --repo /absolute/path/to/repository
+```
+
+The first Cargo invocation may compile bundled DuckDB and take longer than an
+MCP client's startup timeout. Warm the target before connecting if needed:
+
+```sh
+cargo run --locked -- --version
+```
+
+The installed-binary form is also supported:
+
 ```sh
 coverage-mcp connect --repo /absolute/path/to/repository
+```
+
+Coverage MCP is a native Rust executable, not a Python package. Do not launch
+it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
+`pyproject.toml` or `setup.py`, so those launchers exit before the MCP
+`initialize` response. Install the binary when the MCP host is not running
+from this checkout or does not have Cargo:
+
+```sh
+cargo install --git https://github.com/appunni-m/coverage-mcp.git \
+  --locked coverage-mcp
+codex mcp add coverage-mcp -- \
+  "$(command -v coverage-mcp)" connect \
+  --repo /absolute/path/to/repository
+```
+
+For a checkout-local MCP registration, point the client at Cargo explicitly:
+
+```json
+{
+  "mcpServers": {
+    "coverage-mcp": {
+      "command": "cargo",
+      "args": [
+        "run", "--locked", "--manifest-path",
+        "/absolute/path/to/coverage-mcp/Cargo.toml", "--", "connect",
+        "--repo", "/absolute/path/to/repository"
+      ]
+    }
+  }
+}
 ```
 
 The `stdio` subcommand is an alias. A project database is created at
@@ -89,7 +137,8 @@ The `stdio` subcommand is an alias. A project database is created at
 
 ### Loopback HTTP
 
-Run `coverage-mcp serve` once per user session and point an MCP client at
+Run `cargo run --locked -- serve` once per local development session, or
+`coverage-mcp serve` for an installed binary, and point an MCP client at
 `http://127.0.0.1:59471/mcp/`. The daemon maintains one common registry at
 `~/.coverage-mcp/common.duckdb` by default and lazily creates one project
 database under `~/.coverage-mcp/projects/` for each canonical Git repository.
@@ -97,6 +146,26 @@ Set `COVERAGE_MCP_COMMON_DB` to relocate the registry and project directory.
 
 The HTTP transport and stdio transport call the same Rust dispatcher, tool
 schemas, service projections, validation, and storage implementation.
+
+To verify the launcher before opening an MCP client, send one complete
+newline-delimited `initialize` request and check that the first response has
+`result.serverInfo.name` equal to `coverage-mcp`:
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  | cargo run --locked --manifest-path /absolute/path/to/coverage-mcp/Cargo.toml \
+      -- connect --repo /absolute/path/to/repository
+```
+
+If the client reports `connection closed: initialize response`, run this
+probe directly and inspect the launcher's stderr. That message means the
+child process exited or emitted an invalid transport stream before the
+handshake; it is not a coverage-query error. Check, in order, that the command
+is either the native `coverage-mcp` executable or an explicit Cargo launcher
+with an existing `Cargo.toml`, that `connect` is present, that `--repo` points
+to a Git checkout, and that the selected database is not already locked by
+another Coverage MCP process.
 
 Every present argument is type-checked. An omitted optional argument receives
 the documented default; a present argument with the wrong JSON type is a
@@ -330,7 +399,7 @@ Configure defaults before the project is first opened with:
 COVERAGE_MCP_COMPACTION_AFTER_DAYS=14 \
 COVERAGE_MCP_COMPACTION_INTERVAL_SECONDS=900 \
 COVERAGE_MCP_COMPACTION_BATCH_SIZE=250 \
-coverage-mcp serve
+cargo run --locked -- serve
 ```
 
 At project creation, `POST /api/projects` accepts `repo_path` and the same

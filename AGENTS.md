@@ -57,10 +57,12 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 git diff --check
 ```
 
-After a release or installed-binary change, rebuild with
-`cargo install --path . --locked`, restart `coverage-mcp serve` or the native
-`coverage-mcp connect` process, verify `/health`, and make a live `tools/list`
-call over both transports.
+During local development, use `cargo run --locked -- serve` or
+`cargo run --locked -- connect --repo .`; source changes do not require an
+install or release build. After a release or installed-binary change, rebuild
+with `cargo install --path . --locked`, restart `coverage-mcp serve` or the
+native `coverage-mcp connect` process, verify `/health`, and make a live
+`tools/list` call over both transports.
 
 When external marketplace/plugin guidance changes, update the corresponding
 documentation in the marketplace checkout only after the Rust contract and

@@ -14,7 +14,7 @@ help:
 	@printf '%s\n' '' 'Verification:'
 	@printf '%s\n' '  make test        all workspace tests' '  make test-ci     compile all targets once, then run test targets concurrently' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
 	@printf '%s\n' '' 'Runtime:'
-	@printf '%s\n' '  cargo run -- serve' '  cargo run -- connect --repo .' '  cargo run -- compact --repo .'
+	@printf '%s\n' '  cargo run --locked -- serve' '  cargo run --locked -- connect --repo .' '  cargo run --locked -- compact --repo .'
 
 build:
 	$(CARGO) check --workspace --all-targets --all-features --locked
