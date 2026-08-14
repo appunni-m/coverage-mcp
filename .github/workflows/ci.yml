@@ -52,10 +52,9 @@ jobs:
         with:
           shared-key: verify
       - name: Compile and run test targets
-        # Compile all targets once. Each harness is isolated by process id and
-        # runs in parallel; its internal tests remain serialized for DuckDB
-        # and signal safety. This preserves the all-targets test set without
-        # making unrelated harnesses wait for one another.
+        # One Cargo process compiles the workspace and runs every target. The
+        # harnesses and their tests remain serialized so bundled DuckDB builds
+        # and database-heavy tests cannot starve a hosted runner.
         run: make test-ci
       - name: Record migration parity marker
         run: ./target/debug/migration-status --record-parity .

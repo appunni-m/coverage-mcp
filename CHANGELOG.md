@@ -12,6 +12,8 @@ minor versions may contain breaking public-contract changes.
   coverage mapping divergence without changing process-group termination.
 - Added failure-only CI annotations and text evidence for the exact source
   files and lines behind a coverage-gate failure.
+- Serialized the unchanged all-target CI test set in one Cargo process so a
+  cold bundled-DuckDB build cannot starve the hosted runner.
 
 ## 0.8.1 - 2026-08-14
 

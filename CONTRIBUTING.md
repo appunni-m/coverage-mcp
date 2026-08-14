@@ -62,10 +62,11 @@ Convenience aliases are available through `make lint`, `make test`,
 including the fixture-backed migration lanes and generated evidence status.
 
 GitHub Actions runs quality, tests, coverage, and the release build as
-independent lanes. The test lane compiles all targets once, then runs each
-test harness with one thread per harness; this keeps DuckDB and signal state
-isolated while avoiding a serial wall-clock bottleneck. Migration evidence is
-assembled after the test and coverage artifacts are uploaded.
+independent lanes. The test lane uses one Cargo process for every target and
+runs each harness with one test thread. This keeps DuckDB and signal state
+isolated without making bundled native builds and database-heavy tests compete
+for hosted-runner memory. Migration evidence is assembled after the test and
+coverage artifacts are uploaded.
 
 The coverage threshold is a line-coverage gate. The report also displays
 function and region data; do not describe a percentage without naming its

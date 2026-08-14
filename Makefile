@@ -12,7 +12,7 @@ help:
 	@printf '%s\n' '' 'Quality:'
 	@printf '%s\n' '  make fmt         check rustfmt' '  make fmt-fix     apply rustfmt' '  make clippy      strict clippy with warnings denied' '  make lint        format + clippy'
 	@printf '%s\n' '' 'Verification:'
-	@printf '%s\n' '  make test        all workspace tests' '  make test-ci     compile all targets once, then run test targets concurrently' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
+	@printf '%s\n' '  make test        all workspace tests' '  make test-ci     run all test targets serially with retained diagnostics' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
 	@printf '%s\n' '' 'Runtime:'
 	@printf '%s\n' '  cargo run -- serve' '  cargo run -- connect --repo .' '  cargo run -- compact --repo .'
 
@@ -44,22 +44,17 @@ test-ci:
 	@set -eu; \
 	mkdir -p target/migration; \
 	rm -f target/migration/test-*.log; \
-	$(CARGO) test --workspace --all-targets --all-features --locked --no-run; \
-	run_harness() { name=$$1; shift; log="target/migration/test-$$name.log"; if "$$@" >"$$log" 2>&1; then printf 'passed %s\n' "$$name"; else code=$$?; printf 'failed %s (exit %s)\n' "$$name" "$$code" >&2; if [ -f "$$log" ]; then tail -n 120 "$$log" >&2; fi; return "$$code"; fi; }; \
-	run_harness lib $(CARGO) test --workspace --lib --all-features --locked -- --test-threads=1 & p1=$$!; \
-	run_harness rust-migration env MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json $(CARGO) test --workspace --test rust_migration --all-features --locked -- --test-threads=1 & p2=$$!; \
-	run_harness migration-status $(CARGO) test --workspace --test migration_status --all-features --locked -- --test-threads=1 & p3=$$!; \
-	run_harness smoke $(CARGO) test --workspace --test smoke --all-features --locked -- --test-threads=1 & p4=$$!; \
-	run_harness coverage-mcp $(CARGO) test --workspace --bin coverage-mcp --all-features --locked -- --test-threads=1 & p5=$$!; \
-	run_harness migration-status-bin $(CARGO) test --workspace --bin migration-status --all-features --locked -- --test-threads=1 & p6=$$!; \
-	status=0; \
-	if ! wait "$$p1"; then status=1; fi; \
-	if ! wait "$$p2"; then status=1; fi; \
-	if ! wait "$$p3"; then status=1; fi; \
-	if ! wait "$$p4"; then status=1; fi; \
-	if ! wait "$$p5"; then status=1; fi; \
-	if ! wait "$$p6"; then status=1; fi; \
-	exit "$$status"
+	log="target/migration/test-all-targets.log"; \
+	if MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json \
+		$(CARGO) test --workspace --all-targets --all-features --locked -- --test-threads=1 \
+		>"$$log" 2>&1; then \
+		printf 'passed all-targets\n'; \
+	else \
+		code=$$?; \
+		printf 'failed all-targets (exit %s)\n' "$$code" >&2; \
+		tail -n 200 "$$log" >&2 || true; \
+		exit "$$code"; \
+	fi
 
 coverage:
 	mkdir -p target/migration
