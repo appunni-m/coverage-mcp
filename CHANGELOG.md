@@ -9,7 +9,8 @@ minor versions may contain breaking public-contract changes.
 
 - Made the 100% line-coverage gate deterministic on the Rust 1.85.1 MSRV by
   removing failure-only assertion source regions and isolating the already
-  exercised background-compaction maintenance path.
+  exercised background-compaction maintenance path, including the
+  platform-dependent Unix process-group fallback.
 - Clarified that the daemon lease belongs only to the daemon process; HTTP and
   stdio clients remain independent concurrent connections.
 

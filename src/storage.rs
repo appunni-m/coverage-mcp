@@ -3419,18 +3419,19 @@ fn terminate_child_group_with(
     child: &mut Child,
     kill_group: impl FnOnce(u32) -> std::io::Result<std::process::ExitStatus>,
 ) -> std::io::Result<()> {
-    terminate_child_group_result(child, kill_group(child.id()))
+    terminate_child_group_result(child, kill_group(child.id()), Child::try_wait)
 }
 
 #[cfg(unix)]
 fn terminate_child_group_result(
     child: &mut Child,
     result: std::io::Result<std::process::ExitStatus>,
+    try_wait: impl FnOnce(&mut Child) -> std::io::Result<Option<std::process::ExitStatus>>,
 ) -> std::io::Result<()> {
     match result {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => {
-            if child.try_wait()?.is_some() {
+            if try_wait(child)?.is_some() {
                 Ok(())
             } else {
                 fallback_after_group_status(status, child.kill())
@@ -4337,6 +4338,14 @@ mod tests {
             });
             assert!(command_error.is_err());
             let _ = command_error_child.wait();
+            let status = Command::new("false").status().unwrap();
+            let completed = Command::new("true").status().unwrap();
+            assert!(
+                terminate_child_group_result(&mut command_error_child, Ok(status), |_| {
+                    Ok(Some(completed))
+                })
+                .is_ok()
+            );
             let status = Command::new("false").status().unwrap();
             assert!(
                 fallback_after_group_status(status, Err(io::Error::other("fallback"))).is_err()
