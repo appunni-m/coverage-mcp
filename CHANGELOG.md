@@ -3,6 +3,16 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.5 - 2026-08-15
+
+### Fixed
+
+- Allow up to 90 minutes and one Cargo compilation job for each isolated test
+  and coverage release runner. Cold bundled-DuckDB debug and instrumented
+  builds can exceed 45 minutes and starve the Actions agent when compilation is
+  unconstrained even though warmed main-branch lanes complete in under ten
+  minutes; the profiles remain isolated and retain all existing gates.
+
 ## 0.8.4 - 2026-08-15
 
 ### Fixed
