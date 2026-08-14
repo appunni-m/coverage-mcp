@@ -761,17 +761,7 @@ impl CoverageStore {
                         .unwrap_or(1);
                     if let Some(settings) = settings {
                         if settings.compaction_enabled {
-                            match maintenance_due(&settings) {
-                                Ok(true) => {
-                                    if let Err(error) = store.compact_now() {
-                                        eprintln!("coverage-mcp background compaction failed: {error}");
-                                    }
-                                }
-                                Ok(false) => {}
-                                Err(error) => eprintln!(
-                                    "coverage-mcp compaction worker rejected invalid maintenance state: {error}"
-                                ),
-                            }
+                            run_compaction_maintenance(&store, &settings);
                         }
                     }
                     for _ in 0..wait_seconds.min(5) {
@@ -2776,6 +2766,20 @@ impl CoverageStore {
             })?;
             Ok(Some(serde_json::from_slice(&decoded)?))
         })
+    }
+}
+
+fn run_compaction_maintenance(store: &CoverageStore, settings: &ProjectSettings) {
+    match maintenance_due(settings) {
+        Ok(true) => {
+            if let Err(error) = store.compact_now() {
+                eprintln!("coverage-mcp background compaction failed: {error}");
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("coverage-mcp compaction worker rejected invalid maintenance state: {error}")
+        }
     }
 }
 
@@ -5716,10 +5720,7 @@ mod tests {
             .unwrap()
             .contains_key(&closing_run)
         {
-            assert!(
-                Instant::now() < deadline,
-                "closing managed process did not start"
-            );
+            assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
         closing_store.inner.closing.store(true, Ordering::SeqCst);

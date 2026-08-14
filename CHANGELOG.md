@@ -3,6 +3,16 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.1 - 2026-08-14
+
+### Fixed
+
+- Made the 100% line-coverage gate deterministic on the Rust 1.85.1 MSRV by
+  removing failure-only assertion source regions and isolating the already
+  exercised background-compaction maintenance path.
+- Clarified that the daemon lease belongs only to the daemon process; HTTP and
+  stdio clients remain independent concurrent connections.
+
 ## 0.8.0 - 2026-08-14
 
 ### Changed
@@ -13,8 +23,9 @@ minor versions may contain breaking public-contract changes.
 - Unified HTTP and stdio MCP JSON-RPC dispatch so inventory, safety behavior,
   resource reads, tool calls, notifications, and errors share one contract.
 - Restored `connect` as a repository-selecting stdio bridge that starts or
-  reuses one locked loopback daemon, preventing concurrent Codex clients from
-  becoming competing DuckDB owners. Explicit `--db` remains standalone.
+  reuses one loopback daemon. Only the daemon process holds its ownership
+  lease; concurrent Codex clients never lock one another. Explicit `--db`
+  remains standalone.
 - Restored repository-local project databases in shared-daemon mode, with a
   compatibility fallback for centralized Rust-era project stores.
 - Synchronized startup, direct-HTTP, ownership, configuration, release, and

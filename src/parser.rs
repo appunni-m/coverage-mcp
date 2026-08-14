@@ -1108,10 +1108,7 @@ mod tests {
             path
         };
         let bad = |name: &str, format: &str, content: &str| {
-            assert!(
-                parse_coverage_report(&write(name, content), format, None).is_err(),
-                "{name} should be rejected"
-            );
+            assert!(parse_coverage_report(&write(name, content), format, None).is_err());
         };
 
         bad("missing-da-line.info", "lcov", "SF:a.py\nDA:\n");
