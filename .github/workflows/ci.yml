@@ -107,7 +107,12 @@ jobs:
           if test -f target/migration/coverage-raw.json; then
             totals=$(jq -c '.data[0].totals' target/migration/coverage-raw.json)
             echo "::error::coverage totals: ${totals}"
-            jq -r '.data[0].files[] | select(.summary.lines.count > .summary.lines.covered or .summary.functions.count > .summary.functions.covered) | "\(.filename): lines missed=\(.summary.lines.count - .summary.lines.covered), functions missed=\(.summary.functions.count - .summary.functions.covered)"' target/migration/coverage-raw.json
+            jq -r --arg workspace "${GITHUB_WORKSPACE}/" '
+              .data[0].files[]
+              | select(.summary.lines.count > .summary.lines.covered or .summary.functions.count > .summary.functions.covered)
+              | (.filename | if startswith($workspace) then ltrimstr($workspace) else . end) as $file
+              | "::error file=\($file)::lines missed=\(.summary.lines.count - .summary.lines.covered), functions missed=\(.summary.functions.count - .summary.functions.covered)"
+            ' target/migration/coverage-raw.json
             cargo llvm-cov report --lcov \
               --ignore-filename-regex '/src/main\.rs$' \
               --output-path target/migration/coverage-lines.lcov
@@ -115,6 +120,21 @@ jobs:
               /^SF:/ { file = substr($0, 4); sub("^" ENVIRON["GITHUB_WORKSPACE"] "/", "", file) }
               /^DA:/ && $3 == 0 { printf "::error file=%s,line=%s::uncovered line\n", file, $2 }
             ' target/migration/coverage-lines.lcov
+            cargo llvm-cov report --text --show-missing-lines \
+              --ignore-filename-regex '/src/main\.rs$' \
+              --output-path target/migration/coverage-lines.txt
+            awk -F '|' '
+              /^[^[:space:]].*:$/ {
+                file = $0
+                sub(":$", "", file)
+                sub("^" ENVIRON["GITHUB_WORKSPACE"] "/", "", file)
+              }
+              $2 ~ /^[[:space:]]*0[[:space:]]*$/ {
+                line = $1
+                gsub(/[[:space:]]/, "", line)
+                printf "::error file=%s,line=%s::uncovered line\n", file, line
+              }
+            ' target/migration/coverage-lines.txt
           else
             echo "::error::coverage report was not generated"
           fi
@@ -126,6 +146,7 @@ jobs:
           path: |
             target/migration/coverage-raw.json
             target/migration/coverage-lines.lcov
+            target/migration/coverage-lines.txt
           if-no-files-found: ignore
       - name: Prepare coverage evidence
         run: |
