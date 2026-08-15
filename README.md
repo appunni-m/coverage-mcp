@@ -32,7 +32,8 @@ a separate diagnostic and is reported by the coverage command.
 
 Requirements:
 
-- Rust 1.85 or newer with Cargo;
+- Rustup; the checkout pins Rust 1.85.1 (the declared 1.85 MSRV) with Cargo,
+  rustfmt, Clippy, and LLVM tools;
 - Git for repository identity and worktree lineage;
 - a platform supported by bundled DuckDB.
 

@@ -7,7 +7,8 @@ artifact.
 ## Maintainer checklist
 
 1. Confirm the working tree is clean, the default branch is protected, and all
-   required checks pass.
+   required checks pass. Confirm `rust-toolchain.toml`, the CI toolchain, and
+   the release workflow all select Rust 1.85.1.
 2. Update `Cargo.toml` and `Cargo.lock` to the release version. Move the
    corresponding `CHANGELOG.md` entries into a dated release section.
 3. Run `make ci`, including strict clippy, all-target tests, fixture-backed

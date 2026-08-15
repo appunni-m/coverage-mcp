@@ -312,13 +312,9 @@ mod tests {
             owner.executable,
             std::env::current_exe().expect("executable")
         );
-        let busy = FileLease::acquire_daemon(
-            path.clone(),
-            "test daemon",
-            "instance-2",
-            "another-secret",
-        )
-        .expect_err("second daemon lease");
+        let busy =
+            FileLease::acquire_daemon(path.clone(), "test daemon", "instance-2", "another-secret")
+                .expect_err("second daemon lease");
         let diagnostic = busy.to_string();
         assert!(diagnostic.contains("instance_id=instance-1"));
         assert!(!diagnostic.contains("handoff-secret"));

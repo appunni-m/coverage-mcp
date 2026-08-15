@@ -525,13 +525,14 @@ async fn wait_for_daemon_handoff(
             DaemonHealth::Incompatible(current) if current == *observation => {
                 if let Some(current_owner) =
                     held_daemon_owner(&daemon_lock_path(&config.common_db_path))?
-                    && current_owner != *owner
                 {
-                    return Err(recovery_refused(
-                        config,
-                        observation,
-                        "the ownership lease changed during handoff",
-                    ));
+                    if current_owner != *owner {
+                        return Err(recovery_refused(
+                            config,
+                            observation,
+                            "the ownership lease changed during handoff",
+                        ));
+                    }
                 }
             }
             DaemonHealth::Incompatible(_) => {

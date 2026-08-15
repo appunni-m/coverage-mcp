@@ -17,6 +17,8 @@ minor versions may contain breaking public-contract changes.
   restricted lock-file permissions on Unix. Recovery also handles an older
   daemon that becomes healthy during connector startup. HTTP and stdio clients
   remain concurrent and never acquire the daemon ownership lease.
+- Pinned checkout builds and formatting to the same Rust 1.85.1 toolchain used
+  by CI so local release gates enforce the crate's declared MSRV syntax.
 
 ## 0.8.6 - 2026-08-15
 

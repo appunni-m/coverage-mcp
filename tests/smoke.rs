@@ -127,10 +127,10 @@ fn loopback_request(port: u16, method: &str, path: &str, body: &str) -> std::io:
 fn wait_for_health(port: u16) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(response) = loopback_request(port, "GET", "/health", "")
-            && response.contains("200 OK")
-        {
-            return response;
+        if let Ok(response) = loopback_request(port, "GET", "/health", "") {
+            if response.contains("200 OK") {
+                return response;
+            }
         }
         thread::sleep(Duration::from_millis(25));
     }

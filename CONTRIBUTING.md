@@ -6,7 +6,9 @@ when changing behavior.
 
 ## Prerequisites
 
-- Rust 1.85 or newer and Cargo;
+- Rustup. The checked-in `rust-toolchain.toml` installs Rust 1.85.1, Cargo,
+  rustfmt, Clippy, and LLVM tools so plain `cargo` commands match CI and enforce
+  the declared Rust 1.85 MSRV;
 - Git;
 - `cargo-llvm-cov` for the required coverage gate. Install it with a current
   stable toolchain because recent releases require Rust newer than the
@@ -42,7 +44,8 @@ cargo build --locked
 
 ## Required local gate
 
-Run the same commands used by CI before opening a pull request:
+Run the same commands used by CI before opening a pull request. Do not override
+the pinned checkout toolchain for these commands:
 
 ```sh
 cargo fmt --all -- --check
