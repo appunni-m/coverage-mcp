@@ -39,7 +39,9 @@ jobs:
   tests:
     name: Rust tests
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Match the branch gate: target compilation and execution are isolated,
+    # and a disconnected runner must not hold a release open for an hour.
+    timeout-minutes: 15
     env:
       DUCKDB_DOWNLOAD_LIB: "1"
     steps:

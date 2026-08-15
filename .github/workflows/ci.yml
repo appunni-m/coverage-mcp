@@ -44,7 +44,10 @@ jobs:
   verify:
     name: Rust tests
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The isolated cold compile and serial target groups normally finish in
+    # minutes. Bound a disconnected hosted runner so it cannot retain this
+    # branch's serialized concurrency slot for an hour.
+    timeout-minutes: 15
     env:
       DUCKDB_DOWNLOAD_LIB: "1"
     steps:

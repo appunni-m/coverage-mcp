@@ -1472,11 +1472,16 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
     let pending_id = pending["id"].as_str().unwrap();
     let cancellation_request = store.cancel_run(pending_id, 20).unwrap();
     assert_eq!(cancellation_request["cancellation_requested"], true);
+    let cancellation_deadline = Instant::now() + Duration::from_secs(10);
     let cancelled = loop {
         let result = store.run_result(pending_id, 20).unwrap();
         if result["terminal"].as_bool().unwrap_or(false) {
             break result;
         }
+        assert!(
+            Instant::now() < cancellation_deadline,
+            "run did not become terminal within 10 seconds after cancellation: {result}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     assert_eq!(cancelled["status"], "cancelled");
