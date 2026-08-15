@@ -39,10 +39,10 @@ minor versions may contain breaking public-contract changes.
 - Bound the managed-run cancellation regression poll to ten seconds so a
   platform-specific cancellation failure reports retained run state instead of
   waiting indefinitely.
-- Bound each hosted runtime test group to two minutes with a final ten-second
-  termination grace period, then retain and print that group's log. A Linux-only
-  stall now identifies its first incomplete test instead of consuming the
-  entire job timeout.
+- Run each migration correctness case in a fresh hosted process with its own
+  three-minute GitHub step deadline and retained log. A Linux-only stall now
+  identifies and terminates the exact case instead of leaking a managed child
+  across the combined test harness.
 - Keep an established stdio bridge alive across a shared-daemon crash. A
   connection-refused request now recreates the single verified daemon and is
   replayed once because it could not have reached the old process; ambiguous

@@ -18,11 +18,11 @@ artifact.
    separate steps, uses one Cargo compilation job, and retains line-table debug
    information. Runtime execution is split into library, binary,
    migration-status, migration parity, compaction benchmark, and daemon/stdio
-   smoke steps with a retained log for each target. Hosted runtime groups have
-   a two-minute process deadline and ten-second termination grace period;
-   branch and tag test jobs both use a 15-minute recovery bound now that cold
-   compilation and runtime targets are isolated. The release build in step 4
-   is the required bundled-linkage check.
+   smoke steps with a retained log for each target. Migration correctness cases
+   run in fresh processes with three-minute GitHub step deadlines so a managed
+   child cannot escape a parent-process timeout; branch and tag test jobs both
+   use a 15-minute recovery bound. The release build in step 4 is the required
+   bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect

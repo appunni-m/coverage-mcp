@@ -44,7 +44,6 @@ jobs:
     timeout-minutes: 15
     env:
       DUCKDB_DOWNLOAD_LIB: "1"
-      COVERAGE_MCP_TEST_TIMEOUT: "timeout --signal=TERM --kill-after=10s 120s"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -61,8 +60,45 @@ jobs:
         run: make test-ci-bins
       - name: Run migration-status tests
         run: make test-ci-migration-status
-      - name: Run migration parity tests
-        run: make test-ci-rust-migration
+      - name: Run migration parser-alias test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_migrates_all_parser_formats_and_aliases
+      - name: Run migration fixture-lane test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_migration_fixture_inputs_drive_registered_lanes
+      - name: Run migration benchmark-report test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_benchmark_report_can_be_written
+      - name: Run migration model-normalization test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_models_merge_metrics_and_path_normalization
+      - name: Run migration storage-query test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_storage_queries_compare_and_compacts_old_detail
+      - name: Run migration worktree-lineage test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_worktree_registration_and_lineage_guards
+      - name: Run migration managed-run test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_managed_runs_keep_idempotency_logs_and_artifacts
+      - name: Run migration storage-edge test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_storage_edge_paths_and_background_run_states_are_covered
+      - name: Run migration worktree-service test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_service_worktree_comparison_views_match_storage_contract
+      - name: Run migration pagination-contract test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_service_pagination_projection_and_mcp_contract_match
+      - name: Run migration HTTP-wire test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_http_rest_dashboard_health_and_mcp_wire_are_live
+      - name: Run migration validation-error test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_validation_errors_are_stable
+      - name: Run migration CLI-entrypoint test
+        timeout-minutes: 3
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_cli_entrypoint_executes_compaction_and_host_validation
       - name: Run compaction benchmark
         run: make test-ci-benchmark
       - name: Run stdio and daemon smoke tests
