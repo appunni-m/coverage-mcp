@@ -95,6 +95,14 @@ binary. It never replaces a newer daemon, an equal-version incompatibility, a
 different common database, an unlocked metadata file, or an unknown process
 occupying the port.
 
+If a daemon exits without completing its managed-run shutdown, reopening a
+project store reconciles the durable queue before accepting work. Runs that
+were already marked `running` become terminal `interrupted` results because
+replaying an arbitrary approved command could duplicate side effects. Runs
+that were still `queued` are restarted automatically through the normal
+concurrency gate. Stale active state therefore clears without a database edit
+or a manual connector restart.
+
 For checkout-local development, run the binary through Cargo. This
 incrementally compiles the current source and does not require a separate
 install or release build:
@@ -123,20 +131,22 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.9.0' --locked
+cargo install coverage-mcp --version '=0.9.1' --locked
 ```
 
 ### Marketplace bootstrap contract
 
-The matching `testing@codegen-marketplace` Codex plugin uses a plugin-relative
-POSIX launcher instead of assuming `coverage-mcp` is already on `PATH`. The
-launcher pins an exact published crate version, takes a versioned installer
-lock, runs `cargo install` once into `~/.coverage-mcp/runtime/<version>`, and
-then releases that install lock before executing `coverage-mcp connect`.
-Concurrent first sessions share that one installation. At runtime, only the
-daemon process holds `daemon.lock` to exclude another daemon owner; HTTP clients
-and stdio bridges do not acquire it or lock one another. Both transports can
-connect concurrently, subject to the daemon's configured resource limits.
+The matching `testing@codegen-marketplace` Codex plugin declares a required
+stdio server in `.mcp.json`. Its small POSIX bootstrap checks `PATH`, installs
+the exact published crate into `~/.coverage-mcp/runtime/<version>` on a cache
+miss, and immediately replaces itself with `coverage-mcp connect`. It does not
+start, inspect, stop, or route around the daemon and it has no custom lifecycle
+lock. All runtime orchestration is implemented by `connect`: repository
+selection, fixed-port discovery, stale-lease recovery, version handoff, daemon
+startup, and request forwarding. Only the daemon process holds `daemon.lock`;
+HTTP clients and stdio bridges do not acquire it or lock one another. Both
+transports can connect concurrently, subject to the daemon's configured
+resource limits.
 
 This bootstrap requires an existing Rust/Cargo toolchain and network access to
 crates.io. It does not install Rust, execute Python or Node, follow a moving Git
@@ -145,7 +155,7 @@ not be released until its exact Coverage MCP crate version is published and a
 clean-cache bootstrap has passed. Checkout development should continue to use
 the explicit Cargo registration above.
 
-The marketplace launcher is POSIX `sh` and targets macOS, Linux, and WSL.
+The marketplace bootstrap is POSIX `sh` and targets macOS, Linux, and WSL.
 Native Windows bootstrap is not currently claimed; install the pinned crate
 manually and configure the MCP host with the absolute
 `coverage-mcp.exe connect` command.
@@ -199,7 +209,7 @@ fallback when no repository-local database exists. Set
 The HTTP transport and stdio transport call the same Rust dispatcher, tool
 schemas, service projections, validation, and storage implementation.
 
-To verify the launcher before opening an MCP client, send one complete
+To verify the connector before opening an MCP client, send one complete
 newline-delimited `initialize` request and check that the first response has
 `result.serverInfo.name` equal to `coverage-mcp`:
 
@@ -211,7 +221,7 @@ printf '%s\n' \
 ```
 
 If the client reports `connection closed: initialize response`, run this
-probe directly and inspect the launcher's stderr. That message means the
+probe directly and inspect the connector's stderr. That message means the
 child process exited or emitted an invalid transport stream before the
 handshake; it is not a coverage-query error. Check that the command is either
 the native `coverage-mcp` executable or an explicit Cargo launcher with an

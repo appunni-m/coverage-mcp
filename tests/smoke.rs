@@ -108,6 +108,18 @@ fn connector_responses(output: Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn connector_request<W: Write, R: BufRead>(
+    stdin: &mut W,
+    stdout: &mut R,
+    request: serde_json::Value,
+) -> serde_json::Value {
+    writeln!(stdin, "{request}").unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
 fn loopback_request(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.write_all(
@@ -404,6 +416,7 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         .env("COVERAGE_MCP_HOST", "127.0.0.1")
         .env("COVERAGE_MCP_PORT", port.to_string())
         .env("COVERAGE_MCP_COMMON_DB", &common_db)
+        .env("COVERAGE_MCP_RUN_CONCURRENCY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -421,6 +434,104 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
     let initialize: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(initialize["result"]["serverInfo"]["name"], "coverage-mcp");
 
+    let register = |id, name: &str, command: &str| {
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{
+                "name":"register_test_command",
+                "arguments":{
+                    "name":name,
+                    "command":command,
+                    "cwd":repository,
+                    "shell":"/bin/sh",
+                    "human_approved":true,
+                    "approved_by":"smoke-test",
+                    "approval_note":"approved daemon-restart recovery fixture"
+                }
+            }
+        })
+    };
+    let running_command = connector_request(
+        &mut stdin,
+        &mut stdout,
+        register(
+            2,
+            "restart-running",
+            "while [ ! -f release-running ]; do sleep 0.05; done",
+        ),
+    );
+    let running_command_id = running_command["result"]["structuredContent"]["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let queued_command = connector_request(
+        &mut stdin,
+        &mut stdout,
+        register(3, "restart-queued", "printf resumed"),
+    );
+    let queued_command_id = queued_command["result"]["structuredContent"]["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let submit = |id, command_ref: &str, key: &str| {
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{
+                "name":"run_test",
+                "arguments":{
+                    "command_ref":command_ref,
+                    "wait":false,
+                    "idempotency_key":key
+                }
+            }
+        })
+    };
+    let running_submission = connector_request(
+        &mut stdin,
+        &mut stdout,
+        submit(4, &running_command_id, "restart-running"),
+    );
+    let running_id = running_submission["result"]["structuredContent"]["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let queued_submission = connector_request(
+        &mut stdin,
+        &mut stdout,
+        submit(5, &queued_command_id, "restart-queued"),
+    );
+    let queued_id = queued_submission["result"]["structuredContent"]["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run_state = |id, run_id: &str| {
+        serde_json::json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{"name":"get_run_data","arguments":{"run_id":run_id}}
+        })
+    };
+    let state_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let running = connector_request(&mut stdin, &mut stdout, run_state(6, &running_id));
+        let queued = connector_request(&mut stdin, &mut stdout, run_state(7, &queued_id));
+        if running["result"]["structuredContent"]["data"]["status"] == "running"
+            && queued["result"]["structuredContent"]["data"]["status"] == "queued"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < state_deadline,
+            "managed runs did not reach running/queued restart fixture state"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
     wait_for_health(port);
     let first_pid = guard.pid().expect("first daemon pid");
     let status = Command::new("kill")
@@ -428,6 +539,7 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         .status()
         .unwrap();
     assert!(status.success());
+    std::fs::write(repository.join("release-running"), "release\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let listener_gone = TcpStream::connect(("127.0.0.1", port)).is_err();
@@ -443,16 +555,41 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
     assert!(lock_path.exists(), "the stale metadata file should remain");
 
     line.clear();
-    stdin
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
-        .unwrap();
-    stdin.flush().unwrap();
-    stdout.read_line(&mut line).unwrap();
-    let tools: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let tools = connector_request(
+        &mut stdin,
+        &mut stdout,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list"}),
+    );
     assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 11);
     wait_for_health(port);
     let second_pid = guard.pid().expect("replacement daemon pid");
     assert_ne!(first_pid, second_pid);
+
+    let interrupted = connector_request(&mut stdin, &mut stdout, run_state(9, &running_id));
+    assert_eq!(
+        interrupted["result"]["structuredContent"]["data"]["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        interrupted["result"]["structuredContent"]["data"]["terminal"],
+        true
+    );
+    let resume_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let resumed = connector_request(&mut stdin, &mut stdout, run_state(10, &queued_id));
+        if resumed["result"]["structuredContent"]["data"]["terminal"] == true {
+            assert_eq!(
+                resumed["result"]["structuredContent"]["data"]["status"],
+                "passed"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < resume_deadline,
+            "queued run did not resume after daemon restart"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
 
     drop(stdin);
     assert!(connector.wait().unwrap().success());

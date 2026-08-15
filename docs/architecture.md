@@ -75,6 +75,10 @@ requests without replaying an operation whose commit status is ambiguous.
   dedicated process group so timeout, cancellation, and shutdown reach shell
   descendants. Any setup, polling, capture, or persistence failure
   terminalizes the durable job as `failed`.
+- When a project store opens after an ungraceful daemon exit, persisted
+  `running` jobs become terminal `interrupted` records and persisted `queued`
+  jobs re-enter the normal worker/concurrency path. Running commands are not
+  replayed because their external side effects may already have occurred.
 - HTTP and stdio MCP calls use the same daemon-side
   `mcp::dispatch_json_rpc` function and therefore cannot diverge in tool
   behavior or error handling.

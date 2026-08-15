@@ -272,7 +272,8 @@ fn rollback_transaction(connection: &Connection, error: AppError) -> AppError {
 }
 
 impl CoverageStore {
-    /// Opens or creates a repository database and starts maintenance workers.
+    /// Opens or creates a repository database, reconciles interrupted/queued
+    /// managed runs, and starts maintenance workers.
     pub fn open(db_path: PathBuf, config: ServerConfig) -> AppResult<Self> {
         if !(1..=MAX_RUN_CONCURRENCY).contains(&config.run_concurrency) {
             return Err(AppError::Validation(format!(
@@ -315,8 +316,33 @@ impl CoverageStore {
         });
         let store = Self { inner };
         store.init_schema(database_preexisted)?;
+        let queued_runs = store.reconcile_persisted_run_jobs()?;
+        store.resume_queued_runs(queued_runs);
         store.start_compaction_worker()?;
         Ok(store)
+    }
+
+    fn reconcile_persisted_run_jobs(&self) -> AppResult<Vec<String>> {
+        let ended = Utc::now();
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE run_jobs SET status = 'interrupted', ended_at = ?, error = 'Coverage MCP restarted before this managed run reported a terminal result.' WHERE status = 'running'",
+                params![ended],
+            )?;
+            let mut statement = connection.prepare(
+                "SELECT id FROM run_jobs WHERE status = 'queued' ORDER BY queued_at, id",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+        })
+    }
+
+    fn resume_queued_runs(&self, run_ids: Vec<String>) {
+        for run_id in run_ids {
+            if let Err(error) = self.start_run_worker(&run_id) {
+                eprintln!("coverage-mcp could not resume queued run {run_id}: {error}");
+            }
+        }
     }
 
     /// Database path owned by this store.
@@ -1703,6 +1729,21 @@ impl CoverageStore {
         Ok(())
     }
 
+    fn start_run_worker(&self, run_id: &str) -> AppResult<()> {
+        let store = self.clone();
+        let worker_run_id = run_id.to_owned();
+        let handle = thread::Builder::new()
+            .name(format!("coverage-mcp-run-{run_id}"))
+            .spawn(move || {
+                report_background_run_error(&store, &worker_run_id);
+            });
+        if let Err(error) = self.retain_run_thread(handle) {
+            self.finalize_failed_job_or_log(run_id, &error, "finalize unretained run");
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Submits one approved command to the background runner.
     pub fn submit_command(
         &self,
@@ -1764,17 +1805,7 @@ impl CoverageStore {
             connection.execute("INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'queued', ?, ?, '', NULL)", params![id, command.get("id").and_then(Value::as_str), command.get("name").and_then(Value::as_str), command.get("command").and_then(Value::as_str), key, command.get("cwd").and_then(Value::as_str), git.repo_path, git.repo_key, git.branch, git.commit_sha, Utc::now(), timeout_seconds.map(|value| value as i64), max_summary_lines as i64, stdout.to_string_lossy(), stderr.to_string_lossy()])?;
             Ok(())
         })?;
-        let store = self.clone();
-        let run_id = id.clone();
-        let handle = thread::Builder::new()
-            .name(format!("coverage-mcp-run-{id}"))
-            .spawn(move || {
-                report_background_run_error(&store, &run_id);
-            });
-        if let Err(error) = self.retain_run_thread(handle) {
-            self.finalize_failed_job_or_log(&id, &error, "finalize unretained run");
-            return Err(error);
-        }
+        self.start_run_worker(&id)?;
         let mut result = self.run_result(&id, max_summary_lines)?;
         #[allow(clippy::option_map_unit_fn)]
         result.as_object_mut().map(|object| {
@@ -5276,6 +5307,7 @@ mod tests {
             let _guard = retain_threads.lock().unwrap();
             panic!("injected run-thread registry poison");
         }));
+        retain_store.resume_queued_runs(vec!["missing-resumed-run".to_owned()]);
         assert!(
             retain_store
                 .submit_command(retain_command["id"].as_str().unwrap(), None, None, 20)
@@ -6380,6 +6412,78 @@ mod tests {
         assert_eq!(result["terminal"], true);
         assert_eq!(result["status"], "failed");
         store.close().unwrap();
+    }
+
+    #[test]
+    fn reopening_a_store_interrupts_running_jobs_and_resumes_queued_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("restart-recovery.duckdb");
+        let store = CoverageStore::open(database.clone(), test_config()).unwrap();
+        let project = store.ensure_project(directory.path()).unwrap();
+        let command = store
+            .register_command(
+                "restart-recovery",
+                "printf resumed",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "restart recovery test",
+                true,
+            )
+            .unwrap();
+        let command_id = command["id"].as_str().unwrap();
+        let queued_id = Uuid::new_v4().to_string();
+        let running_id = Uuid::new_v4().to_string();
+        let insert = |id: &str, status: &str, started_at: Option<DateTime<Utc>>| {
+            let run_directory = database.parent().unwrap().join("runs").join(id);
+            std::fs::create_dir_all(&run_directory).unwrap();
+            let stdout = run_directory.join("stdout.log");
+            let stderr = run_directory.join("stderr.log");
+            store
+                .with_connection(|connection| {
+                    connection.execute(
+                        "INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, 'restart-recovery', 'printf resumed', NULL, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 20, ?, ?, ?, '', NULL)",
+                        params![
+                            id,
+                            command_id,
+                            project.repo_path,
+                            project.repo_path,
+                            project.repo_key,
+                            Utc::now(),
+                            started_at,
+                            status,
+                            stdout.to_string_lossy(),
+                            stderr.to_string_lossy(),
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        insert(&queued_id, "queued", None);
+        insert(&running_id, "running", Some(Utc::now()));
+        store.close().unwrap();
+
+        let reopened = CoverageStore::open(database, test_config()).unwrap();
+        reopened.ensure_project(directory.path()).unwrap();
+        let interrupted = reopened.run_result(&running_id, 20).unwrap();
+        assert_eq!(interrupted["terminal"], true);
+        assert_eq!(interrupted["status"], "interrupted");
+        assert!(interrupted["error"].as_str().unwrap().contains("restarted"));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let resumed = loop {
+            let result = reopened.run_result(&queued_id, 20).unwrap();
+            if result["terminal"] == true {
+                break result;
+            }
+            assert!(Instant::now() < deadline, "queued run did not resume");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(resumed["status"], "passed");
+        reopened.close().unwrap();
     }
 
     fn test_settings() -> ProjectSettings {

@@ -3,6 +3,20 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.9.1 - 2026-08-15
+
+### Fixed
+
+- Reconcile durable managed-run state whenever a daemon reopens a project:
+  terminalize orphaned `running` jobs as `interrupted` without replaying their
+  possibly side-effecting commands, and automatically resume jobs that never
+  left `queued` state.
+- Clarify the downstream connector boundary: an MCP configuration may install
+  the exact binary, but `coverage-mcp connect` alone owns repository routing,
+  fixed-port daemon discovery/startup, version handoff, stale-lease recovery,
+  and stdio request forwarding. Connectors do not take a connection lock and
+  have no direct-database mode.
+
 ## 0.9.0 - 2026-08-15
 
 ### Changed

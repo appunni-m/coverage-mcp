@@ -34,7 +34,10 @@ artifact.
    kill that daemon, and require the next `tools/list` request to recreate one
    daemon with a new PID through the unlocked stale lease file. Also verify HTTP
    `tools/list`, the dashboard, report ingest, a project policy edit, a manual
-   compaction pass, and a database reopen.
+   compaction pass, and a database reopen. Simulate an ungraceful exit with one
+   persisted `running` job and one `queued` job; require the former to become
+   terminal `interrupted` without execution and the latter to resume through
+   the normal worker limit.
 6. Verify lifecycle hardening: start two daemons against one common database
    and confirm the second exits with `resource busy`; open one project database
    twice and confirm the second owner is rejected. Start the previous released
@@ -62,12 +65,14 @@ artifact.
    coverage-mcp --root <temporary-root>`. Verify its version and both MCP
    transports; a local checkout or Git install is not registry evidence.
 10. Update the downstream testing plugin's pinned version only after the
-    published crate passes that clean install. Run two plugin launchers against
-    one empty runtime cache, confirm one Cargo install under the versioned
-    installer lock, then confirm both stdio bridges and a direct HTTP client
-    connect concurrently while only the daemon process holds its ownership
-    lock.
-    Exercise each claimed launcher platform; record native Windows as
+    published crate passes that clean install. Start two required plugin MCP
+    connectors against one empty runtime cache and confirm both eventually
+    execute the exact binary even if Cargo installation races. Confirm the
+    bootstrap contains no custom installer or client-connection lock and does
+    no daemon work before `exec coverage-mcp connect`. Then confirm both stdio
+    bridges and a direct HTTP client connect concurrently while only the daemon
+    process holds its ownership lease.
+    Exercise each claimed bootstrap platform; record native Windows as
     unsupported until a Windows bootstrap and its clean-machine test exist.
 11. Record the artifact checksums and release evidence. Do not publish a
     marketplace pin for an absent, yanked, or moving runtime source.
