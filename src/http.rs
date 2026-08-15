@@ -335,7 +335,7 @@ impl CoverageServer {
             && path.as_slice() == ["api", "projects"]
             && repository_header.is_none()
             && query_value(&query, "repo_path").is_none()
-            && self.config.db_path.is_none()
+            && self.config.default_repository_path.is_none()
         {
             return Ok(json_response(StatusCode::OK, self.unscoped_projects()?));
         }
@@ -353,24 +353,14 @@ impl CoverageServer {
             if project_id == "project" {
                 repository_header
                     .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
-                    .or_else(|| {
-                        self.config
-                            .db_path
-                            .as_ref()
-                            .map(|path| database_repository(path))
-                    })
+                    .or_else(|| self.config.default_repository_path_string())
             } else {
                 Some(self.repository_for_project_id(project_id)?)
             }
         } else {
             repository_header
                 .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
-                .or_else(|| {
-                    self.config
-                        .db_path
-                        .as_ref()
-                        .map(|path| database_repository(path))
-                })
+                .or_else(|| self.config.default_repository_path_string())
         };
         let service = self.service_for_repository_path(&repository.ok_or_else(|| {
             AppError::Validation(format!(
@@ -459,8 +449,8 @@ impl CoverageServer {
     }
 
     fn default_repository_path(&self) -> AppResult<String> {
-        if let Some(path) = &self.config.db_path {
-            return Ok(database_repository(path));
+        if let Some(path) = self.config.default_repository_path_string() {
+            return Ok(path);
         }
         std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
@@ -468,14 +458,10 @@ impl CoverageServer {
     }
 
     fn repository_for_project_id(&self, project_id: &str) -> AppResult<String> {
-        let repository = if let Some(path) = &self.config.db_path {
-            let repository = database_repository(path);
-            (key_hash(&repository) == project_id).then_some(repository)
-        } else {
-            self.registry_repositories()?
-                .into_iter()
-                .find(|repo_key| key_hash(repo_key) == project_id)
-        };
+        let repository = self
+            .registry_repositories()?
+            .into_iter()
+            .find(|repo_key| key_hash(repo_key) == project_id);
         repository.ok_or_else(|| AppError::NotFound(format!("project not found: {project_id}")))
     }
 
@@ -498,10 +484,7 @@ impl CoverageServer {
                 },
             ));
         }
-        let db_path = match self.config.db_path.clone() {
-            Some(path) => path,
-            None => project_database_path(&self.config.common_db_path, &key),
-        };
+        let db_path = project_database_path(&self.config.common_db_path, &key);
         let store = CoverageStore::open(db_path, self.config.clone())?;
         store.ensure_project(Path::new(&git.repo_path))?;
         self.stores()?.insert(key.clone(), store.clone());
@@ -606,9 +589,6 @@ impl CoverageServer {
     }
 
     fn register_repository(&self, repo_key: &str) -> AppResult<()> {
-        if self.config.db_path.is_some() {
-            return Ok(());
-        }
         let connection = registry_connection(&self.config.common_db_path)?;
         connection.execute(
             "INSERT INTO repositories (id, repo_key, last_seen) VALUES (?, ?, current_timestamp) ON CONFLICT (repo_key) DO UPDATE SET last_seen = excluded.last_seen",
@@ -622,7 +602,7 @@ impl CoverageServer {
     }
 
     fn registry_repositories_with_limit(&self, limit: i64) -> AppResult<Vec<String>> {
-        if self.config.db_path.is_some() || !self.config.common_db_path.exists() {
+        if !self.config.common_db_path.exists() {
             return Ok(Vec::new());
         }
         let connection = Connection::open(&self.config.common_db_path)?;
@@ -764,22 +744,6 @@ async fn wait_for_shutdown(
         }
     } else {
         ctrl_c.await
-    }
-}
-
-fn database_repository(path: &Path) -> String {
-    let parent = path.parent().unwrap_or(Path::new("."));
-    if parent
-        .file_name()
-        .is_some_and(|name| name == ".coverage-mcp")
-    {
-        parent
-            .parent()
-            .unwrap_or(parent)
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        parent.to_string_lossy().into_owned()
     }
 }
 
@@ -1052,7 +1016,7 @@ mod tests {
         ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 59_471,
-            db_path: None,
+            default_repository_path: None,
             common_db_path: std::env::temp_dir().join(format!(
                 "coverage-mcp-http-test-{}.duckdb",
                 std::process::id()
@@ -1175,13 +1139,7 @@ mod tests {
         assert!(project_patch(&json!({"compaction_enabled":"true"})).is_err());
         assert!(project_patch(&json!({"compaction_interval_seconds":"60"})).is_err());
 
-        let normal_db = database_repository(Path::new("/tmp/data.duckdb"));
-        assert!(normal_db.ends_with("/tmp"));
-        let project_db =
-            database_repository(Path::new("/tmp/project/.coverage-mcp/coverage.duckdb"));
-        assert!(project_db.ends_with("/tmp/project"));
         assert_eq!(key_hash("repo").len(), 24);
-        assert!(database_repository(Path::new("")).ends_with("."));
         let database_directory = tempfile::tempdir().unwrap();
         let repository = database_directory.path().join("repo");
         std::fs::create_dir_all(&repository).unwrap();
@@ -1281,6 +1239,24 @@ mod tests {
         assert_eq!(health["instance_id"], server.instance_id.as_ref());
         assert_eq!(health["handoff_supported"], true);
         assert!(!health.to_string().contains(server.handoff_token.as_ref()));
+        let fallback_directory = tempfile::tempdir().unwrap();
+        let fallback_store =
+            CoverageStore::open(fallback_directory.path().join("fallback.duckdb"), config())
+                .unwrap();
+        let fallback_project = fallback_store
+            .ensure_project(fallback_directory.path())
+            .unwrap();
+        let fallback_service = CoverageService::new(
+            fallback_store.clone(),
+            RequestContext {
+                repo_key: fallback_project.repo_key,
+                checkout_path: fallback_project.repo_path,
+                suite: None,
+            },
+        );
+        let fallback_projects = server.project_list(fallback_service, None, 600).unwrap();
+        assert_eq!(fallback_projects["data"].as_array().unwrap().len(), 1);
+        fallback_store.close().unwrap();
         let poisoned_server = CoverageServer::new(config()).unwrap();
         let stores = poisoned_server.stores.clone();
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1297,13 +1273,6 @@ mod tests {
                 .contains("coverage-mcp")
         );
         let directory = tempfile::tempdir().unwrap();
-        let mut standalone_config = config();
-        standalone_config.db_path = Some(directory.path().join("coverage.duckdb"));
-        let standalone = CoverageServer::new(standalone_config).unwrap();
-        assert_eq!(
-            standalone.default_repository_path().unwrap(),
-            directory.path().to_string_lossy()
-        );
         let store =
             CoverageStore::open(directory.path().join("selected.duckdb"), config()).unwrap();
         let project = store.ensure_project(directory.path()).unwrap();
@@ -1325,7 +1294,6 @@ mod tests {
             },
         );
         assert!(server.project_list(service.clone(), None, 600).is_ok());
-        assert!(standalone.project_list(service.clone(), None, 600).is_ok());
         let stale_directory = tempfile::tempdir().unwrap();
         let stale =
             CoverageStore::open(stale_directory.path().join("stale.duckdb"), config()).unwrap();
@@ -1469,18 +1437,16 @@ mod tests {
             registry_connection_with_schema(&parent_file.join("child.duckdb"), "SELECT 1").is_err()
         );
 
-        let mut standalone_config = config();
-        standalone_config.db_path = Some(directory.path().join("standalone.duckdb"));
-        let standalone_server = CoverageServer::new(standalone_config).unwrap();
+        let shared_server = CoverageServer::new(config()).unwrap();
         let store =
             CoverageStore::open(directory.path().join("selected.duckdb"), config()).unwrap();
         let project = store.ensure_project(directory.path()).unwrap();
-        standalone_server
+        shared_server
             .stores
             .lock()
             .unwrap()
             .insert(project.repo_key, store.clone());
-        assert!(standalone_server.unscoped_projects().is_ok());
+        assert!(shared_server.unscoped_projects().is_ok());
         store.close().unwrap();
     }
 

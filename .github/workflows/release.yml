@@ -216,7 +216,7 @@ jobs:
           shared-key: verify
       - name: Package and verify crate
         # Feature selection changes only the verification build. The .crate
-        # still declares bundled DuckDB as its default for standalone installs.
+        # still declares bundled DuckDB as its default for Cargo installs.
         run: cargo package --locked --no-default-features
       - name: Prepare crate artifact
         run: |

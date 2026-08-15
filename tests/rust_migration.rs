@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use coverage_mcp::config::ServerConfig;
@@ -27,7 +27,7 @@ fn config() -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".to_owned(),
         port: 59_471,
-        db_path: None,
+        default_repository_path: None,
         common_db_path: std::env::temp_dir().join(format!(
             "coverage-mcp-test-common-{}.duckdb",
             std::process::id()
@@ -3015,7 +3015,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     run_task.abort();
     let _ = run_task.await;
     let mut server_config = config();
-    server_config.db_path = Some(directory.path().join("coverage.duckdb"));
+    server_config.default_repository_path = Some(directory.path().to_path_buf());
     let server = CoverageServer::new(server_config).unwrap();
     let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
         Ok(listener) => listener,
@@ -3636,12 +3636,17 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
 
     let mut common_config = config();
     common_config.common_db_path = directory.path().join("common-registry.duckdb");
+    let common_repository = tempfile::tempdir().unwrap();
+    git_repo(common_repository.path());
     let common_server = CoverageServer::new(common_config).unwrap();
     let common_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let common_address = common_listener.local_addr().unwrap();
     let common_task = tokio::spawn(common_server.serve_listener(common_listener));
     let _empty_projects = http_exchange(common_address, "GET", "/api/projects", None, None).await;
-    let repo_header = ("x-coverage-mcp-repo", directory.path().to_str().unwrap());
+    let repo_header = (
+        "x-coverage-mcp-repo",
+        common_repository.path().to_str().unwrap(),
+    );
     let _empty_latest_run = http_exchange(
         common_address,
         "GET",
@@ -3712,7 +3717,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let bad_db_directory = bad_directory.path().join("database-directory");
     std::fs::create_dir_all(&bad_db_directory).unwrap();
     let mut bad_config = config();
-    bad_config.db_path = Some(bad_db_directory);
+    bad_config.common_db_path = bad_db_directory;
     let bad_server = CoverageServer::new(bad_config).unwrap();
     let bad_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let bad_address = bad_listener.local_addr().unwrap();
@@ -3853,6 +3858,31 @@ fn rust_cli_entrypoint_executes_compaction_and_host_validation() {
     let Some(binary) = binary else {
         return;
     };
+    let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = port_probe.local_addr().unwrap().port();
+    drop(port_probe);
+    let common_db = directory.path().join("daemon/common.duckdb");
+    let mut compaction_daemon = Command::new(&binary)
+        .args([
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--common-db",
+            common_db.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let compact = Command::new(&binary)
         .args([
             "compact",
@@ -3861,18 +3891,35 @@ fn rust_cli_entrypoint_executes_compaction_and_host_validation() {
             "--older-than-days",
             "1",
         ])
+        .env("COVERAGE_MCP_HOST", "127.0.0.1")
+        .env("COVERAGE_MCP_PORT", port.to_string())
+        .env("COVERAGE_MCP_COMMON_DB", &common_db)
         .output()
         .unwrap();
     assert!(compact.status.success(), "compact failed: {compact:?}");
     assert!(String::from_utf8_lossy(&compact.stdout).contains("completed"));
     let compact_with_default_policy = Command::new(&binary)
         .args(["compact", "--repo", directory.path().to_str().unwrap()])
+        .env("COVERAGE_MCP_HOST", "127.0.0.1")
+        .env("COVERAGE_MCP_PORT", port.to_string())
+        .env("COVERAGE_MCP_COMMON_DB", &common_db)
         .output()
         .unwrap();
     assert!(
         compact_with_default_policy.status.success(),
         "default-policy compact failed: {compact_with_default_policy:?}"
     );
+    assert!(compaction_daemon.try_wait().unwrap().is_none());
+    let registry = duckdb::Connection::open(&common_db).unwrap();
+    let registered_repositories = registry
+        .query_row("SELECT COUNT(*) FROM repositories", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(registered_repositories, 1);
+    drop(registry);
+    compaction_daemon.kill().unwrap();
+    let _ = compaction_daemon.wait().unwrap();
     let invalid_host = Command::new(&binary)
         .args(["serve", "--host", "0.0.0.0"])
         .output()
@@ -3880,7 +3927,17 @@ fn rust_cli_entrypoint_executes_compaction_and_host_validation() {
     assert!(!invalid_host.status.success());
     assert!(String::from_utf8_lossy(&invalid_host.stderr).contains("daemon host"));
     let mut daemon = Command::new(&binary)
-        .args(["serve", "--port", "0"])
+        .args([
+            "serve",
+            "--port",
+            "0",
+            "--common-db",
+            directory
+                .path()
+                .join("port-zero/common.duckdb")
+                .to_str()
+                .unwrap(),
+        ])
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));

@@ -21,7 +21,7 @@ fn config() -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".to_owned(),
         port: 59471,
-        db_path: None,
+        default_repository_path: None,
         common_db_path: std::env::temp_dir().join(format!(
             "coverage-mcp-test-common-{}.duckdb",
             std::process::id()
@@ -77,7 +77,6 @@ fn spawn_shared_connector(repo: &Path, common_db: &Path, port: u16) -> Child {
         .env("COVERAGE_MCP_HOST", "127.0.0.1")
         .env("COVERAGE_MCP_PORT", port.to_string())
         .env("COVERAGE_MCP_COMMON_DB", common_db)
-        .env_remove("COVERAGE_MCP_DB")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -297,48 +296,25 @@ fn storage_smoke() {
 }
 
 #[test]
-fn standalone_stdio_mcp_smoke() {
+fn cli_rejects_direct_database_modes() {
     let directory = tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
-        .args(["connect", "--repo", env!("CARGO_MANIFEST_DIR"), "--db"])
-        .arg(directory.path().join("stdio.duckdb"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let input = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
-        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/list\"}\n",
-        "not-json\n"
-    );
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "stdio failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let responses = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 4);
-    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "coverage-mcp");
-    assert_eq!(
-        responses[1]["result"]["tools"].as_array().unwrap().len(),
-        11
-    );
-    assert!(responses[2]["result"]["resources"].is_array());
-    assert_eq!(responses[3]["error"]["code"], -32000);
+    for subcommand in ["connect", "serve"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+            .args([subcommand, "--help"])
+            .output()
+            .unwrap();
+        assert!(help.status.success());
+        assert!(!String::from_utf8(help.stdout).unwrap().contains("--db"));
+
+        let rejected = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+            .arg(subcommand)
+            .arg("--db")
+            .arg(directory.path().join("direct.duckdb"))
+            .output()
+            .unwrap();
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(String::from_utf8(rejected.stderr).unwrap().contains("--db"));
+    }
 }
 
 #[cfg(unix)]
@@ -428,7 +404,6 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         .env("COVERAGE_MCP_HOST", "127.0.0.1")
         .env("COVERAGE_MCP_PORT", port.to_string())
         .env("COVERAGE_MCP_COMMON_DB", &common_db)
-        .env_remove("COVERAGE_MCP_DB")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -561,7 +536,6 @@ fn connector_refuses_to_replace_an_unlocked_health_lookalike() {
         .env("COVERAGE_MCP_HOST", "127.0.0.1")
         .env("COVERAGE_MCP_PORT", port.to_string())
         .env("COVERAGE_MCP_COMMON_DB", &common_db)
-        .env_remove("COVERAGE_MCP_DB")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -380,7 +380,7 @@ fn fixture_config(root: &Path) -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".to_owned(),
         port: 59_471,
-        db_path: None,
+        default_repository_path: None,
         common_db_path: root.join("common.duckdb"),
         run_retention: 100,
         run_concurrency: 4,

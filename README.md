@@ -123,7 +123,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.8.7' --locked
+cargo install coverage-mcp --version '=0.9.0' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -167,10 +167,10 @@ For a checkout-local MCP registration, point the client at Cargo explicitly:
 }
 ```
 
-The `stdio` subcommand is an alias. A project database is created at
-`<repository>/.coverage-mcp/coverage.duckdb`. Supplying `--db` or
-`COVERAGE_MCP_DB` explicitly selects standalone stdio mode instead of the
-shared daemon. A typical client entry is:
+The `stdio` subcommand is an alias. Every stdio connector starts or reuses the
+shared daemon and forwards its repository selection over loopback HTTP. Only
+the daemon opens `<repository>/.coverage-mcp/coverage.duckdb`; connectors have
+no direct-database mode. A typical client entry is:
 
 ```json
 {
@@ -220,9 +220,9 @@ Git checkout. An older verified daemon is replaced automatically. If startup
 still reports an incompatible daemon, recovery deliberately refused an
 unverified owner, a different common database, an equal or newer version, or
 inconsistent health/lease identity; inspect `/health`, `daemon.lock`, and
-`~/.coverage-mcp/daemon.log` without deleting them. A database lock in shared
-mode means a standalone connector or other process already owns that
-repository store; stop that competing owner instead of deleting the lock file.
+`~/.coverage-mcp/daemon.log` without deleting them. A project database lock
+means another daemon or external process already owns that repository store;
+stop that competing owner instead of deleting the lock file.
 
 Every present argument is type-checked. An omitted optional argument receives
 the documented default; a present argument with the wrong JSON type is a
@@ -469,7 +469,9 @@ project-specific routes can use that identifier without a repository header;
 the header and `repo_path` query parameter remain supported for compatibility.
 Project settings are applied per canonical repository, not per checkout.
 
-The command-line one-shot pass is useful for maintenance jobs:
+The command-line one-shot pass is useful for maintenance jobs. It starts or
+reuses the shared daemon and sends the maintenance request over loopback HTTP;
+the CLI process never opens the project database:
 
 ```sh
 coverage-mcp compact --repo /absolute/path/to/repository \
@@ -513,9 +515,9 @@ health identity and actively held lease agree, then waits for the lease before
 starting the replacement. Clients never take this lease: direct HTTP
 connections and any number of stdio bridges can use the daemon concurrently,
 subject to configured resource limits. Each project database has the same
-protection at `<database>.lock`; this prevents a daemon, standalone stdio
-process, and compaction process from opening the same DuckDB file at the same
-time.
+protection at `<database>.lock`; this prevents daemons using different registry
+locations, or another library process, from opening the same DuckDB file at the
+same time. Stdio and compaction clients never open that file themselves.
 
 Every project store uses a bounded DuckDB connection pool. Writes are
 serialized through the store write gate, while read-only paths can use the
@@ -537,7 +539,6 @@ reported explicitly; the server never deletes a WAL or lock file to recover.
 | `COVERAGE_MCP_HOST` | `127.0.0.1` | Loopback bind host; public binding is rejected. |
 | `COVERAGE_MCP_PORT` | `59471` | HTTP port. |
 | `COVERAGE_MCP_COMMON_DB` | `~/.coverage-mcp/common.duckdb` | Common registry database. |
-| `COVERAGE_MCP_DB` | unset | Explicit database for standalone `connect`; normal shared-daemon connectors must leave it unset. |
 | `COVERAGE_MCP_RUN_RETENTION` | `100` | Terminal runs retained per command. |
 | `COVERAGE_MCP_RUN_CONCURRENCY` | `4` | Managed command workers. |
 | `COVERAGE_MCP_HTTP_CONCURRENCY` | `16` | Concurrent HTTP MCP requests. |

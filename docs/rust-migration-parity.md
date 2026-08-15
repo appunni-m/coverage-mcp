@@ -14,7 +14,7 @@ changes can be reviewed against the contract that was carried forward.
 | Git identity and worktree lineage | `src/git.rs`, `src/storage.rs` | `rust_worktree_registration_and_lineage_guards`, storage lineage tests |
 | DuckDB snapshots, queries, runs, artifacts, and compaction | `src/storage.rs`, `src/compaction.rs` | `rust_storage_queries_compare_and_compacts_old_detail`, storage tests, smoke test |
 | Response budgets, cursors, compact projections, and service validation | `src/service.rs` | `rust_service_pagination_projection_and_mcp_contract_match` |
-| MCP inventory, schemas, resources, safety, and JSON-RPC dispatch | `src/mcp.rs` | MCP contract assertions, HTTP wire test, standalone stdio smoke test |
+| MCP inventory, schemas, resources, safety, and JSON-RPC dispatch | `src/mcp.rs` | MCP contract assertions, HTTP wire test, daemon-only CLI rejection test |
 | Shared-daemon stdio lifecycle, crash autorecovery, authenticated version handoff, and repository routing | `src/main.rs`, `src/http.rs`, `src/lock.rs` | concurrent two-repository connector smoke test, same-bridge crash/stale-file recovery, daemon-owner assertion, handoff authorization/process-exit test, and older-version replacement probe |
 | REST routing, health, dashboard, common registry, and lifecycle | `src/http.rs`, `src/dashboard.html` | live REST/dashboard/health/MCP test and browser smoke verification |
 | Background detail compaction | `src/compaction.rs`, `src/storage.rs` | policy default/edit/manual-pass, compressed payload, transparent restore tests |
@@ -99,9 +99,10 @@ the self-contained runtime shipped to users.
 
 The coverage gate proves 100% measured function and line coverage for the Rust
 library/runtime target set. The CLI launcher is excluded from aggregate LLVM
-counters because it is exercised in child processes; standalone and concurrent
-shared-daemon stdio smoke tests still verify that launcher directly. Region
-and branch percentages remain diagnostics and are not represented as 100%.
+counters because it is exercised in child processes; daemon-only CLI and
+concurrent shared-daemon stdio smoke tests still verify that launcher directly.
+Region and branch percentages remain diagnostics and are not represented as
+100%.
 
 ## Compaction policy carried forward
 

@@ -118,7 +118,7 @@ pub fn daemon_lock_path(common_db_path: &Path) -> PathBuf {
         .join("daemon.lock")
 }
 
-/// Returns the per-database lock path used by standalone and project stores.
+/// Returns the per-database lock path used by daemon-owned project stores.
 pub fn database_lock_path(db_path: &Path) -> PathBuf {
     let mut value = db_path.as_os_str().to_os_string();
     value.push(".lock");

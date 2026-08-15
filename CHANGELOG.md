@@ -3,6 +3,25 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.9.0 - 2026-08-15
+
+### Changed
+
+- Removed direct database selection from the CLI and environment. `connect`,
+  its `stdio` alias, and `compact` now always start or reuse the shared daemon;
+  only the daemon opens repository stores. `serve` always uses the common
+  registry and lazy multi-project routing.
+- Removed the public `ServerConfig::db_path` and `ServerConfig::for_repository`
+  standalone configuration surface. Embedded servers may provide
+  `default_repository_path` only as a headerless routing default; database
+  selection remains daemon-owned.
+
+### Migration
+
+- Remove `--db` from `serve`, `connect`, and `stdio` invocations and stop
+  setting `COVERAGE_MCP_DB`. Select a project with `--repo`; use
+  `COVERAGE_MCP_COMMON_DB` only to relocate the shared daemon registry.
+
 ## 0.8.7 - 2026-08-15
 
 ### Fixed
@@ -139,8 +158,8 @@ minor versions may contain breaking public-contract changes.
   resource reads, tool calls, notifications, and errors share one contract.
 - Restored `connect` as a repository-selecting stdio bridge that starts or
   reuses one loopback daemon. Only the daemon process holds its ownership
-  lease; concurrent Codex clients never lock one another. Explicit `--db`
-  remains standalone.
+  lease; concurrent Codex clients never lock one another. That release still
+  retained the legacy direct-database connector option removed in 0.9.0.
 - Restored repository-local project databases in shared-daemon mode, with a
   compatibility fallback for centralized Rust-era project stores.
 - Synchronized startup, direct-HTTP, ownership, configuration, release, and

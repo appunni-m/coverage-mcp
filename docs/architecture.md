@@ -42,7 +42,7 @@ requests without replaying an operation whose commit status is ambiguous.
 
 | Module | Responsibility |
 | --- | --- |
-| `src/main.rs` | CLI, `serve`, `connect`/`stdio`, and one-shot `compact` lifecycle. |
+| `src/main.rs` | CLI, shared-daemon `serve`, `connect`/`stdio`, and daemon-routed `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
 | `src/mcp.rs` | Explicit schema-7 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
@@ -146,9 +146,9 @@ project stores live at `<repository>/.coverage-mcp/coverage.duckdb`. This
 preserves coverage history and approvals across stdio client restarts without
 allowing each client to own DuckDB. A centralized Rust-era
 `projects/<stable-key>.duckdb` is reused only when it already exists and the
-repository-local database does not. Explicit `connect --db <path>` and
-`compact` remain standalone operations. All parent directories are created by
-the Rust storage layer.
+repository-local database does not. All connector and compaction requests go
+through the shared daemon; only that daemon resolves and opens project stores.
+All parent directories are created by the Rust storage layer.
 
 The database contains project settings, repository registry rows, snapshots,
 files, lines, compacted payloads, worktrees, registered commands, runs, jobs,

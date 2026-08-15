@@ -1473,7 +1473,7 @@ mod tests {
         let config = ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 59_471,
-            db_path: None,
+            default_repository_path: None,
             common_db_path: directory.path().join("common.duckdb"),
             run_retention: 100,
             run_concurrency: 1,

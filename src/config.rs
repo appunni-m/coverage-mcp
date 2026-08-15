@@ -2,7 +2,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
-use crate::git::inspect_git;
 
 /// Default loopback port used by the shared daemon.
 pub const DEFAULT_PORT: u16 = 59_471;
@@ -46,8 +45,11 @@ pub struct ServerConfig {
     pub host: String,
     /// Bind port.
     pub port: u16,
-    /// Optional standalone repository database.
-    pub db_path: Option<PathBuf>,
+    /// Optional default repository for headerless HTTP requests.
+    ///
+    /// The daemon still owns and routes the repository store; this value only
+    /// selects the repository context.
+    pub default_repository_path: Option<PathBuf>,
     /// Daemon-wide project registry database.
     pub common_db_path: PathBuf,
     /// Terminal run retention per command.
@@ -77,22 +79,24 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub(crate) fn default_repository_path_string(&self) -> Option<String> {
+        self.default_repository_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
     /// Builds configuration from CLI overrides and environment variables.
     pub fn from_environment(
         host: Option<String>,
         port: Option<u16>,
-        db_path: Option<PathBuf>,
         common_db_path: Option<PathBuf>,
     ) -> AppResult<Self> {
-        Self::from_environment_with_lookup(host, port, db_path, common_db_path, &|name| {
-            env::var(name).ok()
-        })
+        Self::from_environment_with_lookup(host, port, common_db_path, &|name| env::var(name).ok())
     }
 
     fn from_environment_with_lookup(
         host: Option<String>,
         port: Option<u16>,
-        db_path: Option<PathBuf>,
         common_db_path: Option<PathBuf>,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> AppResult<Self> {
@@ -206,7 +210,7 @@ impl ServerConfig {
         Ok(Self {
             host,
             port,
-            db_path,
+            default_repository_path: None,
             common_db_path,
             run_retention,
             run_concurrency,
@@ -222,24 +226,9 @@ impl ServerConfig {
             default_compaction_batch_size,
         })
     }
-
-    /// Builds standalone configuration rooted at a repository checkout.
-    pub fn for_repository(path: PathBuf) -> AppResult<Self> {
-        Self::for_repository_with_lookup(path, &|name| env::var(name).ok())
-    }
-
-    fn for_repository_with_lookup(
-        path: PathBuf,
-        lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> AppResult<Self> {
-        let git = inspect_git(&path)?;
-        let mut config = Self::from_environment_with_lookup(None, None, None, None, lookup)?;
-        config.db_path = Some(default_db_path(Path::new(&git.repo_key)));
-        Ok(config)
-    }
 }
 
-/// Returns the repository-local database path used by standalone mode.
+/// Returns the repository-local database path owned by the shared daemon.
 pub fn default_db_path(path: &Path) -> PathBuf {
     path.join(".coverage-mcp").join("coverage.duckdb")
 }
@@ -251,7 +240,6 @@ pub fn default_common_db_path() -> PathBuf {
 
 fn default_common_db_path_with_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     lookup("COVERAGE_MCP_COMMON_DB")
-        .or_else(|| lookup("COVERAGE_MCP_DB"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(lookup("HOME").unwrap_or_else(|| ".".to_owned()))
@@ -335,22 +323,24 @@ mod tests {
         let config = ServerConfig::from_environment(
             Some("localhost".to_owned()),
             Some(1234),
-            Some(PathBuf::from("db.duckdb")),
             Some(PathBuf::from("common.duckdb")),
         )
         .expect("configuration");
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 1234);
-        assert_eq!(config.db_path, Some(PathBuf::from("db.duckdb")));
         assert_eq!(config.common_db_path, PathBuf::from("common.duckdb"));
         assert_eq!(
             config.default_compaction_after_days,
             DEFAULT_COMPACTION_AFTER_DAYS
         );
 
-        let defaults =
-            ServerConfig::from_environment(None, None, None, Some(PathBuf::from("common")))
-                .expect("default configuration");
+        let defaults = ServerConfig::from_environment_with_lookup(
+            None,
+            None,
+            Some(PathBuf::from("common")),
+            &|_| None,
+        )
+        .expect("default configuration");
         assert_eq!(defaults.host, "127.0.0.1");
         assert_eq!(defaults.port, DEFAULT_PORT);
         assert_eq!(defaults.run_retention, DEFAULT_RUN_RETENTION);
@@ -381,31 +371,13 @@ mod tests {
     #[test]
     fn repository_and_path_defaults_are_usable() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let config = ServerConfig::for_repository(directory.path().to_path_buf()).expect("config");
-        assert!(
-            config
-                .db_path
-                .expect("db path")
-                .ends_with("coverage.duckdb")
-        );
         assert_eq!(
             default_db_path(directory.path()),
             directory.path().join(".coverage-mcp/coverage.duckdb")
         );
         assert!(default_common_db_path().ends_with("common.duckdb"));
-
-        let invalid = |name: &str| {
-            (name == "COVERAGE_MCP_RUN_RETENTION").then(|| "not-an-integer".to_owned())
-        };
-        assert!(
-            ServerConfig::for_repository_with_lookup(directory.path().to_path_buf(), &invalid)
-                .is_err()
-        );
-        let no_environment = |_: &str| None;
+        let no_environment = |_: &str| None::<String>;
         assert!(no_environment("HOME").is_none());
-        assert!(
-            ServerConfig::for_repository_with_lookup(PathBuf::from("\0"), &no_environment).is_err()
-        );
     }
 
     #[test]
@@ -456,7 +428,7 @@ mod tests {
         };
         assert!(overrides("UNKNOWN").is_none());
         let configured =
-            ServerConfig::from_environment_with_lookup(None, None, None, None, &overrides).unwrap();
+            ServerConfig::from_environment_with_lookup(None, None, None, &overrides).unwrap();
         assert_eq!(configured.host, "localhost");
         assert_eq!(configured.port, 1234);
         assert_eq!(configured.run_retention, 7);
@@ -481,7 +453,6 @@ mod tests {
             ServerConfig::from_environment_with_lookup(
                 None,
                 None,
-                None,
                 Some(PathBuf::from("common")),
                 &invalid_deadline,
             )
@@ -504,8 +475,7 @@ mod tests {
         ] {
             let invalid = |name: &str| (name == invalid_name).then(|| "not-an-integer".to_owned());
             assert!(
-                ServerConfig::from_environment_with_lookup(None, None, None, None, &invalid)
-                    .is_err()
+                ServerConfig::from_environment_with_lookup(None, None, None, &invalid).is_err()
             );
         }
 
@@ -515,19 +485,12 @@ mod tests {
             ServerConfig::from_environment_with_lookup(
                 None,
                 None,
-                None,
                 Some(PathBuf::from("common")),
                 &invalid_port,
             )
             .is_err()
         );
 
-        let legacy_db =
-            |name: &str| (name == "COVERAGE_MCP_DB").then(|| "legacy.duckdb".to_owned());
-        assert_eq!(
-            default_common_db_path_with_lookup(&legacy_db),
-            PathBuf::from("legacy.duckdb")
-        );
         let home = |name: &str| (name == "HOME").then(|| "/tmp/test-home".to_owned());
         assert_eq!(
             default_common_db_path_with_lookup(&home),
@@ -554,7 +517,6 @@ mod tests {
                 ServerConfig::from_environment_with_lookup(
                     None,
                     None,
-                    None,
                     Some(PathBuf::from("common")),
                     &lookup,
                 )
@@ -579,7 +541,6 @@ mod tests {
             let lookup = |candidate: &str| (candidate == name).then(|| value.to_owned());
             assert!(
                 ServerConfig::from_environment_with_lookup(
-                    None,
                     None,
                     None,
                     Some(PathBuf::from("common")),

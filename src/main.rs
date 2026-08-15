@@ -8,14 +8,11 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use coverage_mcp::config::default_db_path;
 use coverage_mcp::error::{AppError, AppResult};
 use coverage_mcp::git::inspect_git;
 use coverage_mcp::http::{DAEMON_HANDOFF_PATH, REPOSITORY_HEADER};
 use coverage_mcp::lock::{DaemonLeaseOwner, daemon_lock_path, held_daemon_owner};
-use coverage_mcp::mcp;
-use coverage_mcp::service::{CoverageService, RequestContext};
-use coverage_mcp::{CoverageServer, CoverageStore, SCHEMA_REVISION, ServerConfig, VERSION};
+use coverage_mcp::{CoverageServer, SCHEMA_REVISION, ServerConfig, VERSION};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
@@ -47,9 +44,6 @@ enum Command {
         /// Bind port, defaulting to COVERAGE_MCP_PORT or 59471.
         #[arg(long, env = "COVERAGE_MCP_PORT")]
         port: Option<u16>,
-        /// Use one standalone repository database instead of lazy project routing.
-        #[arg(long)]
-        db: Option<PathBuf>,
         /// Override the daemon-wide common registry database.
         #[arg(long, env = "COVERAGE_MCP_COMMON_DB")]
         common_db: Option<PathBuf>,
@@ -60,9 +54,6 @@ enum Command {
         /// Repository checkout used for project selection, defaulting to `.`.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// Run standalone against this database instead of using the shared daemon.
-        #[arg(long, env = "COVERAGE_MCP_DB")]
-        db: Option<PathBuf>,
     },
     /// Run one compaction pass for a project and exit.
     Compact {
@@ -81,87 +72,29 @@ async fn main() -> AppResult<()> {
     match cli.command.unwrap_or(Command::Serve {
         host: None,
         port: None,
-        db: None,
         common_db: None,
     }) {
         Command::Serve {
             host,
             port,
-            db,
             common_db,
         } => {
-            let config = ServerConfig::from_environment(host, port, db, common_db)?;
+            let config = ServerConfig::from_environment(host, port, common_db)?;
             CoverageServer::new(config)?.run().await?;
         }
-        Command::Connect { repo, db } => run_stdio(repo, db).await?,
+        Command::Connect { repo } => run_shared_stdio(repo).await?,
         Command::Compact {
             repo,
             older_than_days,
         } => {
-            let config = ServerConfig::for_repository(repo.clone())?;
-            let db_path = standalone_db_path(&config)?;
-            let store = coverage_mcp::CoverageStore::open(db_path, config.clone())?;
-            store.ensure_project(&repo)?;
-            if let Some(days) = older_than_days {
-                store.update_project_settings(coverage_mcp::storage::ProjectSettingsPatch {
-                    compaction_after_days: Some(days),
-                    ..Default::default()
-                })?;
-            }
-            let result = store.compact_now()?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            store.close()?;
+            run_compact(repo, older_than_days).await?;
         }
     }
-    Ok(())
-}
-
-async fn run_stdio(repo: PathBuf, db: Option<PathBuf>) -> AppResult<()> {
-    if let Some(db) = db {
-        return run_standalone_stdio(repo, db).await;
-    }
-    run_shared_stdio(repo).await
-}
-
-async fn run_standalone_stdio(repo: PathBuf, db: PathBuf) -> AppResult<()> {
-    let mut config = ServerConfig::for_repository(repo.clone())?;
-    config.db_path = Some(db);
-    let repo_path = config
-        .db_path
-        .clone()
-        .unwrap_or_else(|| default_db_path(&repo));
-    let store = CoverageStore::open(repo_path, config)?;
-    let git = store.ensure_project(&repo)?;
-    let service = CoverageService::new(
-        store.clone(),
-        RequestContext {
-            repo_key: git.repo_key,
-            checkout_path: git.repo_path,
-            suite: None,
-        },
-    );
-
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    let stdout = BufWriter::new(tokio::io::stdout());
-    let mut stdout = stdout;
-    while let Some(line) = lines.next_line().await? {
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => mcp::dispatch_json_rpc(Some(&service), &request),
-            Err(error) => Some(json_rpc_error(None, coverage_mcp::AppError::Json(error))),
-        };
-        if let Some(response) = response {
-            stdout.write_all(response.to_string().as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
-        }
-    }
-    store.close()?;
     Ok(())
 }
 
 async fn run_shared_stdio(repo: PathBuf) -> AppResult<()> {
-    let config = ServerConfig::from_environment(None, None, None, None)?;
+    let config = ServerConfig::from_environment(None, None, None)?;
     validate_loopback_host(&config.host)?;
     let git = inspect_git(&repo)?;
     ensure_daemon(&config).await?;
@@ -190,28 +123,55 @@ async fn run_shared_stdio(repo: PathBuf) -> AppResult<()> {
     Ok(())
 }
 
+async fn run_compact(repo: PathBuf, older_than_days: Option<u32>) -> AppResult<()> {
+    let config = ServerConfig::from_environment(None, None, None)?;
+    validate_loopback_host(&config.host)?;
+    let git = inspect_git(&repo)?;
+    ensure_daemon(&config).await?;
+
+    if let Some(days) = older_than_days {
+        let body = json!({"compaction_after_days":days}).to_string();
+        let response = daemon_request_with_recovery(
+            &config,
+            "PATCH",
+            "/api/projects/project",
+            Some(&git.repo_path),
+            body.as_bytes(),
+        )
+        .await?;
+        successful_daemon_json(response, "update compaction settings")?;
+    }
+
+    let response = daemon_request_with_recovery(
+        &config,
+        "POST",
+        "/api/projects/project/compact",
+        Some(&git.repo_path),
+        b"{}",
+    )
+    .await?;
+    let envelope = successful_daemon_json(response, "compact project")?;
+    let result = envelope.get("data").unwrap_or(&envelope);
+    println!("{}", serde_json::to_string_pretty(result)?);
+    Ok(())
+}
+
 async fn forward_mcp_request_with_recovery(
     config: &ServerConfig,
     repo_path: &str,
     request: &Value,
 ) -> AppResult<Option<Value>> {
-    match forward_mcp_request(config, repo_path, request).await {
-        Ok(response) => Ok(response),
-        Err(error) if is_transport_interruption(&error) => {
-            // A stdio bridge can outlive the shared daemon. Re-establish the
-            // verified single owner before returning control to the MCP host.
-            // Replay only when TCP refused the connection, which proves the
-            // JSON-RPC request was never delivered; timeouts and other I/O
-            // failures may have committed a write and must not be duplicated.
-            let replay = is_connection_refused(&error);
-            ensure_daemon(config).await?;
-            if replay {
-                forward_mcp_request(config, repo_path, request).await
-            } else {
-                Err(error)
-            }
-        }
-        Err(error) => Err(error),
+    let body = request.to_string();
+    let response =
+        daemon_request_with_recovery(config, "POST", "/mcp/", Some(repo_path), body.as_bytes())
+            .await?;
+    match response.status {
+        200 => Ok(Some(serde_json::from_slice(&response.body)?)),
+        202 => Ok(None),
+        status => Err(AppError::Runtime(format!(
+            "Coverage MCP daemon returned HTTP {status}: {}",
+            String::from_utf8_lossy(&response.body)
+        ))),
     }
 }
 
@@ -684,24 +644,6 @@ fn daemon_log_path(common_db_path: &Path) -> PathBuf {
         .join("daemon.log")
 }
 
-async fn forward_mcp_request(
-    config: &ServerConfig,
-    repo_path: &str,
-    request: &Value,
-) -> AppResult<Option<Value>> {
-    let body = request.to_string();
-    let response =
-        daemon_request(config, "POST", "/mcp/", Some(repo_path), body.as_bytes()).await?;
-    match response.status {
-        200 => Ok(Some(serde_json::from_slice(&response.body)?)),
-        202 => Ok(None),
-        status => Err(AppError::Runtime(format!(
-            "Coverage MCP daemon returned HTTP {status}: {}",
-            String::from_utf8_lossy(&response.body)
-        ))),
-    }
-}
-
 struct WireResponse {
     status: u16,
     body: Vec<u8>,
@@ -756,6 +698,42 @@ async fn daemon_request(
             operation: format!("{method} {path}"),
             timeout_ms: config.http_request_timeout_seconds * 1_000,
         })?
+}
+
+async fn daemon_request_with_recovery(
+    config: &ServerConfig,
+    method: &str,
+    path: &str,
+    repo_path: Option<&str>,
+    body: &[u8],
+) -> AppResult<WireResponse> {
+    match daemon_request(config, method, path, repo_path, body).await {
+        Ok(response) => Ok(response),
+        Err(error) if is_transport_interruption(&error) => {
+            // Re-establish the verified single owner after any transport
+            // interruption. Replay only connection refusal, which proves the
+            // request never reached the old process.
+            let replay = is_connection_refused(&error);
+            ensure_daemon(config).await?;
+            if replay {
+                daemon_request(config, method, path, repo_path, body).await
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn successful_daemon_json(response: WireResponse, operation: &str) -> AppResult<Value> {
+    if response.status != 200 {
+        return Err(AppError::Runtime(format!(
+            "Coverage MCP daemon could not {operation}; HTTP {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        )));
+    }
+    Ok(serde_json::from_slice(&response.body)?)
 }
 
 fn parse_http_response(bytes: Vec<u8>) -> AppResult<WireResponse> {
@@ -821,26 +799,13 @@ fn json_rpc_error(id: Option<Value>, error: coverage_mcp::AppError) -> Value {
     })
 }
 
-fn standalone_db_path(config: &ServerConfig) -> AppResult<PathBuf> {
-    config.db_path.clone().ok_or_else(|| {
-        coverage_mcp::AppError::Validation(
-            "standalone compaction requires a repository database path".to_owned(),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn recovery_config(common_db: PathBuf) -> ServerConfig {
-        ServerConfig::from_environment(
-            Some("127.0.0.1".to_owned()),
-            Some(59_471),
-            None,
-            Some(common_db),
-        )
-        .expect("config")
+        ServerConfig::from_environment(Some("127.0.0.1".to_owned()), Some(59_471), Some(common_db))
+            .expect("config")
     }
 
     fn older_observation(config: &ServerConfig) -> DaemonObservation {
@@ -864,23 +829,6 @@ mod tests {
             instance_id: Some("instance-1".to_owned()),
             handoff_token: Some("secret".to_owned()),
         }
-    }
-
-    #[test]
-    fn standalone_db_path_enforces_repository_mode() {
-        let mut config = ServerConfig::from_environment(
-            None,
-            None,
-            Some(PathBuf::from("coverage.duckdb")),
-            None,
-        )
-        .expect("config");
-        assert_eq!(
-            standalone_db_path(&config).unwrap(),
-            PathBuf::from("coverage.duckdb")
-        );
-        config.db_path = None;
-        assert!(standalone_db_path(&config).is_err());
     }
 
     #[test]
