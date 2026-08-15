@@ -22,7 +22,8 @@ minor versions may contain breaking public-contract changes.
 - Restored a single Cargo compilation job for the all-target CI test command
   while retaining prebuilt DuckDB. This prevents cold hosted runners from
   becoming CPU/memory starved without serializing unrelated quality, coverage,
-  package, or release-build lanes.
+  package, or release-build lanes. Branch and tag test jobs both allow the same
+  60-minute cold-cache window.
 
 ## 0.8.6 - 2026-08-15
 
