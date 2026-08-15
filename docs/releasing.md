@@ -123,6 +123,16 @@ are reported by `/health`.
 
 ## Recovery
 
+If crates.io publication succeeds but GitHub Release creation fails, do not
+move or recreate the tag and do not publish another crate. The
+`Release asset recovery` workflow resolves the existing tag to its immutable
+commit, accepts only a completed `Release` run for that exact tag and commit,
+downloads its retained `coverage-mcp-v<version>` bundle, verifies all four
+native archives and the crate against `SHA256SUMS`, re-attests those files, and
+creates the missing GitHub Release. It is also available through
+`workflow_dispatch` with an explicit tag and optional source run ID. If the
+release already exists, recovery is a no-op.
+
 If an artifact is bad, revoke or yank it according to the registry policy and
 publish a corrected version. Do not overwrite a database schema or retarget a
 release tag. A user-visible storage migration requires an upgrade note and a

@@ -3,6 +3,15 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## Unreleased
+
+### Fixed
+
+- Give GitHub CLI an explicit repository when publishing release assets. Add a
+  checksum-verifying recovery workflow that can reuse an existing validated
+  release bundle when crates.io publication succeeds but GitHub Release
+  creation fails, without moving the tag or rebuilding native artifacts.
+
 ## 0.9.2 - 2026-08-15
 
 ### Added
