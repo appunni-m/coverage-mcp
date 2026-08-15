@@ -15,7 +15,7 @@ changes can be reviewed against the contract that was carried forward.
 | DuckDB snapshots, queries, runs, artifacts, and compaction | `src/storage.rs`, `src/compaction.rs` | `rust_storage_queries_compare_and_compacts_old_detail`, storage tests, smoke test |
 | Response budgets, cursors, compact projections, and service validation | `src/service.rs` | `rust_service_pagination_projection_and_mcp_contract_match` |
 | MCP inventory, schemas, resources, safety, and JSON-RPC dispatch | `src/mcp.rs` | MCP contract assertions, HTTP wire test, standalone stdio smoke test |
-| Shared-daemon stdio lifecycle, authenticated version handoff, and repository routing | `src/main.rs`, `src/http.rs`, `src/lock.rs` | concurrent two-repository connector smoke test, daemon-owner assertion, handoff authorization/process-exit test, and older-version replacement probe |
+| Shared-daemon stdio lifecycle, crash autorecovery, authenticated version handoff, and repository routing | `src/main.rs`, `src/http.rs`, `src/lock.rs` | concurrent two-repository connector smoke test, same-bridge crash/stale-file recovery, daemon-owner assertion, handoff authorization/process-exit test, and older-version replacement probe |
 | REST routing, health, dashboard, common registry, and lifecycle | `src/http.rs`, `src/dashboard.html` | live REST/dashboard/health/MCP test and browser smoke verification |
 | Background detail compaction | `src/compaction.rs`, `src/storage.rs` | policy default/edit/manual-pass, compressed payload, transparent restore tests |
 

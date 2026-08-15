@@ -1068,7 +1068,7 @@
     async function getJSON(url, options) {
       const payload = await fetchJSON(url, options);
       if (!payload || payload.context?.schema_revision !== 7 || !Object.hasOwn(payload, 'data')) {
-        throw new Error('Coverage MCP dashboard requires schema revision 7. Restart the daemon after upgrading.');
+        throw new Error('Coverage MCP dashboard requires schema revision 7. Start the current coverage-mcp connector to replace a verified older daemon automatically, then reload.');
       }
       return payload.data;
     }

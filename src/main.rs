@@ -173,7 +173,7 @@ async fn run_shared_stdio(repo: PathBuf) -> AppResult<()> {
         let response = match serde_json::from_str::<Value>(&line) {
             Ok(request) => {
                 let id = request.get("id").cloned();
-                match forward_mcp_request(&config, &git.repo_path, &request).await {
+                match forward_mcp_request_with_recovery(&config, &git.repo_path, &request).await {
                     Ok(response) => response,
                     Err(error) if id.is_some() => Some(json_rpc_error(id, error)),
                     Err(_) => None,
@@ -188,6 +188,39 @@ async fn run_shared_stdio(repo: PathBuf) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+async fn forward_mcp_request_with_recovery(
+    config: &ServerConfig,
+    repo_path: &str,
+    request: &Value,
+) -> AppResult<Option<Value>> {
+    match forward_mcp_request(config, repo_path, request).await {
+        Ok(response) => Ok(response),
+        Err(error) if is_transport_interruption(&error) => {
+            // A stdio bridge can outlive the shared daemon. Re-establish the
+            // verified single owner before returning control to the MCP host.
+            // Replay only when TCP refused the connection, which proves the
+            // JSON-RPC request was never delivered; timeouts and other I/O
+            // failures may have committed a write and must not be duplicated.
+            let replay = is_connection_refused(&error);
+            ensure_daemon(config).await?;
+            if replay {
+                forward_mcp_request(config, repo_path, request).await
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_transport_interruption(error: &AppError) -> bool {
+    matches!(error, AppError::Io(_) | AppError::Timeout { .. })
+}
+
+fn is_connection_refused(error: &AppError) -> bool {
+    matches!(error, AppError::Io(source) if source.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 #[derive(Debug, PartialEq, Eq)]

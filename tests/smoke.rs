@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -407,6 +407,80 @@ fn shared_daemon_stdio_connectors_route_multiple_repositories() {
             .is_ok_and(|status| status.success()),
         "shared daemon exited while stdio clients disconnected"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
+    let directory = tempdir().unwrap();
+    let repository = directory.path().join("repository");
+    init_git_repository(&repository, "recovery");
+    let common_db = directory.path().join("daemon").join("common.duckdb");
+    let lock_path = daemon_lock_path(&common_db);
+    let guard = DaemonGuard {
+        lock_path: lock_path.clone(),
+        armed: true,
+    };
+    let port = unused_loopback_port();
+    let mut connector = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+        .args(["connect", "--repo"])
+        .arg(&repository)
+        .env("COVERAGE_MCP_HOST", "127.0.0.1")
+        .env("COVERAGE_MCP_PORT", port.to_string())
+        .env("COVERAGE_MCP_COMMON_DB", &common_db)
+        .env_remove("COVERAGE_MCP_DB")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = connector.stdin.take().unwrap();
+    let mut stdout = BufReader::new(connector.stdout.take().unwrap());
+
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+        .unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let initialize: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "coverage-mcp");
+
+    wait_for_health(port);
+    let first_pid = guard.pid().expect("first daemon pid");
+    let status = Command::new("kill")
+        .args(["-KILL", &first_pid])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let listener_gone = TcpStream::connect(("127.0.0.1", port)).is_err();
+        if listener_gone && held_daemon_owner(&lock_path).unwrap().is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        held_daemon_owner(&lock_path).unwrap().is_none(),
+        "crashed daemon lease remained held"
+    );
+    assert!(lock_path.exists(), "the stale metadata file should remain");
+
+    line.clear();
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
+        .unwrap();
+    stdin.flush().unwrap();
+    stdout.read_line(&mut line).unwrap();
+    let tools: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 11);
+    wait_for_health(port);
+    let second_pid = guard.pid().expect("replacement daemon pid");
+    assert_ne!(first_pid, second_pid);
+
+    drop(stdin);
+    assert!(connector.wait().unwrap().success());
 }
 
 #[cfg(unix)]

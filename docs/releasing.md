@@ -18,10 +18,11 @@ artifact.
    separate steps, uses one Cargo compilation job, and retains line-table debug
    information. Runtime execution is split into library, binary,
    migration-status, migration parity, compaction benchmark, and daemon/stdio
-   smoke steps with a retained log for each target. Branch and tag test jobs
-   both use a 15-minute recovery bound now that cold compilation and runtime
-   targets are isolated; the release build in step 4 is the required
-   bundled-linkage check.
+   smoke steps with a retained log for each target. Hosted runtime groups have
+   a two-minute process deadline and ten-second termination grace period;
+   branch and tag test jobs both use a 15-minute recovery bound now that cold
+   compilation and runtime targets are isolated. The release build in step 4
+   is the required bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect
@@ -29,7 +30,9 @@ artifact.
 5. Verify the binary in clean checkouts: start two default `connect` processes
    for different repositories, confirm they return stdio
    `initialize`/`tools/list` through one daemon PID on port `59471`, and confirm
-   the daemon remains healthy after both bridges exit. Also verify HTTP
+   the daemon remains healthy after both bridges exit. Keep one bridge open,
+   kill that daemon, and require the next `tools/list` request to recreate one
+   daemon with a new PID through the unlocked stale lease file. Also verify HTTP
    `tools/list`, the dashboard, report ingest, a project policy edit, a manual
    compaction pass, and a database reopen.
 6. Verify lifecycle hardening: start two daemons against one common database

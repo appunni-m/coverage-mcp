@@ -3,6 +3,7 @@ CARGO ?= cargo
 DUCKDB_DOWNLOAD_LIB ?= 1
 FAST_FEATURES ?= --no-default-features
 COVERAGE_MCP_TEST_BUILD_JOBS ?= 1
+COVERAGE_MCP_TEST_TIMEOUT ?=
 
 .DEFAULT_GOAL := help
 
@@ -17,7 +18,7 @@ help:
 	@printf '%s\n' '' 'Verification:'
 	@printf '%s\n' '  make test        all workspace tests with exact prebuilt DuckDB' '  make test-bundled  all tests with self-contained bundled DuckDB' '  make test-ci-compile  compile every CI test target with one Cargo job' '  make test-ci     run each CI test target serially with retained diagnostics' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
 	@printf '%s\n' '' 'Fast verification:'
-	@printf '%s\n' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  COVERAGE_MCP_TEST_BUILD_JOBS=1 bounds both CI test phases; raise it only on memory-rich hosts.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
+	@printf '%s\n' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  COVERAGE_MCP_TEST_BUILD_JOBS=1 bounds both CI test phases; raise it only on memory-rich hosts.' '  CI may set COVERAGE_MCP_TEST_TIMEOUT to a platform timeout command; local runs leave it empty.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
 	@printf '%s\n' '' 'Runtime:'
 	@printf '%s\n' '  cargo run -- serve' '  cargo run -- connect --repo .' '  cargo run -- compact --repo .'
 
@@ -57,7 +58,7 @@ define run_ci_test
 	@set -eu; \
 	mkdir -p target/migration; \
 	log="target/migration/test-$(2).log"; \
-	if MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json \
+	if $(COVERAGE_MCP_TEST_TIMEOUT) env MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json \
 		CARGO_BUILD_JOBS=$(COVERAGE_MCP_TEST_BUILD_JOBS) DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --workspace $(1) $(FAST_FEATURES) --locked -- --test-threads=1 $(3) \
 		>"$$log" 2>&1; then \
 		printf 'passed %s\n' '$(2)'; \

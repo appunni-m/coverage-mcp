@@ -39,6 +39,15 @@ minor versions may contain breaking public-contract changes.
 - Bound the managed-run cancellation regression poll to ten seconds so a
   platform-specific cancellation failure reports retained run state instead of
   waiting indefinitely.
+- Bound each hosted runtime test group to two minutes with a final ten-second
+  termination grace period, then retain and print that group's log. A Linux-only
+  stall now identifies its first incomplete test instead of consuming the
+  entire job timeout.
+- Keep an established stdio bridge alive across a shared-daemon crash. A
+  connection-refused request now recreates the single verified daemon and is
+  replayed once because it could not have reached the old process; ambiguous
+  timeouts recover the daemon for later requests without replaying a possible
+  write.
 - Pin the Rust toolchain, cache, supply-chain, and crates.io authentication
   actions to reviewed full commit SHAs instead of movable branch or
   major-version references.

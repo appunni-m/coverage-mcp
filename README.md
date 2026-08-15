@@ -75,6 +75,15 @@ DuckDB ownership in that one daemon even when several agents connect at once.
 The daemon remains available when an individual stdio bridge exits, so later
 sessions reuse the same owner and port.
 
+An established stdio bridge also survives a daemon crash. If its next TCP
+connection is refused, the bridge re-runs the same verified startup path,
+reuses the unlocked stale lease file, starts one replacement daemon, and
+replays that JSON-RPC request once because no server could have received it. If
+a timeout or another interruption occurs once delivery may have begun, it
+restores daemon health for following requests but does not replay a potentially
+mutating call. Use the call's stable idempotency key when retrying that
+ambiguous request.
+
 When a newer connector finds an older Coverage MCP daemon on that port, it
 recovers automatically. It first verifies the healthy loopback response
 against the actively held `daemon.lock`, common database, process, executable,

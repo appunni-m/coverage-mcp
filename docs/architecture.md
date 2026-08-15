@@ -32,7 +32,11 @@ after the health response and actively held daemon lease agree on the common
 database, executable, process, resource, and instance. Unknown owners,
 downgrades, and equal-version incompatibilities fail closed instead of
 starting or terminating a second process. The daemon is independent of any
-one stdio bridge and remains available after bridges disconnect.
+one stdio bridge and remains available after bridges disconnect. A bridge that
+outlives a crashed daemon treats connection refusal as proof that its request
+was not delivered, executes the same verified startup path, and replays that
+request once. Other transport interruptions trigger daemon recovery for later
+requests without replaying an operation whose commit status is ambiguous.
 
 ## Module ownership
 
@@ -96,6 +100,11 @@ from that exact loopback instance, and waits for both its listener and lease to
 disappear. A verified legacy daemon without the endpoint receives a
 platform-native termination request for the recorded PID. The connector never
 downgrades a newer owner or takes over a different common database.
+
+After an ungraceful daemon exit, the OS releases the lease even though the
+metadata file remains. The next new or already-running stdio bridge acquires
+that same file and starts the replacement; no operator deletes a lock, and no
+client-to-client connection lock is introduced.
 
 Each project store owns a bounded `r2d2` pool. The write gate preserves
 DuckDB's single-writer semantics, while read-only operations use the pool with
