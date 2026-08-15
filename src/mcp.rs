@@ -13,13 +13,17 @@ use crate::service::{CoverageService, DEFAULT_MAX_WORDS};
 use crate::storage::LineRange;
 
 /// MCP stream endpoint instructions shown during initialization.
-pub const MCP_INSTRUCTIONS: &str = r#"Coverage MCP 0.8.6 schema 7 exposes a compact, composable agent interface.
+pub const MCP_INSTRUCTIONS: &str = concat!(
+    "Coverage MCP ",
+    env!("CARGO_PKG_VERSION"),
+    r#" schema 7 exposes a compact, composable agent interface.
 
 Start with project_context, then run only exact approved registrations returned there or created with register_test_command after human approval. Submit with run_test(wait=false), save the run id, then fetch status with get_run_data(detailed=false). get_run_data is read-only: it only returns durable run data and never starts, advances, reruns, or cancels work. For every non-terminal response, wait at least the returned poll_after_ms before the next get_run_data call; do not poll immediately. Use cancel_run only when the user no longer wants the run. Use search_test_logs for targeted retained stdout/stderr evidence; managed output is byte-capped and a terminal summary reports truncated=true when the cap was reached. Run setup, capture, polling, persistence, timeout, cancellation, and shutdown failures are terminalized as failed durable jobs, so never assume a non-terminal run is permanent.
 
 Coverage queries are deliberately narrow and composable. Each coverage_query, coverage_compare, or source_context call answers one projection or one bounded source range; it is expected and supported to make multiple calls for one user task. Use coverage_query view=targets for the ranked next work, coverage_compare view=regions for grouped previous-session impact, coverage_query view=file for one file's red regions, and source_context for the exact source text of a selected region. Chain calls by carrying forward snapshot_id, file_path, and start/end ranges from earlier results. Run independent calls separately or in parallel; run source follow-ups only after their target ranges are known. Use coverage_query view=file with line_ranges or coverage_compare view=lines only when exact per-line audit data is needed.
 
-Every successful response is {context,data,page}; max_words is the per-call response budget (50–5000, default 600) and collections continue with page.next_cursor. Omit detailed or keep it false for normal work; set it true only when a tool description names required audit or raw-provenance fields. detailed never returns logs. The daemon uses stateless JSON responses, bounded MCP concurrency, bounded HTTP/DuckDB deadlines, and bounded HTTP bodies; keep query fan-out bounded and retry an individual request with backoff after a transient 503/504 or interrupted connection. Coverage ingestion is capped at 64 MiB and malformed numeric report fields are validation errors, never silent zeroes."#;
+Every successful response is {context,data,page}; max_words is the per-call response budget (50–5000, default 600) and collections continue with page.next_cursor. Omit detailed or keep it false for normal work; set it true only when a tool description names required audit or raw-provenance fields. detailed never returns logs. The daemon uses stateless JSON responses, bounded MCP concurrency, bounded HTTP/DuckDB deadlines, and bounded HTTP bodies; keep query fan-out bounded and retry an individual request with backoff after a transient 503/504 or interrupted connection. Coverage ingestion is capped at 64 MiB and malformed numeric report fields are validation errors, never silent zeroes."#
+);
 
 /// Returns the MCP initialize result.
 pub fn initialize_result() -> Value {
@@ -824,6 +828,8 @@ mod tests {
 
         let initialize = initialize_result();
         let instructions = initialize["instructions"].as_str().unwrap();
+        assert_eq!(initialize["serverInfo"]["version"], VERSION);
+        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 7")));
         assert!(instructions.contains("multiple calls"));
         assert!(instructions.contains("snapshot_id, file_path, and start/end ranges"));
         let tools = tools_list();

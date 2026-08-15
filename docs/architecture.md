@@ -27,9 +27,12 @@ take this lease and may connect concurrently. The defaults are
 `127.0.0.1:59471`, `~/.coverage-mcp/common.duckdb`, and
 `~/.coverage-mcp/daemon.lock`. Before forwarding a request, a connector
 requires the daemon health response to match its binary version, schema
-revision, and common database. It reports an incompatible daemon instead of
-silently starting a second instance. The daemon is independent of any one
-stdio bridge and remains available after bridges disconnect.
+revision, and common database. A newer connector replaces an older daemon only
+after the health response and actively held daemon lease agree on the common
+database, executable, process, resource, and instance. Unknown owners,
+downgrades, and equal-version incompatibilities fail closed instead of
+starting or terminating a second process. The daemon is independent of any
+one stdio bridge and remains available after bridges disconnect.
 
 ## Module ownership
 
@@ -83,6 +86,16 @@ fast with holder metadata instead of deleting a lock or attempting concurrent
 DuckDB access. These leases protect process and database ownership, not client
 connections: HTTP and stdio requests can execute concurrently within the
 configured MCP, pool, and deadline limits.
+
+Daemon lease metadata includes a per-process instance ID and handoff
+capability. The public health response includes the PID, instance ID, and
+whether handoff is supported, but never the capability. On Unix the metadata
+file is restricted to mode `0600`. During an upgrade, a newer connector reads
+the capability only from the actively locked file, requests graceful shutdown
+from that exact loopback instance, and waits for both its listener and lease to
+disappear. A verified legacy daemon without the endpoint receives a
+platform-native termination request for the recorded PID. The connector never
+downgrades a newer owner or takes over a different common database.
 
 Each project store owns a bounded `r2d2` pool. The write gate preserves
 DuckDB's single-writer semantics, while read-only operations use the pool with

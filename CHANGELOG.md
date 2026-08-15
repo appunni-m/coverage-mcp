@@ -3,6 +3,21 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.7 - 2026-08-15
+
+### Fixed
+
+- Made `coverage-mcp connect` automatically replace an older owned daemon on
+  the fixed loopback port. New daemons use an authenticated graceful handoff;
+  the first upgrade can also stop a verified legacy owner using its active
+  daemon lease metadata. Recovery refuses unknown listeners, different common
+  databases, equal-version incompatibilities, and downgrade attempts.
+- Added per-process identity and handoff capability fields to `/health`, kept
+  the handoff capability out of public responses and lock diagnostics, and
+  restricted lock-file permissions on Unix. Recovery also handles an older
+  daemon that becomes healthy during connector startup. HTTP and stdio clients
+  remain concurrent and never acquire the daemon ownership lease.
+
 ## 0.8.6 - 2026-08-15
 
 ### Changed

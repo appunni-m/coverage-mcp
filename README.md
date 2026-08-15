@@ -74,6 +74,17 @@ DuckDB ownership in that one daemon even when several agents connect at once.
 The daemon remains available when an individual stdio bridge exits, so later
 sessions reuse the same owner and port.
 
+When a newer connector finds an older Coverage MCP daemon on that port, it
+recovers automatically. It first verifies the healthy loopback response
+against the actively held `daemon.lock`, common database, process, executable,
+and instance identity. New daemons then accept a capability-authenticated
+graceful handoff; the first upgrade from a pre-handoff release uses the same
+verified lease metadata to request process termination. The connector waits
+for both the listener and lease to be released before starting its exact
+binary. It never replaces a newer daemon, an equal-version incompatibility, a
+different common database, an unlocked metadata file, or an unknown process
+occupying the port.
+
 For checkout-local development, run the binary through Cargo. This
 incrementally compiles the current source and does not require a separate
 install or release build:
@@ -102,7 +113,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.8.6' --locked
+cargo install coverage-mcp --version '=0.8.7' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -194,12 +205,14 @@ probe directly and inspect the launcher's stderr. That message means the
 child process exited or emitted an invalid transport stream before the
 handshake; it is not a coverage-query error. Check that the command is either
 the native `coverage-mcp` executable or an explicit Cargo launcher with an
-existing `Cargo.toml`, that `connect` is present, that `--repo` points to a Git
-checkout, and that the daemon version/schema matches the connector. The bridge
-writes startup diagnostics to `~/.coverage-mcp/daemon.log` by default. A
-database lock in shared mode means a standalone connector or other process
-already owns that repository store; stop the competing owner instead of
-deleting the lock file.
+existing `Cargo.toml`, that `connect` is present, and that `--repo` points to a
+Git checkout. An older verified daemon is replaced automatically. If startup
+still reports an incompatible daemon, recovery deliberately refused an
+unverified owner, a different common database, an equal or newer version, or
+inconsistent health/lease identity; inspect `/health`, `daemon.lock`, and
+`~/.coverage-mcp/daemon.log` without deleting them. A database lock in shared
+mode means a standalone connector or other process already owns that
+repository store; stop that competing owner instead of deleting the lock file.
 
 Every present argument is type-checked. An omitted optional argument receives
 the documented default; a present argument with the wrong JSON type is a
@@ -458,8 +471,9 @@ coverage-mcp compact --repo /absolute/path/to/repository \
 The loopback API uses the same response envelope and repository routing as
 MCP. Important routes are:
 
-- `GET /health` — version, schema revision, daemon path, registry, and worker
-  configuration;
+- `GET /health` — version, schema revision, daemon path, PID, per-process
+  instance ID, handoff support, registry, and worker configuration; the
+  handoff capability itself is never returned;
 - `GET /api/projects`, `POST /api/projects`, `GET/PATCH /api/projects/{id}` —
   project discovery and compaction policy;
 - `POST /api/ingest` — report ingestion;
@@ -479,15 +493,19 @@ untrusted Host headers.
 
 The daemon acquires an OS-backed exclusive lease at
 `<common-db-parent>/daemon.lock` before binding its listener. A second daemon
-using the same common database fails with a 503-style `resource busy` error and
-the lock file includes best-effort PID, executable, and resource metadata for
-diagnostics. The operating system releases the lease when the owner exits, so
-recovery does not depend on guessing whether a PID is stale. Clients never take
-this lease: direct HTTP connections and any number of stdio bridges can use the
-daemon concurrently, subject to configured resource limits. Each project
-database has the same protection at `<database>.lock`; this prevents a daemon,
-standalone stdio process, and compaction process from opening the same DuckDB
-file at the same time.
+using the same common database fails with a 503-style `resource busy` error.
+The lock file records PID, executable, resource, instance identity, and a
+per-process handoff capability; Unix permissions are restricted to `0600`, and
+the capability is not exposed by `/health`. The operating system releases the
+lease when the owner exits, so an unlocked leftover file is never treated as
+proof of ownership. A newer connector may request shutdown only after the
+health identity and actively held lease agree, then waits for the lease before
+starting the replacement. Clients never take this lease: direct HTTP
+connections and any number of stdio bridges can use the daemon concurrently,
+subject to configured resource limits. Each project database has the same
+protection at `<database>.lock`; this prevents a daemon, standalone stdio
+process, and compaction process from opening the same DuckDB file at the same
+time.
 
 Every project store uses a bounded DuckDB connection pool. Writes are
 serialized through the store write gate, while read-only paths can use the

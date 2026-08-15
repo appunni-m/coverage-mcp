@@ -27,10 +27,13 @@ artifact.
    compaction pass, and a database reopen.
 6. Verify lifecycle hardening: start two daemons against one common database
    and confirm the second exits with `resource busy`; open one project database
-   twice and confirm the second owner is rejected; exercise an incompatible
-   connector/daemon health check, a bounded query, pool saturation, and SIGTERM
-   shutdown; verify that the database and WAL are left untouched after each
-   failure.
+   twice and confirm the second owner is rejected. Start the previous released
+   daemon, connect with the candidate binary, and confirm the connector verifies
+   ownership, stops the older daemon, starts the candidate on the same port,
+   and preserves the database. Also verify authenticated handoff, refusal of an
+   unknown port occupant, downgrade/equal-version refusal, a bounded query,
+   pool saturation, and SIGTERM shutdown; verify that the database and WAL are
+   left untouched after each failure.
 7. Run `cargo package --locked --allow-dirty --no-verify` only when a dirty
    package inspection is intentional; release packaging should use a clean
    tree.

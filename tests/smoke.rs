@@ -2,7 +2,8 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -10,6 +11,10 @@ use std::time::{Duration, Instant};
 
 use coverage_mcp::storage::ProjectSettingsPatch;
 use coverage_mcp::{CoverageStore, ServerConfig};
+use coverage_mcp::{
+    http::DAEMON_HANDOFF_PATH,
+    lock::{daemon_lock_path, held_daemon_owner},
+};
 use tempfile::tempdir;
 
 fn config() -> ServerConfig {
@@ -104,9 +109,60 @@ fn connector_responses(output: Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn loopback_request(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    stream.write_all(
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )?;
+    stream.flush()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn wait_for_health(port: u16) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(response) = loopback_request(port, "GET", "/health", "")
+            && response.contains("200 OK")
+        {
+            return response;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("daemon did not become healthy on port {port}");
+}
+
+fn serve_fixed_health(listener: TcpListener, body: String, requests: usize) {
+    for _ in 0..requests {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1_024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "client closed before completing HTTP headers");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+    }
+}
+
 #[cfg(unix)]
 struct DaemonGuard {
     lock_path: PathBuf,
+    armed: bool,
 }
 
 #[cfg(unix)]
@@ -117,11 +173,18 @@ impl DaemonGuard {
             .lines()
             .find_map(|line| line.strip_prefix("pid=").map(str::to_owned))
     }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 #[cfg(unix)]
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let Some(pid) = self.pid() else {
             return;
         };
@@ -289,6 +352,7 @@ fn shared_daemon_stdio_connectors_route_multiple_repositories() {
     let common_db = directory.path().join("daemon").join("common.duckdb");
     let guard = DaemonGuard {
         lock_path: common_db.parent().unwrap().join("daemon.lock"),
+        armed: true,
     };
     let port = unused_loopback_port();
 
@@ -343,4 +407,96 @@ fn shared_daemon_stdio_connectors_route_multiple_repositories() {
             .is_ok_and(|status| status.success()),
         "shared daemon exited while stdio clients disconnected"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_handoff_endpoint_closes_the_owned_process_and_releases_its_lease() {
+    let directory = tempdir().unwrap();
+    let common_db = directory.path().join("daemon").join("common.duckdb");
+    let lock_path = daemon_lock_path(&common_db);
+    let port = unused_loopback_port();
+    let mut guard = DaemonGuard {
+        lock_path: lock_path.clone(),
+        armed: true,
+    };
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+        .args(["serve", "--host", "127.0.0.1", "--port"])
+        .arg(port.to_string())
+        .args(["--common-db"])
+        .arg(&common_db)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let health = wait_for_health(port);
+    let owner = held_daemon_owner(&lock_path)
+        .unwrap()
+        .expect("held daemon owner");
+    assert_eq!(owner.pid, daemon.id());
+    assert!(health.contains(owner.instance_id.as_deref().expect("instance id")));
+    assert!(!health.contains(owner.handoff_token.as_deref().expect("handoff token")));
+
+    let rejected =
+        loopback_request(port, "POST", DAEMON_HANDOFF_PATH, r#"{"token":"wrong"}"#).unwrap();
+    assert!(rejected.contains("403 Forbidden"));
+    assert!(daemon.try_wait().unwrap().is_none());
+
+    let accepted = loopback_request(
+        port,
+        "POST",
+        DAEMON_HANDOFF_PATH,
+        &serde_json::json!({"token":owner.handoff_token}).to_string(),
+    )
+    .unwrap();
+    assert!(accepted.contains("202 Accepted"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "daemon did not finish handoff");
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success());
+    assert!(held_daemon_owner(&lock_path).unwrap().is_none());
+    guard.disarm();
+}
+
+#[test]
+fn connector_refuses_to_replace_an_unlocked_health_lookalike() {
+    let directory = tempdir().unwrap();
+    let common_db = directory.path().join("common.duckdb");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = serde_json::json!({
+        "status":"ok",
+        "version":"0.8.6",
+        "schema_revision":7,
+        "common_db_path":common_db,
+        "daemon_path":"/tmp/not-an-owned-coverage-mcp"
+    })
+    .to_string();
+    let server = thread::spawn(move || serve_fixed_health(listener, body, 2));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+        .args(["connect", "--repo", env!("CARGO_MANIFEST_DIR")])
+        .env("COVERAGE_MCP_HOST", "127.0.0.1")
+        .env("COVERAGE_MCP_PORT", port.to_string())
+        .env("COVERAGE_MCP_COMMON_DB", &common_db)
+        .env_remove("COVERAGE_MCP_DB")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("automatic recovery refused"));
+    assert!(stderr.contains("does not hold the expected ownership lease"));
 }

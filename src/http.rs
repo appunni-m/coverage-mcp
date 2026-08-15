@@ -19,8 +19,9 @@ use hyper::{Method, Request, Response, StatusCode, Uri, http::uri::Authority};
 use hyper_util::rt::TokioIo;
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::{Duration as TokioDuration, timeout};
+use uuid::Uuid;
 
 use crate::config::{
     MAX_HTTP_MAX_BODY_BYTES, MIN_HTTP_MAX_BODY_BYTES, ServerConfig, default_db_path,
@@ -35,6 +36,8 @@ use crate::{SCHEMA_REVISION, VERSION, stable_project_id};
 
 /// Header selecting a repository in daemon-wide mode.
 pub const REPOSITORY_HEADER: &str = "x-coverage-mcp-repo";
+/// Private loopback route used by a newer connector for graceful daemon handoff.
+pub const DAEMON_HANDOFF_PATH: &str = "/_coverage-mcp/handoff";
 
 type HttpResponse = Response<Full<Bytes>>;
 
@@ -45,6 +48,9 @@ pub struct CoverageServer {
     stores: Arc<Mutex<HashMap<String, CoverageStore>>>,
     store_open_gate: Arc<Mutex<()>>,
     mcp_limiter: Arc<Semaphore>,
+    instance_id: Arc<str>,
+    handoff_token: Arc<str>,
+    shutdown: Arc<Notify>,
 }
 
 impl std::fmt::Debug for CoverageServer {
@@ -71,6 +77,9 @@ impl CoverageServer {
             config,
             stores: Arc::new(Mutex::new(HashMap::new())),
             store_open_gate: Arc::new(Mutex::new(())),
+            instance_id: Uuid::new_v4().to_string().into(),
+            handoff_token: Uuid::new_v4().to_string().into(),
+            shutdown: Arc::new(Notify::new()),
         })
     }
 
@@ -84,9 +93,11 @@ impl CoverageServer {
                 "daemon host must be loopback".to_owned(),
             ));
         }
-        let _daemon_lease = FileLease::acquire(
+        let _daemon_lease = FileLease::acquire_daemon(
             daemon_lock_path(&self.config.common_db_path),
             &format!("Coverage MCP daemon on port {}", self.config.port),
+            self.instance_id.as_ref(),
+            self.handoff_token.as_ref(),
         )?;
         let listener = TcpListener::bind((self.config.host.as_str(), self.config.port)).await?;
         self.serve_until_shutdown(listener).await
@@ -113,17 +124,22 @@ impl CoverageServer {
     }
 
     async fn serve_until_shutdown(self, listener: TcpListener) -> AppResult<()> {
-        self.serve_until_shutdown_with_acceptor(|| listener.accept(), shutdown_signal())
+        self.serve_until_shutdown_with(listener, shutdown_signal())
             .await
     }
 
-    #[cfg(test)]
     async fn serve_until_shutdown_with<F>(self, listener: TcpListener, shutdown: F) -> AppResult<()>
     where
         F: Future<Output = AppResult<()>>,
     {
-        self.serve_until_shutdown_with_acceptor(|| listener.accept(), shutdown)
-            .await
+        let internal_shutdown = self.shutdown.clone();
+        self.serve_until_shutdown_with_acceptor(|| listener.accept(), async move {
+            tokio::select! {
+                result = shutdown => result,
+                () = internal_shutdown.notified() => Ok(()),
+            }
+        })
+        .await
     }
 
     async fn serve_until_shutdown_with_acceptor<F, A, Fut>(
@@ -199,7 +215,10 @@ impl CoverageServer {
             "run_log_max_bytes":self.config.run_log_max_bytes,
             "common_db_path":self.config.common_db_path,
             "repository_count":repository_count,
-            "daemon_path":daemon_path
+            "daemon_path":daemon_path,
+            "pid":std::process::id(),
+            "instance_id":self.instance_id.as_ref(),
+            "handoff_supported":true
         }))
     }
 
@@ -234,6 +253,9 @@ impl CoverageServer {
         if path == "/health" && request.method() == Method::GET {
             return Ok(json_response(StatusCode::OK, self.health()?));
         }
+        if path == DAEMON_HANDOFF_PATH {
+            return self.dispatch_daemon_handoff(request).await;
+        }
         if path == "/favicon.ico" {
             return Ok(empty_response(StatusCode::NO_CONTENT));
         }
@@ -244,6 +266,30 @@ impl CoverageServer {
             return self.dispatch_mcp(request).await;
         }
         self.dispatch_rest(request).await
+    }
+
+    async fn dispatch_daemon_handoff(&self, request: Request<Incoming>) -> AppResult<HttpResponse> {
+        if request.method() != Method::POST {
+            return Ok(empty_response(StatusCode::METHOD_NOT_ALLOWED));
+        }
+        let body = json_body(request, self.config.http_max_body_bytes).await?;
+        if body.get("token").and_then(Value::as_str) != Some(self.handoff_token.as_ref()) {
+            return Ok(empty_response(StatusCode::FORBIDDEN));
+        }
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            // Let Hyper flush the accepted response before the binary's main
+            // future returns and starts shutting down the Tokio runtime.
+            tokio::time::sleep(TokioDuration::from_millis(25)).await;
+            shutdown.notify_one();
+        });
+        Ok(json_response(
+            StatusCode::ACCEPTED,
+            json!({
+                "status":"shutting_down",
+                "instance_id":self.instance_id.as_ref()
+            }),
+        ))
     }
 
     async fn dispatch_mcp(&self, request: Request<Incoming>) -> AppResult<HttpResponse> {
@@ -1228,8 +1274,13 @@ mod tests {
     #[test]
     fn server_health_and_unscoped_projects_are_safe_before_selection() {
         let server = CoverageServer::new(config()).unwrap();
-        assert_eq!(server.health().unwrap()["status"], "ok");
-        assert_eq!(server.health().unwrap()["schema_revision"], SCHEMA_REVISION);
+        let health = server.health().unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["schema_revision"], SCHEMA_REVISION);
+        assert_eq!(health["pid"], std::process::id());
+        assert_eq!(health["instance_id"], server.instance_id.as_ref());
+        assert_eq!(health["handoff_supported"], true);
+        assert!(!health.to_string().contains(server.handoff_token.as_ref()));
         let poisoned_server = CoverageServer::new(config()).unwrap();
         let stores = poisoned_server.stores.clone();
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1431,6 +1482,85 @@ mod tests {
             .insert(project.repo_key, store.clone());
         assert!(standalone_server.unscoped_projects().is_ok());
         store.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_handoff_requires_the_lease_capability_and_stops_cleanly() {
+        let server = CoverageServer::new(config()).unwrap();
+        for listener in std::iter::once(
+            listener_or_skip(TcpListener::bind("127.0.0.1:0").await).unwrap_or(None),
+        )
+        .flatten()
+        {
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(
+                server
+                    .clone()
+                    .serve_until_shutdown_with(listener, std::future::pending::<AppResult<()>>()),
+            );
+
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "GET {DAEMON_HANDOFF_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains("405 Method Not Allowed")
+            );
+
+            let wrong_body = br#"{"token":"wrong"}"#;
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST {DAEMON_HANDOFF_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        wrong_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(wrong_body).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(
+                String::from_utf8(response)
+                    .unwrap()
+                    .contains("403 Forbidden")
+            );
+
+            let body = json!({"token":server.handoff_token.as_ref()}).to_string();
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST {DAEMON_HANDOFF_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.contains("202 Accepted"));
+            assert!(response.contains(server.instance_id.as_ref()));
+            tokio::time::timeout(TokioDuration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
