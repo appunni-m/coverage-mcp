@@ -14,8 +14,9 @@ artifact.
 3. Run `make ci`, including strict clippy, all-target tests, fixture-backed
    migration lanes, line/function coverage, generated migration status, and
    rustdoc warnings. The verification lanes use the exact prebuilt DuckDB
-   release to avoid repeated C++ compilation; the release build in step 4 is
-   the required bundled-linkage check.
+   release and the all-target test lane uses one Cargo compilation job to avoid
+   starving cold hosted runners; the release build in step 4 is the required
+   bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect
