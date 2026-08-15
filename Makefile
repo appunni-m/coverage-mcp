@@ -6,7 +6,7 @@ COVERAGE_MCP_TEST_BUILD_JOBS ?= 1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release fmt fmt-fix check check-diff clippy test test-bundled test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
+.PHONY: help build release fmt fmt-fix check check-diff clippy test test-bundled test-ci-compile test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
 
 help:
 	@printf '%s\n' 'Coverage MCP Rust workspace'
@@ -15,9 +15,9 @@ help:
 	@printf '%s\n' '' 'Quality:'
 	@printf '%s\n' '  make fmt         check rustfmt' '  make fmt-fix     apply rustfmt' '  make clippy      strict clippy with warnings denied' '  make lint        format + clippy'
 	@printf '%s\n' '' 'Verification:'
-	@printf '%s\n' '  make test        all workspace tests with exact prebuilt DuckDB' '  make test-bundled  all tests with self-contained bundled DuckDB' '  make test-ci     one compile job + serial tests with retained diagnostics' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
+	@printf '%s\n' '  make test        all workspace tests with exact prebuilt DuckDB' '  make test-bundled  all tests with self-contained bundled DuckDB' '  make test-ci-compile  compile every CI test target with one Cargo job' '  make test-ci     serial tests with retained diagnostics (compiles if needed)' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
 	@printf '%s\n' '' 'Fast verification:'
-	@printf '%s\n' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  COVERAGE_MCP_TEST_BUILD_JOBS=1 bounds make test-ci; raise it only on memory-rich hosts.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
+	@printf '%s\n' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  COVERAGE_MCP_TEST_BUILD_JOBS=1 bounds both CI test phases; raise it only on memory-rich hosts.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
 	@printf '%s\n' '' 'Runtime:'
 	@printf '%s\n' '  cargo run -- serve' '  cargo run -- connect --repo .' '  cargo run -- compact --repo .'
 
@@ -47,6 +47,9 @@ test:
 
 test-bundled:
 	$(CARGO) test --workspace --all-targets --all-features --locked
+
+test-ci-compile:
+	CARGO_BUILD_JOBS=$(COVERAGE_MCP_TEST_BUILD_JOBS) DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --workspace --all-targets $(FAST_FEATURES) --locked --no-run
 
 test-ci:
 	@set -eu; \
@@ -95,6 +98,7 @@ lint: fmt clippy
 
 ci:
 	$(MAKE) lint
+	$(MAKE) test-ci-compile
 	$(MAKE) test-ci
 	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) run $(FAST_FEATURES) --locked --bin migration-status -- --record-parity .
 	$(MAKE) coverage

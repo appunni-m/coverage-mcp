@@ -64,9 +64,10 @@ Convenience aliases are available through `make lint`, `make test`,
 `make coverage`, `make migration-parity`, `make migration-benchmark`,
 `make migration-status`, and `make docs`. `make ci` runs the complete gate,
 including the fixture-backed migration lanes and generated evidence status.
-`make test-ci` also bounds Cargo compilation to one job before running test
-harnesses serially; override `COVERAGE_MCP_TEST_BUILD_JOBS` only when the host
-has enough memory for concurrent Rust links.
+`make test-ci-compile` bounds Cargo compilation to one job, and `make test-ci`
+runs the same targets with serial test harnesses and retained diagnostics.
+`make ci` runs both phases. Override `COVERAGE_MCP_TEST_BUILD_JOBS` only when
+the host has enough memory for concurrent Rust links.
 
 The fast quality, test, coverage, and documentation commands download the
 official DuckDB release matching `libduckdb-sys` once and use it only while

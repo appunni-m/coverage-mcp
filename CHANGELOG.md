@@ -24,6 +24,10 @@ minor versions may contain breaking public-contract changes.
   becoming CPU/memory starved without serializing unrelated quality, coverage,
   package, or release-build lanes. Branch and tag test jobs both allow the same
   60-minute cold-cache window.
+- Split hosted test compilation from execution so the first slow or failed
+  phase is visible, and use line-table debug information for the test profile
+  instead of linking full dependency debug data into every DuckDB/Arrow test
+  binary. Runtime test semantics and retained failure diagnostics are unchanged.
 
 ## 0.8.6 - 2026-08-15
 

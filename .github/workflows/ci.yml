@@ -55,11 +55,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: verify
-      - name: Compile and run test targets
-        # One Cargo process compiles the workspace and runs every target. It
-        # downloads the matching DuckDB release instead of compiling the C++
-        # amalgamation; test harnesses remain serialized for deterministic
-        # database and signal behavior.
+      - name: Compile test targets
+        # Keep the expensive link phase observable independently from runtime
+        # tests while bounding Cargo to one compilation job.
+        run: make test-ci-compile
+      - name: Run test targets
+        # The matching DuckDB release is downloaded instead of compiling the
+        # C++ amalgamation; test harnesses remain serialized for deterministic
+        # database and signal behavior. Diagnostics are retained on failure.
         run: make test-ci
       - name: Record migration parity marker
         run: ./target/debug/migration-status --record-parity .

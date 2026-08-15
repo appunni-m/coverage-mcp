@@ -50,7 +50,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: verify
-      - name: Compile and run test targets
+      - name: Compile test targets
+        run: make test-ci-compile
+      - name: Run test targets
         run: make test-ci
       - name: Record migration parity marker
         run: ./target/debug/migration-status --record-parity .
