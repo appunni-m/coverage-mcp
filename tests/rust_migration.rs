@@ -575,10 +575,10 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
     reopened.ensure_project(directory.path()).unwrap();
     reopened
         .update_project_settings(ProjectSettingsPatch {
+            compaction_enabled: Some(false),
             compaction_after_days: Some(30),
             compaction_interval_seconds: Some(3_600),
             compaction_batch_size: Some(10),
-            ..Default::default()
         })
         .unwrap();
     let result = reopened.compact_now().unwrap();

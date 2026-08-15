@@ -3,6 +3,24 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.8.6 - 2026-08-15
+
+### Changed
+
+- Reduced the locked dependency graph by removing unused DuckDB, CLI, URL, and
+  error-derive features and dependencies. Quality, test, coverage, rustdoc,
+  and package-verification jobs now download the exact matching DuckDB release
+  instead of independently compiling its C++ amalgamation; default builds,
+  installs, and release binaries remain self-contained with bundled DuckDB.
+- Made the compaction worker actually wait on its existing wakeup signal, so
+  store closure and settings updates no longer wait for a one-second polling
+  sleep. This removes the repeated shutdown delay from database-heavy tests
+  and from normal daemon shutdown.
+- Documented the one-time crates.io bootstrap and made tagged releases
+  idempotent when that exact version was already published manually. CI keeps
+  long-lived registry tokens out of GitHub and uses trusted publishing for
+  subsequent versions.
+
 ## 0.8.5 - 2026-08-15
 
 ### Fixed

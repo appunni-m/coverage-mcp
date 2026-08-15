@@ -102,7 +102,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.8.5' --locked
+cargo install coverage-mcp --version '=0.8.6' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -535,6 +535,7 @@ are available through `make`:
 make fmt
 make clippy
 make test
+make test-bundled  # optional full bundled-linkage test
 make coverage
 make migration-parity
 make migration-benchmark
@@ -548,15 +549,24 @@ The full local gate is:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo llvm-cov --offline --lib --all-features --locked \
+DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
+cargo build --release --locked
 git diff --check
 ```
+
+Fast verification asks `libduckdb-sys` to download the official DuckDB
+release matching the Rust crate once, then links it dynamically while Cargo
+runs the checks. This avoids rebuilding DuckDB's large C++ amalgamation in
+every test profile. It requires network access on a cold cache. Normal
+`cargo build`, `cargo install`, and release binaries keep the default
+`bundled-duckdb` feature and remain self-contained; `make test-bundled`
+provides an explicit full-suite linkage check.
 
 The migration fixture manifest and input-only cases in
 [`tests/fixtures`](tests/fixtures) record the public surface carried into

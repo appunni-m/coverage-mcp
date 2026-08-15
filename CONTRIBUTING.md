@@ -46,13 +46,14 @@ Run the same commands used by CI before opening a pull request:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo llvm-cov --offline --lib --all-features --locked \
+DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
+cargo build --release --locked
 git diff --check
 ```
 
@@ -61,11 +62,19 @@ Convenience aliases are available through `make lint`, `make test`,
 `make migration-status`, and `make docs`. `make ci` runs the complete gate,
 including the fixture-backed migration lanes and generated evidence status.
 
+The fast quality, test, coverage, and documentation commands download the
+official DuckDB release matching `libduckdb-sys` once and use it only while
+Cargo runs the command. This avoids repeatedly compiling DuckDB's large C++
+amalgamation. A cold cache therefore needs network access. Default builds,
+installs, and the required release build retain the `bundled-duckdb` feature
+and produce a self-contained binary. Run `make test-bundled` when changing the
+linkage feature itself.
+
 GitHub Actions runs quality, tests, coverage, and the release build as
 independent lanes. The test lane uses one Cargo process for every target and
-runs each harness with one test thread. This keeps DuckDB and signal state
-isolated without making bundled native builds and database-heavy tests compete
-for hosted-runner memory. Migration evidence is assembled after the test and
+runs each harness with one test thread. This keeps database and signal state
+deterministic; the dedicated release lane separately compiles and verifies the
+bundled native build. Migration evidence is assembled after the test and
 coverage artifacts are uploaded.
 
 The coverage threshold is a line-coverage gate. The report also displays

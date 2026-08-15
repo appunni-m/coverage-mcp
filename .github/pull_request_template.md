@@ -6,7 +6,7 @@ Describe the problem and the user-visible result.
 
 - [ ] Tests added or updated
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- [ ] `make clippy`
 - [ ] Full suite and 100% function/line coverage gate
 - [ ] Rustdoc builds with warnings denied
 - [ ] Documentation/changelog updated when user-visible

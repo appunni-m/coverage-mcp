@@ -14,7 +14,9 @@ jobs:
   quality:
     name: Rust quality
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
+    env:
+      DUCKDB_DOWNLOAD_LIB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -30,16 +32,16 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - name: Rustdoc
-        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
 
   tests:
     name: Rust tests
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: "1"
+      DUCKDB_DOWNLOAD_LIB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -71,9 +73,9 @@ jobs:
   coverage:
     name: Rust coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: "1"
+      DUCKDB_DOWNLOAD_LIB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -143,7 +145,9 @@ jobs:
   package:
     name: Verify crate package
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
+    env:
+      DUCKDB_DOWNLOAD_LIB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
@@ -153,7 +157,9 @@ jobs:
         with:
           shared-key: verify
       - name: Package and verify crate
-        run: cargo package --locked
+        # Feature selection changes only the verification build. The .crate
+        # still declares bundled DuckDB as its default for standalone installs.
+        run: cargo package --locked --no-default-features
       - name: Prepare crate artifact
         run: |
           mkdir -p release-package
@@ -271,9 +277,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.85.1
+      - name: Detect an already-published bootstrap version
+        id: registry
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          set +e
+          output=$(cargo info "coverage-mcp@${version}" --registry crates-io 2>&1)
+          status=$?
+          set -e
+          if test "$status" -eq 0; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "coverage-mcp ${version} is already published; skipping duplicate upload"
+          elif grep -Fq 'could not find `coverage-mcp@' <<<"$output"; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s\n' "$output" >&2
+            exit "$status"
+          fi
       - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.registry.outputs.published != 'true'
         id: crates-io-auth
       - name: Publish verified crate
+        if: steps.registry.outputs.published != 'true'
         # The package job already ran Cargo's clean package verification on an
         # isolated runner. Avoid recompiling bundled DuckDB after minting the
         # short-lived trusted-publishing token.

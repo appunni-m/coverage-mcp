@@ -47,13 +47,14 @@ The required local gate is:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo llvm-cov --offline --lib --all-features --locked \
+DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
+cargo build --release --locked
 git diff --check
 ```
 

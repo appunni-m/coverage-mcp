@@ -797,7 +797,7 @@ fn key_hash(value: &str) -> String {
     stable_project_id(value)
 }
 fn query_params(uri: &Uri) -> HashMap<String, Vec<String>> {
-    url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+    form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
         .into_owned()
         .fold(HashMap::new(), |mut output, (key, value)| {
             output.entry(key).or_default().push(value);

@@ -79,14 +79,20 @@ turns a passing Rust conformance test into cross-runtime parity evidence.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo llvm-cov --offline --lib --all-features --locked \
+DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
   --fail-under-lines 100 --fail-under-functions 100 \
   --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
+cargo build --release --locked
 ```
+
+The non-default verification mode downloads the exact matching official
+DuckDB release instead of compiling its C++ amalgamation in every test
+profile. The release build still enables bundled DuckDB by default and proves
+the self-contained runtime shipped to users.
 
 The coverage gate proves 100% measured function and line coverage for the Rust
 library/runtime target set. The CLI launcher is excluded from aggregate LLVM

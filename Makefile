@@ -1,18 +1,22 @@
 # Requires GNU Make 3.81 or newer.
 CARGO ?= cargo
+DUCKDB_DOWNLOAD_LIB ?= 1
+FAST_FEATURES ?= --no-default-features
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release fmt fmt-fix check check-diff clippy test test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
+.PHONY: help build release fmt fmt-fix check check-diff clippy test test-bundled test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
 
 help:
 	@printf '%s\n' 'Coverage MCP Rust workspace'
 	@printf '%s\n' '' 'Build:'
-	@printf '%s\n' '  make build       cargo check for all targets' '  make release      optimized release binary'
+	@printf '%s\n' '  make build       cargo check with self-contained bundled DuckDB' '  make release      optimized self-contained release binary'
 	@printf '%s\n' '' 'Quality:'
 	@printf '%s\n' '  make fmt         check rustfmt' '  make fmt-fix     apply rustfmt' '  make clippy      strict clippy with warnings denied' '  make lint        format + clippy'
 	@printf '%s\n' '' 'Verification:'
-	@printf '%s\n' '  make test        all workspace tests' '  make test-ci     run all test targets serially with retained diagnostics' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
+	@printf '%s\n' '  make test        all workspace tests with exact prebuilt DuckDB' '  make test-bundled  all tests with self-contained bundled DuckDB' '  make test-ci     serial tests with retained diagnostics and prebuilt DuckDB' '  make coverage    100% function/line gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
+	@printf '%s\n' '' 'Fast verification:'
+	@printf '%s\n' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
 	@printf '%s\n' '' 'Runtime:'
 	@printf '%s\n' '  cargo run -- serve' '  cargo run -- connect --repo .' '  cargo run -- compact --repo .'
 
@@ -29,15 +33,18 @@ fmt-fix:
 	$(CARGO) fmt --all
 
 check:
-	$(CARGO) check --workspace --all-targets --all-features --locked
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) check --workspace --all-targets $(FAST_FEATURES) --locked
 
 check-diff:
 	git diff --check
 
 clippy:
-	$(CARGO) clippy --workspace --all-targets --all-features --locked -- -D warnings
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) clippy --workspace --all-targets $(FAST_FEATURES) --locked -- -D warnings
 
 test:
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --workspace --all-targets $(FAST_FEATURES) --locked
+
+test-bundled:
 	$(CARGO) test --workspace --all-targets --all-features --locked
 
 test-ci:
@@ -46,7 +53,7 @@ test-ci:
 	rm -f target/migration/test-*.log; \
 	log="target/migration/test-all-targets.log"; \
 	if MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json \
-		$(CARGO) test --workspace --all-targets --all-features --locked -- --test-threads=1 \
+		DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --workspace --all-targets $(FAST_FEATURES) --locked -- --test-threads=1 \
 		>"$$log" 2>&1; then \
 		printf 'passed all-targets\n'; \
 	else \
@@ -58,38 +65,37 @@ test-ci:
 
 coverage:
 	mkdir -p target/migration
-	$(CARGO) llvm-cov --offline --lib --all-features --locked \
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) llvm-cov --lib $(FAST_FEATURES) --locked \
 		--ignore-filename-regex '/src/main\.rs$$' \
 		--json --summary-only --output-path target/migration/coverage-raw.json \
 		--fail-under-lines 100 --fail-under-functions 100 \
 		--fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
 
 docs:
-	RUSTDOCFLAGS='-D warnings' $(CARGO) doc --workspace --all-features --no-deps --locked
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) RUSTDOCFLAGS='-D warnings' $(CARGO) doc --workspace $(FAST_FEATURES) --no-deps --locked
 
 migration-parity:
 	mkdir -p target/migration
-	$(CARGO) test --offline --test rust_migration --all-features --locked
-	$(CARGO) run --offline --locked --bin migration-status -- --record-parity .
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --test rust_migration $(FAST_FEATURES) --locked
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) run $(FAST_FEATURES) --locked --bin migration-status -- --record-parity .
 
 migration-benchmark:
 	mkdir -p target/migration
-	MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json $(CARGO) test --offline --test rust_migration --all-features --locked rust_compaction_benchmark_workload -- --exact --test-threads=1
+	MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --test rust_migration $(FAST_FEATURES) --locked rust_compaction_benchmark_workload -- --exact --test-threads=1
 
 migration-status:
-	$(CARGO) build --offline --locked --bin migration-status
-	./target/debug/migration-status .
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) run $(FAST_FEATURES) --locked --bin migration-status -- .
 
 mcp-evals:
 	mkdir -p target/evals
-	$(CARGO) run --offline --locked --bin mcp-evals -- --report target/evals/mcp-eval-report.json
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) run $(FAST_FEATURES) --locked --bin mcp-evals -- --report target/evals/mcp-eval-report.json
 
 lint: fmt clippy
 
 ci:
 	$(MAKE) lint
 	$(MAKE) test-ci
-	./target/debug/migration-status --record-parity .
+	DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) run $(FAST_FEATURES) --locked --bin migration-status -- --record-parity .
 	$(MAKE) coverage
 	$(MAKE) docs
 	$(MAKE) migration-status

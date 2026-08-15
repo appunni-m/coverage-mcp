@@ -116,7 +116,6 @@ struct StoreInner {
     active_processes: Mutex<HashMap<String, Arc<Mutex<Option<Child>>>>>,
     run_threads: Mutex<Vec<JoinHandle<()>>>,
     compaction_thread: Mutex<Option<JoinHandle<()>>>,
-    compaction_wakeup: Condvar,
 }
 
 struct LogCaptureResult {
@@ -313,7 +312,6 @@ impl CoverageStore {
             active_processes: Mutex::new(HashMap::new()),
             run_threads: Mutex::new(Vec::new()),
             compaction_thread: Mutex::new(None),
-            compaction_wakeup: Condvar::new(),
         });
         let store = Self { inner };
         store.init_schema(database_preexisted)?;
@@ -355,7 +353,6 @@ impl CoverageStore {
     pub fn close(&self) -> AppResult<()> {
         let mut worker_error = None;
         if !self.inner.closing.swap(true, Ordering::SeqCst) {
-            self.inner.compaction_wakeup.notify_all();
             self.inner.slots.1.notify_all();
             if let Err(error) = self.terminate_active_processes() {
                 worker_error = Some(error);
@@ -367,6 +364,7 @@ impl CoverageStore {
                 .map_err(lock_error)?
                 .take()
             {
+                thread.thread().unpark();
                 if let Err(error) = join_worker(thread, "compaction") {
                     worker_error.get_or_insert(error);
                 }
@@ -698,7 +696,15 @@ impl CoverageStore {
             connection.execute(UPDATE_PROJECT_SETTINGS_SQL, values)?;
             Ok(())
         })?;
-        self.inner.compaction_wakeup.notify_all();
+        if let Some(thread) = self
+            .inner
+            .compaction_thread
+            .lock()
+            .map_err(lock_error)?
+            .as_ref()
+        {
+            thread.thread().unpark();
+        }
         self.project_settings()
     }
 
@@ -764,12 +770,7 @@ impl CoverageStore {
                             run_compaction_maintenance(&store, &settings);
                         }
                     }
-                    for _ in 0..wait_seconds.min(5) {
-                        if store.inner.closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        thread::sleep(Duration::from_secs(1));
-                    }
+                    thread::park_timeout(Duration::from_secs(wait_seconds.min(5)));
                 }
             });
         retain_compaction_thread(&self.inner.compaction_thread, handle)
@@ -5895,8 +5896,8 @@ mod tests {
         let store =
             CoverageStore::open(directory.path().join("poisoned.duckdb"), test_config()).unwrap();
         store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&store);
         store.inner.closing.store(true, Ordering::SeqCst);
-        store.inner.compaction_wakeup.notify_all();
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = store.inner.write_gate.lock().unwrap();
             panic!("injected write gate lock poison");
@@ -6420,16 +6421,15 @@ mod tests {
 
     fn stop_compaction_worker(store: &CoverageStore) {
         store.inner.closing.store(true, Ordering::SeqCst);
-        store.inner.compaction_wakeup.notify_all();
-        store
+        let thread = store
             .inner
             .compaction_thread
             .lock()
             .unwrap()
             .take()
-            .unwrap()
-            .join()
             .unwrap();
+        thread.thread().unpark();
+        thread.join().unwrap();
         store.inner.closing.store(false, Ordering::SeqCst);
     }
 
