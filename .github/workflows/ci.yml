@@ -59,11 +59,19 @@ jobs:
         # Keep the expensive link phase observable independently from runtime
         # tests while bounding Cargo to one compilation job.
         run: make test-ci-compile
-      - name: Run test targets
+      - name: Run library tests
         # The matching DuckDB release is downloaded instead of compiling the
         # C++ amalgamation; test harnesses remain serialized for deterministic
         # database and signal behavior. Diagnostics are retained on failure.
-        run: make test-ci
+        run: make test-ci-lib
+      - name: Run binary tests
+        run: make test-ci-bins
+      - name: Run migration-status tests
+        run: make test-ci-migration-status
+      - name: Run migration parity tests
+        run: make test-ci-rust-migration
+      - name: Run stdio and daemon smoke tests
+        run: make test-ci-smoke
       - name: Record migration parity marker
         run: ./target/debug/migration-status --record-parity .
       - name: Upload test diagnostics

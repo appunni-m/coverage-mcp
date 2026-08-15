@@ -28,6 +28,10 @@ minor versions may contain breaking public-contract changes.
   phase is visible, and use line-table debug information for the test profile
   instead of linking full dependency debug data into every DuckDB/Arrow test
   binary. Runtime test semantics and retained failure diagnostics are unchanged.
+- Run the already-compiled library, binary, migration-status, migration parity,
+  and daemon/stdio smoke targets as separate hosted steps. A platform-specific
+  hang now identifies its exact executable and both branch and tag workflows
+  retain that target's log instead of exhausting the whole job invisibly.
 
 ## 0.8.6 - 2026-08-15
 

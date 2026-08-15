@@ -52,10 +52,25 @@ jobs:
           shared-key: verify
       - name: Compile test targets
         run: make test-ci-compile
-      - name: Run test targets
-        run: make test-ci
+      - name: Run library tests
+        run: make test-ci-lib
+      - name: Run binary tests
+        run: make test-ci-bins
+      - name: Run migration-status tests
+        run: make test-ci-migration-status
+      - name: Run migration parity tests
+        run: make test-ci-rust-migration
+      - name: Run stdio and daemon smoke tests
+        run: make test-ci-smoke
       - name: Record migration parity marker
         run: ./target/debug/migration-status --record-parity .
+      - name: Upload test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-test-diagnostics
+          path: target/migration/test-*.log
+          if-no-files-found: ignore
       - name: Prepare test evidence
         run: |
           test -x target/debug/migration-status
