@@ -7,6 +7,9 @@ minor versions may contain breaking public-contract changes.
 
 ### Fixed
 
+- Fixed managed-run cancellation on Linux by terminating negative process-group
+  operands with portable `kill -- -PGID` syntax, preventing orphaned commands
+  from holding stdio connectors or CI steps open.
 - Made `coverage-mcp connect` automatically replace an older owned daemon on
   the fixed loopback port. New daemons use an authenticated graceful handoff;
   the first upgrade can also stop a verified legacy owner using its active

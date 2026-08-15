@@ -3390,7 +3390,9 @@ fn terminate_child_group(child: &mut Child) -> std::io::Result<()> {
         terminate_child_group_with(child, |pid| {
             let group = format!("-{pid}");
             Command::new("kill")
-                .args(["-KILL", group.as_str()])
+                // POSIX requires `--` before a negative PID operand; without
+                // it Linux kill(1) may parse the process group as a signal.
+                .args(["-KILL", "--", group.as_str()])
                 .stderr(Stdio::null())
                 .status()
         })
