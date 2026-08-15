@@ -25,8 +25,12 @@ artifact.
    bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
-4. Build a release binary with `cargo build --release --locked` and inspect
-   `coverage-mcp --version`.
+4. Build the bundled release binary with `cargo build --release --locked` and
+   inspect `coverage-mcp --version`. The tag workflow must additionally build
+   and execute native archives for `x86_64-unknown-linux-gnu`,
+   `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and
+   `aarch64-apple-darwin` on matching hosted runners; do not substitute an
+   unexecuted cross-compile for native evidence.
 5. Verify the binary in clean checkouts: start two default `connect` processes
    for different repositories, confirm they return stdio
    `initialize`/`tools/list` through one daemon PID on port `59471`, and confirm
@@ -54,24 +58,29 @@ artifact.
    configured crates.io/asset workflow. For the first crates.io version, use
    the bootstrap procedure below before pushing the tag. The workflow
    reproduces quality, all-target tests, coverage, clean package verification,
-   bundled release compilation, and migration-evidence validation on isolated
-   hosted runners before it mints the trusted-publishing token. Feature
-   selection accelerates only package verification; the packaged crate still
-   defaults to bundled DuckDB. Pin every third-party action, including the
-   crates.io authenticator, to a reviewed full commit SHA. Never move a
-   published tag.
-9. After registry propagation, install the exact crate into an empty temporary
-   root with `cargo install coverage-mcp --version =<version> --locked --bin
-   coverage-mcp --root <temporary-root>`. Verify its version and both MCP
-   transports; a local checkout or Git install is not registry evidence.
+   four native bundled release builds, and migration-evidence validation on
+   isolated hosted runners before it mints the trusted-publishing token. After
+   crates.io succeeds, it creates the GitHub Release with checksums and signed
+   build provenance. Feature selection accelerates only package verification;
+   the packaged crate and native archives still bundle DuckDB. Pin every
+   third-party action, including the crates.io authenticator and provenance
+   action, to a reviewed full commit SHA. Never move a published tag.
+9. After propagation, download every target archive and `SHA256SUMS` from the
+   exact GitHub Release. Verify each digest, extract it, and execute
+   `coverage-mcp --version` on its matching native host. Also install the exact
+   crate into an empty temporary root with `cargo install coverage-mcp
+   --version =<version> --locked --bin coverage-mcp --root <temporary-root>` as
+   fallback evidence. Verify both MCP transports; a checkout or Git install is
+   not release evidence.
 10. Update the downstream testing plugin's pinned version only after the
     published crate passes that clean install. Start two required plugin MCP
-    connectors against one empty runtime cache and confirm both eventually
-    execute the exact binary even if Cargo installation races. Confirm the
-    bootstrap contains no custom installer or client-connection lock and does
-    no daemon work before `exec coverage-mcp connect`. Then confirm both stdio
-    bridges and a direct HTTP client connect concurrently while only the daemon
-    process holds its ownership lease.
+    connectors against one empty runtime cache and confirm both download,
+    checksum, version-check, and atomically install the same target archive.
+    Confirm an unsupported target can use the exact Cargo fallback, the
+    bootstrap contains no custom installer or client-connection lock, and it
+    does no daemon work before `exec coverage-mcp connect`. Then confirm both
+    stdio bridges and a direct HTTP client connect concurrently while only the
+    daemon process holds its ownership lease.
     Exercise each claimed bootstrap platform; record native Windows as
     unsupported until a Windows bootstrap and its clean-machine test exist.
 11. Record the artifact checksums and release evidence. Do not publish a

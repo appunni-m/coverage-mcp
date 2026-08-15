@@ -230,9 +230,25 @@ jobs:
           if-no-files-found: error
 
   binary:
-    name: Build release binary
-    runs-on: ubuntu-latest
+    name: Build release binary (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      # Keep native macOS artifacts usable on older supported hosts instead of
+      # inheriting the runner image's deployment target.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -240,18 +256,34 @@ jobs:
           toolchain: 1.85.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: verify
+          shared-key: release-${{ matrix.target }}
+      - name: Verify native target
+        shell: bash
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.target }}"
       - name: Build binary
         run: cargo build --release --locked
-      - name: Prepare binary artifact
+      - name: Verify binary
+        shell: bash
         run: |
+          binary="target/release/coverage-mcp"
+          test "$("${binary}" --version)" = "coverage-mcp ${GITHUB_REF_NAME#v}"
+          "${binary}" --help >/dev/null
+      - name: Prepare binary artifact
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          directory="coverage-mcp-${version}-${{ matrix.target }}"
           mkdir -p release-binary
-          cp target/release/coverage-mcp release-binary/coverage-mcp
+          mkdir -p "release-binary/${directory}"
+          cp target/release/coverage-mcp "release-binary/${directory}/coverage-mcp"
+          cp LICENSE README.md "release-binary/${directory}/"
+          tar -C release-binary -czf "release-binary/${directory}.tar.gz" "${directory}"
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-binary
-          path: release-binary/
+          name: release-binary-${{ matrix.target }}
+          path: release-binary/*.tar.gz
           if-no-files-found: error
 
   evidence:
@@ -296,11 +328,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Download release binary
+      - name: Download release binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-binary
+          pattern: release-binary-*
           path: bundle/
+          merge-multiple: true
       - name: Download crate package
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -313,7 +346,7 @@ jobs:
           path: bundle/
       - name: Generate checksums
         working-directory: bundle
-        run: sha256sum coverage-mcp "coverage-mcp-${GITHUB_REF_NAME#v}.crate" > SHA256SUMS
+        run: sha256sum coverage-mcp-*.tar.gz "coverage-mcp-${GITHUB_REF_NAME#v}.crate" > SHA256SUMS
       - name: Upload release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -364,3 +397,39 @@ jobs:
         run: cargo publish --locked --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  github-release:
+    name: Publish GitHub release assets
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-mcp-${{ github.ref_name }}
+          path: bundle/
+      - name: Attest release artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            bundle/coverage-mcp-*.tar.gz
+            bundle/coverage-mcp-*.crate
+            bundle/SHA256SUMS
+      - name: Publish immutable release assets
+        shell: bash
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            bundle/coverage-mcp-*.tar.gz \
+            bundle/coverage-mcp-*.crate \
+            bundle/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"
+        env:
+          GH_TOKEN: ${{ github.token }}

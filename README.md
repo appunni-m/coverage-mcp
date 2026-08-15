@@ -131,29 +131,36 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.9.1' --locked
+cargo install coverage-mcp --version '=0.9.2' --locked
 ```
 
 ### Marketplace bootstrap contract
 
 The matching `testing@codegen-marketplace` Codex plugin declares a required
-stdio server in `.mcp.json`. Its small POSIX bootstrap checks `PATH`, installs
-the exact published crate into `~/.coverage-mcp/runtime/<version>` on a cache
-miss, and immediately replaces itself with `coverage-mcp connect`. It does not
-start, inspect, stop, or route around the daemon and it has no custom lifecycle
-lock. All runtime orchestration is implemented by `connect`: repository
-selection, fixed-port discovery, stale-lease recovery, version handoff, daemon
-startup, and request forwarding. Only the daemon process holds `daemon.lock`;
-HTTP clients and stdio bridges do not acquire it or lock one another. Both
-transports can connect concurrently, subject to the daemon's configured
-resource limits.
+stdio server in `.mcp.json`. Its small POSIX bootstrap checks `PATH`, then a
+versioned cache, then downloads the exact GitHub Release archive for macOS or
+Linux on ARM64 or x86-64. It verifies the archive against `SHA256SUMS`, verifies
+the extracted binary's version, installs it atomically under
+`~/.coverage-mcp/runtime/<version>`, and immediately replaces itself with
+`coverage-mcp connect`. Cargo is a fallback for unsupported hosts or a release
+download failure, not the normal first-install path.
 
-This bootstrap requires an existing Rust/Cargo toolchain and network access to
-crates.io. It does not install Rust, execute Python or Node, follow a moving Git
-branch, or write diagnostics to MCP stdout. A downstream plugin version must
-not be released until its exact Coverage MCP crate version is published and a
-clean-cache bootstrap has passed. Checkout development should continue to use
-the explicit Cargo registration above.
+The bootstrap does not start, inspect, stop, or route around the daemon and it
+has no custom lifecycle lock. All runtime orchestration is implemented by
+`connect`: repository selection, fixed-port discovery, stale-lease recovery,
+version handoff, daemon startup, and request forwarding. Only the daemon
+process holds `daemon.lock`; HTTP clients and stdio bridges do not acquire it or
+lock one another. Both transports can connect concurrently, subject to the
+daemon's configured resource limits.
+
+Supported prebuilt targets need POSIX `sh`, `curl`, `tar`, and either
+`sha256sum` or `shasum`; they do not need Rust or Cargo. The fallback requires
+an existing Rust toolchain and crates.io access. The bootstrap never executes
+Python or Node, follows a moving Git branch, or writes diagnostics to MCP
+stdout. A downstream plugin version must not be released until its exact crate
+and all claimed release archives are published and a clean-cache bootstrap has
+passed. Checkout development should continue to use the explicit Cargo
+registration above.
 
 The marketplace bootstrap is POSIX `sh` and targets macOS, Linux, and WSL.
 Native Windows bootstrap is not currently claimed; install the pinned crate

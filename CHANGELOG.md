@@ -3,6 +3,18 @@
 Notable user-visible changes are documented here. Coverage MCP follows Semantic Versioning after 1.0.0; before 1.0,
 minor versions may contain breaking public-contract changes.
 
+## 0.9.2 - 2026-08-15
+
+### Added
+
+- Publish checksummed, provenance-attested release archives built natively for
+  macOS and Linux on both ARM64 and x86-64. Downstream MCP bootstraps can now
+  download and verify a matching executable instead of compiling bundled
+  DuckDB on every new machine.
+- Create a GitHub Release from each verified tag only after crates.io Trusted
+  Publishing succeeds. The release contains the four native archives, the
+  verified crate, and `SHA256SUMS`.
+
 ## 0.9.1 - 2026-08-15
 
 ### Fixed
