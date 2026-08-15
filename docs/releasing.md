@@ -19,8 +19,9 @@ artifact.
    information. Runtime execution is split into library, binary,
    migration-status, migration parity, compaction benchmark, and daemon/stdio
    smoke steps with a retained log for each target. Branch and tag test jobs
-   both allow a 60-minute cold-cache window; the release build in step 4 is the
-   required bundled-linkage check.
+   both use a 15-minute recovery bound now that cold compilation and runtime
+   targets are isolated; the release build in step 4 is the required
+   bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect

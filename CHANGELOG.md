@@ -22,8 +22,9 @@ minor versions may contain breaking public-contract changes.
 - Restored a single Cargo compilation job for the all-target CI test command
   while retaining prebuilt DuckDB. This prevents cold hosted runners from
   becoming CPU/memory starved without serializing unrelated quality, coverage,
-  package, or release-build lanes. Branch and tag test jobs both allow the same
-  60-minute cold-cache window.
+  package, or release-build lanes. Branch and tag test jobs both use the same
+  15-minute recovery bound so a disconnected runner cannot retain the
+  serialized branch or release gate for an hour.
 - Split hosted test compilation from execution so the first slow or failed
   phase is visible, and use line-table debug information for the test profile
   instead of linking full dependency debug data into every DuckDB/Arrow test
@@ -35,6 +36,9 @@ minor versions may contain breaking public-contract changes.
 - Separate the measured compaction benchmark from the remaining migration
   correctness cases while preserving both in the required gate. Benchmark
   latency and parity execution now have independent status and logs.
+- Bound the managed-run cancellation regression poll to ten seconds so a
+  platform-specific cancellation failure reports retained run state instead of
+  waiting indefinitely.
 
 ## 0.8.6 - 2026-08-15
 
