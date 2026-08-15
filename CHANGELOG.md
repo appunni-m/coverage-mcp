@@ -39,6 +39,9 @@ minor versions may contain breaking public-contract changes.
 - Bound the managed-run cancellation regression poll to ten seconds so a
   platform-specific cancellation failure reports retained run state instead of
   waiting indefinitely.
+- Pin the Rust toolchain, cache, supply-chain, and crates.io authentication
+  actions to reviewed full commit SHAs instead of movable branch or
+  major-version references.
 
 ## 0.8.6 - 2026-08-15
 

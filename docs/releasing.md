@@ -51,7 +51,9 @@ artifact.
    bundled release compilation, and migration-evidence validation on isolated
    hosted runners before it mints the trusted-publishing token. Feature
    selection accelerates only package verification; the packaged crate still
-   defaults to bundled DuckDB. Never move a published tag.
+   defaults to bundled DuckDB. Pin every third-party action, including the
+   crates.io authenticator, to a reviewed full commit SHA. Never move a
+   published tag.
 9. After registry propagation, install the exact crate into an empty temporary
    root with `cargo install coverage-mcp --version =<version> --locked --bin
    coverage-mcp --root <temporary-root>`. Verify its version and both MCP
