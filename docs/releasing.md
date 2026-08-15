@@ -17,10 +17,10 @@ artifact.
    release; the all-target test lane exposes compilation and execution as
    separate steps, uses one Cargo compilation job, and retains line-table debug
    information. Runtime execution is split into library, binary,
-   migration-status, migration parity, and daemon/stdio smoke steps with a
-   retained log for each target. Branch and tag test jobs both allow a 60-minute
-   cold-cache window; the release build in step 4 is the required bundled-linkage
-   check.
+   migration-status, migration parity, compaction benchmark, and daemon/stdio
+   smoke steps with a retained log for each target. Branch and tag test jobs
+   both allow a 60-minute cold-cache window; the release build in step 4 is the
+   required bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
 4. Build a release binary with `cargo build --release --locked` and inspect

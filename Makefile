@@ -6,7 +6,7 @@ COVERAGE_MCP_TEST_BUILD_JOBS ?= 1
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release fmt fmt-fix check check-diff clippy test test-bundled test-ci-compile test-ci-lib test-ci-bins test-ci-migration-status test-ci-rust-migration test-ci-smoke test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
+.PHONY: help build release fmt fmt-fix check check-diff clippy test test-bundled test-ci-compile test-ci-lib test-ci-bins test-ci-migration-status test-ci-rust-migration test-ci-benchmark test-ci-smoke test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
 
 help:
 	@printf '%s\n' 'Coverage MCP Rust workspace'
@@ -58,7 +58,7 @@ define run_ci_test
 	mkdir -p target/migration; \
 	log="target/migration/test-$(2).log"; \
 	if MIGRATION_BENCHMARK_REPORT=target/migration/benchmark-result.json \
-		CARGO_BUILD_JOBS=$(COVERAGE_MCP_TEST_BUILD_JOBS) DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --workspace $(1) $(FAST_FEATURES) --locked -- --test-threads=1 \
+		CARGO_BUILD_JOBS=$(COVERAGE_MCP_TEST_BUILD_JOBS) DUCKDB_DOWNLOAD_LIB=$(DUCKDB_DOWNLOAD_LIB) $(CARGO) test --workspace $(1) $(FAST_FEATURES) --locked -- --test-threads=1 $(3) \
 		>"$$log" 2>&1; then \
 		printf 'passed %s\n' '$(2)'; \
 	else \
@@ -79,7 +79,10 @@ test-ci-migration-status:
 	$(call run_ci_test,--test migration_status,migration-status)
 
 test-ci-rust-migration:
-	$(call run_ci_test,--test rust_migration,rust-migration)
+	$(call run_ci_test,--test rust_migration,rust-migration,--skip rust_compaction_benchmark_workload)
+
+test-ci-benchmark:
+	$(call run_ci_test,--test rust_migration rust_compaction_benchmark_workload,benchmark,--exact)
 
 test-ci-smoke:
 	$(call run_ci_test,--test smoke,smoke)
@@ -89,6 +92,7 @@ test-ci:
 	$(MAKE) test-ci-bins
 	$(MAKE) test-ci-migration-status
 	$(MAKE) test-ci-rust-migration
+	$(MAKE) test-ci-benchmark
 	$(MAKE) test-ci-smoke
 
 coverage:

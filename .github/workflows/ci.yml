@@ -70,6 +70,8 @@ jobs:
         run: make test-ci-migration-status
       - name: Run migration parity tests
         run: make test-ci-rust-migration
+      - name: Run compaction benchmark
+        run: make test-ci-benchmark
       - name: Run stdio and daemon smoke tests
         run: make test-ci-smoke
       - name: Record migration parity marker

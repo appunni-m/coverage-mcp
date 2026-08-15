@@ -32,6 +32,9 @@ minor versions may contain breaking public-contract changes.
   and daemon/stdio smoke targets as separate hosted steps. A platform-specific
   hang now identifies its exact executable and both branch and tag workflows
   retain that target's log instead of exhausting the whole job invisibly.
+- Separate the measured compaction benchmark from the remaining migration
+  correctness cases while preserving both in the required gate. Benchmark
+  latency and parity execution now have independent status and logs.
 
 ## 0.8.6 - 2026-08-15
 
