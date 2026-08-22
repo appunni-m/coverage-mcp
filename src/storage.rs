@@ -11003,15 +11003,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        store
-            .submit_command_with_options(
-                fail_command["id"].as_str().unwrap(),
-                None,
-                None,
-                20,
-                false,
-            )
+        let failed = store
+            .run_command(fail_command["id"].as_str().unwrap(), None, None, 20)
             .unwrap();
+        assert_eq!(failed["status"], "failed");
         assert!(
             store
                 .reusable_run_id(&fail_command, fail_command["id"].as_str().unwrap())
