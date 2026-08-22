@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/appunni-m/coverage-mcp/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/appunni-m/coverage-mcp/actions/workflows/ci.yml)
 [![Release workflow](https://github.com/appunni-m/coverage-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/appunni-m/coverage-mcp/actions/workflows/release.yml)
-[![Coverage policy](https://img.shields.io/badge/coverage-policy%20enforced-brightgreen.svg)](CONTRIBUTING.md#required-local-gate)
+[![Coverage policy](https://img.shields.io/badge/coverage-policy%20enforced-brightgreen.svg)](https://github.com/appunni-m/coverage-mcp/blob/main/CONTRIBUTING.md#required-local-gate)
 [![MSRV: 1.85+](https://img.shields.io/badge/MSRV-1.85%2B-orange.svg)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Open issues](https://img.shields.io/github/issues/appunni-m/coverage-mcp.svg)](https://github.com/appunni-m/coverage-mcp/issues)
@@ -12,7 +12,7 @@
 
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
-dashboard and REST API, and provides the same schema-7 projections over
+dashboard and REST API, and provides the consolidated schema-9 projections over
 loopback HTTP and native MCP stdio.
 
 The project is designed for one user-level daemon shared by agents and Git
@@ -22,11 +22,21 @@ frontend build or a separate language runtime.
 ## Status
 
 The Rust implementation is the only runtime and the checked-in Rust test suite
-is the source of truth. The public contract is schema revision 7. The local
-gate proves 100% function and line coverage for the measured Rust
-library/runtime targets; `src/main.rs` is exercised by child-process smoke
-tests and excluded from aggregate LLVM counters. LLVM region coverage remains
-a separate diagnostic and is reported by the coverage command.
+is the source of truth. The public contract is schema revision 9 with seven
+agent-facing tools. The local gate is configured to require 100% region, line,
+and function coverage for the measured Rust library/runtime targets. `src/main.rs`
+is exercised by child-process smoke tests and excluded from aggregate LLVM
+counters.
+
+## Documentation map
+
+- **Use the server:** this README's MCP and REST sections, plus the
+  self-describing `initialize` and `tools/list` responses.
+- **Understand the design:** [`docs/architecture.md`](docs/architecture.md).
+- **Contribute:** [the source-checkout guide](https://github.com/appunni-m/coverage-mcp/blob/main/CONTRIBUTING.md)
+  and the repository's module-level Rust documentation.
+- **Release or operate:** [the release guide](https://github.com/appunni-m/coverage-mcp/blob/main/docs/releasing.md),
+  [`SECURITY.md`](SECURITY.md), and [`SUPPORT.md`](SUPPORT.md).
 
 ## Install and first success
 
@@ -35,7 +45,9 @@ Requirements:
 - Rustup; the checkout pins Rust 1.85.1 (the declared 1.85 MSRV) with Cargo,
   rustfmt, Clippy, and LLVM tools;
 - Git for repository identity and worktree lineage;
-- a platform supported by bundled DuckDB.
+- a host supported by the bundled DuckDB build. The release workflow targets
+  native archives for macOS and Linux on ARM64 and x86-64; other hosts need a
+  working Rust/Cargo toolchain or an independently configured binary.
 
 Install from a checkout:
 
@@ -49,7 +61,7 @@ started daemon. For direct HTTP or dashboard development, run the daemon
 without installing it:
 
 ```sh
-cargo run --locked -- serve
+cargo run --package coverage-mcp --locked -- serve
 ```
 
 The daemon listens on `127.0.0.1:59471` by default. Verify it:
@@ -108,14 +120,14 @@ incrementally compiles the current source and does not require a separate
 install or release build:
 
 ```sh
-cargo run --locked -- connect --repo /absolute/path/to/repository
+cargo run --package coverage-mcp --locked -- connect --repo /absolute/path/to/repository
 ```
 
 The first Cargo invocation may compile bundled DuckDB and take longer than an
 MCP client's startup timeout. Warm the target before connecting if needed:
 
 ```sh
-cargo run --locked -- --version
+cargo run --package coverage-mcp --locked -- --version
 ```
 
 The installed-binary form is also supported:
@@ -131,7 +143,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.9.2' --locked
+cargo install coverage-mcp --version '=0.10.0' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -204,13 +216,14 @@ no direct-database mode. A typical client entry is:
 
 Normal stdio clients should use `connect`, which starts or reuses the daemon
 automatically. When a client connects to HTTP directly instead of using the
-stdio bridge, run `cargo run --locked -- serve` for a checkout or
+stdio bridge, run `cargo run --package coverage-mcp --locked -- serve` for a checkout or
 `coverage-mcp serve` for an installed binary, then point the client at
 `http://127.0.0.1:59471/mcp/`. The daemon maintains one common registry at
 `~/.coverage-mcp/common.duckdb` by default and lazily opens each canonical Git
-repository's `.coverage-mcp/coverage.duckdb`. Rust-era centralized project
-databases under `~/.coverage-mcp/projects/` remain readable as a compatibility
-fallback when no repository-local database exists. Set
+repository's `.coverage-mcp/coverage.duckdb`, or the current centralized
+project location under `~/.coverage-mcp/projects/` when that location is
+selected. An incompatible database is not migrated or repaired; the server
+creates a fresh schema when opened against a disposable store. Set
 `COVERAGE_MCP_COMMON_DB` to relocate the registry and daemon lock.
 
 The HTTP transport and stdio transport call the same Rust dispatcher, tool
@@ -243,8 +256,10 @@ stop that competing owner instead of deleting the lock file.
 
 Every present argument is type-checked. An omitted optional argument receives
 the documented default; a present argument with the wrong JSON type is a
-validation error and is never silently treated as omitted. The HTTP MCP route
-also requires a JSON object with a string \`method\`; malformed JSON, malformed
+validation error and is never silently treated as omitted. Unknown public
+arguments are validation errors, including unknown fields inside the structured
+review selectors. The HTTP MCP route
+also requires a JSON object with a string `method`; malformed JSON, malformed
 headers, and missing required fields return an explicit error response.
 HTTP JSON bodies are capped by `COVERAGE_MCP_HTTP_MAX_BODY_BYTES` (1 MiB by
 default). Coverage ingestion rejects reports larger than 64 MiB and rejects
@@ -253,204 +268,147 @@ dropping them.
 
 ## MCP Usage Guide
 
-Coverage MCP is a query interface, not a request for the full raw coverage
-report. Each `tools/call` chooses one projection and returns only the fields
-needed for that projection. It is expected—and usually more efficient—to make
-several narrow calls for one task instead of asking one call to return every
-file, line, branch, and parser detail.
+The server's `initialize` instructions and `tools/list` contract are sufficient
+for an agent to operate without this README. The public MCP surface is exactly
+the seven tools listed below. This section documents task selection and wire
+shapes; approval, polling, freshness, lineage, and reporting policy belong in
+the marketplace's `plugins/testing/skills/coverage-review/SKILL.md` workflow in
+the [companion marketplace repository](https://github.com/appunni-m/codegen-marketplace).
 
-Initialization instructions plus `tools/list` are intended to be sufficient
-for an agent without reading this README. Start with `project_context`, use
-only an exact approved command, submit asynchronously, wait for the returned
-`poll_after_ms`, and then inspect the durable result. Coverage reads are
-read-only and can be composed by carrying `snapshot_id`, `file_path`, and line
-ranges from one response into the next request.
+### Why use Coverage MCP instead of grepping a report?
 
-### Choose the smallest projection
+Grepping LLVM JSON, LCOV, or another report is valid for a quick point-in-time
+answer. Coverage MCP is valuable when the question is about change, history,
+or trustworthiness:
 
-| Question | First call | Minimum selection | Follow-up when needed |
-| --- | --- | --- | --- |
-| What should I attack next? | `coverage_query` with `view="targets"` | Optional `order_by`; default is `priority` | Call `source_context` only for the returned file/range. |
-| What changed since the previous session? | `coverage_compare` with `view="regions"` | No ids required for automatic latest/previous selection; use `only_regressions=true` for red impact only | Call `source_context` for a regressed range. |
-| Where are the red portions in one file? | `coverage_query` with `view="file"` | `snapshot_id`, `file_path` | Add `line_ranges` with one or more exact ranges to receive selected line records. |
-| What does the code around a gap look like? | `source_context` | `snapshot_id`, `file_path`, contiguous `start`/`end` | Make another call for each disjoint range; each call is capped at 200 lines. |
-| Which exact lines changed? | `coverage_compare` with `view="lines"` | `snapshot_id` and `baseline_snapshot_id`, or a `worktree_id` | Use only for an audit; `regions` is smaller for normal reasoning. |
-| How did one line behave over time? | `coverage_query` with `view="line_history"` | `file_path`, `line_number`, and `suite` | Keep `detailed=false` unless raw history fields are required. |
-| Do I need parser or provenance detail? | `coverage_query` with `view="summary"` or `view="files"` | The relevant snapshot selector | Set `detailed=true` only for that audit. |
+| Raw report grep | Coverage MCP |
+| --- | --- |
+| One file at one moment | Immutable snapshots with repository, branch, commit, suite, and report provenance |
+| Caller must infer which run produced it | Durable approved test runs, artifact fingerprints, freshness states, and explicit run ids |
+| Repeated JSON keys and line records | Grouped ranges, compact symbols, response byte/word limits, and bounded source evidence |
+| Manual diff and baseline selection | Changed executable lines, branch gaps, compatible baselines, parent/ref lineage, and reasons for limited claims |
+| Custom history scripts | Latest two detailed points plus an aggregate window by default |
+| No execution semantics | Human approval, polling, cancellation, idempotency, and unchanged-run reuse |
 
-The `targets` priority score is deterministic: `uncovered_lines × 100 +
-uncovered_branches × 10 + uncovered_functions × 5`; ties are ordered by
-`file_path`. This makes `order_by="priority"` a useful default while still
-allowing `uncovered_lines`, `line_rate`, or `file_path` when the question calls
-for a different ordering.
+Use `coverage_import` when a report was produced outside the managed runner.
+It records the report as external evidence; it does not pretend that the file
+was produced by `run_test`.
 
-### Compose multiple narrow calls
+### Contract-level sequence
 
-MCP requests are stateless, so the client should retain ids and feed exact
-results into the next call. Independent calls may be issued separately or in
-parallel; dependent calls should wait for the earlier result. A typical
-coverage investigation is:
+The server advertises the required first call, safe execution sequence,
+response budgets, and evidence rules in `initialize`. Use the task table below
+to select the smallest projection, then carry the returned run, snapshot,
+baseline, file, and source identifiers into the next request. The server never
+requires a raw report dump to answer a supported review question.
 
-1. Call `project_context` once and keep the selected repository context.
-2. Call `coverage_query(view="targets", order_by="priority")` to get a short
-   ranked list and its `snapshot.id`.
-3. Call `coverage_compare(view="regions", only_regressions=true)` separately
-   if the user also asked what got worse. This call can auto-select the latest
-   and previous matching snapshots.
-4. For the one or two regions worth inspecting, call `source_context` with the
-   exact `file_path`, `start`, and `end` returned by `targets` or `regions`.
-5. Use `coverage_query(view="file", line_ranges=[...])` or
-   `coverage_compare(view="lines")` only if the user asks for exact line
-   records or an audit trail.
+### Coverage review tasks
 
-For example, these are separate `tools/call` argument objects, not one large
-request:
+| Question | Request |
+| --- | --- |
+| Did new code get covered? | `task="change"`; choose `baseline.kind="worktree_base"`, `"parent_commit"`, `"ref"`, `"previous_snapshot"`, `"explicit"`, or `"none"`. |
+| What happened over time? | `task="history"`; default is two detailed snapshots and a ten-point summary. |
+| What should be tested next? | `task="insight"`; returns ranked uncovered regions without a raw line dump. |
+| What source surrounds selected gaps? | `task="source"` with up to ten grouped `{file_path,start,end}` ranges. |
+| Which exact change records are needed? | `task="audit"` or `representation="audit"`; use deliberately because it is larger. |
+| Need a bounded overview? | `task="all"`; combines change, history, and insight under one response budget. |
+
+Example change request:
 
 ```json
-{"view":"targets","order_by":"priority","max_words":400}
+{
+  "task": "change",
+  "measurement": {"run_id": "<terminal-run-id>"},
+  "baseline": {"kind": "parent_commit"},
+  "limits": {"max_files": 10, "max_regions": 20, "max_words": 600, "max_bytes": 12000},
+  "representation": "review"
+}
 ```
 
-```json
-{"view":"file","snapshot_id":"<snapshot-id-from-targets>","file_path":"src/parser.rs","line_ranges":[{"start":120,"end":127},{"start":201,"end":206}],"max_words":500}
-```
+`measurement.snapshot_id` is explicit when already known. `measurement.run_id`
+resolves the first ingested snapshot attached to that run. A missing or stale
+measurement is reported as `not_measured` or `limited`; the server never turns
+it into an `unchanged` claim.
 
-```json
-{"snapshot_id":"<snapshot-id-from-file>","file_path":"src/parser.rs","start":120,"end":127,"max_words":350}
-```
+`claim_status` is one of `supported`, `limited`, `not_measured`, `stale`, or
+`invalid`. A status other than `supported` must be reported with the server's
+`reasons` rather than summarized as a coverage result.
 
-The second call can select multiple disjoint ranges in one file request. The
-third call is intentionally one contiguous source window; repeat it for the
-next range rather than expanding it to the whole file. A response's
-`data.targets[].regions[]` and `data.regions[]` are designed to be passed
-directly into these follow-up calls.
+### Token-efficient representations
 
-### Tool reference
+The default `review` representation is readable and groups related ranges.
+For large diffs, request `compact`. It emits each file path once per file group
+and uses field-specific range legends plus short ranges such as
+`[120,127,"!"]`:
 
-All tool failures are returned as an MCP tool error payload with a stable
-human-readable message. Invalid required fields, unknown names, invalid
-lineage, stale cursors, missing files, and unavailable snapshots are errors;
-an empty log search is a successful empty result.
+| Symbol | Meaning |
+| --- | --- |
+| `+` | added executable line covered |
+| `!` | added executable line uncovered |
+| `~` | changed line has a branch gap |
+| `.` | added line is non-executable |
+| `?` | coverage unavailable or unmeasured |
 
-| Tool | Inputs | Returns and next step |
-| --- | --- | --- |
-| `project_context` | `cursor`, `max_words`, `detailed` | Project identity including the stable project `id`, compaction policy, approved commands, `latest_run`, active runs, and page metadata. Call first; use `data.latest_run.id` as the `run_id` for `get_run_data`. |
-| `register_test_command` | `name`, `command`, `human_approved`, `approved_by`, `approval_note`, optional `cwd`, `shell`, `artifact_paths`, `max_words` | Immutable approval record. Human approval must be true; pass its id or name to `run_test`. |
-| `run_test` | `command_ref`, optional `timeout_seconds`, `idempotency_key`, `wait`, `max_words` | Durable run id, queue/ETA, process counters, and coverage-ingest status. Prefer `wait=false`; failed setup and shutdown paths are terminalized rather than left running. |
-| `get_run_data` | required `run_id`, `max_words`, `detailed` | Read-only durable state for exactly one run. It does not select the latest run implicitly; use `project_context.data.latest_run.id`. When `terminal=false`, wait at least `poll_after_ms` before calling again. |
-| `cancel_run` | `run_id`, `max_words`, `detailed` | Cancellation request and terminal state. Use only when the user no longer wants the run. |
-| `search_test_logs` | `run_id`, `query` string or array, optional `stream`, `context_lines`, `max_matches`, `max_words`, `case_sensitive` | Word-bounded stdout/stderr matches. Queries in an array use OR matching. Retained output is capped per stream; ask for matches or small context windows rather than full logs. |
-| `ingest_coverage` | `report_path`, optional `format`, `suite`, `branch`, `commit_sha`, `base_ref`, `max_words` | Immutable snapshot summary, parser warnings, and provenance. Supported formats include LCOV, coverage JSON, Cobertura, JaCoCo, Istanbul, Go, and LLVM. Reports are size-bounded and malformed numeric fields are explicit validation errors. |
-| `register_worktree` | `path`, `base_ref`, optional `name`, `max_words` | Worktree identity and frozen baseline snapshot for `coverage_compare`. |
-| `coverage_query` | One `view` per call; optional snapshot/baseline selectors, `suite`, `branch`, `file_path`, `line_number`, `line_ranges`, `order_by`, `cursor`, `max_words`, `detailed` | `summary`, `files`, `targets`, `file`, `insights`, or `line_history` projection. `targets` returns ranked files with compact uncovered red regions; `order_by` is `priority` (default), `uncovered_lines`, `line_rate`, or `file_path`. Continue bounded collections with the cursor. Make another narrow call for source or history. |
-| `coverage_compare` | One `view` per call; optional `snapshot_id`, `baseline_snapshot_id`, `worktree_id`, `suite`, `file_path`, `only_regressions`, `cursor`, `max_words`, `detailed` | `overview`, `files`, `lines`, `regions`, or `progress` comparison. `regions` groups improved/regressed/new/removed line ranges and, without ids, compares the latest snapshot with its previous matching snapshot. Select compatible lineage or a registered worktree; compose with `source_context` for code. |
-| `source_context` | One contiguous `snapshot_id`, `file_path`, `start`, `end`, optional `cursor`, `max_words` | Numbered source lines for a bounded range already identified by coverage data, each marked `red`, `green`, `yellow`, or `gray`, plus grouped `red_regions`. Make separate calls for disjoint ranges. |
+The `changed_code` legend applies to added executable-line ranges. The separate
+`regions` projection uses the same compact shape but a different legend:
+
+| Symbol | Region meaning |
+| --- | --- |
+| `+` | region coverage improved or region is newly measured |
+| `!` | previously measured region regressed |
+| `-` | region was removed from the comparison |
+| `~` | region exists in both snapshots with changed coverage |
+
+`audit` keeps exact records and is reserved for verification or export. Do not
+ask for audit data merely to decide what to test next. History intentionally
+returns two detailed points plus a compact aggregate for the next eight points
+of the ten-point default window; increase limits only when the question needs
+it. All responses are also bounded by `max_words` and, for review/run/import,
+`max_bytes`.
+
+In compact change reviews, file metrics use `p` for path and `l`/`b`/`f`/`r`
+arrays for line/branch/function/region baseline, current, and delta values;
+`file_legend` defines those array positions once.
+
+### Public tool reference
+
+| Tool | Purpose and important inputs |
+| --- | --- |
+| `project_context` | Read project identity, freshness, approved commands, active runs, and latest run. Paginate commands with `cursor`. |
+| `register_test_command` | Store one exact human-approved command and its artifacts. `human_approved` must be true. |
+| `run_test` | Submit an approved command. Prefer `wait=false`; use `idempotency_key` and the default `reuse_if_unchanged=true`. |
+| `run_review` | Read one explicit `run_id`; `view="status"` returns durable state and terminal coverage, while `view="logs"` returns bounded literal matches. |
+| `cancel_run` | Request cancellation for a run the user no longer wants. |
+| `coverage_import` | Import a repository-relative external report with format, suite, branch, commit, and base provenance. Follow with `coverage_review`. |
+| `coverage_review` | Bounded change/history/insight/source/audit/all analysis with structured measurement, baseline, source, history, limits, and representation selectors. |
 
 Every successful tool uses this envelope:
 
 ```json
 {
-  "context": {
-    "repo_key": "…",
-    "checkout_path": "…",
-    "suite": "…",
-    "schema_revision": 7
-  },
+  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 9},
   "data": {},
   "page": null
 }
 ```
 
-Coverage projection shapes are intentionally small:
+### Compatibility and errors
 
-| Projection | `data` shape and important fields |
-| --- | --- |
-| `coverage_query:summary` | One compact snapshot object: id, commit, suite, rates, and metric counts. |
-| `coverage_query:files` | An array of compact file summaries; use only when you actually need the file list. |
-| `coverage_query:targets` | `{snapshot, order_by, targets[]}`. Each target has `file_path`, uncovered counts, `priority`, and contiguous `regions`. |
-| `coverage_query:file` | `{file, red_regions, gaps, selected_lines, line_selection}`. `selected_lines` is populated only for requested `line_ranges`; `red_regions` remains the compact GitHub-like gap map. |
-| `coverage_query:insights` | `{snapshot, baseline, summary, items[]}` with prioritized findings. |
-| `coverage_query:line_history` | An array of compact points for one `file_path` and `line_number`; `suite` is required. |
-| `coverage_compare:overview` | `{baseline, current, overall, file_change_count, line_change_count}`. |
-| `coverage_compare:files` | Baseline/current file metrics and deltas, ordered by change. |
-| `coverage_compare:lines` | Exact changed line records; larger than regions and intended for audits. |
-| `coverage_compare:regions` | `{baseline, current, overall, region_change_count, regions[]}` where each region has `file_path`, `status`, `start`, `end`, and `line_count`. |
-| `coverage_compare:progress` | Worktree baseline plus paged progress points; requires `worktree_id` and `suite`. |
-| `source_context` | `{snapshot_commit_sha, file_path, red_regions, lines[]}`. Each line has source text, line number, `status`, and `marker`. |
+Only the seven tools in the public reference above are part of the executable
+MCP contract. REST resources and typed internal lineage operations are separate
+from the MCP tool inventory.
 
-### Response budgets, pagination, and selection
-
-- `max_words` is per call, not a budget shared across a sequence. It accepts
-  `50`–`5000` and defaults to `600`. Use a smaller budget for a ranked first
-  pass and a larger budget only for the exact follow-up you need.
-- Collection pages report `returned`, `total`, `word_count`, `max_words`,
-  `truncated`, and `next_cursor`. If `truncated` is true, repeat the identical
-  view, filters, ordering, and budget with `cursor=page.next_cursor`.
-- Cursors are opaque and query-scoped. Keep the view, selectors, filters,
-  ordering, `detailed`, and `max_words` unchanged while continuing a page; if
-  you change the query, start a new cursor instead of reusing the old one.
-- `snapshot_id` is optional for normal snapshot reads and selects the latest
-  snapshot for the selected checkout. `coverage_compare(view="regions")` can
-  select the latest snapshot and its previous matching snapshot automatically.
-- `line_ranges` accepts multiple inclusive `{start,end}` objects for one file.
-  `source_context` accepts one contiguous range per call and caps the range at
-  200 lines.
-- `detailed=false` is the normal mode. It suppresses raw report paths,
-  parser metadata, raw file metrics, and other audit-only fields; it never
-  returns logs.
-- Collections have a defensive 5,000-record cap. Refine the query with a
-  snapshot, file, range, ordering, or regression filter instead of requesting
-  an unbounded report.
-
-### Errors and retry behavior
-
-MCP returns a JSON-RPC error with a stable message; the same error classes are
-used by the HTTP and stdio transports. Treat these classes differently:
-
-| Class | Typical cause | Client action |
-| --- | --- | --- |
-| Validation (HTTP 400) | Missing/invalid view, range, ordering, budget, or cursor | Fix the request; do not retry unchanged. |
-| Not found (HTTP 404) | No matching snapshot, previous snapshot, worktree, or source file | Narrow or correct the selector; an empty search is not an error. |
-| Storage/runtime (HTTP 500) | Database, filesystem, parser, or process failure | Report the stable message and investigate the retained evidence. |
-| Busy (HTTP 503) | Another daemon/store owns the resource or capacity is saturated | Retry the individual call with backoff. |
-| Timeout (HTTP 504) | HTTP, pool checkout, or DuckDB deadline exceeded | Retry the individual read with backoff and a narrower query if possible. |
-
-Coverage projections are read-only. `ingest_coverage`,
-`register_test_command`, `run_test`, `cancel_run`, and `register_worktree` are
-the state-changing or execution tools; use their explicit workflow and safety
-annotations.
+Validation errors are not silently retried. Correct the request when a type,
+range, lineage selector, budget, cursor, or path is invalid. Retry a read with
+backoff only for busy, timeout, or transient runtime failures. Notifications
+receive no response. HTTP and native stdio share this dispatcher and therefore
+have the same contract.
 
 Resources:
 
-- `coverage://context` — current project context, policy, commands, and active
-  runs;
-- `coverage://snapshot/{snapshot_id}/summary` — compact immutable snapshot
-  summary.
+- `coverage://context` — current project context, policy, commands, and runs;
+- `coverage://snapshot/{snapshot_id}/summary` — one compact immutable snapshot.
 
-The server advertises read-only safety annotations for query tools and
-explicit mutation/execution annotations for registration, run, cancellation,
-ingest, and worktree operations.
-
-For normal agent work, use the compact projections in this order:
-
-- `coverage_query(view="targets", order_by="priority")` answers what to attack
-  next. Each item is one file with only its uncovered counts, a priority score,
-  and contiguous `regions` such as `12-16`; it does not return every covered
-  line or parser-specific detail.
-- `coverage_compare(view="regions")` answers what changed since the previous
-  session. It returns grouped ranges with `status` values `improved`,
-  `regressed`, `new`, `removed`, or `changed`; pass `only_regressions=true` to
-  narrow it to red impact. If both snapshot ids are omitted, the latest and
-  previous matching snapshots are selected automatically.
-- `source_context` is the follow-up when the actual file text is needed. Its
-  bounded lines carry a coverage `status` and display `marker`, while
-  `red_regions` identifies the missed executable portions without shipping a
-  full raw coverage report.
-
-Use `coverage_query(view="file", line_ranges=[...])` or
-`coverage_compare(view="lines")` only when an exact per-line audit is needed;
-the compact views intentionally avoid repeating covered-line JSON. Multiple
-small calls are the intended way to answer multiple related questions while
-keeping each response focused.
 
 ## Coverage storage and compaction
 
@@ -574,67 +532,17 @@ the storage boundary as well.
 
 ## Development
 
-The repository uses strict, reproducible Cargo commands. The short commands
-are available through `make`:
+Development and release commands require a source checkout. Published Cargo
+packages intentionally omit tests, fixtures, evaluator cases, maintainer
+scripts, generated evidence, and internal release plans. See the
+[source-checkout contribution guide](https://github.com/appunni-m/coverage-mcp/blob/main/CONTRIBUTING.md)
+for the reproducible format, test, lint, coverage, migration, documentation,
+and release commands, and the [release guide](https://github.com/appunni-m/coverage-mcp/blob/main/docs/releasing.md)
+for artifact verification.
 
-```sh
-make fmt
-make clippy
-make test
-make test-bundled  # optional full bundled-linkage test
-make coverage
-make migration-parity
-make migration-benchmark
-make migration-status
-make mcp-evals  # opt-in; not part of CI
-make docs
-make lint
-```
-
-The full local gate is:
-
-```sh
-cargo fmt --all -- --check
-DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
-DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
-  --ignore-filename-regex '/src/main\.rs$' \
-  --fail-under-lines 100 --fail-under-functions 100 \
-  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
-DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
-cargo build --release --locked
-git diff --check
-```
-
-Fast verification asks `libduckdb-sys` to download the official DuckDB
-release matching the Rust crate once, then links it dynamically while Cargo
-runs the checks. This avoids rebuilding DuckDB's large C++ amalgamation in
-every test profile. It requires network access on a cold cache. Normal
-`cargo build`, `cargo install`, and release binaries keep the default
-`bundled-duckdb` feature and remain self-contained; `make test-bundled`
-provides an explicit full-suite linkage check.
-
-The migration fixture manifest and input-only cases in
-[`tests/fixtures`](tests/fixtures) record the public surface carried into
-Rust. [`docs/rust-migration-parity.md`](docs/rust-migration-parity.md) records
-the mapping and evidence state; it is not an alternate runtime. After the
-lanes and coverage gate, `make migration-status` emits the fixed aggregate at
-`target/migration/status-report.json` plus generated contract and status pages
-under `docs/generated/`. Missing, dirty, or incompatible evidence is reported
-as `not_proven`.
-
-### MCP evaluation suite
-
-The opt-in [`evals/README.md`](evals/README.md) describes the comprehensive
-agent-facing evaluation suite. It covers independent usability, confusion,
-token and compute efficiency, outcome-driven tool selection, compact coverage
-workflows, protocol behavior, safety, validation, idempotent runs, pagination,
-and retained evidence. Run it with `make mcp-evals`; it intentionally does not
-run in CI or in the default workspace test commands.
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the review workflow,
-[`docs/architecture.md`](docs/architecture.md) for ownership boundaries, and
-[`docs/releasing.md`](docs/releasing.md) for release verification.
+The published crate contains the runtime and its production-facing
+documentation; it does not contain the repository's test corpus or opt-in
+agent evaluator.
 
 ## Security and support
 

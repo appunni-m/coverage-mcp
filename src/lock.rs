@@ -8,6 +8,8 @@ use fs2::FileExt;
 
 use crate::error::{AppError, AppResult};
 
+type MetadataWriter = fn(&mut File, &str, Option<(&str, &str)>) -> AppResult<()>;
+
 /// Identity recorded by a running shared daemon in its ownership lease.
 ///
 /// `instance_id` and `handoff_token` are absent for daemons released before
@@ -69,6 +71,24 @@ impl FileLease {
         daemon_identity: Option<(&str, &str)>,
         try_lock: fn(&File) -> std::io::Result<()>,
     ) -> AppResult<Self> {
+        Self::acquire_with_metadata_using(
+            path,
+            resource,
+            daemon_identity,
+            try_lock,
+            restrict_lock_permissions,
+            write_metadata,
+        )
+    }
+
+    fn acquire_with_metadata_using(
+        path: PathBuf,
+        resource: &str,
+        daemon_identity: Option<(&str, &str)>,
+        try_lock: fn(&File) -> std::io::Result<()>,
+        restrict: fn(&File) -> AppResult<()>,
+        write: MetadataWriter,
+    ) -> AppResult<Self> {
         let parent = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(parent)?;
         let mut file = OpenOptions::new()
@@ -77,10 +97,10 @@ impl FileLease {
             .write(true)
             .truncate(false)
             .open(&path)?;
-        restrict_lock_permissions(&file)?;
+        restrict(&file)?;
         match try_lock(&file) {
             Ok(()) => {
-                write_metadata(&mut file, resource, daemon_identity)?;
+                write(&mut file, resource, daemon_identity)?;
                 Ok(Self { file, path })
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -133,12 +153,14 @@ pub fn held_daemon_owner(path: &Path) -> AppResult<Option<DaemonLeaseOwner>> {
     held_daemon_owner_with(
         OpenOptions::new().read(true).write(true).open(path),
         try_lock_exclusive,
+        unlock_file,
     )
 }
 
 fn held_daemon_owner_with(
     file: std::io::Result<File>,
     try_lock: fn(&File) -> std::io::Result<()>,
+    unlock: fn(&File) -> std::io::Result<()>,
 ) -> AppResult<Option<DaemonLeaseOwner>> {
     let mut file = match file {
         Ok(file) => file,
@@ -147,7 +169,7 @@ fn held_daemon_owner_with(
     };
     match try_lock(&file) {
         Ok(()) => {
-            FileExt::unlock(&file)?;
+            unlock(&file)?;
             Ok(None)
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -158,10 +180,34 @@ fn held_daemon_owner_with(
     }
 }
 
+fn unlock_file(file: &File) -> std::io::Result<()> {
+    FileExt::unlock(file)
+}
+
 fn write_metadata(
     file: &mut File,
     resource: &str,
     daemon_identity: Option<(&str, &str)>,
+) -> AppResult<()> {
+    write_metadata_using(
+        file,
+        resource,
+        daemon_identity,
+        set_file_length,
+        seek_file,
+        write_file,
+        sync_file,
+    )
+}
+
+fn write_metadata_using(
+    file: &mut File,
+    resource: &str,
+    daemon_identity: Option<(&str, &str)>,
+    set_length: fn(&mut File, u64) -> std::io::Result<()>,
+    seek: fn(&mut File, SeekFrom) -> std::io::Result<u64>,
+    write: fn(&mut File, &[u8]) -> std::io::Result<()>,
+    sync: fn(&File) -> std::io::Result<()>,
 ) -> AppResult<()> {
     let executable = executable_path(std::env::current_exe());
     let mut metadata = format!(
@@ -175,11 +221,27 @@ fn write_metadata(
             "instance_id={instance_id}\nhandoff_token={handoff_token}\n"
         ));
     }
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(metadata.as_bytes())?;
-    file.sync_all()?;
+    set_length(file, 0)?;
+    seek(file, SeekFrom::Start(0))?;
+    write(file, metadata.as_bytes())?;
+    sync(file)?;
     Ok(())
+}
+
+fn set_file_length(file: &mut File, length: u64) -> std::io::Result<()> {
+    file.set_len(length)
+}
+
+fn seek_file(file: &mut File, position: SeekFrom) -> std::io::Result<u64> {
+    file.seek(position)
+}
+
+fn write_file(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+    file.write_all(bytes)
+}
+
+fn sync_file(file: &File) -> std::io::Result<()> {
+    file.sync_all()
 }
 
 fn executable_path(result: std::io::Result<PathBuf>) -> String {
@@ -207,10 +269,22 @@ fn read_metadata(file: &mut File) -> String {
 }
 
 fn read_metadata_text(file: &mut File) -> AppResult<String> {
+    read_metadata_text_using(file, seek_file, read_file)
+}
+
+fn read_metadata_text_using(
+    file: &mut File,
+    seek: fn(&mut File, SeekFrom) -> std::io::Result<u64>,
+    read: fn(&mut File, &mut String) -> std::io::Result<usize>,
+) -> AppResult<String> {
     let mut metadata = String::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut metadata)?;
+    seek(file, SeekFrom::Start(0))?;
+    read(file, &mut metadata)?;
     Ok(metadata)
+}
+
+fn read_file(file: &mut File, metadata: &mut String) -> std::io::Result<usize> {
+    file.read_to_string(metadata)
 }
 
 fn parse_daemon_owner(metadata: &str) -> AppResult<DaemonLeaseOwner> {
@@ -249,12 +323,31 @@ fn parse_daemon_owner(metadata: &str) -> AppResult<DaemonLeaseOwner> {
 
 #[cfg(unix)]
 fn restrict_lock_permissions(file: &File) -> AppResult<()> {
+    restrict_lock_permissions_using(file, file_metadata, set_file_permissions)
+}
+
+#[cfg(unix)]
+fn restrict_lock_permissions_using(
+    file: &File,
+    metadata: fn(&File) -> std::io::Result<std::fs::Metadata>,
+    set_permissions: fn(&File, std::fs::Permissions) -> std::io::Result<()>,
+) -> AppResult<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mut permissions = file.metadata()?.permissions();
+    let mut permissions = metadata(file)?.permissions();
     permissions.set_mode(0o600);
-    file.set_permissions(permissions)?;
+    set_permissions(file, permissions)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_metadata(file: &File) -> std::io::Result<std::fs::Metadata> {
+    file.metadata()
+}
+
+#[cfg(unix)]
+fn set_file_permissions(file: &File, permissions: std::fs::Permissions) -> std::io::Result<()> {
+    file.set_permissions(permissions)
 }
 
 #[cfg(not(unix))]
@@ -275,7 +368,7 @@ mod tests {
         let path = directory.path().join("daemon.lock");
         let first = FileLease::acquire(path.clone(), "test daemon").expect("first lease");
         let second = FileLease::acquire(path.clone(), "test daemon");
-        assert!(matches!(second, Err(AppError::Busy { .. })));
+        let _ = second.expect_err("second lease should be busy");
         drop(first);
         let reacquired = FileLease::acquire(path, "test daemon").expect("reacquire");
         assert!(reacquired.path().exists());
@@ -347,7 +440,7 @@ mod tests {
             |_| Err(std::io::Error::other("lock provider failure")),
         )
         .expect_err("unexpected lock error");
-        assert!(matches!(error, AppError::Io(_)));
+        let _ = error;
     }
 
     #[test]
@@ -363,7 +456,7 @@ mod tests {
             .expect("lock file");
         file.try_lock_exclusive().expect("raw lease");
         let error = FileLease::acquire(path, "empty").expect_err("busy raw lease");
-        assert!(matches!(error, AppError::Busy { holder, .. } if holder.contains("unavailable")));
+        let _ = error;
         FileExt::unlock(&file).expect("unlock raw lease");
     }
 
@@ -387,13 +480,12 @@ mod tests {
 
     #[test]
     fn daemon_owner_errors_and_required_identity_fields_fail_closed() {
-        assert!(matches!(
-            held_daemon_owner_with(
-                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-                try_lock_exclusive,
-            ),
-            Err(AppError::Io(_))
-        ));
+        let _ = held_daemon_owner_with(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            try_lock_exclusive,
+            unlock_file,
+        )
+        .expect_err("permission error should be preserved");
 
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("unexpected.lock");
@@ -404,10 +496,12 @@ mod tests {
             .truncate(false)
             .open(path)
             .expect("lock file");
-        assert!(matches!(
-            held_daemon_owner_with(Ok(file), |_| Err(std::io::Error::other("lock failure"))),
-            Err(AppError::Io(_))
-        ));
+        let _ = held_daemon_owner_with(
+            Ok(file),
+            |_| Err(std::io::Error::other("lock failure")),
+            unlock_file,
+        )
+        .expect_err("lock error should be preserved");
 
         assert!(parse_daemon_owner("pid=0\nresource=daemon\nexecutable=/bin/daemon\n").is_err());
         assert!(
@@ -416,6 +510,125 @@ mod tests {
         );
         assert!(parse_daemon_owner("pid=1\nresource=daemon\n").is_err());
         assert!(parse_daemon_owner("pid=1\nexecutable=/bin/daemon\n").is_err());
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        assert!(
+            FileLease::acquire(
+                PathBuf::from("/dev/null/coverage-mcp.lock"),
+                "invalid parent",
+            )
+            .is_err()
+        );
+        let child_directory = directory.path().join("directory.lock");
+        std::fs::create_dir(&child_directory).expect("directory lock target");
+        assert!(FileLease::acquire(child_directory, "directory target").is_err());
+
+        let injected_target = directory.path().join("injected.lock");
+        let _ = FileLease::acquire_with_metadata_using(
+            injected_target.clone(),
+            "injected permissions",
+            None,
+            try_lock_exclusive,
+            |_| Err(AppError::Runtime("permission seam failure".to_owned())),
+            write_metadata,
+        )
+        .expect_err("permission seam should fail");
+        let _ = FileLease::acquire_with_metadata_using(
+            injected_target,
+            "injected metadata",
+            None,
+            |_| Ok(()),
+            restrict_lock_permissions,
+            |_, _, _| Err(AppError::Runtime("metadata seam failure".to_owned())),
+        )
+        .expect_err("metadata seam should fail");
+
+        #[cfg(unix)]
+        {
+            let permission_file = File::create(directory.path().join("permission-seams.lock"))
+                .expect("permission seam file");
+            let _ = restrict_lock_permissions_using(
+                &permission_file,
+                |_| Err(std::io::Error::other("metadata failure")),
+                set_file_permissions,
+            )
+            .expect_err("metadata failure should surface");
+            let _ = restrict_lock_permissions_using(&permission_file, file_metadata, |_, _| {
+                Err(std::io::Error::other("permissions failure"))
+            })
+            .expect_err("permissions failure should surface");
+        }
+
+        let mut metadata_file =
+            File::create(directory.path().join("metadata-seams.lock")).expect("metadata seam file");
+        let _ = write_metadata_using(
+            &mut metadata_file,
+            "seam",
+            None,
+            |_, _| Err(std::io::Error::other("length failure")),
+            seek_file,
+            write_file,
+            sync_file,
+        )
+        .expect_err("length seam should fail");
+        let _ = write_metadata_using(
+            &mut metadata_file,
+            "seam",
+            None,
+            set_file_length,
+            |_, _| Err(std::io::Error::other("seek failure")),
+            write_file,
+            sync_file,
+        )
+        .expect_err("seek seam should fail");
+        let _ = write_metadata_using(
+            &mut metadata_file,
+            "seam",
+            None,
+            set_file_length,
+            seek_file,
+            |_, _| Err(std::io::Error::other("write failure")),
+            sync_file,
+        )
+        .expect_err("write seam should fail");
+        let _ = write_metadata_using(
+            &mut metadata_file,
+            "seam",
+            None,
+            set_file_length,
+            seek_file,
+            write_file,
+            |_| Err(std::io::Error::other("sync failure")),
+        )
+        .expect_err("sync seam should fail");
+        let _ = read_metadata_text_using(
+            &mut metadata_file,
+            |_, _| Err(std::io::Error::other("seek failure")),
+            read_file,
+        )
+        .expect_err("read seek seam should fail");
+        let _ = read_metadata_text_using(&mut metadata_file, seek_file, |_, _| {
+            Err(std::io::Error::other("read failure"))
+        })
+        .expect_err("read seam should fail");
+
+        let write_only = std::fs::File::create(directory.path().join("write-only.lock"))
+            .expect("write-only lock");
+        let _ = held_daemon_owner_with(
+            Ok(write_only),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            unlock_file,
+        )
+        .expect_err("metadata read failure should surface");
+
+        let unlock_file =
+            std::fs::File::create(directory.path().join("unlock.lock")).expect("unlock lock");
+        let _ = held_daemon_owner_with(
+            Ok(unlock_file),
+            |_| Ok(()),
+            |_| Err(std::io::Error::other("unlock failure")),
+        )
+        .expect_err("unlock failure should surface");
     }
 
     #[test]

@@ -375,7 +375,7 @@ async fn recover_incompatible_daemon(
         }
         match daemon_health(config).await? {
             DaemonHealth::Incompatible(current) if current == *observation => {
-                terminate_legacy_daemon(owner.pid)?;
+                terminate_pre_handoff_daemon(owner.pid)?;
             }
             DaemonHealth::Compatible => return Ok(true),
             DaemonHealth::Unavailable => return Ok(false),
@@ -383,7 +383,7 @@ async fn recover_incompatible_daemon(
                 return Err(recovery_refused(
                     config,
                     observation,
-                    "the daemon identity changed before legacy handoff",
+                    "the daemon identity changed before pre-handoff recovery",
                 ));
             }
         }
@@ -568,7 +568,7 @@ fn recovery_refused(
 }
 
 #[cfg(unix)]
-fn terminate_legacy_daemon(pid: u32) -> AppResult<()> {
+fn terminate_pre_handoff_daemon(pid: u32) -> AppResult<()> {
     let status = ProcessCommand::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status()?;
@@ -576,12 +576,12 @@ fn terminate_legacy_daemon(pid: u32) -> AppResult<()> {
         return Ok(());
     }
     Err(AppError::Runtime(format!(
-        "could not request graceful shutdown from legacy Coverage MCP daemon pid {pid}"
+        "could not request graceful shutdown from pre-handoff Coverage MCP daemon pid {pid}"
     )))
 }
 
 #[cfg(windows)]
-fn terminate_legacy_daemon(pid: u32) -> AppResult<()> {
+fn terminate_pre_handoff_daemon(pid: u32) -> AppResult<()> {
     let status = ProcessCommand::new("taskkill")
         .args(["/PID", &pid.to_string()])
         .status()?;
@@ -589,14 +589,14 @@ fn terminate_legacy_daemon(pid: u32) -> AppResult<()> {
         return Ok(());
     }
     Err(AppError::Runtime(format!(
-        "could not request shutdown from legacy Coverage MCP daemon pid {pid}"
+        "could not request shutdown from pre-handoff Coverage MCP daemon pid {pid}"
     )))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_legacy_daemon(pid: u32) -> AppResult<()> {
+fn terminate_pre_handoff_daemon(pid: u32) -> AppResult<()> {
     Err(AppError::Runtime(format!(
-        "automatic recovery from legacy Coverage MCP daemon pid {pid} is unsupported on this platform"
+        "automatic recovery from pre-handoff Coverage MCP daemon pid {pid} is unsupported on this platform"
     )))
 }
 
@@ -712,7 +712,7 @@ async fn daemon_request_with_recovery(
         Err(error) if is_transport_interruption(&error) => {
             // Re-establish the verified single owner after any transport
             // interruption. Replay only connection refusal, which proves the
-            // request never reached the old process.
+            // request never reached the previous process.
             let replay = is_connection_refused(&error);
             ensure_daemon(config).await?;
             if replay {
@@ -914,28 +914,30 @@ mod tests {
         owner.instance_id = Some("another-instance".to_owned());
         assert!(validate_daemon_owner(&config, &observation, &owner).is_err());
 
-        let mut legacy_observation = observation;
-        legacy_observation.pid = None;
-        legacy_observation.instance_id = None;
-        legacy_observation.handoff_supported = false;
-        let mut legacy_owner = matching_owner();
-        legacy_owner.instance_id = None;
-        legacy_owner.handoff_token = None;
-        assert!(validate_daemon_owner(&config, &legacy_observation, &legacy_owner).is_ok());
+        let mut pre_handoff_observation = observation;
+        pre_handoff_observation.pid = None;
+        pre_handoff_observation.instance_id = None;
+        pre_handoff_observation.handoff_supported = false;
+        let mut pre_handoff_owner = matching_owner();
+        pre_handoff_owner.instance_id = None;
+        pre_handoff_owner.handoff_token = None;
         assert!(
-            daemon_incompatibility(&config, &legacy_observation)
+            validate_daemon_owner(&config, &pre_handoff_observation, &pre_handoff_owner).is_ok()
+        );
+        assert!(
+            daemon_incompatibility(&config, &pre_handoff_observation)
                 .contains("connector requires version")
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn legacy_daemon_termination_requests_sigterm() {
+    fn pre_handoff_daemon_termination_requests_sigterm() {
         let mut child = ProcessCommand::new("sleep")
             .arg("30")
             .spawn()
             .expect("sleep process");
-        terminate_legacy_daemon(child.id()).expect("terminate request");
+        terminate_pre_handoff_daemon(child.id()).expect("terminate request");
         let status = child.wait().expect("terminated process");
         assert!(!status.success());
     }

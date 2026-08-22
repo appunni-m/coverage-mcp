@@ -77,7 +77,7 @@ jobs:
         run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_storage_queries_compare_and_compacts_old_detail
       - name: Run migration worktree-lineage test
         timeout-minutes: 3
-        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_worktree_registration_and_lineage_guards
+        run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_lineage_baseline_and_guards
       - name: Run migration managed-run test
         timeout-minutes: 3
         run: make test-ci-rust-migration RUST_MIGRATION_TEST=rust_managed_runs_keep_idempotency_logs_and_artifacts

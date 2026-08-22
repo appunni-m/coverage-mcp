@@ -1,7 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+
+/// One inclusive range of lines added to the current Git revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangedLineRange {
+    /// Repository-relative file path.
+    pub file_path: String,
+    /// One-based first added line.
+    pub start: i64,
+    /// Number of added lines in the range.
+    pub line_count: i64,
+}
 
 /// Git identity attached to a coverage measurement or project.
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -50,9 +61,29 @@ pub fn inspect_git(path: &Path) -> AppResult<GitInfo> {
     })
 }
 
+/// Returns whether a Git checkout has no tracked, staged, or untracked changes.
+pub fn is_clean(path: &Path) -> bool {
+    let root = resolve_path(path);
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && output.stdout.is_empty()
+}
+
 /// Returns the merge base of two revisions when Git can resolve it.
 pub fn merge_base(repo_path: &str, base_ref: &str, head_ref: &str) -> Option<String> {
     run_git(Path::new(repo_path), &["merge-base", base_ref, head_ref])
+}
+
+/// Returns the first parent commit for one revision when Git can resolve it.
+pub fn parent_commit(repo_path: &str, commit: &str) -> Option<String> {
+    let parent = format!("{commit}^");
+    run_git(Path::new(repo_path), &["rev-parse", &parent])
 }
 
 /// Returns whether `ancestor` is an ancestor of `descendant`.
@@ -69,6 +100,108 @@ pub fn is_ancestor(repo_path: &str, ancestor: &str, descendant: &str) -> bool {
             ])
             .output(),
     )
+}
+
+/// Returns added-line ranges between two Git revisions.
+pub fn changed_line_ranges(
+    repo_path: &str,
+    baseline: &str,
+    current: &str,
+) -> AppResult<Vec<ChangedLineRange>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--unified=0",
+            baseline,
+            current,
+            "--",
+        ])
+        .output()
+        .map_err(AppError::from)?;
+    if !output.status.success() {
+        return Err(AppError::Validation(format!(
+            "git diff could not compare {baseline} with {current}"
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_changed_line_ranges(&text)
+}
+
+fn parse_changed_line_ranges(text: &str) -> AppResult<Vec<ChangedLineRange>> {
+    let mut path = None;
+    let mut ranges = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("+++ b/") {
+            path = Some(value.to_owned());
+            continue;
+        }
+        let Some(header) = line.strip_prefix("@@") else {
+            continue;
+        };
+        let Some(path) = path.as_ref() else {
+            continue;
+        };
+        let Some(plus_range) = header
+            .split_whitespace()
+            .find(|value| value.starts_with('+'))
+        else {
+            continue;
+        };
+        let range = plus_range.trim_start_matches('+');
+        let mut parts = range.splitn(2, ',');
+        let start = parts
+            .next()
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| {
+                AppError::Validation("git diff has an invalid added range".to_owned())
+            })?;
+        let line_count = parts
+            .next()
+            .map(|value| value.parse::<i64>())
+            .transpose()
+            .map_err(|_| AppError::Validation("git diff has an invalid added count".to_owned()))?
+            .unwrap_or(1);
+        if line_count > 0 {
+            ranges.push(ChangedLineRange {
+                file_path: path.clone(),
+                start,
+                line_count,
+            });
+        }
+    }
+    Ok(ranges)
+}
+
+/// Reads a repository-relative file from a Git commit when that object exists.
+pub fn read_file_at_commit(
+    repo_path: &str,
+    commit_sha: &str,
+    file_path: &str,
+) -> AppResult<Option<String>> {
+    let path = Path::new(file_path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(AppError::Validation(
+            "file_path must remain inside the repository".to_owned(),
+        ));
+    }
+    let object = format!("{commit_sha}:{file_path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["show", &object])
+        .output()
+        .map_err(AppError::from)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 fn command_succeeded(result: std::io::Result<std::process::Output>) -> bool {
@@ -156,6 +289,7 @@ mod tests {
         assert!(merge_base(&outside.repo_path, "main", "HEAD").is_none());
         assert!(!is_ancestor(&outside.repo_path, "main", "HEAD"));
         assert!(inspect_git(Path::new("\0")).is_err());
+        assert!(!is_clean(Path::new("\0")));
 
         run_git_checked(directory.path(), &["init", "-b", "main"]);
         run_git_checked(
@@ -176,6 +310,10 @@ mod tests {
             info.commit_sha.as_deref().expect("commit"),
             "HEAD"
         ));
+        assert!(is_clean(directory.path()));
+        assert!(!is_clean(&directory.path().join("missing")));
+        std::fs::write(directory.path().join("file.txt"), "changed\n").expect("dirty");
+        assert!(!is_clean(directory.path()));
         assert!(!is_ancestor(&info.repo_path, "missing", "HEAD"));
         assert!(run_git(directory.path(), &["definitely-not-a-git-subcommand"]).is_none());
     }
@@ -217,5 +355,106 @@ mod tests {
             PathBuf::from("/tmp/repository")
         );
         assert!(!command_succeeded(Err(std::io::Error::other("injected"))));
+    }
+
+    #[test]
+    fn parses_added_line_ranges_from_git_diff() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        run_git_checked(directory.path(), &["init", "-b", "main"]);
+        run_git_checked(
+            directory.path(),
+            &["config", "user.email", "rust@example.com"],
+        );
+        run_git_checked(directory.path(), &["config", "user.name", "Rust Tests"]);
+        std::fs::write(directory.path().join("file.rs"), "one\ntwo\n").expect("base");
+        run_git_checked(directory.path(), &["add", "."]);
+        run_git_checked(directory.path(), &["commit", "-m", "base"]);
+        let baseline = run_git(directory.path(), &["rev-parse", "HEAD"]).expect("baseline");
+        std::fs::write(directory.path().join("file.rs"), "one\nadded\ntwo\n").expect("change");
+        run_git_checked(directory.path(), &["add", "."]);
+        run_git_checked(directory.path(), &["commit", "-m", "add line"]);
+        let current = run_git(directory.path(), &["rev-parse", "HEAD"]).expect("current");
+        assert_eq!(
+            changed_line_ranges(
+                directory.path().to_str().expect("path"),
+                &baseline,
+                &current
+            )
+            .unwrap(),
+            vec![ChangedLineRange {
+                file_path: "file.rs".to_owned(),
+                start: 2,
+                line_count: 1
+            }]
+        );
+        assert_eq!(
+            read_file_at_commit(
+                directory.path().to_str().expect("path"),
+                &current,
+                "file.rs"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("one\nadded\ntwo\n")
+        );
+        assert_eq!(
+            read_file_at_commit(
+                directory.path().to_str().expect("path"),
+                &current,
+                "missing.rs"
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            read_file_at_commit(
+                directory.path().to_str().expect("path"),
+                &current,
+                "../file.rs"
+            )
+            .is_err()
+        );
+        assert!(
+            changed_line_ranges(
+                directory.path().to_str().expect("path"),
+                "missing",
+                &current
+            )
+            .is_err()
+        );
+        assert!(
+            parse_changed_line_ranges("@@ -1 +1 @@\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_changed_line_ranges("+++ b/file.rs\n@@ -1 1 @@\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_changed_line_ranges("+++ b/file.rs\n@@ -1 +bad @@\n").is_err());
+        assert!(parse_changed_line_ranges("+++ b/file.rs\n@@ -1 +1,bad @@\n").is_err());
+        std::fs::remove_file(directory.path().join("file.rs")).expect("remove");
+        run_git_checked(directory.path(), &["add", "."]);
+        run_git_checked(directory.path(), &["commit", "-m", "delete file"]);
+        let deleted = run_git(directory.path(), &["rev-parse", "HEAD"]).expect("deleted");
+        assert!(
+            changed_line_ranges(directory.path().to_str().expect("path"), &current, &deleted)
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            parse_changed_line_ranges("+++ b/file.rs\n@@ -1,1 +1,0 @@\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(changed_line_ranges("\0", &current, &deleted).is_err());
+        assert!(read_file_at_commit("\0", &current, "file.rs").is_err());
+        assert!(run_git(Path::new("\0"), &["status"]).is_none());
+        let failed_helper = std::panic::catch_unwind(|| {
+            run_git_checked(directory.path(), &["definitely-not-a-git-subcommand"]);
+        });
+        assert!(failed_helper.is_err());
     }
 }

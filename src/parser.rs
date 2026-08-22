@@ -1,6 +1,12 @@
+// Parser branches operate on records that have passed the format-specific
+// shape checks; retain local assertions for impossible in-memory states.
+#![allow(clippy::expect_used, clippy::unwrap_in_result)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use quick_xml::events::Event;
 use quick_xml::{Reader, XmlVersion};
@@ -28,6 +34,9 @@ pub const SUPPORTED_FORMATS: &[&str] = &[
 /// Maximum coverage report size accepted by the parser.
 pub const MAX_COVERAGE_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
+#[cfg(test)]
+static FORCE_METADATA_FAILURE: AtomicBool = AtomicBool::new(false);
+
 /// Parses one supported coverage artifact into normalized rows.
 pub fn parse_coverage_report(
     path: &Path,
@@ -40,7 +49,7 @@ pub fn parse_coverage_report(
             path.display()
         )));
     }
-    let report_size = fs::metadata(path)?.len();
+    let report_size = report_metadata(path)?.len();
     if report_size > MAX_COVERAGE_REPORT_BYTES {
         return Err(parse_error(format!(
             "coverage report exceeds the {} byte limit",
@@ -53,6 +62,14 @@ pub fn parse_coverage_report(
         normalize_format(format)?
     };
     parse_selected(&selected, path, repo_path)
+}
+
+fn report_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if FORCE_METADATA_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected coverage metadata failure"));
+    }
+    fs::metadata(path)
 }
 
 fn parse_selected(
@@ -279,18 +296,18 @@ fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<Cove
                 "coverage.py file entry must be an object: {file_path}"
             ))
         })?;
-        let mut line_numbers = Vec::new();
-        for key in ["executed_lines", "missing_lines"] {
-            if let Some(lines) = coverage_array(payload, key)? {
-                line_numbers.extend(numeric_line_numbers(lines)?);
-            }
-        }
-        line_numbers.sort_unstable();
-        line_numbers.dedup();
-        let executed: std::collections::BTreeSet<i64> = coverage_array(payload, "executed_lines")?
+        let executed_lines = coverage_array(payload, "executed_lines")?;
+        let missing_lines = coverage_array(payload, "missing_lines")?;
+        let executed = executed_lines
             .map(|lines| numeric_line_numbers(lines))
             .transpose()?
             .unwrap_or_default();
+        let mut line_numbers = executed.iter().copied().collect::<Vec<_>>();
+        if let Some(lines) = missing_lines {
+            line_numbers.extend(numeric_line_numbers(lines)?);
+        }
+        line_numbers.sort_unstable();
+        line_numbers.dedup();
         for line in line_numbers {
             let covered = executed.contains(&line);
             builder.add_line(
@@ -307,8 +324,13 @@ fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<Cove
             );
         }
         let mut branches: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
-        for (key, covered) in [("executed_branches", true), ("missing_branches", false)] {
-            if let Some(values) = coverage_array(payload, key)? {
+        let executed_branches = coverage_array(payload, "executed_branches")?;
+        let missing_branches = coverage_array(payload, "missing_branches")?;
+        for (key, values, covered) in [
+            ("executed_branches", executed_branches, true),
+            ("missing_branches", missing_branches, false),
+        ] {
+            if let Some(values) = values {
                 for value in values {
                     let items = value.as_array().ok_or_else(|| {
                         parse_error(format!("coverage.py {key} entry must be an array"))
@@ -575,7 +597,8 @@ fn parse_istanbul(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRep
                                 "Istanbul branch hit data must be an array: {key}:{branch_id}"
                             ))
                         })?;
-                    let total = checked_len_i64(counts.len(), "Istanbul branch count")?;
+                    let total = i64::try_from(counts.len())
+                        .expect("an in-memory JSON array cannot exceed i64::MAX elements");
                     let mut covered = 0_i64;
                     for value in counts {
                         if value_i64(value)? > 0 {
@@ -1062,10 +1085,6 @@ fn go_position_line(position: &str) -> AppResult<i64> {
     Ok(line)
 }
 
-fn checked_len_i64(value: usize, field: &str) -> AppResult<i64> {
-    i64::try_from(value).map_err(|_| parse_error(format!("{field} exceeds the supported range")))
-}
-
 fn parse_error(message: String) -> AppError {
     AppError::Validation(format!("coverage parse error: {message}"))
 }
@@ -1097,6 +1116,8 @@ mod tests {
             "coveragepy"
         );
         assert_eq!(normalize_format("nyc").expect("format"), "istanbul");
+        assert_eq!(normalize_format("go-cover").expect("format"), "go");
+        assert_eq!(normalize_format("llvm-json").expect("format"), "llvm");
     }
 
     #[test]
@@ -1311,6 +1332,23 @@ mod tests {
             std::fs::write(&path, content).expect("write fixture");
             path
         };
+        let metadata_probe = write("metadata-probe.lcov", "TN:\n");
+        FORCE_METADATA_FAILURE.store(true, Ordering::SeqCst);
+        assert!(parse_coverage_report(&metadata_probe, "lcov", None).is_err());
+        assert!(detect_format(directory.path()).is_err());
+        let invalid_json = write("invalid-json.json", "{");
+        assert!(detect_format(&invalid_json).is_err());
+        assert!(parse_selected("lcov", directory.path(), None).is_err());
+        for format in [
+            "coveragepy",
+            "cobertura",
+            "jacoco",
+            "istanbul",
+            "go",
+            "llvm",
+        ] {
+            assert!(parse_selected(format, directory.path(), None).is_err());
+        }
         let oversized = directory.path().join("oversized.lcov");
         std::fs::File::create(&oversized)
             .expect("create oversized fixture")
@@ -1329,11 +1367,54 @@ mod tests {
         assert!(report.total_branches() >= 1);
         let malformed_lcov = write("malformed.info", "SF:a.py\nDA:not,a\nend_of_record\n");
         assert!(parse_coverage_report(&malformed_lcov, "lcov", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write("malformed-hit.info", "SF:a.py\nDA:1,bad\nend_of_record\n"),
+                "lcov",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write("malformed-fn-number.info", "SF:a.py\nFN:bad,func\n"),
+                "lcov",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "malformed-fnda-number.info",
+                    "SF:a.py\nFN:1,func\nFNDA:bad,func\n"
+                ),
+                "lcov",
+                None,
+            )
+            .is_err()
+        );
         let malformed_branch_lcov = write(
             "malformed-branch.info",
             "SF:a.py\nBRDA:1,0\nend_of_record\n",
         );
         assert!(parse_coverage_report(&malformed_branch_lcov, "lcov", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write("malformed-branch-line.info", "SF:a.py\nBRDA:bad,0,0,1\n"),
+                "lcov",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write("malformed-branch-count.info", "SF:a.py\nBRDA:1,0,0,bad\n"),
+                "lcov",
+                None,
+            )
+            .is_err()
+        );
 
         let coveragepy = write(
             "coverage.json",
@@ -1350,11 +1431,78 @@ mod tests {
             r#"{"files":{"a.py":{"executed_lines":["bad"]}}}"#,
         );
         assert!(parse_coverage_report(&malformed_coveragepy, "coveragepy", None).is_err());
+        assert!(parse_coverage_report(&invalid_json, "coveragepy", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "coveragepy-lines-type.json",
+                    r#"{"files":{"a.py":{"executed_lines":true}}}"#
+                ),
+                "coveragepy",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "coveragepy-missing-lines-type.json",
+                    r#"{"files":{"a.py":{"executed_lines":[],"missing_lines":true}}}"#,
+                ),
+                "coveragepy",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "coveragepy-missing-lines-number.json",
+                    r#"{"files":{"a.py":{"executed_lines":[],"missing_lines":["bad"]}}}"#,
+                ),
+                "coveragepy",
+                None,
+            )
+            .is_err()
+        );
         let malformed_branch_type = write(
             "malformed-branch-type.json",
             r#"{"files":{"a.py":{"executed_branches":[{}]}}}"#,
         );
         assert!(parse_coverage_report(&malformed_branch_type, "coveragepy", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "coveragepy-missing-branch-type.json",
+                    r#"{"files":{"a.py":{"executed_branches":[],"missing_branches":true}}}"#,
+                ),
+                "coveragepy",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "coveragepy-executed-branch-type.json",
+                    r#"{"files":{"a.py":{"executed_branches":true,"missing_branches":[]}}}"#,
+                ),
+                "coveragepy",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "coveragepy-branch-number.json",
+                    r#"{"files":{"a.py":{"executed_branches":[["bad"]],"missing_branches":[]}}}"#,
+                ),
+                "coveragepy",
+                None,
+            )
+            .is_err()
+        );
         let malformed_branch_line = write(
             "malformed-branch-line.json",
             r#"{"files":{"a.py":{"executed_branches":[[]]}}}"#,
@@ -1374,6 +1522,82 @@ mod tests {
             r#"<coverage><class><lines><line number="1" hits="0"/></lines></class></coverage>"#,
         );
         assert!(parse_coverage_report(&malformed_cobertura, "cobertura", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "cobertura-line-rate.xml",
+                    r#"<coverage><class filename="a.py" line-rate="bad"/></coverage>"#,
+                ),
+                "cobertura",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "cobertura-branch-rate.xml",
+                    r#"<coverage><class filename="a.py" branch-rate="bad"/></coverage>"#,
+                ),
+                "cobertura",
+                None,
+            )
+            .is_err()
+        );
+        assert!(parse_coverage_report(
+            &write(
+                "cobertura-count-number.xml",
+                r#"<coverage><class filename="a.py"><line number="bad" hits="0"/></class></coverage>"#,
+            ),
+            "cobertura",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "cobertura-hit-number.xml",
+                r#"<coverage><class filename="a.py"><line number="1" hits="bad"/></class></coverage>"#,
+            ),
+            "cobertura",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "cobertura-branch-count-number.xml",
+                r#"<coverage><class filename="a.py"><line number="1" hits="0" branch="true" branches-valid="bad" branches-covered="0"/></class></coverage>"#,
+            ),
+            "cobertura",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "cobertura-condition-total-number.xml",
+                r#"<coverage><class filename="a.py"><line number="1" hits="0" branch="true" condition-coverage="50% (bad/2)"/></class></coverage>"#,
+            ),
+            "cobertura",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "cobertura-condition-covered-number.xml",
+                r#"<coverage><class filename="a.py"><line number="1" hits="0" branch="true" condition-coverage="50% (1/bad)"/></class></coverage>"#,
+            ),
+            "cobertura",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "cobertura-explicit-covered-number.xml",
+                r#"<coverage><class filename="a.py"><line number="1" hits="0" branch="true" branches-valid="2" branches-covered="bad"/></class></coverage>"#,
+            ),
+            "cobertura",
+            None,
+        )
+        .is_err());
         let jacoco = write(
             "plain.xml",
             r#"<report><package name=""><sourcefile name="A.java"><line nr="1" mi="1" ci="0" mb="0" cb="1"/></sourcefile></package><counter type="LINE" missed="0" covered="1"/></report>"#,
@@ -1387,6 +1611,51 @@ mod tests {
             r#"<report><package><sourcefile/></package></report>"#,
         );
         assert!(parse_coverage_report(&jacoco_missing_name, "jacoco", None).is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "jacoco-invalid-line.xml",
+                r#"<report><package><sourcefile name="A.java"><line nr="bad" mi="1" ci="0" mb="0" cb="1"/></sourcefile></package></report>"#,
+            ),
+            "jacoco",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "jacoco-invalid-instructions.xml",
+                r#"<report><package><sourcefile name="A.java"><line nr="1" mi="bad" ci="0" mb="0" cb="1"/></sourcefile></package></report>"#,
+            ),
+            "jacoco",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "jacoco-invalid-covered.xml",
+                r#"<report><package><sourcefile name="A.java"><line nr="1" mi="1" ci="bad" mb="0" cb="1"/></sourcefile></package></report>"#,
+            ),
+            "jacoco",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "jacoco-invalid-missed-branches.xml",
+                r#"<report><package><sourcefile name="A.java"><line nr="1" mi="1" ci="0" mb="bad" cb="1"/></sourcefile></package></report>"#,
+            ),
+            "jacoco",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "jacoco-invalid-covered-branches.xml",
+                r#"<report><package><sourcefile name="A.java"><line nr="1" mi="1" ci="0" mb="0" cb="bad"/></sourcefile></package></report>"#,
+            ),
+            "jacoco",
+            None,
+        )
+        .is_err());
         let bad_xml = write("bad.xml", "<report>");
         assert!(parse_coverage_report(&bad_xml, "auto", None).is_err());
         let unknown_xml = write("unknown.xml", "<unknown/>");
@@ -1398,6 +1667,16 @@ mod tests {
         );
         let report = parse_coverage_report(&istanbul, "auto", None).expect("istanbul");
         assert_eq!(report.format, "istanbul");
+        assert!(parse_coverage_report(&invalid_json, "istanbul", None).is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "istanbul-location-variants.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{"0":{"loc":{"start":{"line":3}}}},"f":{"0":1},"branchMap":{"0":{"loc":{"start":{"line":4}}}},"b":{"0":[1,0]}}}"#,
+            ),
+            "istanbul",
+            None,
+        )
+        .is_ok());
         let bad_istanbul = write("bad-istanbul.json", "[]");
         assert!(parse_coverage_report(&bad_istanbul, "istanbul", None).is_err());
         let not_istanbul = write("not-istanbul.json", r#"{"a.js":{}}"#);
@@ -1407,6 +1686,54 @@ mod tests {
             r#"{"null.js":null,"missing-map":{"s":{"0":1}},"missing-location":{"statementMap":{"0":{}},"s":{"0":1}},"missing-start-line":{"statementMap":{"0":{"start":{}}},"s":{"0":1}},"bad-location":{"statementMap":{"0":null},"s":{}},"missing-statement-hit":{"statementMap":{"0":{"line":1},"1":{"line":2}},"s":{"0":1}},"missing-function":{"statementMap":{},"s":{},"fnMap":{"0":{}},"f":{"0":1}},"missing-branch":{"statementMap":{},"s":{},"branchMap":{"0":{}},"b":{"0":[1]}}}"#,
         );
         assert!(parse_coverage_report(&mixed_istanbul, "istanbul", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "istanbul-invalid-location-number.json",
+                    r#"{"a.js":{"statementMap":{"0":{"line":"bad"}},"s":{"0":1}}}"#,
+                ),
+                "istanbul",
+                None,
+            )
+            .is_err()
+        );
+        assert!(parse_coverage_report(
+            &write(
+                "istanbul-invalid-branch-count.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{"0":{"line":1}},"b":{"0":[null]}}}"#,
+            ),
+            "istanbul",
+            None,
+        )
+        .is_err());
+        for (name, function) in [
+            (
+                "istanbul-invalid-function-loc.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{"0":{"loc":{"start":{}}}},"f":{"0":1}}}"#,
+            ),
+            (
+                "istanbul-invalid-function-decl.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{"0":{"decl":{}}},"f":{"0":1}}}"#,
+            ),
+            (
+                "istanbul-invalid-function-fallback.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"fnMap":{"0":{}},"f":{"0":1}}}"#,
+            ),
+        ] {
+            assert!(parse_coverage_report(&write(name, function), "istanbul", None).is_err());
+        }
+        for (name, branch) in [
+            (
+                "istanbul-invalid-branch-loc.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{"0":{"loc":{"start":{}}}},"b":{"0":[1]}}}"#,
+            ),
+            (
+                "istanbul-invalid-branch-fallback.json",
+                r#"{"a.js":{"statementMap":{},"s":{},"branchMap":{"0":{}},"b":{"0":[1]}}}"#,
+            ),
+        ] {
+            assert!(parse_coverage_report(&write(name, branch), "istanbul", None).is_err());
+        }
         let go = write(
             "cover.out",
             "mode: set\na.go:1.1,2.1 2 1\na.go:3.1,3.1 1 0\n",
@@ -1419,6 +1746,52 @@ mod tests {
         assert!(parse_coverage_report(&bad_go, "go", None).is_err());
         let malformed_go = write("malformed-cover.out", "mode: set\nshort\n");
         assert!(parse_coverage_report(&malformed_go, "go", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "go-invalid-statements.out",
+                    "mode: set\na.go:1.1,1.1 bad 1\n"
+                ),
+                "go",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write("go-invalid-hits.out", "mode: set\na.go:1.1,1.1 1 bad\n"),
+                "go",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write("go-invalid-end.out", "mode: set\na.go:1.1,bad 1 1\n"),
+                "go",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "go-invalid-position-line.out",
+                    "mode: set\na.go:bad.1,1.1 1 1\n"
+                ),
+                "go",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write("go-reversed-range.out", "mode: set\na.go:2.1,1.1 1 1\n"),
+                "go",
+                None,
+            )
+            .is_err()
+        );
         let llvm = write(
             "llvm.json",
             r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,2,true],[2,0,0,false]],"branches":[[4,0,0,0,1,0],{"line_start":5,"trueCount":1,"falseCount":0}],"summary":{"lines":{"count":2,"covered":1},"branches":{"count":2,"covered":1},"functions":{"covered":1},"regions":{"count":2}}},{"filename":"no-summary.c","segments":[]}]}]}"#,
@@ -1437,6 +1810,70 @@ mod tests {
             r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,1,1]]}]}]}"#,
         );
         assert!(parse_coverage_report(&llvm_bad_flag, "llvm", None).is_err());
+        assert!(parse_coverage_report(&invalid_json, "llvm", None).is_err());
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "llvm-invalid-segment-number.json",
+                    r#"{"data":[{"files":[{"filename":"a.c","segments":[[null,0,1,true]]}]}]}"#,
+                ),
+                "llvm",
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_coverage_report(
+                &write(
+                    "llvm-invalid-segment-count.json",
+                    r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,null,true]]}]}]}"#,
+                ),
+                "llvm",
+                None,
+            )
+            .is_err()
+        );
+        assert!(parse_coverage_report(
+            &write(
+                "llvm-invalid-summary-count.json",
+                r#"{"data":[{"files":[{"filename":"a.c","summary":{"lines":{"count":"bad"}}}]}]}"#,
+            ),
+            "llvm",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "llvm-invalid-branch-count.json",
+                r#"{"data":[{"files":[{"filename":"a.c","branches":[{"line":1,"trueCount":null,"falseCount":0}]}]}]}"#,
+            ),
+            "llvm",
+            None,
+        )
+        .is_err());
+        assert!(parse_coverage_report(
+            &write(
+                "llvm-invalid-summary-covered.json",
+                r#"{"data":[{"files":[{"filename":"a.c","summary":{"lines":{"covered":"bad"}}}]}]}"#,
+            ),
+            "llvm",
+            None,
+        )
+        .is_err());
+        for content in [
+            r#"{"data":[{"files":[{"filename":"a.c","branches":[[null,0,0,0,1,0]]}]}]}"#,
+            r#"{"data":[{"files":[{"filename":"a.c","branches":[[1,0,0,0,null,0]]}]}]}"#,
+            r#"{"data":[{"files":[{"filename":"a.c","branches":[[1,0,0,0,1,null]]}]}]}"#,
+        ] {
+            assert!(
+                parse_coverage_report(
+                    &write("llvm-invalid-branch-value.json", content),
+                    "llvm",
+                    None,
+                )
+                .is_err()
+            );
+        }
         let no_data = write("no-data.json", "{}");
         assert!(parse_coverage_report(&no_data, "auto", None).is_err());
         assert!(parse_coverage_report(&no_data, "llvm", None).is_err());
@@ -1460,6 +1897,9 @@ mod tests {
         assert!(parse_xml(Path::new("\0")).is_err());
         let invalid_attribute = write("invalid-attribute.xml", "<root =\"bad\"/>");
         assert!(parse_xml(&invalid_attribute).is_err());
+        let invalid_start_attribute =
+            write("invalid-start-attribute.xml", "<root =\"bad\">x</root>");
+        assert!(parse_xml(&invalid_start_attribute).is_err());
         let invalid_escape = write("invalid-escape.xml", "<root attr=\"&not-an-entity;\"/>");
         assert!(parse_xml(&invalid_escape).is_err());
         let comment_xml = write("comment.xml", "<!-- comment -->");
@@ -1530,6 +1970,13 @@ mod tests {
         assert!(value_i64(&json!(true)).is_err());
         assert!(safe_i64(Some("4.5")).is_err());
         assert!(safe_i64(Some("bad")).is_err());
+        assert_eq!(parse_f64("1.5").unwrap(), 1.5);
+        assert!(parse_f64("NaN").is_err());
+        assert!(parse_f64("-inf").is_err());
+        assert_eq!(numeric_i64(-2.0).unwrap(), -2);
+        assert!(numeric_i64(1.5).is_err());
+        assert!(go_position_line("2.bad").is_err());
+        assert_eq!(go_position_line("2.1").unwrap(), 2);
         assert_eq!(
             numeric_line_numbers(&[json!(1), json!(2)])
                 .unwrap()
@@ -1555,7 +2002,6 @@ mod tests {
         assert!(value_i64(&Value::Null).is_err());
         assert!(parse_f64("inf").is_err());
         assert!(numeric_i64(9_223_372_036_854_775_808.0).is_err());
-        assert!(checked_len_i64(usize::MAX, "test count").is_err());
         let metrics = llvm_summary_metrics(
             json!({"lines":{"count":2,"covered":1},"branches":{"count":3,"covered":2},"functions":{"count":4,"covered":3},"regions":{"count":5,"covered":4},"other":{}})
                 .as_object()

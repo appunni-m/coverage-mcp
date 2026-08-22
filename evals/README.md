@@ -47,8 +47,12 @@ Checks that the tool catalog and projections do not force an agent to request a
 large raw report:
 
 - compact views omit unrelated line, parser, and provenance detail;
-- `targets` exposes ranked red regions rather than all covered lines;
-- `regions` is smaller than exact changed-line audit output;
+- `coverage_review` returns one bounded task-level answer instead of requiring
+  target/file/source fan-out;
+- unchanged `run_test` submissions reuse the latest compatible terminal run,
+  even without an idempotency key;
+- `task=insight` exposes ranked red regions rather than all covered lines;
+- `task=change` with grouped regions is smaller than exact audit output;
 - `max_words` is honored and collection cursors continue without duplicates;
 - detailed fields are opt-in and measurably larger than normal projections;
 - multiple narrow calls can compose a task without repeating the full snapshot.
@@ -57,12 +61,15 @@ large raw report:
 
 Golden workflows cover:
 
-- next coverage work: `targets` → selected `source_context`;
-- previous-session impact: `regions` → regressed source range;
-- one-file red regions: `file` with optional `line_ranges`;
-- exact source inspection: one bounded contiguous range;
-- line history and audit-only exact lines;
-- approved test execution, polling, and targeted log search.
+- next coverage work: `task=insight` → selected `task=source` ranges;
+- previous-session impact: `task=change` with an explicit baseline;
+- one-file red regions: `task=change` with a file selector;
+- exact source inspection: `task=source` with one or more bounded ranges and
+  source provenance;
+- `task=history` and audit-only exact records;
+- changed-code review in one bounded projection;
+- two detailed history points plus an aggregate ten-snapshot summary;
+- approved test execution, polling, and targeted `run_review` log search.
 
 The suite also verifies that the first response contains the information needed
 to select the next action, rather than merely returning an implementation-shaped

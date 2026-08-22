@@ -47,6 +47,10 @@ fn config() -> ServerConfig {
     }
 }
 
+fn repository_count_row(row: &duckdb::Row<'_>) -> duckdb::Result<i64> {
+    row.get::<_, i64>(0)
+}
+
 fn write_file(root: &Path, name: &str, content: &str) -> PathBuf {
     let path = root.join(name);
     if let Some(parent) = path.parent() {
@@ -682,7 +686,7 @@ fn rust_storage_queries_compare_and_compacts_old_detail() {
 }
 
 #[test]
-fn rust_worktree_registration_and_lineage_guards() {
+fn rust_lineage_baseline_and_guards() {
     let directory = tempfile::tempdir().unwrap();
     git_repo(directory.path());
     let report = write_file(
@@ -692,7 +696,7 @@ fn rust_worktree_registration_and_lineage_guards() {
     );
     let store = store(directory.path());
     let no_baseline = store
-        .register_worktree(directory.path(), "main", Some("before coverage"))
+        .ensure_lineage_baseline(directory.path(), "main", Some("before coverage"))
         .unwrap();
     let base = ingest(&store, &report, "main", &git_sha(directory.path()));
     assert!(no_baseline["baseline_snapshot_id"].is_null());
@@ -707,7 +711,7 @@ fn rust_worktree_registration_and_lineage_guards() {
             .is_err()
     );
     let worktree = store
-        .register_worktree(directory.path(), "main", Some("main checkout"))
+        .ensure_lineage_baseline(directory.path(), "main", Some("main checkout"))
         .unwrap();
     assert_eq!(worktree["baseline_snapshot_id"], base["id"]);
     assert_eq!(store.list_worktrees(100).unwrap().len(), 2);
@@ -752,6 +756,13 @@ fn git_sha(root: &Path) -> String {
 #[test]
 fn rust_managed_runs_keep_idempotency_logs_and_artifacts() {
     let directory = tempfile::tempdir().unwrap();
+    git_repo(directory.path());
+    write_file(directory.path(), ".gitignore", "*\n!.gitignore\n");
+    run_git(directory.path(), &["add", ".gitignore"]);
+    run_git(
+        directory.path(),
+        &["commit", "-m", "ignore managed artifact"],
+    );
     let store = store(directory.path());
     let artifact =
         json!({"coverage":{"path":"coverage.lcov","coverage_format":"lcov","suite":"unit"}});
@@ -780,6 +791,13 @@ fn rust_managed_runs_keep_idempotency_logs_and_artifacts() {
         .unwrap();
     assert_eq!(repeated["id"], run["id"]);
     assert_eq!(repeated["submission_reused"], true);
+    assert_eq!(repeated["reuse_reason"], "idempotency_key");
+    let unchanged = store
+        .submit_command_with_options(command["id"].as_str().unwrap(), Some(10), None, 20, true)
+        .unwrap();
+    assert_eq!(unchanged["id"], run["id"]);
+    assert_eq!(unchanged["submission_reused"], true);
+    assert_eq!(unchanged["reuse_reason"], "unchanged_checkout");
     let logs = store
         .search_run_logs(
             run["id"].as_str().unwrap(),
@@ -798,6 +816,130 @@ fn rust_managed_runs_keep_idempotency_logs_and_artifacts() {
         .unwrap();
     assert_eq!(artifact["ingest_status"], "ingested");
     assert!(store.cancel_run(run["id"].as_str().unwrap(), 20).is_err());
+    store.close().unwrap();
+}
+
+#[test]
+fn rust_managed_coverage_requires_a_changed_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    git_repo(directory.path());
+    write_file(directory.path(), ".gitignore", "*\n!.gitignore\n");
+    run_git(directory.path(), &["add", ".gitignore"]);
+    run_git(
+        directory.path(),
+        &["commit", "-m", "ignore managed artifact"],
+    );
+    let report = write_file(
+        directory.path(),
+        "coverage.lcov",
+        "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+    );
+    let store = store(directory.path());
+    let artifact = json!({
+        "coverage": {
+            "path": report.file_name().unwrap().to_string_lossy(),
+            "coverage_format": "lcov",
+            "suite": "unit"
+        }
+    });
+    let unchanged_command = store
+        .register_command(
+            "unchanged-artifact",
+            "true",
+            Some(directory.path()),
+            "/bin/sh",
+            Some(artifact.clone()),
+            true,
+            "tester",
+            "approved unchanged-artifact test",
+            true,
+        )
+        .unwrap();
+    let unchanged = store
+        .run_command(
+            unchanged_command["id"].as_str().unwrap(),
+            Some(10),
+            None,
+            20,
+        )
+        .unwrap();
+    assert_eq!(unchanged["status"], "passed");
+    assert_eq!(unchanged["coverage_ingest"]["status"], "stale");
+    assert!(
+        unchanged["coverage_ingest"]["snapshot_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let unchanged_artifact = store
+        .latest_artifact("coverage", Some(unchanged_command["id"].as_str().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged_artifact["modified_by_run"], false);
+    assert_eq!(unchanged_artifact["ingest_status"], "skipped_stale");
+
+    let changed_command = store
+        .register_command(
+            "changed-artifact",
+            "printf 'TN:\\nSF:src/a.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' > coverage.lcov",
+            Some(directory.path()),
+            "/bin/sh",
+            Some(artifact),
+            true,
+            "tester",
+            "approved changed-artifact test",
+            true,
+        )
+        .unwrap();
+    let changed = store
+        .run_command(changed_command["id"].as_str().unwrap(), Some(10), None, 20)
+        .unwrap();
+    assert_eq!(changed["coverage_ingest"]["status"], "ingested");
+    assert_eq!(
+        changed["coverage_ingest"]["snapshot_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    store.close().unwrap();
+}
+
+#[test]
+fn rust_source_lines_read_snapshot_commit_before_dirty_checkout() {
+    let directory = tempfile::tempdir().unwrap();
+    git_repo(directory.path());
+    let report = write_file(
+        directory.path(),
+        "coverage.lcov",
+        "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+    );
+    let base_sha = git_sha(directory.path());
+    let store = store(directory.path());
+    let snapshot = store
+        .ingest_report(
+            &report,
+            "lcov",
+            Some(directory.path()),
+            Some("main"),
+            Some(&base_sha),
+            None,
+            "unit",
+        )
+        .unwrap();
+    write_file(directory.path(), "src/a.py", "changed\n");
+    assert_eq!(
+        store
+            .source_lines(snapshot["id"].as_str().unwrap(), "src/a.py", 1, 1)
+            .unwrap()[0]["text"],
+        "one"
+    );
+    assert_eq!(
+        store
+            .source_resolution(snapshot["id"].as_str().unwrap(), "src/a.py")
+            .unwrap(),
+        "snapshot_commit"
+    );
     store.close().unwrap();
 }
 
@@ -1042,11 +1184,11 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
     let missing_worktree = directory.path().join("missing");
     assert!(
         store
-            .register_worktree(&missing_worktree, "main", None)
+            .ensure_lineage_baseline(&missing_worktree, "main", None)
             .is_err()
     );
     let worktree = store
-        .register_worktree(directory.path(), "main", None)
+        .ensure_lineage_baseline(directory.path(), "main", None)
         .unwrap();
     let worktree_id = worktree["id"].as_str().unwrap();
     assert!(store.worktree("missing").is_err());
@@ -1341,7 +1483,7 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
     let artifact_run = store
         .run_command(artifact_command["id"].as_str().unwrap(), Some(20), None, 20)
         .unwrap();
-    assert_eq!(artifact_run["coverage_ingest"]["status"], "failed");
+    assert_eq!(artifact_run["coverage_ingest"]["status"], "stale");
     assert!(
         store
             .latest_artifact("coverage", Some(artifact_command["id"].as_str().unwrap()))
@@ -1392,7 +1534,7 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
                 20,
             )
             .unwrap()["coverage_ingest"]["status"],
-        "failed"
+        "stale"
     );
     let skipped_artifact_command = store
         .register_command(
@@ -1500,7 +1642,7 @@ fn rust_storage_edge_paths_and_background_run_states_are_covered() {
         CoverageStore::open(other_repository.path().join("coverage.duckdb"), config()).unwrap();
     other_store.ensure_project(other_repository.path()).unwrap();
     let empty_worktree = other_store
-        .register_worktree(other_repository.path(), "main", Some("empty"))
+        .ensure_lineage_baseline(other_repository.path(), "main", Some("empty"))
         .unwrap();
     assert!(
         other_store
@@ -1586,7 +1728,7 @@ fn rust_service_worktree_comparison_views_match_storage_contract() {
     let base = ingest(&store, &base_report, "main", "base");
     let current = ingest(&store, &current_report, "feature", "head");
     let worktree = store
-        .register_worktree(directory.path(), "main", Some("service worktree"))
+        .ensure_lineage_baseline(directory.path(), "main", Some("service worktree"))
         .unwrap();
     let project = store.project().unwrap();
     let service = CoverageService::new(
@@ -1599,7 +1741,7 @@ fn rust_service_worktree_comparison_views_match_storage_contract() {
     );
     assert!(
         service
-            .worktree_registration(
+            .ensure_lineage_baseline(
                 directory.path().to_str().unwrap(),
                 "main",
                 Some("service-registered"),
@@ -1836,17 +1978,17 @@ fn rust_service_worktree_comparison_views_match_storage_contract() {
 }
 
 #[test]
-fn rust_service_pagination_projection_and_mcp_contract_match() {
+fn rust_service_projection_and_mcp_contract_match() {
     let directory = tempfile::tempdir().unwrap();
     git_repo(directory.path());
-    write_file(directory.path(), "a.py", "one\ntwo\nthree\n");
     let report = write_file(
         directory.path(),
         "coverage.lcov",
-        "TN:\nSF:a.py\nDA:1,1\nDA:2,0\nend_of_record\n",
+        "TN:\nSF:src/a.py\nDA:1,1\nDA:2,0\nend_of_record\n",
     );
     let store = store(directory.path());
-    let snapshot = ingest(&store, &report, "main", "head");
+    let baseline = ingest(&store, &report, "main", "base");
+    let current = ingest(&store, &report, "main", "head");
     let project = store.project().unwrap();
     let service = CoverageService::new(
         store.clone(),
@@ -1856,1122 +1998,143 @@ fn rust_service_pagination_projection_and_mcp_contract_match() {
             suite: None,
         },
     );
+
     let context = service.project_context(None, 600, false).unwrap();
     assert_eq!(context["context"]["schema_revision"], SCHEMA_REVISION);
-    assert!(context["data"]["project"]["compaction"].is_object());
-    assert_eq!(service.context(Some("unit")).suite.as_deref(), Some("unit"));
-    let duplicate_values = vec![
-        json!({"value": "one ".repeat(60)}),
-        json!({"value": "one ".repeat(60)}),
-        json!({"value": "one ".repeat(60)}),
-    ];
-    let (_, first_page) = service
-        .page(&duplicate_values, None, 130, "duplicate-values", None)
-        .unwrap();
-    let cursor = first_page["next_cursor"].as_str().unwrap().to_owned();
-    assert!(
-        service
-            .page(
-                &duplicate_values,
-                Some(&cursor),
-                130,
-                "duplicate-values",
-                None
-            )
-            .is_ok()
-    );
-    service.validate_repository_path(None).unwrap();
-    service
-        .validate_repository_path(Some(directory.path().to_str().unwrap()))
-        .unwrap();
-    let other = tempfile::tempdir().unwrap();
-    assert!(
-        service
-            .validate_repository_path(other.path().to_str())
-            .is_err()
-    );
-    let other_git = tempfile::tempdir().unwrap();
-    git_repo(other_git.path());
-    assert!(
-        service
-            .validate_repository_path(other_git.path().to_str())
-            .is_err()
-    );
-    let mismatched_service = CoverageService::new(
-        store.clone(),
-        RequestContext {
-            repo_key: "deliberately-mismatched-repo".to_owned(),
-            checkout_path: directory.path().to_string_lossy().into_owned(),
-            suite: None,
-        },
-    );
-    assert!(
-        mismatched_service
-            .ingest("coverage.lcov", "lcov", "mismatch", None, None, None, false)
-            .is_err()
-    );
-    assert!(
-        service
-            .ingest("missing.lcov", "lcov", "unit", None, None, None, false)
-            .is_err()
-    );
-    assert!(
-        service
-            .ingest("coverage.lcov", "lcov", " ", None, None, None, false)
-            .is_err()
-    );
+    assert!(context["data"]["project"].is_object());
 
-    let second_report = write_file(
-        directory.path(),
-        "coverage-second.lcov",
-        "TN:\nSF:a.py\nDA:1,0\nDA:2,1\nDA:3,1\nend_of_record\n",
-    );
-    let second = service
-        .ingest(
-            second_report.to_str().unwrap(),
-            "lcov",
-            "unit",
-            Some("main"),
-            Some("head-2"),
-            None,
-            true,
-        )
-        .unwrap();
-    let second_id = second["data"]["id"].as_str().unwrap();
-    let first_id = snapshot["id"].as_str().unwrap();
-    assert!(
-        service
-            .coverage_query(
-                "summary",
-                Some(second_id),
-                None,
-                Some("unit"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                49,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_comparison(
-                "overview",
-                Some(second_id),
-                Some(first_id),
-                None,
-                Some("unit"),
-                None,
-                false,
-                None,
-                49,
-                false,
-            )
-            .is_err()
-    );
-    let other_suite_snapshot = service
-        .ingest(
-            "coverage.lcov",
-            "lcov",
-            "other-suite",
-            Some("main"),
-            Some("other-head"),
-            None,
-            false,
-        )
-        .unwrap();
-    let other_suite_id = other_suite_snapshot["data"]["id"].as_str().unwrap();
-    let targets = service
-        .coverage_query_ordered(
-            "targets",
-            Some(second_id),
-            None,
-            Some("unit"),
-            None,
-            None,
-            None,
-            None,
-            Some("uncovered_lines"),
-            None,
-            600,
-            false,
-        )
-        .unwrap();
-    assert_eq!(targets["data"]["order_by"], "uncovered_lines");
-    assert_eq!(targets["data"]["targets"][0]["regions"][0]["start"], 1);
-    let filtered_targets = service
-        .coverage_query_ordered(
-            "targets",
-            Some(second_id),
-            None,
-            Some("unit"),
-            None,
-            Some("a.py"),
-            None,
-            None,
-            None,
-            None,
-            600,
-            false,
-        )
-        .unwrap();
-    assert_eq!(
-        filtered_targets["data"]["targets"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(
-        service
-            .coverage_query_ordered(
-                "targets",
-                Some(second_id),
-                None,
-                Some("unit"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("invalid"),
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query_ordered(
-                "targets",
-                Some(second_id),
-                None,
-                Some("unit"),
-                None,
-                None,
-                None,
-                None,
-                Some("invalid"),
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    let compact_regions = service
-        .coverage_comparison(
-            "regions",
-            None,
-            None,
-            None,
-            Some("unit"),
-            None,
-            false,
-            None,
-            600,
-            false,
-        )
-        .unwrap();
-    assert!(compact_regions["data"]["regions"].is_array());
-    assert!(compact_regions["data"]["region_change_count"].is_number());
-    assert!(
-        service
-            .coverage_comparison(
-                "regions",
-                None,
-                None,
-                None,
-                Some("missing-suite"),
-                None,
-                false,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_comparison(
-                "regions",
-                Some(second_id),
-                Some(other_suite_id),
-                None,
-                None,
-                None,
-                false,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "summary",
-                None,
-                None,
-                Some("unit"),
-                Some("main"),
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_ok()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "files",
-                None,
-                None,
-                Some("unit"),
-                Some("main"),
-                None,
-                None,
-                None,
-                None,
-                600,
-                true,
-            )
-            .is_ok()
-    );
-    let file_view = service
-        .coverage_query(
-            "file",
-            Some(second_id),
-            None,
-            Some("unit"),
-            None,
-            Some("a.py"),
-            None,
-            Some(vec![(1, 2)]),
-            None,
-            600,
-            false,
-        )
-        .unwrap();
-    assert!(file_view["data"]["selected_lines"].is_array());
-    assert_eq!(file_view["data"]["red_regions"][0]["start"], 1);
-    assert!(
-        service
-            .coverage_query(
-                "file",
-                Some(second_id),
-                None,
-                Some("unit"),
-                None,
-                Some("a.py"),
-                None,
-                None,
-                Some("invalid"),
-                600,
-                false,
-            )
-            .is_err()
-    );
-    let insights = service
-        .coverage_query(
-            "insights",
-            Some(second_id),
-            Some(first_id),
-            Some("unit"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            600,
-            true,
-        )
-        .unwrap();
-    assert!(insights["data"]["items"].is_array());
-    assert!(
-        service
-            .coverage_query(
-                "insights",
-                Some(second_id),
-                None,
-                Some("unit"),
-                None,
-                None,
-                None,
-                None,
-                Some("invalid"),
-                600,
-                false,
-            )
-            .is_err()
-    );
-    let history = service
-        .coverage_query(
-            "line_history",
-            None,
-            None,
-            Some("unit"),
-            Some("main"),
-            Some("a.py"),
-            Some(1),
-            None,
-            None,
-            600,
-            false,
-        )
-        .unwrap();
-    assert_eq!(history["data"].as_array().unwrap().len(), 2);
-    assert!(
-        service
-            .coverage_query(
-                "line_history",
-                None,
-                None,
-                Some("unit"),
-                Some("main"),
-                Some("a.py"),
-                Some(1),
-                None,
-                Some("invalid"),
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "line_history",
-                None,
-                None,
-                None,
-                None,
-                Some("a.py"),
-                Some(1),
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "file",
-                Some(second_id),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
+    let review_args = json!({
+        "task":"all",
+        "measurement":{"snapshot_id":current["id"]},
+        "baseline":{"kind":"explicit","snapshot_id":baseline["id"]},
+        "source":{"include":true,"context_lines":0},
+        "limits":{"max_files":5,"max_regions":10,"max_source_lines":40,"max_words":1200,"max_bytes":12000}
+    });
+    let review = mcp::call_tool(&service, "coverage_review", &review_args).unwrap();
+    assert_eq!(review["context"]["schema_revision"], SCHEMA_REVISION);
+    assert_eq!(review["data"]["task"], "all");
+    assert!(review["data"]["change"]["files"].is_array());
+    assert!(review["data"]["history"].is_object());
+    assert!(review["data"]["insight"].is_object());
 
-    for (view, detailed, only_regressions) in [
-        ("overview", false, false),
-        ("files", true, false),
-        ("lines", false, false),
-        ("lines", false, true),
+    for (task, arguments) in [
+        (
+            "change",
+            json!({"task":"change","measurement":{"snapshot_id":current["id"]},"baseline":{"kind":"explicit","snapshot_id":baseline["id"]},"limits":{"max_words":600,"max_bytes":12000}}),
+        ),
+        (
+            "history",
+            json!({"task":"history","measurement":{"snapshot_id":current["id"]},"limits":{"max_words":600,"max_bytes":12000}}),
+        ),
+        (
+            "insight",
+            json!({"task":"insight","measurement":{"snapshot_id":current["id"]},"limits":{"max_regions":5,"max_words":600,"max_bytes":12000}}),
+        ),
+        (
+            "source",
+            json!({"task":"source","measurement":{"snapshot_id":current["id"]},"source":{"ranges":[{"file_path":"src/a.py","start":1,"end":2}]},"limits":{"max_words":600,"max_bytes":12000}}),
+        ),
+        (
+            "audit",
+            json!({"task":"audit","measurement":{"snapshot_id":current["id"]},"baseline":{"kind":"explicit","snapshot_id":baseline["id"]},"limits":{"max_words":600,"max_bytes":12000}}),
+        ),
     ] {
-        assert!(
-            service
-                .coverage_comparison(
-                    view,
-                    Some(second_id),
-                    Some(first_id),
-                    None,
-                    Some("unit"),
-                    Some("a.py"),
-                    only_regressions,
-                    None,
-                    600,
-                    detailed,
-                )
-                .is_ok()
-        );
+        let response = mcp::call_tool(&service, "coverage_review", &arguments).unwrap();
+        assert_eq!(response["data"]["task"], task);
     }
-    assert!(
-        service
-            .coverage_comparison(
-                "invalid",
-                Some(second_id),
-                Some(first_id),
-                None,
-                None,
-                None,
-                false,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_comparison(
-                "overview",
-                Some(second_id),
-                Some(first_id),
-                None,
-                Some("other-suite"),
-                None,
-                false,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_comparison(
-                "overview",
-                None,
-                Some(first_id),
-                None,
-                None,
-                None,
-                false,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
 
-    let source = service.source(second_id, "a.py", 1, 2, None, 600).unwrap();
-    assert_eq!(source["data"]["lines"].as_array().unwrap().len(), 2);
-    assert_eq!(source["data"]["lines"][0]["marker"], "red");
-    assert_eq!(source["data"]["lines"][1]["marker"], "green");
-    assert_eq!(source["data"]["red_regions"][0]["start"], 1);
-    assert!(service.source(second_id, "a.py", 2, 1, None, 600).is_err());
-    assert!(
-        service
-            .source(second_id, "a.py", 1, 2, Some("invalid"), 600)
-            .is_err()
-    );
-    assert!(
-        service
-            .file_detail(second_id, "a.py", None, 600, false)
-            .unwrap()["data"]["lines"]
-            .is_array()
-    );
-    assert!(
-        service
-            .file_detail(second_id, "a.py", None, 600, true)
-            .unwrap()["data"]["lines"]
-            .is_array()
-    );
-    assert!(
-        service
-            .file_detail(second_id, "a.py", Some("invalid"), 600, false)
-            .is_err()
-    );
-
-    let command = service
-        .command_registration(
-            "service-unit",
-            "printf 'service passed\\n'",
-            true,
-            "tester",
-            "approved for Rust service test",
-            None,
-            "/bin/sh",
-            None,
-            true,
-        )
-        .unwrap();
-    let command_id = command["data"]["id"].as_str().unwrap();
-    let context_detailed = service.project_context(None, 600, true).unwrap();
-    assert!(context_detailed["data"]["commands"].is_array());
-    let run = service
-        .run_submission(command_id, Some(20), Some("service-wait"), true, true)
-        .unwrap();
+    let command = mcp::call_tool(
+        &service,
+        "register_test_command",
+        &json!({
+            "name":"current-contract-command",
+            "command":"printf current",
+            "human_approved":true,
+            "approved_by":"test",
+            "approval_note":"current contract test",
+            "cwd":directory.path(),
+            "shell":"/bin/sh"
+        }),
+    )
+    .unwrap();
+    let run = mcp::call_tool(
+        &service,
+        "run_test",
+        &json!({"command_ref":command["data"]["id"],"wait":true,"idempotency_key":"current-contract"}),
+    )
+    .unwrap();
     let run_id = run["data"]["id"].as_str().unwrap();
-    assert!(service.run_state(run_id, "status", true).is_ok());
-    assert!(
-        service
-            .search_logs(
-                run_id,
-                vec!["passed".to_owned()],
-                "stdout",
-                1,
-                5,
-                600,
-                false,
-            )
-            .is_ok()
-    );
-    assert!(
-        service
-            .search_logs(
-                "missing",
-                vec!["missing".to_owned()],
-                "stdout",
-                0,
-                5,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(service.run_state(run_id, "unknown", false).is_err());
-    let queued = service
-        .run_submission(command_id, Some(20), Some("service-queued"), false, false)
-        .unwrap();
-    assert!(queued["data"]["id"].is_string());
-    let active_command = service
-        .command_registration(
-            "service-active",
-            "sleep 2",
-            true,
-            "tester",
-            "approved for Rust service queue test",
-            None,
-            "/bin/sh",
-            None,
-            false,
-        )
-        .unwrap();
-    let active_run = service
-        .run_submission(
-            active_command["data"]["id"].as_str().unwrap(),
-            Some(20),
-            Some("service-active"),
-            false,
-            false,
-        )
-        .unwrap();
-    let active_context = service.project_context(None, 600, false).unwrap();
-    assert!(active_context["data"]["active_runs"].is_array());
-    assert!(
-        service
-            .run_state(active_run["data"]["id"].as_str().unwrap(), "cancel", false)
-            .is_ok()
-    );
-    assert!(
-        service
-            .command_registration(
-                "bad-cwd",
-                "true",
-                true,
-                "tester",
-                "approved",
-                Some(other.path().to_str().unwrap()),
-                "/bin/sh",
-                None,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .command_registration(
-                "bad-artifacts",
-                "true",
-                true,
-                "tester",
-                "approved",
-                None,
-                "/bin/sh",
-                Some(json!({"bad": 1})),
-                false,
-            )
-            .is_err()
-    );
-    service
-        .update_project_settings(ProjectSettingsPatch {
-            compaction_batch_size: Some(5),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(
-        service.compact_now().unwrap()["data"]["status"],
-        "completed"
-    );
+    let run_review = mcp::call_tool(
+        &service,
+        "run_review",
+        &json!({"run_id":run_id,"view":"status","max_words":600,"max_bytes":12000}),
+    )
+    .unwrap();
+    assert_eq!(run_review["data"]["terminal"], true);
 
-    let large = vec![
-        json!({"payload": vec!["word"; 80]}),
-        json!({"payload": vec!["word"; 80]}),
-    ];
-    let (first_page, page) = service.page(&large, None, 50, "large", None).unwrap();
-    assert_eq!(first_page.len(), 1);
-    let next = page["next_cursor"].as_str().unwrap();
-    assert_eq!(
-        service
-            .page(&large, Some(next), 50, "large", None)
-            .unwrap()
-            .0
-            .len(),
-        1
-    );
-    let two_small = vec![
-        json!({"payload": vec!["word"; 30]}),
-        json!({"payload": vec!["word"; 30]}),
-    ];
-    assert_eq!(
-        service
-            .page(&two_small, None, 50, "two-small", None)
-            .unwrap()
-            .0
-            .len(),
-        1
-    );
-    assert!(service.page(&large, None, 50, "large", Some(3)).is_err());
-    let summary = service
-        .coverage_query(
-            "summary",
-            Some(snapshot["id"].as_str().unwrap()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            600,
-            false,
-        )
-        .unwrap();
-    assert!(summary["data"]["line_rate"].is_number());
-    let detailed = service
-        .coverage_query(
-            "summary",
-            Some(snapshot["id"].as_str().unwrap()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            600,
-            true,
-        )
-        .unwrap();
-    assert!(detailed["data"]["report_path"].is_string());
-    let files = service
-        .coverage_query(
-            "files",
-            Some(snapshot["id"].as_str().unwrap()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            50,
-            false,
-        )
-        .unwrap();
-    assert_eq!(files["page"]["max_words"], 50);
-    assert!(
-        service
-            .coverage_query(
-                "files",
-                Some(snapshot["id"].as_str().unwrap()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("invalid"),
-                600,
-                false,
-            )
-            .is_err()
-    );
-    let cursor = files["page"]["next_cursor"].clone();
-    assert!(cursor.is_null() || cursor.is_string());
-    assert!(
-        service
-            .coverage_query(
-                "unknown", None, None, None, None, None, None, None, None, 600, false
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .apply_budget(json!({"data":{"large":vec!["word"; 100]} }), 50)
-            .is_err()
-    );
-    assert!(
-        service
-            .page(&[json!({"id":1})], Some("invalid"), 50, "scope", None)
-            .is_err()
-    );
-    let wrong_cursor = coverage_mcp::service::encode_cursor(&"a".repeat(64), "scope", 1).unwrap();
-    assert!(
-        service
-            .page(&[json!({"id":1})], Some(&wrong_cursor), 50, "scope", None)
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "files",
-                None,
-                None,
-                Some("missing-suite"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "line_history",
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(1),
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "line_history",
-                None,
-                None,
-                Some("unit"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .coverage_query(
-                "line_history",
-                None,
-                None,
-                Some("unit"),
-                None,
-                Some("a.py"),
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    let empty_directory = tempfile::tempdir().unwrap();
-    let empty_store =
-        CoverageStore::open(empty_directory.path().join("coverage.duckdb"), config()).unwrap();
-    empty_store.ensure_project(empty_directory.path()).unwrap();
-    let empty_project = empty_store.project().unwrap();
-    let empty_service = CoverageService::new(
-        empty_store.clone(),
-        RequestContext {
-            repo_key: empty_project.repo_key,
-            checkout_path: empty_project.repo_path,
-            suite: None,
-        },
-    );
-    assert!(
-        empty_service
-            .coverage_query(
-                "files", None, None, None, None, None, None, None, None, 600, false,
-            )
-            .is_err()
-    );
-    assert!(
-        empty_service
-            .coverage_query(
-                "summary",
-                Some("missing"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        empty_service
-            .coverage_query(
-                "file",
-                Some("missing"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    assert!(
-        empty_service
-            .coverage_query(
-                "insights",
-                Some("missing"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    empty_store.close().unwrap();
-    assert!(
-        empty_service
-            .coverage_query(
-                "line_history",
-                None,
-                None,
-                Some("unit"),
-                None,
-                Some("a.py"),
-                Some(1),
-                None,
-                None,
-                600,
-                false,
-            )
-            .is_err()
-    );
-    let tools = mcp::tools_list();
-    let tools = tools.as_array().unwrap();
-    assert_eq!(tools.len(), 11);
-    let names = tools
+    let imported = mcp::call_tool(
+        &service,
+        "coverage_import",
+        &json!({"report_path":"coverage.lcov","format":"lcov","suite":"external","max_words":600,"max_bytes":12000}),
+    )
+    .unwrap();
+    assert!(imported["data"]["id"].is_string());
+
+    let resource = mcp::read_resource(
+        &service,
+        &format!(
+            "coverage://snapshot/{}/summary",
+            current["id"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    assert_eq!(resource["context"]["schema_revision"], SCHEMA_REVISION);
+    assert_eq!(resource["data"]["id"], current["id"]);
+
+    let tool_inventory = mcp::tools_list();
+    let names = tool_inventory
+        .as_array()
+        .unwrap()
         .iter()
-        .filter_map(|tool| tool["name"].as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(names.contains("project_context") && names.contains("source_context"));
-    assert!(
-        mcp::resources_list()
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value["uri"] == "coverage://context")
-    );
-    assert!(
-        mcp::resource_templates_list()
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|value| value["uriTemplate"] == "coverage://snapshot/{snapshot_id}/summary")
-    );
-    let call = mcp::call_tool(
-        &service,
-        "coverage_query",
-        &json!({"view":"summary","snapshot_id":snapshot["id"]}),
-    )
-    .unwrap();
-    assert_eq!(call["data"]["total_lines"], 2);
-    let mcp_command = mcp::call_tool(
-        &service,
-        "register_test_command",
-        &json!({
-            "name":"mcp-unit",
-            "command":"printf 'mcp passed\\n'",
-            "human_approved":true,
-            "approved_by":"tester",
-            "approval_note":"approved for Rust MCP test",
-            "cwd":directory.path(),
-            "shell":"/bin/sh"
-        }),
-    )
-    .unwrap();
-    let mcp_command_id = mcp_command["data"]["id"].as_str().unwrap();
-    let mcp_run = mcp::call_tool(
-        &service,
-        "run_test",
-        &json!({"command_ref":mcp_command_id,"wait":true,"idempotency_key":"mcp-one"}),
-    )
-    .unwrap();
-    let mcp_run_id = mcp_run["data"]["id"].as_str().unwrap();
-    assert!(mcp::call_tool(&service, "get_run_data", &json!({"run_id":mcp_run_id})).is_ok());
-    assert!(
-        mcp::call_tool(
-            &service,
-            "search_test_logs",
-            &json!({"run_id":mcp_run_id,"query":["mcp","missing"],"stream":"both"})
-        )
-        .is_ok()
-    );
-    assert!(mcp::call_tool(&service, "cancel_run", &json!({"run_id":mcp_run_id})).is_err());
-
-    let cancel_command = mcp::call_tool(
-        &service,
-        "register_test_command",
-        &json!({
-            "name":"mcp-cancel",
-            "command":"sleep 2",
-            "human_approved":true,
-            "approved_by":"tester",
-            "approval_note":"approved for Rust MCP cancellation test",
-            "cwd":directory.path(),
-            "shell":"/bin/sh"
-        }),
-    )
-    .unwrap();
-    let pending = mcp::call_tool(
-        &service,
-        "run_test",
-        &json!({"command_ref":cancel_command["data"]["id"],"wait":false}),
-    )
-    .unwrap();
-    assert!(
-        mcp::call_tool(
-            &service,
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "project_context",
+            "register_test_command",
+            "run_test",
+            "run_review",
             "cancel_run",
-            &json!({"run_id":pending["data"]["id"]})
-        )
-        .is_ok()
+            "coverage_import",
+            "coverage_review",
+        ]
     );
-    assert!(mcp::call_tool(&service, "register_test_command", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "run_test", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "get_run_data", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "cancel_run", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "search_test_logs", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "ingest_coverage", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "register_worktree", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "source_context", &json!({})).is_err());
-    assert!(mcp::call_tool(&service, "coverage_query", &Value::Null).is_err());
-    assert!(mcp::call_tool(&service, "coverage_compare", &json!({})).is_err());
-    let mcp_ingest = mcp::call_tool(
-        &service,
-        "ingest_coverage",
-        &json!({"report_path":"coverage-second.lcov","format":"lcov","suite":"mcp"}),
+    let wire = mcp::dispatch_json_rpc(
+        Some(&service),
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
     )
     .unwrap();
-    let mcp_snapshot_id = mcp_ingest["data"]["id"].as_str().unwrap();
-    assert!(
-        service
-            .coverage_comparison(
-                "regions",
-                Some(mcp_snapshot_id),
-                None,
-                None,
-                Some("mcp"),
-                None,
-                false,
-                None,
-                600,
-                false,
-            )
-            .is_err()
+    assert_eq!(
+        wire["result"]["contract"]["schema_revision"],
+        SCHEMA_REVISION
     );
-    assert!(mcp::call_tool(
-        &service,
-        "coverage_query",
-        &json!({"view":"file","snapshot_id":mcp_snapshot_id,"file_path":"a.py","line_ranges":[{"start":1,"end":2}]})
-    )
-    .is_ok());
-    let mcp_targets = mcp::call_tool(
-        &service,
-        "coverage_query",
-        &json!({"view":"targets","snapshot_id":mcp_snapshot_id,"order_by":"priority"}),
-    )
-    .unwrap();
-    assert!(mcp_targets["data"]["targets"].is_array());
     assert!(
-        mcp::call_tool(
-            &service,
-            "coverage_query",
-            &json!({"view":"insights","snapshot_id":mcp_snapshot_id})
+        mcp::dispatch_json_rpc(
+            None,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"})
         )
-        .is_ok()
+        .is_none()
     );
-    assert!(
-        mcp::call_tool(
-            &service,
-            "coverage_query",
-            &json!({"view":"line_history","file_path":"a.py","line_number":1,"suite":"unit"})
-        )
-        .is_ok()
-    );
-    assert!(
-        mcp::call_tool(
-            &service,
-            "coverage_compare",
-            &json!({"view":"files","snapshot_id":second_id,"baseline_snapshot_id":first_id})
-        )
-        .is_ok()
-    );
-    assert!(mcp::call_tool(
-        &service,
-        "coverage_compare",
-        &json!({"view":"lines","snapshot_id":second_id,"baseline_snapshot_id":first_id,"only_regressions":true})
-    )
-    .is_ok());
-    let mcp_regions = mcp::call_tool(
-        &service,
-        "coverage_compare",
-        &json!({"view":"regions","snapshot_id":second_id,"baseline_snapshot_id":first_id}),
-    )
-    .unwrap();
-    assert!(mcp_regions["data"]["regions"].is_array());
-    let mcp_worktree = mcp::call_tool(
-        &service,
-        "register_worktree",
-        &json!({"path":directory.path(),"base_ref":"main"}),
-    )
-    .unwrap();
-    assert!(mcp_worktree["data"]["id"].is_string());
-    assert!(
-        mcp::call_tool(
-            &service,
-            "source_context",
-            &json!({"snapshot_id":second_id,"file_path":"a.py","start":1,"end":2})
-        )
-        .is_ok()
-    );
-    assert!(mcp::read_resource(&service, "coverage://unknown").is_err());
-    assert!(mcp::call_tool(&service, "not-a-tool", &json!({})).is_err());
+    assert!(mcp::call_tool(&service, "unknown_tool", &json!({})).is_err());
     store.close().unwrap();
 }
 
 #[tokio::test]
 async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let directory = tempfile::tempdir().unwrap();
+    write_file(directory.path(), "a.py", "one\ntwo\nthree\n");
+    git_repo(directory.path());
     let mut invalid_host = config();
     invalid_host.host = "0.0.0.0".to_owned();
     assert!(
@@ -3011,6 +2174,11 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         )
         .await
         .contains("400 Bad Request")
+    );
+    assert!(
+        http_raw(probe_address, "GET", "/api/projects", None, None)
+            .await
+            .contains("200 OK")
     );
     run_task.abort();
     let _ = run_task.await;
@@ -3053,7 +2221,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     drop(malformed);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let health = http_exchange(address, "GET", "/health", None, None).await;
-    assert_eq!(health["schema_revision"], 7);
+    assert_eq!(health["schema_revision"], SCHEMA_REVISION);
     assert!(
         http_raw(address, "GET", "/mcp/", None, None)
             .await
@@ -3108,8 +2276,75 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let second_body = json!({"report_path":second_report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head-2"});
     let second = http_exchange(address, "POST", "/api/ingest", Some(&second_body), None).await;
     let second_snapshot_id = second["data"]["id"].as_str().unwrap().to_owned();
+    let _default_ingest = http_exchange(
+        address,
+        "POST",
+        "/api/ingest",
+        Some(&json!({"report_path":report})),
+        None,
+    )
+    .await;
+    let _validated_repo_error = http_raw(
+        address,
+        "POST",
+        "/api/ingest",
+        Some(&json!({"report_path":report,"repo_path":"/tmp"})),
+        None,
+    )
+    .await;
+    for body in [
+        json!({"report_path":report,"format":7}),
+        json!({"report_path":report,"suite":7}),
+        json!({"report_path":report,"branch":7}),
+        json!({"report_path":report,"commit_sha":7}),
+        json!({"report_path":report,"base_ref":7}),
+        json!({"report_path":report,"repo_path":7}),
+    ] {
+        assert!(
+            http_raw(address, "POST", "/api/ingest", Some(&body), None)
+                .await
+                .contains("400 Bad Request")
+        );
+    }
+    assert!(
+        http_raw(
+            address,
+            "POST",
+            "/api/projects",
+            Some(&json!({"compaction_after_days":"bad"})),
+            None,
+        )
+        .await
+        .contains("400 Bad Request")
+    );
+    assert!(
+        http_raw(address, "POST", "/api/projects", Some(&json!({})), None)
+            .await
+            .contains("400 Bad Request")
+    );
+    assert!(
+        http_raw(
+            address,
+            "PATCH",
+            "/api/projects/project",
+            Some(&json!({"compaction":[]})),
+            None,
+        )
+        .await
+        .contains("400 Bad Request")
+    );
+    assert!(
+        http_raw(address, "GET", "/api/snapshots?detailed=maybe", None, None)
+            .await
+            .contains("400 Bad Request")
+    );
+    assert!(
+        http_raw(address, "GET", "/api/trend?limit=bad", None, None)
+            .await
+            .contains("400 Bad Request")
+    );
     let snapshots = http_exchange(address, "GET", "/api/snapshots", None, None).await;
-    assert_eq!(snapshots["data"].as_array().unwrap().len(), 2);
+    assert!(snapshots["data"].as_array().unwrap().len() >= 2);
     let _filtered_snapshots = http_raw(
         address,
         "GET",
@@ -3279,7 +2514,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     )
     .await;
     let _worktrees = http_exchange(address, "GET", "/api/worktrees", None, None).await;
-    let _registered_worktree = http_exchange(
+    let registered_worktree = http_exchange(
         address,
         "POST",
         "/api/worktrees/register",
@@ -3287,6 +2522,34 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
+    let _unnamed_worktree = http_exchange(
+        address,
+        "POST",
+        "/api/worktrees/register",
+        Some(&json!({"path":directory.path(),"base_ref":"main"})),
+        None,
+    )
+    .await;
+    if let Some(registered_worktree_id) = registered_worktree["data"]["id"].as_str() {
+        let _worktree_progress = http_exchange(
+            address,
+            "GET",
+            &format!("/api/worktrees/{registered_worktree_id}/progress?suite=unit"),
+            None,
+            None,
+        )
+        .await;
+        let _worktree_compare = http_exchange(
+            address,
+            "GET",
+            &format!(
+                "/api/worktrees/{registered_worktree_id}/compare?snapshot_id={second_snapshot_id}"
+            ),
+            None,
+            None,
+        )
+        .await;
+    }
     assert!(
         http_raw(
             address,
@@ -3307,6 +2570,14 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     )
     .await;
     assert_eq!(created_project["data"]["compaction_after_days"], 7);
+    let _default_project = http_exchange(
+        address,
+        "POST",
+        "/api/projects",
+        Some(&json!({"repo_path":directory.path()})),
+        None,
+    )
+    .await;
     let edited_project = http_exchange(
         address,
         "PATCH",
@@ -3328,6 +2599,14 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     )
     .await;
     let command_id = command["data"]["id"].as_str().unwrap().to_owned();
+    let _minimal_command = http_exchange(
+        address,
+        "POST",
+        "/api/commands/register",
+        Some(&json!({"name":"http-minimal","command":"true","approved_by":"tester","approval_note":"minimal approval"})),
+        None,
+    )
+    .await;
     let _commands = http_exchange(address, "GET", "/api/commands", None, None).await;
     let _command = http_exchange(
         address,
@@ -3339,6 +2618,47 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     .await;
     let run = http_exchange(address, "POST", "/api/runs/profiled", Some(&json!({"command_ref":command_id,"wait":true,"idempotency_key":"http-one","timeout_seconds":20})), None).await;
     let run_id = run["data"]["id"].as_str().unwrap().to_owned();
+    let _queued_run = http_exchange(
+        address,
+        "POST",
+        "/api/runs/profiled",
+        Some(&json!({"command_ref":command_id,"wait":false,"idempotency_key":"http-queued"})),
+        None,
+    )
+    .await;
+    let mcp_run_review = http_exchange(
+        address,
+        "POST",
+        "/mcp/",
+        Some(&json!({
+            "jsonrpc":"2.0",
+            "id":30,
+            "method":"tools/call",
+            "params":{"name":"run_review","arguments":{"run_id":run_id,"view":"status","max_words":600,"max_bytes":12000}}
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(mcp_run_review["result"]["isError"], false);
+    assert_eq!(
+        mcp_run_review["result"]["structuredContent"]["data"]["id"],
+        run_id
+    );
+    let mcp_run_logs = http_exchange(
+        address,
+        "POST",
+        "/mcp/",
+        Some(&json!({
+            "jsonrpc":"2.0",
+            "id":31,
+            "method":"tools/call",
+            "params":{"name":"run_review","arguments":{"run_id":run_id,"view":"logs","query":"passed","max_words":300,"max_bytes":12000}}
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(mcp_run_logs["result"]["isError"], false);
+    assert!(mcp_run_logs["result"]["structuredContent"]["data"]["match_count"].is_number());
     let _queue = http_exchange(address, "GET", "/api/runs/queue", None, None).await;
     let _latest_run = http_exchange(
         address,
@@ -3365,6 +2685,22 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
+    let _multi_query_logs = http_exchange(
+        address,
+        "GET",
+        &format!("/api/runs/{run_id}/logs/search?query=passed&query=warning&stream=both&case_sensitive=false"),
+        None,
+        None,
+    )
+    .await;
+    for path in [
+        format!("/api/runs/{run_id}/logs/search"),
+        format!("/api/runs/{run_id}/logs/search?query=passed&stream=invalid"),
+        format!("/api/runs/{run_id}/logs/search?query=passed&context_lines=21"),
+        format!("/api/runs/{run_id}/logs/search?query=passed&max_matches=0"),
+    ] {
+        let _ = http_raw(address, "GET", &path, None, None).await;
+    }
     let _artifact = http_exchange(
         address,
         "GET",
@@ -3498,6 +2834,171 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
             .await
             .contains("404 Not Found")
     );
+    let _unscoped_projects = http_exchange(address, "GET", "/api/projects", None, None).await;
+    for (method, path, body) in [
+        ("GET", "/api/snapshots?max_words=bad", None),
+        ("POST", "/api/ingest", Some(json!({"report_path": 7}))),
+        (
+            "POST",
+            "/api/ingest",
+            Some(json!({"report_path": report, "repo_path": 7})),
+        ),
+        (
+            "POST",
+            "/api/ingest",
+            Some(json!({"report_path": "/missing-coverage-report"})),
+        ),
+        ("POST", "/api/projects", Some(json!({"repo_path": 7}))),
+        (
+            "POST",
+            "/api/projects",
+            Some(json!({"repo_path": "/missing-repository"})),
+        ),
+        (
+            "POST",
+            "/api/projects",
+            Some(json!({
+                "repo_path": directory.path(),
+                "compaction": {"compaction_after_days": "bad"}
+            })),
+        ),
+        (
+            "POST",
+            "/api/projects",
+            Some(json!({
+                "repo_path": directory.path(),
+                "compaction": {"compaction_after_days": 0}
+            })),
+        ),
+        (
+            "PATCH",
+            "/api/projects/project",
+            Some(json!({"compaction": {"compaction_enabled": "bad"}})),
+        ),
+        (
+            "PATCH",
+            "/api/projects/project",
+            Some(json!({"compaction": {"compaction_after_days": 0}})),
+        ),
+        ("GET", "/api/changed-lines?snapshot_id=missing", None),
+        (
+            "GET",
+            "/api/changed-lines?snapshot_id=missing&baseline_snapshot_id=missing&only_regressions=bad",
+            None,
+        ),
+        ("GET", "/api/line-history?file_path=a.py", None),
+        ("GET", "/api/line-history?line_number=1", None),
+        (
+            "GET",
+            "/api/line-history?file_path=a.py&line_number=bad",
+            None,
+        ),
+        (
+            "GET",
+            "/api/source-lines?file_path=a.py&start=1&end=2",
+            None,
+        ),
+        (
+            "GET",
+            "/api/source-lines?snapshot_id=missing&file_path=a.py&start=1",
+            None,
+        ),
+        (
+            "GET",
+            "/api/source-lines?snapshot_id=missing&start=1&end=2",
+            None,
+        ),
+        (
+            "GET",
+            "/api/source-lines?snapshot_id=missing&file_path=a.py&end=2",
+            None,
+        ),
+        (
+            "POST",
+            "/api/worktrees/register",
+            Some(json!({"path": directory.path()})),
+        ),
+        (
+            "POST",
+            "/api/worktrees/register",
+            Some(json!({"path": directory.path(), "base_ref": "main", "name": 7})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"name": "missing-command"})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"command": "true"})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"name": "bad-approval", "command": "true", "human_approved": 7})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"name": "bad-cwd", "command": "true", "cwd": 7})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"name": "bad-approved-by", "command": "true", "approved_by": 7})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"name": "bad-approval-note", "command": "true", "approval_note": 7})),
+        ),
+        (
+            "POST",
+            "/api/commands/register",
+            Some(json!({"name": "bad-shell", "command": "true", "shell": 7})),
+        ),
+        (
+            "POST",
+            "/api/runs/profiled",
+            Some(json!({"command_ref": command_id, "timeout_seconds": "bad"})),
+        ),
+        ("POST", "/api/runs/profiled", Some(json!({}))),
+        (
+            "POST",
+            "/api/runs/profiled",
+            Some(json!({"command_ref": command_id, "wait": "bad"})),
+        ),
+        (
+            "POST",
+            "/api/runs/profiled",
+            Some(json!({"command_ref": command_id, "idempotency_key": 7})),
+        ),
+        (
+            "GET",
+            &format!("/api/runs/{run_id}/logs/search?query=passed&context_lines=bad"),
+            None,
+        ),
+        (
+            "GET",
+            &format!("/api/runs/{run_id}/logs/search?query=passed&max_matches=bad"),
+            None,
+        ),
+        (
+            "GET",
+            &format!("/api/runs/{run_id}/logs/search?query=passed&case_sensitive=bad"),
+            None,
+        ),
+    ] {
+        let payload = body.as_ref();
+        let response = http_raw(address, method, path, payload, None).await;
+        assert!(
+            response.contains("400 Bad Request")
+                || response.contains("404 Not Found")
+                || response.contains("500 Internal Server Error"),
+            "unexpected response for {method} {path}: {response}"
+        );
+    }
     for (method, path, body) in [
         ("GET", "/api/projects?max_words=49", None),
         ("GET", "/api/snapshots/missing", None),
@@ -3524,6 +3025,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         ("GET", "/api/runs/missing", None),
         ("POST", "/api/runs/missing/cancel", None),
         ("GET", "/api/runs/missing/logs/search?query=missing", None),
+        ("GET", "/api/artifacts/latest?kind=coverage", None),
         ("GET", "/api/topology/run/missing", None),
         ("GET", "/api/topology/snapshot/missing", None),
     ] {
@@ -3546,7 +3048,12 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(
+        tools["result"]["contract"]["schema_revision"],
+        SCHEMA_REVISION
+    );
+    assert_eq!(tools["result"]["contract"]["tool_count"], 7);
     let _resources = http_exchange(
         address,
         "POST",
@@ -3582,15 +3089,75 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     )
     .await;
     let _mcp_context = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"project_context","arguments":{}}})), None).await;
-    let _mcp_files = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"coverage_query","arguments":{"view":"files","snapshot_id":second_snapshot_id}}})), None).await;
-    let mcp_targets = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":101,"method":"tools/call","params":{"name":"coverage_query","arguments":{"view":"targets","snapshot_id":second_snapshot_id}}})), None).await;
-    assert_eq!(mcp_targets["result"]["isError"], false);
-    assert!(mcp_targets["result"]["structuredContent"]["data"]["targets"].is_array());
-    let _mcp_compare = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"coverage_compare","arguments":{"view":"overview","snapshot_id":second_snapshot_id,"baseline_snapshot_id":snapshot_id}}})), None).await;
-    let mcp_regions = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":102,"method":"tools/call","params":{"name":"coverage_compare","arguments":{"view":"regions","snapshot_id":second_snapshot_id,"baseline_snapshot_id":snapshot_id}}})), None).await;
-    assert_eq!(mcp_regions["result"]["isError"], false);
-    assert!(mcp_regions["result"]["structuredContent"]["data"]["regions"].is_array());
-    let _mcp_source = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"source_context","arguments":{"snapshot_id":second_snapshot_id,"file_path":"a.py","start":1,"end":2}}})), None).await;
+    let mcp_insight = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"insight","measurement":{"snapshot_id":second_snapshot_id},"limits":{"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_insight["result"]["isError"], false);
+    assert!(mcp_insight["result"]["structuredContent"]["data"]["insight"]["items"].is_array());
+    let mcp_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"change","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_review["result"]["isError"], false);
+    assert!(
+        mcp_review["result"]["structuredContent"]["data"]["change"]["changed_code"]["status"]
+            .is_string()
+    );
+    let mcp_compact_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"change","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"representation":"compact","limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_compact_review["result"]["isError"], false);
+    assert!(mcp_compact_review["result"]["structuredContent"]["data"]["change"]["changed_code"]["legend"].is_object());
+    assert!(
+        mcp_compact_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["p"]
+            .is_string()
+    );
+    assert!(mcp_compact_review["result"]["structuredContent"]["data"]["reasons"].is_array());
+    let mcp_audit_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"audit","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_audit_review["result"]["isError"], false);
+    assert!(mcp_audit_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["file_path"].is_string());
+    assert_eq!(
+        mcp_compact_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["p"],
+        mcp_audit_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["file_path"]
+    );
+    assert!(
+        mcp_compact_review["result"]["structuredContent"]["data"]["change"]["next_action"]["kind"]
+            .is_string()
+    );
+    let mcp_source = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":121,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"source","measurement":{"snapshot_id":second_snapshot_id},"source":{"ranges":[{"file_path":"a.py","start":1,"end":2}]},"limits":{"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_source["result"]["isError"], false);
+    assert_eq!(
+        mcp_source["result"]["structuredContent"]["data"]["source"][0]["source_resolution"],
+        "current_checkout_fallback"
+    );
+    assert!(
+        mcp_source["result"]["structuredContent"]["data"]
+            .get("sources")
+            .is_none()
+    );
+    let mcp_source_batch = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":120,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"source","measurement":{"snapshot_id":second_snapshot_id},"source":{"ranges":[{"file_path":"a.py","start":1,"end":1},{"file_path":"a.py","start":3,"end":3}]},"limits":{"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_source_batch["result"]["isError"], false);
+    assert_eq!(
+        mcp_source_batch["result"]["structuredContent"]["data"]["source"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        mcp_source_batch["result"]["structuredContent"]["data"]["source"][0]["ranges"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let mcp_bad_nested = http_exchange(
+        address,
+        "POST",
+        "/mcp/",
+        Some(&json!({
+            "jsonrpc":"2.0",
+            "id":122,
+            "method":"tools/call",
+            "params":{"name":"coverage_review","arguments":{"task":"change","measurement":"invalid"}}
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(mcp_bad_nested["result"]["isError"], true);
     let _mcp_missing_uri = http_exchange(
         address,
         "POST",
@@ -3629,8 +3196,6 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
             .await
             .contains("400 Bad Request")
     );
-    let mcp_summary = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"coverage_query","arguments":{"view":"summary","snapshot_id":snapshot_id}}})), None).await;
-    assert_eq!(mcp_summary["result"]["isError"], false);
     task.abort();
     let _ = task.await;
 
@@ -3912,9 +3477,11 @@ fn rust_cli_entrypoint_executes_compaction_and_host_validation() {
     assert!(compaction_daemon.try_wait().unwrap().is_none());
     let registry = duckdb::Connection::open(&common_db).unwrap();
     let registered_repositories = registry
-        .query_row("SELECT COUNT(*) FROM repositories", [], |row| {
-            row.get::<_, i64>(0)
-        })
+        .query_row(
+            "SELECT COUNT(*) FROM repositories",
+            [],
+            repository_count_row,
+        )
         .unwrap();
     assert_eq!(registered_repositories, 1);
     drop(registry);

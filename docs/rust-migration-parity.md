@@ -1,17 +1,21 @@
 # Rust migration and parity evidence
 
 The migration is complete at the runtime boundary: the repository contains
-one Rust implementation, Rust tests, and input-only migration fixtures. The
-pre-migration implementation is not required, installed, imported, or
-executed. This document preserves the behavior-family mapping so future
-changes can be reviewed against the contract that was carried forward.
+one Rust implementation, Rust tests, and input-only migration fixtures. A
+separate source runtime is not required, installed, imported, or executed.
+This document preserves the behavior-family mapping so future
+changes can be reviewed against the current schema-9 contract.
+
+This is a maintainer document for a source checkout. Published Cargo packages
+intentionally omit the test corpus, fixtures, and generated evidence described
+here.
 
 ## Surface mapping
 
 | Behavior family | Rust implementation | Rust evidence |
 | --- | --- | --- |
 | Report parsing and normalization | `src/parser.rs`, `src/models.rs` | `rust_migrates_all_parser_formats_and_aliases`, model merge/rate/path tests |
-| Git identity and worktree lineage | `src/git.rs`, `src/storage.rs` | `rust_worktree_registration_and_lineage_guards`, storage lineage tests |
+| Git identity and worktree lineage | `src/git.rs`, `src/storage.rs` | `rust_lineage_baseline_and_guards`, storage lineage tests |
 | DuckDB snapshots, queries, runs, artifacts, and compaction | `src/storage.rs`, `src/compaction.rs` | `rust_storage_queries_compare_and_compacts_old_detail`, storage tests, smoke test |
 | Response budgets, cursors, compact projections, and service validation | `src/service.rs` | `rust_service_pagination_projection_and_mcp_contract_match` |
 | MCP inventory, schemas, resources, safety, and JSON-RPC dispatch | `src/mcp.rs` | MCP contract assertions, HTTP wire test, daemon-only CLI rejection test |
@@ -21,11 +25,13 @@ changes can be reviewed against the contract that was carried forward.
 
 ## Compatibility invariants
 
-- The public MCP inventory contains eleven tools and schema revision 7.
+- The public MCP inventory contains exactly seven tools and schema revision 9.
+  Unsupported names use the ordinary unknown-tool error path.
 - Every successful public projection uses the `{context,data,page}` envelope.
 - Word budgets, opaque query-scoped cursors, defensive collection caps, and
   compact-by-default detailed fields remain enforced at the service boundary.
-- DuckDB schema migrations are additive and run when a store opens.
+- A fresh schema is created when a store opens; incompatible database contents
+  are disposable and are not repaired through compatibility migrations.
 - Compacted snapshots remain readable through file, line, source, insight, and
   comparison queries.
 - HTTP and native stdio call the same JSON-RPC dispatcher and therefore share
@@ -38,8 +44,9 @@ changes can be reviewed against the contract that was carried forward.
 
 ## Fixture and evidence contract
 
-The machine-readable manifest at `tests/fixtures/manifest.yaml` identifies the
-frozen schema-7 contract, Rust target profile, public surfaces, input-only
+The machine-readable manifest in the source checkout at
+`tests/fixtures/manifest.yaml` identifies the schema-9 contract, Rust target
+profile, public surfaces, input-only
 parity cases, coverage plan, and compaction benchmark workload. Inputs contain
 no expected outputs; generated reports, logs, and coverage artifacts are
 runtime evidence and are never checked in as claimed results.
@@ -63,7 +70,7 @@ result to `target/migration/benchmark-result.json`.
 `make migration-parity` records a Rust-generated, manifest- and revision-bound
 marker after the conformance test completes. `migration-status` ignores a
 missing, malformed, or stale marker and records the lane as `not_proven`; a
-bare timestamp or an old worktree result can never be treated as current proof.
+bare timestamp or a stale worktree result can never be treated as current proof.
 
 After the parity, benchmark, and coverage lanes have completed, render the
 fixed aggregate and generated pages with:
@@ -75,7 +82,7 @@ make migration-status
 The command writes `target/migration/status-report.json` and the manifest's
 generated pages under `docs/generated/`. Those paths are build artifacts and
 are intentionally ignored by Git. Missing artifacts, a dirty target, and the
-removed legacy Python oracle are rendered as `not_proven`; the generator never
+unavailable independent source oracle are rendered as `not_proven`; the generator never
 turns a passing Rust conformance test into cross-runtime parity evidence.
 
 ## Verification
@@ -83,11 +90,11 @@ turns a passing Rust conformance test into cross-runtime parity evidence.
 ```sh
 cargo fmt --all -- --check
 DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked -- --test-threads=1
 DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
-  --fail-under-lines 100 --fail-under-functions 100 \
-  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+  --fail-under-lines 100 --fail-under-functions 100 --fail-under-regions 100 \
+  --fail-uncovered-lines 0 --fail-uncovered-functions 0 --fail-uncovered-regions 0 -- --test-threads=1
 DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
 cargo build --release --locked
 ```
@@ -97,12 +104,13 @@ DuckDB release instead of compiling its C++ amalgamation in every test
 profile. The release build still enables bundled DuckDB by default and proves
 the self-contained runtime shipped to users.
 
-The coverage gate proves 100% measured function and line coverage for the Rust
-library/runtime target set. The CLI launcher is excluded from aggregate LLVM
-counters because it is exercised in child processes; daemon-only CLI and
-concurrent shared-daemon stdio smoke tests still verify that launcher directly.
-Region and branch percentages remain diagnostics and are not represented as
-100%.
+The coverage gate requires 100% measured region, function, and line coverage
+for the Rust library/runtime target set. The schema-9 rewrite audit is measured
+by the same command above. The CLI launcher is excluded from aggregate LLVM counters
+because it is exercised in child processes; daemon-only CLI and concurrent
+shared-daemon stdio smoke tests still verify that launcher directly. Branch
+coverage is not a separate threshold in this gate; region coverage is enforced
+and reported explicitly for the measured target set.
 
 ## Compaction policy carried forward
 

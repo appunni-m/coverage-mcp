@@ -22,24 +22,14 @@ safety annotations, resources, pagination, or workflow:
 5. Verify both transports. The shared dispatcher is
    `mcp::dispatch_json_rpc`; do not fork transport-specific semantics.
 
-## Current MCP workflow
+## Workflow ownership
 
-Agents should:
-
-1. Call `project_context` first.
-2. Run only exact approved registrations returned by `project_context`, or
-   register a command only after human approval of the exact command, cwd,
-   shell, and artifacts.
-3. Submit with `run_test(wait=false)` and a stable `idempotency_key`.
-4. Poll `get_run_data(detailed=false)` no sooner than `poll_after_ms` until
-   `terminal` is true.
-5. Use `search_test_logs` for targeted retained stdout/stderr evidence; never
-   use `detailed` to retrieve logs.
-6. Inspect `coverage_ingest.status` and `snapshot_ids` before making coverage
-   claims.
-7. Use `coverage_query` for snapshot reads, `coverage_compare` only for
-   compatible lineage or registered worktrees, and `source_context` only for
-   bounded source ranges already identified by coverage data.
+Operational approval, polling, freshness, lineage, response-budget, and
+reporting rules belong in the marketplace's `testing:coverage-review` skill
+and the campaign skill that composes it. Keep this repository's copy limited to
+the server contract and implementation invariants; do not duplicate workflow
+instructions here. The server must still advertise a complete self-describing
+workflow through `initialize` instructions and `tools/list` descriptions.
 
 ## Rust verification
 
@@ -48,11 +38,11 @@ The required local gate is:
 ```sh
 cargo fmt --all -- --check
 DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked -- --test-threads=1
 DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
-  --fail-under-lines 100 --fail-under-functions 100 \
-  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+  --fail-under-lines 100 --fail-under-functions 100 --fail-under-regions 100 \
+  --fail-uncovered-lines 0 --fail-uncovered-functions 0 --fail-uncovered-regions 0 -- --test-threads=1
 DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
 cargo build --release --locked
 git diff --check

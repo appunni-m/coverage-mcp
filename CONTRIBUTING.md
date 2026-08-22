@@ -50,11 +50,11 @@ the pinned checkout toolchain for these commands:
 ```sh
 cargo fmt --all -- --check
 DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked
+DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked -- --test-threads=1
 DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
   --ignore-filename-regex '/src/main\.rs$' \
-  --fail-under-lines 100 --fail-under-functions 100 \
-  --fail-uncovered-lines 0 --fail-uncovered-functions 0 -- --test-threads=1
+  --fail-under-lines 100 --fail-under-functions 100 --fail-under-regions 100 \
+  --fail-uncovered-lines 0 --fail-uncovered-functions 0 --fail-uncovered-regions 0 -- --test-threads=1
 DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
 cargo build --release --locked
 git diff --check
@@ -86,7 +86,7 @@ deterministic; the dedicated release lane separately compiles and verifies the
 bundled native build. Migration evidence is assembled after the test and
 coverage artifacts are uploaded.
 
-The coverage threshold is a line-coverage gate. The report also displays
+The coverage threshold is a region, line, and function coverage gate. The report also displays
 function and region data; do not describe a percentage without naming its
 dimension and measured target set.
 

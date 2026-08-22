@@ -6,50 +6,80 @@
       "id": "next-coverage",
       "category": "outcome",
       "prompt": "What should I attack next?",
-      "first_tool": "coverage_query",
-      "view": "targets",
-      "outcome": "A ranked list of uncovered red regions with exact file and range follow-ups.",
+      "first_tool": "coverage_review",
+      "view": "task=insight",
+      "outcome": "A ranked list of uncovered red regions with compact evidence.",
       "required_terms": ["ranked", "red", "regions"],
-      "follow_up_tools": ["source_context"]
+      "follow_up_tools": ["coverage_review"]
     },
     {
       "id": "previous-impact",
       "category": "outcome",
       "prompt": "What got impacted since the previous session?",
-      "first_tool": "coverage_compare",
-      "view": "regions",
+      "first_tool": "coverage_review",
+      "view": "task=change",
       "outcome": "Grouped regressions and improvements without returning every covered line.",
-      "required_terms": ["grouped", "token-efficient", "source_context"],
-      "follow_up_tools": ["source_context", "coverage_compare"]
+      "required_terms": ["grouped", "red", "source"],
+      "follow_up_tools": ["coverage_review"]
     },
     {
       "id": "red-file",
       "category": "outcome",
       "prompt": "Show the red portions in one file.",
-      "first_tool": "coverage_query",
-      "view": "file",
+      "first_tool": "coverage_review",
+      "view": "task=audit",
       "outcome": "GitHub-like red ranges first, with exact selected lines only when requested.",
-      "required_terms": ["one file", "red", "line_ranges"],
-      "follow_up_tools": ["source_context"]
+      "required_terms": ["red", "exact", "audit"],
+      "follow_up_tools": ["coverage_review"]
     },
     {
       "id": "source-range",
       "category": "outcome",
       "prompt": "Show the source around this uncovered range.",
-      "first_tool": "source_context",
-      "view": "bounded source range",
-      "outcome": "Numbered source lines annotated red, green, yellow, or gray for one contiguous range.",
-      "required_terms": ["bounded", "contiguous", "red/green/yellow/gray"],
+      "first_tool": "coverage_review",
+      "view": "task=source",
+      "outcome": "Numbered source lines annotated red, green, yellow, or gray for one contiguous range or a bounded batch.",
+      "required_terms": ["bounded", "source", "ranges"],
       "follow_up_tools": []
+    },
+    {
+      "id": "unchanged-run",
+      "category": "workflow",
+      "prompt": "The checkout and test command are unchanged. Should I rerun the test?",
+      "first_tool": "run_test",
+      "view": "reuse_if_unchanged",
+      "outcome": "The server returns the latest compatible terminal run instead of launching duplicate work.",
+      "required_terms": ["reuse_if_unchanged", "submission_reused", "unchanged"],
+      "follow_up_tools": ["run_review"]
     },
     {
       "id": "line-history",
       "category": "outcome",
       "prompt": "How has this line behaved over time?",
-      "first_tool": "coverage_query",
-      "view": "line_history",
+      "first_tool": "coverage_review",
+      "view": "task=history",
       "outcome": "A compact history for one file and line, with detailed mode reserved for an audit.",
       "required_terms": ["line over time", "detailed"],
+      "follow_up_tools": []
+    },
+    {
+      "id": "change-review",
+      "category": "outcome",
+      "prompt": "Did the new code get covered after the test run?",
+      "first_tool": "coverage_review",
+      "view": "task=change",
+      "outcome": "One bounded review with baseline/current metrics, changed regions, and optional source context.",
+      "required_terms": ["changed", "source", "bounded"],
+      "follow_up_tools": ["coverage_review"]
+    },
+    {
+      "id": "history-review",
+      "category": "outcome",
+      "prompt": "Show the last two coverage runs and summarize the last ten.",
+      "first_tool": "coverage_review",
+      "view": "task=history",
+      "outcome": "Two detailed points plus an aggregate historical window without dumping every file.",
+      "required_terms": ["history", "aggregate", "snapshots"],
       "follow_up_tools": []
     },
     {
@@ -60,17 +90,17 @@
       "view": "approved asynchronous run",
       "outcome": "Discover approved commands, submit asynchronously, respect polling, then search targeted logs.",
       "required_terms": ["approved", "poll", "targeted"],
-      "follow_up_tools": ["register_test_command", "run_test", "get_run_data", "search_test_logs"]
+      "follow_up_tools": ["register_test_command", "run_test", "run_review"]
     },
     {
       "id": "latest-run-selector",
       "category": "confusion",
-      "prompt": "Do I need a run_id to read the last run, or can get_run_data select it automatically?",
+      "prompt": "Do I need a run_id to read the last run, or can run_review select it automatically?",
       "first_tool": "project_context",
-      "view": "latest_run.id → get_run_data(run_id)",
-      "outcome": "The agent understands that project_context exposes latest_run.id and get_run_data requires that explicit id.",
-      "required_terms": ["latest_run", "run_id", "get_run_data", "no implicit latest"],
-      "follow_up_tools": ["get_run_data"]
+      "view": "latest_run.id → run_review(run_id)",
+      "outcome": "The agent understands that project_context exposes latest_run.id and run_review requires that explicit id.",
+      "required_terms": ["latest_run", "run_id", "run_review", "no implicit latest"],
+      "follow_up_tools": ["run_review"]
     }
   ]
 }

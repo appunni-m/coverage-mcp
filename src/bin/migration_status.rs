@@ -530,7 +530,7 @@ fn coverage_result(
                                 "dimension":name,
                                 "covered":value["covered"],
                                 "total":value["total"],
-                                "uncovered": if value["covered"] == value["total"] {json!([])} else {json!(["uncovered lines or functions"])}
+                                "uncovered": if value["covered"] == value["total"] {json!([])} else {json!(["uncovered coverage records"])}
                             })
                         })
                         .collect::<Vec<_>>();
@@ -541,7 +541,7 @@ fn coverage_result(
         .unwrap_or_default();
     let plan = &input["plans"][0];
     let component_id = plan["component_ids"][0].as_str().unwrap_or("rust-source");
-    let thresholds = ["function", "line"]
+    let thresholds = ["function", "line", "region"]
         .iter()
         .map(|dimension| {
             let value = dimensions_summary[format!("{dimension}_coverage")].clone();
@@ -608,7 +608,7 @@ fn parity_result(
                 "case_id":case.id,
                 "target_profile":TARGET_PROFILE,
                 "requirements":case.requirements,
-                "source":workflow_not_run(&case.id, &case.step, "legacy Python oracle was removed"),
+                "source":workflow_not_run(&case.id, &case.step, "no independent source oracle is configured"),
                 "target":workflow_not_run(&case.id, &case.step, "Rust conformance tests have no differential adapter"),
                 "outcome":"not_run",
                 "diffs":[]
@@ -624,14 +624,14 @@ fn parity_result(
             "manifest":{"path":MANIFEST_RELATIVE,"schema":"migration-parity/manifest@2","sha256":context.manifest_sha256},
             "inputs":parity_inputs,
             "assets":[],
-            "oracles":[{"oracle_id":"frozen-contract","name":"Frozen schema-7 behavior contract","version":"1","runtime":"specification"}],
+            "oracles":[{"oracle_id":"frozen-contract","name":"Schema-9 behavior contract","version":"9","runtime":"specification"}],
             "targets":[context.target],
             "command":{"command_id":"parity","argv":["cargo","test","rust_migration"],"cwd":".","timeout_seconds":900}
         },
         "status":"infrastructure_failed",
         "summary":{"selected":cases.len(),"executed":0,"passed":0,"failed":0,"not_run":cases.len(),"infrastructure_errors":1},
         "comparisons":comparisons,
-        "infrastructure_errors":[{"scope":"oracle","id":Value::Null,"kind":"removed","message":"legacy Python oracle is intentionally absent"}]
+        "infrastructure_errors":[{"scope":"oracle","id":Value::Null,"kind":"unavailable","message":"no independent source oracle is configured"}]
     }))
 }
 
@@ -788,7 +788,7 @@ fn operations(
                     "classification":"endpoint",
                     "support":"supported",
                     "requirements":case.requirements,
-                    "parity":{"applicability":"required","input_ids":[case.id],"outcome":parity,"evidence_id":parity_id,"details":if parity == "not_proven" {vec!["legacy Python oracle was intentionally removed".to_owned()]} else {Vec::new()}},
+                    "parity":{"applicability":"required","input_ids":[case.id],"outcome":parity,"evidence_id":parity_id,"details":if parity == "not_proven" {vec!["no independent source oracle is configured".to_owned()]} else {Vec::new()}},
                     "coverage":{"applicability":"required","input_ids":[case.id],"outcome":coverage,"evidence_id":coverage_id,"details":Vec::<String>::new()},
                     "benchmark":{"applicability":if case.operation == "compact" {"required"} else {"not_applicable"},"input_ids":if case.operation == "compact" {vec![case.id.clone()]} else {Vec::new()},"outcome":if case.operation == "compact" {benchmark} else {"not_applicable"},"evidence_id":if case.operation == "compact" {benchmark_id} else {None::<&str>},"details":Vec::<String>::new()}
                 })
@@ -827,14 +827,14 @@ fn render_documents(context: &DocumentContext<'_>) -> StatusResult<()> {
         context.manifest_sha256
     );
     let parity_page = format!(
-        "{header}# Migration parity status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Evidence: `{evidence}`\n\nThe legacy Python oracle was intentionally removed. Rust migration tests remain passing conformance tests, but this repository does not claim cross-runtime parity without an executable source oracle.\n",
+        "{header}# Migration parity status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Evidence: `{evidence}`\n\nRust migration tests are conformance tests against the checked-in schema-9 contract. Cross-runtime parity remains `not_proven` because no independent source oracle is configured.\n",
         context.parity_outcome
     );
     let function = &context.coverage["function_coverage"];
     let lines = &context.coverage["line_coverage"];
     let regions = &context.coverage["region_coverage"];
     let coverage_page = format!(
-        "{header}# Coverage status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Functions: `{}/{} ({:.2}%)`\n- Lines: `{}/{} ({:.2}%)`\n- Regions (diagnostic): `{}/{} ({:.2}%)`\n\nFunction and line coverage are measured from the manifest-selected Rust library target with `cargo llvm-cov`; this local aggregate does not claim a passing status without a fresh ingested snapshot and a clean target identity.\n",
+        "{header}# Coverage status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Functions: `{}/{} ({:.2}%)`\n- Lines: `{}/{} ({:.2}%)`\n- Regions: `{}/{} ({:.2}%)`\n\nFunction, line, and region coverage are measured from the manifest-selected Rust library target with `cargo llvm-cov`; this local aggregate does not claim a passing status without a fresh ingested snapshot and a clean target identity.\n",
         context.coverage_outcome,
         function["covered"],
         function["total"],
@@ -847,7 +847,7 @@ fn render_documents(context: &DocumentContext<'_>) -> StatusResult<()> {
         percent(regions)
     );
     let benchmark_page = format!(
-        "{header}# Benchmark status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Workloads measured: `{}`\n- Median compaction latency: `{}` ms\n- Budget: `<= 5000` ms\n\nThe benchmark is correctness-gated. Because the legacy parity oracle is absent, the aggregate keeps the budget outcome `not_proven` even when the Rust compaction workload itself passes.\n",
+        "{header}# Benchmark status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Workloads measured: `{}`\n- Median compaction latency: `{}` ms\n- Budget: `<= 5000` ms\n\nThe benchmark is correctness-gated within the Rust implementation. The aggregate remains `not_proven` when the independent parity lane is unavailable, even if the measured compaction workload passes.\n",
         context.benchmark_outcome,
         context.benchmark["sample_count"],
         context.benchmark["median_latency_ms"]

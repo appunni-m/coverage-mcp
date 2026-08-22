@@ -71,8 +71,8 @@ extern crate self as coverage_mcp;
 #[path = "../tests/rust_migration.rs"]
 mod rust_migration;
 
-/// Public Coverage MCP contract revision retained during the runtime port.
-pub const SCHEMA_REVISION: u32 = 7;
+/// Public Coverage MCP wire-contract schema revision.
+pub const SCHEMA_REVISION: u32 = 9;
 
 /// Rust daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

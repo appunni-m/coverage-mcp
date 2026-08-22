@@ -279,8 +279,13 @@ impl Fixture {
         let repo = workspace.path.clone();
         initialize_git_repository(&repo)?;
         write_fixture_sources(&repo)?;
+        write_text(
+            &repo.join(".gitignore"),
+            "coverage*.lcov\ncoverage.duckdb\ncoverage.duckdb.wal\ncoverage.duckdb.lock\nruns/\n",
+        )?;
         run_git(&repo, &["add", "."])?;
         run_git(&repo, &["commit", "-m", "evaluation fixture"])?;
+        let baseline_revision = git_revision(&repo)?;
 
         let store = CoverageStore::open(repo.join("coverage.duckdb"), fixture_config(&repo))
             .map_err(|error| format!("open evaluation store: {error}"))?;
@@ -296,12 +301,19 @@ impl Fixture {
                 "lcov",
                 Some(&repo),
                 Some("main"),
-                Some("evaluation-base"),
+                Some(&baseline_revision),
                 None,
                 "unit",
             )
             .map_err(|error| format!("ingest base fixture: {error}"))?;
         let current_report = repo.join("coverage-current.lcov");
+        write_text(
+            &repo.join("src/priority.rs"),
+            "pub fn prioritize(values: &[i32]) -> i32 {\n    let mut total = 0;\n    for value in values {\n        if *value >= 0 {\n            total += *value;\n        } else {\n            total -= *value;\n        }\n    }\n    total\n}\n\npub fn review_marker() -> bool {\n    true\n}\n",
+        )?;
+        run_git(&repo, &["add", "src/priority.rs"])?;
+        run_git(&repo, &["commit", "-m", "evaluation source change"])?;
+        let current_revision = git_revision(&repo)?;
         write_coverage_report(&current_report, true)?;
         let current = store
             .ingest_report(
@@ -309,7 +321,7 @@ impl Fixture {
                 "lcov",
                 Some(&repo),
                 Some("main"),
-                Some("evaluation-current"),
+                Some(&current_revision),
                 None,
                 "unit",
             )
@@ -517,6 +529,22 @@ fn run_git(root: &Path, arguments: &[&str]) -> Result<(), String> {
     }
 }
 
+fn git_revision(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| format!("run git rev-parse: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 fn evaluate_usability(section: &mut SectionBuilder, cases: &CaseCorpus) -> Result<(), String> {
     let initialize = dispatch(None, json!({"jsonrpc":"2.0","id":1,"method":"initialize"}))?;
     let instructions = initialize["result"]["instructions"]
@@ -603,14 +631,10 @@ fn evaluate_usability(section: &mut SectionBuilder, cases: &CaseCorpus) -> Resul
         "project_context",
         "register_test_command",
         "run_test",
-        "get_run_data",
+        "run_review",
         "cancel_run",
-        "search_test_logs",
-        "ingest_coverage",
-        "register_worktree",
-        "coverage_query",
-        "coverage_compare",
-        "source_context",
+        "coverage_review",
+        "coverage_import",
     ];
     section.check(
         "public-tool-inventory-is-complete",
@@ -683,23 +707,80 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         "project_context returns identity and project state in the stable envelope",
     );
 
-    let broad_targets = call_tool(
+    let review = call_tool(
         &fixture.service,
-        "coverage_query",
-        &json!({"view":"targets","order_by":"priority","max_words":400}),
+        "coverage_review",
+        &json!({
+            "task":"change",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id,"file_path":"src/priority.rs"},
+            "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "limits":{"max_files":3,"max_regions":5,"max_words":1200,"max_bytes":12000}
+        }),
     )?;
-    let broad_data = data(&broad_targets)?;
-    let broad_targets_array = array_field(broad_data, "targets")?;
+    let review_data = data(&review)?;
+    section.check(
+        "change-review-is-one-bounded-projection",
+        review_data["claim_status"] == "supported"
+            && review_data["change"]["current"]["id"].is_string()
+            && review_data["change"]["regions"].is_array()
+            && review_data["change"]["files"].is_array()
+            && review_data["change"]["changed_code"]["status"] == "measured",
+        "coverage_review returns a bounded changed-code result with baseline and current evidence",
+    );
+    let parent_review = call_tool(
+        &fixture.service,
+        "coverage_review",
+        &json!({
+            "task":"change",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id,"file_path":"src/priority.rs"},
+            "baseline":{"kind":"parent_commit"},
+            "limits":{"max_files":3,"max_regions":5,"max_words":1200,"max_bytes":12000}
+        }),
+    )?;
+    section.check(
+        "parent-commit-baseline-resolves",
+        data(&parent_review)?["claim_status"] == "supported"
+            && data(&parent_review)?["baseline"]["commit_sha"]
+                == data(&review)?["baseline"]["commit_sha"],
+        "parent_commit resolves the compatible snapshot at the current Git parent",
+    );
+
+    let history = call_tool(
+        &fixture.service,
+        "coverage_review",
+        &json!({
+            "task":"history",
+            "measurement":{"suite":"unit"},
+            "history":{"detail_snapshots":2,"summary_window":10},
+            "limits":{"max_words":700,"max_bytes":12000}
+        }),
+    )?;
+    let history_data = data(&history)?;
+    section.check(
+        "history-review-separates-detail-and-summary",
+        history_data["history"]["detail"].is_array()
+            && history_data["history"]["summary"]["window"].is_number(),
+        "history review returns detailed recent points and an aggregate window",
+    );
+
+    let broad_insight = call_tool(
+        &fixture.service,
+        "coverage_review",
+        &json!({
+            "task":"insight",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "limits":{"max_regions":10,"max_words":400,"max_bytes":12000}
+        }),
+    )?;
+    let broad_data = data(&broad_insight)?;
+    let broad_targets_array = array_field(&broad_data["insight"], "items")?;
     section.check(
         "next-work-returns-ranked-targets",
         !broad_targets_array.is_empty()
-            && broad_data["order_by"] == "priority"
-            && broad_targets_array.iter().all(|target| {
-                target["file_path"].is_string()
-                    && target["priority"].is_number()
-                    && target["regions"].is_array()
-            }),
-        "targets contains ranked files and compact uncovered regions",
+            && broad_targets_array
+                .iter()
+                .all(|target| target["file_path"].is_string() || target["category"].is_string()),
+        "insight returns bounded ranked findings without a raw line dump",
     );
     section.check(
         "targets-are-not-raw-line-dumps",
@@ -707,19 +788,21 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         "the next-work projection does not include unrelated exact line records",
     );
 
-    let target_args = json!({
-        "view":"targets",
-        "snapshot_id":fixture.current_snapshot_id,
-        "file_path":"src/priority.rs",
-        "max_words":250
-    });
-    let target = call_tool(&fixture.service, "coverage_query", &target_args)?;
-    let target_item = array_field(data(&target)?, "targets")?
-        .first()
-        .ok_or_else(|| "target-specific query returned no target".to_owned())?;
-    let region = target_item["regions"]
-        .as_array()
-        .and_then(|regions| regions.first())
+    let target = call_tool(
+        &fixture.service,
+        "coverage_review",
+        &json!({
+            "task":"change",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id,"file_path":"src/priority.rs"},
+            "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "representation":"audit",
+            "limits":{"max_files":3,"max_regions":10,"max_words":1200,"max_bytes":12000}
+        }),
+    )?;
+    let target_data = data(&target)?;
+    let region = array_field(&target_data["change"], "regions")?
+        .iter()
+        .find(|region| region["status"] == "regressed")
         .ok_or_else(|| "target-specific query returned no red region".to_owned())?;
     let start = region["start"]
         .as_i64()
@@ -730,22 +813,13 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
     section.check(
         "target-carries-source-follow-up-range",
         start >= 1 && end >= start,
-        format!("target carries the bounded range {start}-{end}"),
+        format!("changed-code review carries the bounded range {start}-{end}"),
     );
 
-    let regions = call_tool(
-        &fixture.service,
-        "coverage_compare",
-        &json!({
-            "view":"regions",
-            "snapshot_id":fixture.current_snapshot_id,
-            "baseline_snapshot_id":fixture.base_snapshot_id,
-            "file_path":"src/priority.rs",
-            "only_regressions":true,
-            "max_words":300
-        }),
-    )?;
-    let regression_regions = array_field(data(&regions)?, "regions")?;
+    let regression_regions = array_field(&target_data["change"], "regions")?
+        .iter()
+        .filter(|region| region["status"] == "regressed")
+        .collect::<Vec<_>>();
     section.check(
         "previous-impact-returns-regressions",
         regression_regions
@@ -754,115 +828,147 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
             && regression_regions.iter().any(|region| {
                 region["file_path"] == "src/priority.rs" && region["start"].as_i64() == Some(5)
             }),
-        "regions isolates the previous-session red impact",
+        "change review exposes grouped previous-session regression impact",
     );
 
     let source = call_tool(
         &fixture.service,
-        "source_context",
+        "coverage_review",
         &json!({
-            "snapshot_id":fixture.current_snapshot_id,
-            "file_path":"src/priority.rs",
-            "start":start,
-            "end":end,
-            "max_words":350
+            "task":"source",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "source":{"ranges":[{"file_path":"src/priority.rs","start":start,"end":end}]},
+            "limits":{"max_words":600,"max_bytes":12000}
         }),
     )?;
-    let source_lines = array_field(data(&source)?, "lines")?;
+    let source_data = data(&source)?;
+    let source_group = source_data["source"]
+        .as_array()
+        .and_then(|groups| groups.first())
+        .ok_or_else(|| "source review returned no file group".to_owned())?;
+    let source_range = source_group["ranges"]
+        .as_array()
+        .and_then(|ranges| ranges.first())
+        .ok_or_else(|| "source review returned no range".to_owned())?;
+    let source_lines = array_field(source_range, "lines")?;
     section.check(
         "source-context-is-bounded-and-annotated",
         !source_lines.is_empty()
             && source_lines.iter().any(|line| line["marker"] == "red")
             && source_lines.iter().all(|line| line["marker"].is_string())
-            && array_field(data(&source)?, "red_regions")?
+            && array_field(source_range, "red_regions")?
                 .iter()
                 .any(|region| {
                     region["start"].as_i64() == Some(start) || region["end"].as_i64() == Some(end)
                 }),
-        "source_context returns numbered source with compact coverage markers",
+        "source review returns numbered source with compact coverage markers",
     );
-
-    let file = call_tool(
+    let source_batch = call_tool(
         &fixture.service,
-        "coverage_query",
+        "coverage_review",
         &json!({
-            "view":"file",
-            "snapshot_id":fixture.current_snapshot_id,
-            "file_path":"src/priority.rs",
-            "line_ranges":[{"start":start,"end":end}],
-            "max_words":450
+            "task":"source",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "source":{"ranges":[
+                {"file_path":"src/priority.rs","start":start,"end":start},
+                {"file_path":"src/priority.rs","start":end,"end":end}
+            ]},
+            "limits":{"max_words":600,"max_bytes":12000}
         }),
     )?;
+    let source_batch_data = data(&source_batch)?;
+    let source_batch_group = source_batch_data["source"]
+        .as_array()
+        .and_then(|groups| groups.first())
+        .ok_or_else(|| "source batch returned no file group".to_owned())?;
+    section.check(
+        "source-context-batches-ranges",
+        source_batch_group["ranges"].is_array()
+            && source_batch_group["source_resolution"].is_string(),
+        "source review can batch disjoint ranges and labels source provenance",
+    );
     section.check(
         "file-view-separates-red-map-and-exact-lines",
-        !array_field(data(&file)?, "red_regions")?.is_empty()
-            && data(&file)?["selected_lines"].is_array()
-            && data(&file)?["line_selection"].is_object(),
-        "file view returns GitHub-like red ranges and exact lines only for requested ranges",
+        target_data["change"]["files"].is_array()
+            && target_data["change"]["representation"] == "audit"
+            && !contains_key(&target_data["change"], "selected_lines"),
+        "change review returns compact file metrics without exact line dumps",
     );
 
     let history = call_tool(
         &fixture.service,
-        "coverage_query",
+        "coverage_review",
         &json!({
-            "view":"line_history",
-            "file_path":"src/priority.rs",
-            "line_number":5,
-            "suite":"unit",
-            "max_words":300
+            "task":"history",
+            "measurement":{"suite":"unit","file_path":"src/priority.rs"},
+            "history":{"detail_snapshots":2,"summary_window":10},
+            "limits":{"max_words":600,"max_bytes":12000}
         }),
     )?;
     let history_data = data(&history)?;
     section.check(
         "line-history-is-narrow",
-        history_data.is_array(),
-        "line history request completed with its one-line projection",
+        history_data["history"]["detail"].is_array(),
+        "history review returns a narrow detailed projection",
     );
     section.check(
         "line-history-has-both-snapshots",
-        history_data
+        history_data["history"]["detail"]
             .as_array()
             .is_some_and(|points| points.len() >= 2),
-        "line history contains the base and current observations",
+        "history detail contains the base and current observations",
     );
 
     let audit = call_tool(
         &fixture.service,
-        "coverage_compare",
+        "coverage_review",
         &json!({
-            "view":"lines",
-            "snapshot_id":fixture.current_snapshot_id,
-            "baseline_snapshot_id":fixture.base_snapshot_id,
-            "max_words":1000
+            "task":"audit",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "limits":{"max_files":3,"max_regions":10,"max_words":1000,"max_bytes":12000}
         }),
     )?;
     section.check(
         "exact-audit-is-explicit",
-        data(&audit)?["lines"].is_array(),
-        "exact changed lines are available as a deliberate audit projection",
+        data(&audit)?["task"] == "audit"
+            && data(&audit)?["representation"] == "audit"
+            && data(&audit)?["change"]["regions"].is_array(),
+        "exact changed regions are available as a deliberate audit projection",
     );
     section.metric(
         "broad_target_words",
         json!(serialized_word_count(broad_data)),
     );
     section.metric(
-        "source_context_words",
+        "source_review_words",
         json!(serialized_word_count(data(&source)?)),
     );
-    section.metric("follow_up_call_count", json!(5));
+    section.metric("follow_up_call_count", json!(6));
     Ok(())
 }
 
 fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Result<(), String> {
     let compact = call_tool(
         &fixture.service,
-        "coverage_query",
-        &json!({"view":"files","snapshot_id":fixture.current_snapshot_id,"max_words":5000}),
+        "coverage_review",
+        &json!({
+            "task":"change",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "representation":"compact",
+            "limits":{"max_files":10,"max_regions":20,"max_words":1200,"max_bytes":12000}
+        }),
     )?;
     let detailed = call_tool(
         &fixture.service,
-        "coverage_query",
-        &json!({"view":"files","snapshot_id":fixture.current_snapshot_id,"max_words":5000,"detailed":true}),
+        "coverage_review",
+        &json!({
+            "task":"audit",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "limits":{"max_files":10,"max_regions":20,"max_words":1200,"max_bytes":12000}
+        }),
     )?;
     let compact_words = serialized_word_count(data(&compact)?);
     let detailed_words = serialized_word_count(data(&detailed)?);
@@ -874,105 +980,156 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
         ),
     );
 
+    let history = call_tool(
+        &fixture.service,
+        "coverage_review",
+        &json!({
+            "task":"history",
+            "measurement":{"suite":"unit"},
+            "history":{"detail_snapshots":2,"summary_window":10},
+            "limits":{"max_words":600,"max_bytes":12000}
+        }),
+    )?;
+    let history_data = data(&history)?;
+    section.check(
+        "history-detail-is-bounded",
+        history_data["history"]["detail"]
+            .as_array()
+            .is_some_and(|points| points.len() <= 2)
+            && history_data["history"]["summary"]["window"]
+                .as_u64()
+                .is_some_and(|window| window <= 10),
+        "history keeps detailed points and aggregate windows bounded",
+    );
+
     let mut cursor = None;
-    let mut seen = BTreeSet::new();
+    let mut seen_commands = BTreeSet::new();
     let mut page_count = 0usize;
-    let mut total = None;
+    let mut command_total = None;
     loop {
         page_count += 1;
         if page_count > 100 {
-            return Err("files pagination exceeded 100 pages".to_owned());
+            return Err("project context pagination exceeded 100 pages".to_owned());
         }
-        let mut arguments = json!({
-            "view":"files",
-            "snapshot_id":fixture.current_snapshot_id,
-            "max_words":50
-        });
+        let mut arguments = json!({"max_words":50});
         if let Some(value) = cursor.as_deref() {
             arguments["cursor"] = json!(value);
         }
-        let page = call_tool(&fixture.service, "coverage_query", &arguments)?;
-        let page_data = data(&page)?;
-        for file in page_data
-            .as_array()
-            .ok_or_else(|| "files projection is not an array".to_owned())?
-        {
-            let path = file["file_path"]
+        let page = call_tool(&fixture.service, "project_context", &arguments)?;
+        for command in array_field(data(&page)?, "commands")? {
+            let id = command["id"]
                 .as_str()
-                .ok_or_else(|| "file projection has no file_path".to_owned())?;
-            if !seen.insert(path.to_owned()) {
-                return Err(format!("files pagination repeated {path}"));
+                .ok_or_else(|| "project context command has no id".to_owned())?;
+            if !seen_commands.insert(id.to_owned()) {
+                return Err(format!("project context pagination repeated {id}"));
             }
         }
         let page_metadata = page["page"]
             .as_object()
-            .ok_or_else(|| "files projection has no page metadata".to_owned())?;
+            .ok_or_else(|| "project context has no page metadata".to_owned())?;
         let word_count = page_metadata["word_count"]
             .as_u64()
-            .ok_or_else(|| "page has no word_count".to_owned())?;
+            .ok_or_else(|| "project context page has no word_count".to_owned())?;
         section.check(
-            format!("pagination-page-{page_count}-bounded"),
+            format!("project-context-page-{page_count}-bounded"),
             word_count <= 50,
-            format!("page uses {word_count} words of a 50-word budget"),
+            format!("project context page uses {word_count} words"),
         );
-        total = total.or_else(|| page_metadata["total"].as_u64());
+        command_total = command_total.or_else(|| page_metadata["total"].as_u64());
         cursor = page_metadata["next_cursor"].as_str().map(str::to_owned);
         if cursor.is_none() {
             break;
         }
     }
     section.check(
-        "pagination-is-complete",
-        total == Some(seen.len() as u64),
+        "project-context-pagination-is-complete",
+        command_total == Some(seen_commands.len() as u64),
         format!(
-            "collected {} unique files from {:?} total",
-            seen.len(),
-            total
+            "collected {} unique commands from {:?} total",
+            seen_commands.len(),
+            command_total
         ),
     );
 
-    let regions = call_tool(
+    let source = call_tool(
         &fixture.service,
-        "coverage_compare",
+        "coverage_review",
         &json!({
-            "view":"regions",
-            "snapshot_id":fixture.current_snapshot_id,
-            "baseline_snapshot_id":fixture.base_snapshot_id,
-            "max_words":5000
+            "task":"source",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "source":{"ranges":[
+                {"file_path":"src/priority.rs","start":1,"end":1},
+                {"file_path":"src/priority.rs","start":3,"end":3}
+            ]},
+            "limits":{"max_words":600,"max_bytes":12000}
         }),
     )?;
-    let lines = call_tool(
-        &fixture.service,
-        "coverage_compare",
-        &json!({
-            "view":"lines",
-            "snapshot_id":fixture.current_snapshot_id,
-            "baseline_snapshot_id":fixture.base_snapshot_id,
-            "max_words":5000
-        }),
-    )?;
-    let region_words = serialized_word_count(data(&regions)?);
-    let line_words = serialized_word_count(data(&lines)?);
+    let source_data = data(&source)?;
+    section.check(
+        "source-response-does-not-duplicate-groups",
+        source_data["source"].is_array() && source_data.get("sources").is_none(),
+        "source review emits one canonical grouped source array",
+    );
+
+    let compact_data = data(&compact)?;
+    let audit_data = data(&detailed)?;
+    let region_words = serialized_word_count(&compact_data["change"]["regions"]);
+    let line_words = serialized_word_count(&audit_data["change"]);
     section.check(
         "grouped-regions-are-smaller-than-line-audit",
         region_words < line_words,
-        format!("regions use {region_words} words versus {line_words} exact-line words"),
+        format!("compact regions use {region_words} words versus {line_words} audit words"),
+    );
+
+    let consolidated = call_tool(
+        &fixture.service,
+        "coverage_review",
+        &json!({
+            "task":"change",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id,"file_path":"src/priority.rs"},
+            "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "source":{"include":true,"context_lines":0},
+            "representation":"compact",
+            "limits":{"max_files":1,"max_regions":1,"max_source_lines":10,"max_words":1200,"max_bytes":12000}
+        }),
+    )?;
+    let consolidated_bytes = serde_json::to_vec(&consolidated)
+        .map_err(|error| format!("serialize consolidated benchmark: {error}"))?
+        .len();
+    section.check(
+        "consolidated-workflow-is-bounded",
+        consolidated_bytes <= 12_000,
+        format!("consolidated review uses {consolidated_bytes} serialized bytes"),
+    );
+    section.metric(
+        "bounded_change_workflow",
+        json!({
+            "calls":1,
+            "serialized_bytes":consolidated_bytes,
+            "failed_calls":0,
+            "source_followups":0
+        }),
     );
 
     let mut latencies = Vec::new();
-    for _ in 0..8 {
+    for index in 0..8 {
         let started = Instant::now();
         let _ = call_tool(
             &fixture.service,
-            "coverage_query",
+            "coverage_review",
             &json!({
-                "view":"targets",
-                "snapshot_id":fixture.current_snapshot_id,
-                "order_by":"priority",
-                "max_words":200
+                "task":"insight",
+                "measurement":{"snapshot_id":fixture.current_snapshot_id},
+                "limits":{"max_regions":5,"max_words":300,"max_bytes":12000}
             }),
         )?;
-        latencies.push(started.elapsed().as_millis() as u64);
+        let latency = started.elapsed().as_millis() as u64;
+        section.check(
+            format!("bounded-insight-query-{}", index + 1),
+            latency < 5_000,
+            format!("bounded insight query completed in {latency} ms"),
+        );
+        latencies.push(latency);
     }
     latencies.sort_unstable();
     let p50 = percentile(&latencies, 50);
@@ -995,8 +1152,14 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
         "query_latency_ms",
         json!({"p50":p50,"p95":p95,"samples":latencies}),
     );
-    section.metric("paginated_file_count", json!(seen.len()));
-    section.metric("pagination_pages", json!(page_count));
+    section.metric(
+        "history_detail_count",
+        json!(
+            history_data["history"]["detail"]
+                .as_array()
+                .map_or(0, Vec::len)
+        ),
+    );
     Ok(())
 }
 
@@ -1013,7 +1176,7 @@ fn evaluate_protocol(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         "json-rpc-tools-list",
         tools["result"]["tools"]
             .as_array()
-            .is_some_and(|items| items.len() == 11),
+            .is_some_and(|items| items.len() == 7),
         "tools/list returns the complete public inventory",
     );
     let resources = dispatch(
@@ -1055,17 +1218,17 @@ fn evaluate_protocol(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         "jsonrpc":"2.0",
         "id":7,
         "method":"tools/call",
-        "params":{"name":"coverage_query","arguments":{
-            "view":"targets",
-            "snapshot_id":fixture.current_snapshot_id,
-            "max_words":250
+        "params":{"name":"coverage_review","arguments":{
+            "task":"insight",
+            "measurement":{"snapshot_id":fixture.current_snapshot_id},
+            "limits":{"max_regions":5,"max_words":250,"max_bytes":12000}
         }}
     });
     let wire = dispatch(Some(&fixture.service), request)?;
     let direct = call_tool(
         &fixture.service,
-        "coverage_query",
-        &json!({"view":"targets","snapshot_id":fixture.current_snapshot_id,"max_words":250}),
+        "coverage_review",
+        &json!({"task":"insight","measurement":{"snapshot_id":fixture.current_snapshot_id},"limits":{"max_regions":5,"max_words":250,"max_bytes":12000}}),
     )?;
     section.check(
         "dispatcher-and-tool-semantics-match",
@@ -1116,46 +1279,46 @@ fn evaluate_protocol(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
 
 fn evaluate_safety(section: &mut SectionBuilder, fixture: &Fixture) -> Result<(), String> {
     let invalid_cases = [
-        ("null-arguments-rejected", "coverage_query", Value::Null),
+        ("null-arguments-rejected", "coverage_review", Value::Null),
         (
-            "missing-view-rejected",
-            "coverage_query",
-            json!({"max_words":200}),
+            "missing-task-budget-rejected",
+            "coverage_review",
+            json!({"limits":{"max_words":49}}),
         ),
         (
-            "invalid-view-rejected",
-            "coverage_query",
-            json!({"view":"everything"}),
+            "invalid-task-rejected",
+            "coverage_review",
+            json!({"task":"everything"}),
         ),
         (
             "invalid-budget-rejected",
-            "coverage_query",
-            json!({"view":"summary","max_words":49}),
+            "coverage_review",
+            json!({"task":"change","limits":{"max_words":49}}),
         ),
         (
-            "wrong-detailed-type-rejected",
-            "coverage_query",
-            json!({"view":"summary","detailed":"false"}),
+            "wrong-representation-type-rejected",
+            "coverage_review",
+            json!({"task":"change","representation":false}),
         ),
         (
-            "invalid-cursor-rejected",
-            "coverage_query",
-            json!({"view":"files","snapshot_id":fixture.current_snapshot_id,"cursor":"invalid"}),
+            "unknown-field-rejected",
+            "coverage_review",
+            json!({"task":"change","unexpected":true}),
         ),
         (
             "unknown-snapshot-rejected",
-            "coverage_query",
-            json!({"view":"summary","snapshot_id":"missing-snapshot"}),
+            "coverage_review",
+            json!({"task":"change","measurement":{"snapshot_id":"missing-snapshot"}}),
         ),
         (
             "oversized-source-range-rejected",
-            "source_context",
-            json!({"snapshot_id":fixture.current_snapshot_id,"file_path":"src/priority.rs","start":1,"end":201}),
+            "coverage_review",
+            json!({"task":"source","measurement":{"snapshot_id":fixture.current_snapshot_id},"source":{"ranges":[{"file_path":"src/priority.rs","start":1,"end":201}]}}),
         ),
         (
             "path-traversal-source-rejected",
-            "source_context",
-            json!({"snapshot_id":fixture.current_snapshot_id,"file_path":"../outside.rs","start":1,"end":2}),
+            "coverage_review",
+            json!({"task":"source","measurement":{"snapshot_id":fixture.current_snapshot_id},"source":{"ranges":[{"file_path":"../outside.rs","start":1,"end":2}]}}),
         ),
     ];
     for (id, tool, arguments) in &invalid_cases {
@@ -1269,16 +1432,50 @@ fn evaluate_reliability(section: &mut SectionBuilder, fixture: &Fixture) -> Resu
         completed["data"]["terminal"] == true && completed["data"]["status"] == "passed",
         "wait=false followed by bounded polling reaches a passed terminal state",
     );
+    let fixture_status = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.repo)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|error| format!("status error: {error}"));
+    let fixture_clean = coverage_mcp::git::is_clean(&fixture.repo);
+    section.check(
+        "fixture-checkout-is-clean-for-reuse",
+        fixture_clean,
+        format!(
+            "the unchanged-run reuse probe requires a clean checkout; status={fixture_status:?}"
+        ),
+    );
+    let unchanged = call_tool(
+        &fixture.service,
+        "run_test",
+        &json!({
+            "command_ref":command_id,
+            "wait":false,
+            "reuse_if_unchanged":true,
+            "max_words":300
+        }),
+    )?;
+    section.check(
+        "unchanged-run-is-reused-without-a-new-key",
+        unchanged["data"]["id"] == first_id
+            && unchanged["data"]["submission_reused"] == true
+            && unchanged["data"]["reuse_reason"] == "unchanged_checkout",
+        "the server returns the latest compatible run when the checkout is unchanged",
+    );
     let logs = call_tool(
         &fixture.service,
-        "search_test_logs",
+        "run_review",
         &json!({
             "run_id":first_id,
+            "view":"logs",
             "query":["MCP_EVAL_STDOUT","MCP_EVAL_STDERR"],
             "stream":"both",
             "context_lines":0,
             "max_matches":5,
-            "max_words":250
+            "max_words":250,
+            "max_bytes":12000
         }),
     )?;
     section.check(
@@ -1373,8 +1570,8 @@ fn wait_for_terminal(service: &CoverageService, run_id: &str) -> Result<Value, S
     loop {
         let state = call_tool(
             service,
-            "get_run_data",
-            &json!({"run_id":run_id,"max_words":300}),
+            "run_review",
+            &json!({"run_id":run_id,"view":"status","max_words":300,"max_bytes":12000}),
         )?;
         if state["data"]["terminal"] == true {
             return Ok(state);

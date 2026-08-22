@@ -44,7 +44,7 @@ requests without replaying an operation whose commit status is ambiguous.
 | --- | --- |
 | `src/main.rs` | CLI, shared-daemon `serve`, `connect`/`stdio`, and daemon-routed `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
-| `src/mcp.rs` | Explicit schema-7 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
+| `src/mcp.rs` | Explicit schema-9 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
 | `src/storage.rs` | DuckDB schema, immutable snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
 | `src/lock.rs` | Process-lifetime daemon and per-database OS-backed exclusive leases. |
@@ -62,7 +62,7 @@ requests without replaying an operation whose commit status is ambiguous.
 - Queue state is mutable only while a managed run is queued or active.
 - Project settings are scoped to the canonical repository key, so linked
   worktrees use the same compaction policy and coverage history.
-- Every public schema-7 response carries `repo_key`, `checkout_path`,
+- Every public schema-9 response carries `repo_key`, `checkout_path`,
   `suite`, and `schema_revision` context.
 - Collections use bounded fetches, word budgets, and opaque query-scoped
   cursors. A defensive record cap fails explicitly instead of silently losing
@@ -101,7 +101,7 @@ whether handoff is supported, but never the capability. On Unix the metadata
 file is restricted to mode `0600`. During an upgrade, a newer connector reads
 the capability only from the actively locked file, requests graceful shutdown
 from that exact loopback instance, and waits for both its listener and lease to
-disappear. A verified legacy daemon without the endpoint receives a
+disappear. A verified pre-handoff daemon without the endpoint receives a
 platform-native termination request for the recorded PID. The connector never
 downgrades a newer owner or takes over a different common database.
 
@@ -156,7 +156,7 @@ All parent directories are created by the Rust storage layer.
 
 The database contains project settings, repository registry rows, snapshots,
 files, lines, compacted payloads, worktrees, registered commands, runs, jobs,
-artifacts, and run output metadata. Schema migration is performed at open and
+artifacts, and run output metadata. Fresh schema creation is performed at open and
 is intentionally owned by storage rather than by transport code.
 
 ## Trust boundary

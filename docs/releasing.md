@@ -12,7 +12,7 @@ artifact.
 2. Update `Cargo.toml` and `Cargo.lock` to the release version. Move the
    corresponding `CHANGELOG.md` entries into a dated release section.
 3. Run `make ci`, including strict clippy, all-target tests, fixture-backed
-   migration lanes, line/function coverage, generated migration status, and
+   migration lanes, region/line/function coverage, generated migration status, and
    rustdoc warnings. The verification lanes use the exact prebuilt DuckDB
    release; the all-target test lane exposes compilation and execution as
    separate steps, uses one Cargo compilation job, and retains line-table debug

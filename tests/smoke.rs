@@ -242,7 +242,7 @@ fn storage_smoke() {
     let store = CoverageStore::open(directory.path().join("coverage.duckdb"), config()).unwrap();
     store.ensure_project(directory.path()).unwrap();
     let no_baseline = store
-        .register_worktree(directory.path(), "main", Some("before coverage"))
+        .ensure_lineage_baseline(directory.path(), "main", Some("before coverage"))
         .unwrap();
     let snapshot = store
         .ingest_report(
@@ -513,7 +513,7 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
             "jsonrpc":"2.0",
             "id":id,
             "method":"tools/call",
-            "params":{"name":"get_run_data","arguments":{"run_id":run_id}}
+            "params":{"name":"run_review","arguments":{"run_id":run_id,"view":"status"}}
         })
     };
     let state_deadline = Instant::now() + Duration::from_secs(10);
@@ -527,7 +527,7 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         }
         assert!(
             Instant::now() < state_deadline,
-            "managed runs did not reach running/queued restart fixture state"
+            "managed runs did not reach running/queued restart fixture state: running={running}, queued={queued}"
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -560,7 +560,7 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         &mut stdout,
         serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list"}),
     );
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
     wait_for_health(port);
     let second_pid = guard.pid().expect("replacement daemon pid");
     assert_ne!(first_pid, second_pid);
@@ -661,7 +661,7 @@ fn connector_refuses_to_replace_an_unlocked_health_lookalike() {
     let body = serde_json::json!({
         "status":"ok",
         "version":"0.8.6",
-        "schema_revision":7,
+        "schema_revision":9,
         "common_db_path":common_db,
         "daemon_path":"/tmp/not-an-owned-coverage-mcp"
     })

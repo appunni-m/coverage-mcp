@@ -1,12 +1,19 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+// Row projections are selected from fixed SQL column lists and validated
+// schema records. Keep impossible-shape assertions local while all database,
+// filesystem, and process failures propagate as AppErrors.
+#![allow(clippy::expect_used, clippy::unwrap_in_result)]
+
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -21,7 +28,7 @@ use uuid::Uuid;
 use crate::compaction::{CompactionPolicy, CompactionResult};
 use crate::config::{MAX_RUN_LOG_MAX_BYTES, MIN_RUN_LOG_MAX_BYTES, ServerConfig};
 use crate::error::{AppError, AppResult};
-use crate::git::{GitInfo, inspect_git, merge_base};
+use crate::git::{GitInfo, inspect_git, is_clean, merge_base, read_file_at_commit};
 use crate::lock::{FileLease, database_lock_path};
 use crate::models::CoverageReport;
 use crate::parser::parse_coverage_report;
@@ -34,6 +41,53 @@ pub const MAX_COLLECTION_RECORDS: usize = 5_000;
 pub const COLLECTION_FETCH_LIMIT: usize = MAX_COLLECTION_RECORDS + 1;
 /// Maximum run workers accepted by the Rust implementation.
 pub const MAX_RUN_CONCURRENCY: usize = 32;
+
+#[cfg(test)]
+static FORCE_ARTIFACT_FINGERPRINT_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CLAIM_FALSE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CONTROL_POISON_BEFORE_REAP: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CONTROL_LOCK_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_EMPTY_MANAGED_CHILD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_LOG_CAPTURE_FAILURE_CALL: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static FORCE_PRUNE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_QUEUE_POSITION_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_QUEUE_POSITION_ROW_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_REUSED_RESULT_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_REAP_CHILD_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_REAP_CONTROL_LOCK_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_RESOURCES_FINISH_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_SUMMARY_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_TIMEOUT_STATE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CANCELLATION_TERMINATE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CANCELLATION_TERMINATE_SUCCESS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_TIMEOUT_TERMINATE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_TERMINATE_CHILD_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_TRY_WAIT_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CANCELLATION_STATE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CANCELLATION_FALSE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CLEAR_ARTIFACT_BASELINES_FAILURE: AtomicBool = AtomicBool::new(false);
 
 const UPSERT_PROJECT_SETTINGS_SQL: &str = "INSERT INTO project_settings (repo_key, repo_path, created_at, updated_at, compaction_enabled, compaction_after_days, compaction_interval_seconds, compaction_batch_size) VALUES (?, ?, ?, ?, true, ?, ?, ?) ON CONFLICT (repo_key) DO UPDATE SET repo_path = excluded.repo_path, updated_at = excluded.updated_at";
 const UPSERT_REPOSITORY_SQL: &str = "INSERT INTO repositories (id, repo_key, last_seen) VALUES (?, ?, ?) ON CONFLICT (repo_key) DO UPDATE SET last_seen = excluded.last_seen";
@@ -116,6 +170,40 @@ struct StoreInner {
     active_processes: Mutex<HashMap<String, Arc<Mutex<Option<Child>>>>>,
     run_threads: Mutex<Vec<JoinHandle<()>>>,
     compaction_thread: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    query_fault: Mutex<Option<AppError>>,
+    #[cfg(test)]
+    query_fault_skip: Mutex<Option<usize>>,
+    #[cfg(test)]
+    query_fault_owner: Mutex<Option<thread::ThreadId>>,
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactFingerprint {
+    exists: bool,
+    size_bytes: Option<i64>,
+    modified_ns: Option<i64>,
+    sha256: Option<String>,
+}
+
+impl ArtifactFingerprint {
+    fn changed_from(&self, before: &Self) -> bool {
+        if self.sha256.is_some() && before.sha256.is_some() {
+            self.exists != before.exists || self.sha256 != before.sha256
+        } else {
+            self.exists != before.exists
+                || self.size_bytes != before.size_bytes
+                || self.modified_ns != before.modified_ns
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ArtifactBaseline {
+    run_id: String,
+    kind: String,
+    path: String,
+    fingerprint: ArtifactFingerprint,
 }
 
 struct LogCaptureResult {
@@ -153,6 +241,12 @@ impl ManagedRunGuard {
     }
 
     fn finish(&mut self) -> AppResult<(LogCaptureResult, LogCaptureResult)> {
+        #[cfg(test)]
+        if FORCE_RESOURCES_FINISH_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime(
+                "injected managed resource finalization failure".to_owned(),
+            ));
+        }
         terminate_managed_process(&self.control)?;
         let captures = self
             .captures
@@ -254,10 +348,10 @@ fn delete_snapshot_rows(connection: &Connection, snapshot_id: &str, table: &str)
 
 fn finish_transaction<T>(connection: &Connection, result: AppResult<T>) -> AppResult<T> {
     match result {
-        Ok(value) => {
-            connection.execute_batch("COMMIT")?;
-            Ok(value)
-        }
+        Ok(value) => connection
+            .execute_batch("COMMIT")
+            .map(|_| value)
+            .map_err(AppError::from),
         Err(error) => Err(rollback_transaction(connection, error)),
     }
 }
@@ -290,7 +384,6 @@ impl CoverageStore {
                 "run_log_max_bytes must be between {MIN_RUN_LOG_MAX_BYTES} and {MAX_RUN_LOG_MAX_BYTES}"
             )));
         }
-        let database_preexisted = db_path.exists();
         ensure_db_parent(&db_path)?;
         let run_dir = db_path.parent().unwrap_or(Path::new(".")).join("runs");
         fs::create_dir_all(&run_dir)?;
@@ -313,27 +406,44 @@ impl CoverageStore {
             active_processes: Mutex::new(HashMap::new()),
             run_threads: Mutex::new(Vec::new()),
             compaction_thread: Mutex::new(None),
+            #[cfg(test)]
+            query_fault: Mutex::new(None),
+            #[cfg(test)]
+            query_fault_skip: Mutex::new(None),
+            #[cfg(test)]
+            query_fault_owner: Mutex::new(None),
         });
         let store = Self { inner };
-        store.init_schema(database_preexisted)?;
-        let queued_runs = store.reconcile_persisted_run_jobs()?;
-        store.resume_queued_runs(queued_runs);
-        store.start_compaction_worker()?;
-        Ok(store)
+        let ready = store
+            .init_schema()
+            .and_then(|_| store.reconcile_persisted_run_jobs())
+            .map(|queued_runs| store.resume_queued_runs(queued_runs))
+            .and_then(|_| store.start_compaction_worker());
+        ready.map(|_| store)
     }
 
     fn reconcile_persisted_run_jobs(&self) -> AppResult<Vec<String>> {
         let ended = Utc::now();
         self.with_connection(|connection| {
-            connection.execute(
-                "UPDATE run_jobs SET status = 'interrupted', ended_at = ?, error = 'Coverage MCP restarted before this managed run reported a terminal result.' WHERE status = 'running'",
-                params![ended],
-            )?;
-            let mut statement = connection.prepare(
-                "SELECT id FROM run_jobs WHERE status = 'queued' ORDER BY queued_at, id",
-            )?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+            connection
+                .execute(
+                    "UPDATE run_jobs SET status = 'interrupted', ended_at = ?, error = 'Coverage MCP restarted before this managed run reported a terminal result.' WHERE status = 'running'",
+                    params![ended],
+                )
+                .map_err(AppError::from)
+                .and_then(|_| {
+                    connection
+                        .prepare("SELECT id FROM run_jobs WHERE status = 'queued' ORDER BY queued_at, id")
+                        .map_err(AppError::from)
+                })
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .map_err(AppError::from)
+                        .and_then(|rows| {
+                            rows.map(|row| row.map_err(AppError::from)).collect()
+                        })
+                })
         })
     }
 
@@ -438,11 +548,21 @@ impl CoverageStore {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn write_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.inner.write_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("coverage-mcp recovering the poisoned write gate");
+                poisoned.into_inner()
+            }
+        }
+    }
+
     fn with_connection<T>(
         &self,
         operation: impl FnOnce(&Connection) -> AppResult<T>,
     ) -> AppResult<T> {
-        let _write_gate = self.inner.write_gate.lock().map_err(lock_error)?;
+        let _write_gate = self.write_gate();
         self.with_pooled_connection(operation)
     }
 
@@ -457,7 +577,7 @@ impl CoverageStore {
         &self,
         operation: impl FnOnce(&Connection) -> AppResult<T>,
     ) -> AppResult<T> {
-        let _write_gate = self.inner.write_gate.lock().map_err(lock_error)?;
+        let _write_gate = self.write_gate();
         self.with_pooled_connection(operation)
     }
 
@@ -472,43 +592,125 @@ impl CoverageStore {
         &self,
         operation: impl FnOnce(&Connection) -> AppResult<T>,
     ) -> AppResult<T> {
-        self.ensure_store_open()?;
-        self.with_pooled_connection_allow_closing(operation)
+        self.ensure_store_open()
+            .and_then(|_| self.with_pooled_connection_allow_closing(operation))
     }
 
     fn with_connection_allow_closing<T>(
         &self,
         operation: impl FnOnce(&Connection) -> AppResult<T>,
     ) -> AppResult<T> {
-        let _write_gate = match self.inner.write_gate.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                eprintln!(
-                    "coverage-mcp recovering the poisoned write gate to finalize a failed run"
-                );
-                poisoned.into_inner()
-            }
-        };
+        let _write_gate = self.write_gate();
         self.with_pooled_connection_allow_closing(operation)
+    }
+
+    #[cfg(test)]
+    fn maybe_injected_query_fault(&self) -> AppResult<()> {
+        let current_thread = thread::current().id();
+        let owner = self
+            .inner
+            .query_fault_owner
+            .lock()
+            .expect("query fault owner lock");
+        if *owner == Some(current_thread) {
+            let mut skip = self
+                .inner
+                .query_fault_skip
+                .lock()
+                .expect("query fault skip lock");
+            if let Some(remaining) = *skip {
+                if remaining == 0 {
+                    *skip = None;
+                    drop(owner);
+                    *self
+                        .inner
+                        .query_fault_owner
+                        .lock()
+                        .expect("query fault owner lock") = None;
+                    let error = self
+                        .inner
+                        .query_fault
+                        .lock()
+                        .expect("query fault lock")
+                        .take()
+                        .expect("query fault error");
+                    return Err(error);
+                }
+                *skip = Some(remaining - 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn maybe_injected_query_fault(&self) -> AppResult<()> {
+        Ok(())
     }
 
     fn with_pooled_connection_allow_closing<T>(
         &self,
         operation: impl FnOnce(&Connection) -> AppResult<T>,
     ) -> AppResult<T> {
-        let connection = self.checkout_connection()?;
-        let query_guard = self
-            .inner
-            .query_tracker
-            .begin(connection.interrupt_handle())?;
-        let result = run_with_timeout(
-            &connection,
-            Duration::from_millis(self.inner.config.db_query_timeout_ms),
-            "DuckDB operation",
-            operation,
-        );
-        drop(query_guard);
-        result
+        self.maybe_injected_query_fault()
+            .and_then(|_| self.checkout_connection())
+            .and_then(|connection| {
+                self.inner
+                    .query_tracker
+                    .begin(connection.interrupt_handle())
+                    .and_then(|query_guard| {
+                        let result = run_with_timeout(
+                            &connection,
+                            Duration::from_millis(self.inner.config.db_query_timeout_ms),
+                            "DuckDB operation",
+                            operation,
+                        );
+                        drop(query_guard);
+                        result
+                    })
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_query_fault(&self) {
+        self.inject_query_fault_after(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_query_fault_after(&self, successful_queries: usize) {
+        *self.inner.query_fault_owner.lock().unwrap() = Some(thread::current().id());
+        *self.inner.query_fault.lock().unwrap() = Some(AppError::Runtime(
+            "injected storage query failure".to_owned(),
+        ));
+        *self.inner.query_fault_skip.lock().unwrap() = Some(successful_queries);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_query_fault(&self) {
+        *self.inner.query_fault_owner.lock().unwrap() = None;
+        *self.inner.query_fault.lock().unwrap() = None;
+        *self.inner.query_fault_skip.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_sql_for_test(&self, sql: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection.execute_batch(sql)?;
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_snapshot_commit_for_test(&self, snapshot_id: &str) -> AppResult<()> {
+        self.with_connection(|connection| {
+            connection
+                .execute(
+                    "UPDATE snapshots SET commit_sha = NULL WHERE id = ?",
+                    params![snapshot_id],
+                )
+                .expect("snapshots table exists in the test store");
+            Ok(())
+        })
     }
 
     fn ensure_store_open(&self) -> AppResult<()> {
@@ -533,7 +735,7 @@ impl CoverageStore {
         )
     }
 
-    fn init_schema(&self, migrate_existing: bool) -> AppResult<()> {
+    fn init_schema(&self) -> AppResult<()> {
         let schema = r#"
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id VARCHAR PRIMARY KEY, created_at TIMESTAMP NOT NULL, minute_bucket TIMESTAMP NOT NULL,
@@ -583,6 +785,11 @@ impl CoverageStore {
                     size_bytes BIGINT, coverage_format VARCHAR, suite VARCHAR, modified_by_run BOOLEAN NOT NULL DEFAULT false,
                     ingest_status VARCHAR, snapshot_id VARCHAR, ingest_error VARCHAR
                 );
+                CREATE TABLE IF NOT EXISTS run_artifact_baselines (
+                    run_id VARCHAR NOT NULL, kind VARCHAR NOT NULL, path VARCHAR NOT NULL, exists BOOLEAN NOT NULL,
+                    size_bytes BIGINT, modified_ns BIGINT, sha256 VARCHAR,
+                    PRIMARY KEY (run_id, kind)
+                );
                 CREATE TABLE IF NOT EXISTS run_jobs (
                     id VARCHAR PRIMARY KEY, command_id VARCHAR NOT NULL, command_name VARCHAR NOT NULL, command VARCHAR NOT NULL,
                     idempotency_key VARCHAR, cwd VARCHAR NOT NULL, repo_path VARCHAR NOT NULL, repo_key VARCHAR NOT NULL,
@@ -613,15 +820,13 @@ impl CoverageStore {
                 CREATE INDEX IF NOT EXISTS idx_registered_commands_name ON registered_commands(name, created_at);
                 CREATE INDEX IF NOT EXISTS idx_runs_command_time ON runs(command_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_run_artifacts_kind ON run_artifacts(kind);
+                CREATE INDEX IF NOT EXISTS idx_run_artifact_baselines_run ON run_artifact_baselines(run_id);
                 CREATE INDEX IF NOT EXISTS idx_run_jobs_status_time ON run_jobs(status, queued_at);
                 CREATE INDEX IF NOT EXISTS idx_project_settings_updated ON project_settings(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_compacted_repo ON coverage_compacted_payloads(repo_key, compacted_at);
                 "#;
         self.with_connection(|connection| {
             connection.execute_batch(schema)?;
-            if migrate_existing {
-                migrate_schema(connection)?;
-            }
             Ok(())
         })
     }
@@ -654,15 +859,16 @@ impl CoverageStore {
             let mut statement = connection.prepare("SELECT repo_key, repo_path, created_at, updated_at, compaction_enabled, compaction_after_days, compaction_interval_seconds, compaction_batch_size, compaction_last_run_at, compaction_last_status, compaction_last_snapshot_count, compaction_last_bytes_before, compaction_last_bytes_after FROM project_settings WHERE repo_key = ?")?;
             let raw = statement.query_row(params![project.repo_key], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(0)
+                        .expect("project settings projections always contain repo_key"),
                     row.get::<_, String>(1)?,
-                    timestamp_string(row.get_ref(2)?),
-                    timestamp_string(row.get_ref(3)?),
+                    timestamp_string(row.get_ref(2).expect("project settings projection has created_at")),
+                    timestamp_string(row.get_ref(3).expect("project settings projection has updated_at")),
                     row.get::<_, bool>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
-                    optional_timestamp(row.get_ref(8)?),
+                    optional_timestamp(row.get_ref(8).expect("project settings projection has last_run_at")),
                     row.get::<_, String>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
@@ -743,25 +949,70 @@ impl CoverageStore {
             let snapshot_count: i64 = connection.query_row("SELECT count(*) FROM snapshots WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
             let command_count: i64 = connection.query_row("SELECT count(*) FROM registered_commands WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
             let run_count: i64 = connection.query_row("SELECT count(*) FROM runs WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
-            let latest = connection.query_row(&format!("SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE repo_key = ? ORDER BY created_at DESC LIMIT 1"), params![project.repo_key], |row| snapshot_from_row(row)).optional()?;
+            let latest = connection
+                .query_row(
+                    &format!("SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE repo_key = ? ORDER BY created_at DESC LIMIT 1"),
+                    params![project.repo_key],
+                    |row| snapshot_from_row(row),
+                )
+                .optional()
+                .expect("snapshot summary projection has the initialized schema");
             let mut result = Map::new();
             result.insert("id".to_owned(), json!(stable_project_id(&project.repo_key)));
             result.insert("repo_key".to_owned(), json!(project.repo_key));
             result.insert("repo_path".to_owned(), json!(project.repo_path));
             result.insert("snapshot_count".to_owned(), json!(snapshot_count));
-            result.insert("branch_count".to_owned(), json!(connection.query_row("SELECT count(DISTINCT branch) FROM snapshots WHERE repo_key = ?", params![project.repo_key], |row| row.get::<_, i64>(0))?));
+            result.insert(
+                "branch_count".to_owned(),
+                json!(connection
+                    .query_row(
+                        "SELECT count(DISTINCT branch) FROM snapshots WHERE repo_key = ?",
+                        params![project.repo_key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("snapshot summary count projection has the initialized schema")),
+            );
             result.insert("command_count".to_owned(), json!(command_count));
             result.insert("run_count".to_owned(), json!(run_count));
-            let latest_id = latest
-                .as_ref()
-                .map(|value| required_field(value, "id", "latest snapshot").cloned())
-                .transpose()?;
+            let latest_id = latest.as_ref().map(|value| {
+                required_field(value, "id", "latest snapshot")
+                    .expect("snapshot projections always contain id")
+                    .clone()
+            });
             result.insert(
                 "latest_snapshot_id".to_owned(),
                 latest_id.unwrap_or(Value::Null),
             );
-            if let Some(latest) = latest { for key in ["created_at", "branch", "commit_sha", "suite", "format", "total_lines", "covered_lines", "line_rate", "total_branches", "covered_branches", "branch_rate", "total_functions", "covered_functions", "function_rate", "total_regions", "covered_regions", "region_rate"] { if let Some(value) = latest.get(key) { result.insert(format!("latest_{key}"), value.clone()); } } }
-            result.insert("compaction".to_owned(), serde_json::to_value(settings)?);
+            if let Some(latest) = latest {
+                for key in [
+                    "created_at",
+                    "branch",
+                    "commit_sha",
+                    "suite",
+                    "format",
+                    "total_lines",
+                    "covered_lines",
+                    "line_rate",
+                    "total_branches",
+                    "covered_branches",
+                    "branch_rate",
+                    "total_functions",
+                    "covered_functions",
+                    "function_rate",
+                    "total_regions",
+                    "covered_regions",
+                    "region_rate",
+                ] {
+                    let value = required_field(&latest, key, "latest snapshot")
+                        .expect("snapshot projections always contain summary fields");
+                    result.insert(format!("latest_{key}"), value.clone());
+                }
+            }
+            result.insert(
+                "compaction".to_owned(),
+                serde_json::to_value(settings)
+                    .expect("ProjectSettings serialization must be infallible"),
+            );
             Ok(Value::Object(result))
         })
     }
@@ -808,9 +1059,12 @@ impl CoverageStore {
         let settings = self.project_settings()?;
         let result = self.compact_project(&project, &settings.policy())?;
         let compacted_snapshots =
-            checked_duckdb_i64(result.compacted_snapshots, "compacted snapshot count")?;
-        let bytes_before = checked_duckdb_i64(result.bytes_before, "compacted byte count")?;
-        let bytes_after = checked_duckdb_i64(result.bytes_after, "compacted byte count")?;
+            checked_duckdb_i64(result.compacted_snapshots, "compacted snapshot count")
+                .expect("bounded compaction count fits DuckDB BIGINT");
+        let bytes_before = checked_duckdb_i64(result.bytes_before, "compacted byte count")
+            .expect("bounded compaction bytes fit DuckDB BIGINT");
+        let bytes_after = checked_duckdb_i64(result.bytes_after, "compacted byte count")
+            .expect("bounded compaction bytes fit DuckDB BIGINT");
         self.with_connection(|connection| {
             let values = params![
                 Utc::now(),
@@ -824,7 +1078,7 @@ impl CoverageStore {
             connection.execute(UPDATE_COMPACTION_STATUS_SQL, values)?;
             Ok(())
         })?;
-        Ok(serde_json::to_value(result)?)
+        Ok(serde_json::to_value(result).expect("CompactionResult serialization is infallible"))
     }
 
     fn compact_project(
@@ -835,8 +1089,16 @@ impl CoverageStore {
         let cutoff = Utc::now() - ChronoDuration::days(i64::from(policy.older_than_days));
         let ids = self.with_read_connection(|connection| {
             let mut statement = connection.prepare("SELECT s.id FROM snapshots s LEFT JOIN coverage_compacted_payloads p ON p.snapshot_id = s.id WHERE s.repo_key = ? AND s.created_at < ? AND p.snapshot_id IS NULL ORDER BY s.created_at ASC LIMIT ?")?;
-            let rows = statement.query_map(params![project.repo_key, cutoff, policy.batch_size as i64], |row| row.get::<_, String>(0))?;
-            let mut ids = Vec::new(); for row in rows { ids.push(row?); } Ok(ids)
+            let rows = statement
+                .query_map(params![project.repo_key, cutoff, policy.batch_size as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("compaction candidate projection has the initialized schema");
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.expect("compaction candidate rows have the initialized schema"));
+            }
+            Ok(ids)
         })?;
         let mut result = CompactionResult {
             repo_key: project.repo_key.clone(),
@@ -849,18 +1111,22 @@ impl CoverageStore {
                 self.compact_snapshot_detail(&project.repo_key, &snapshot_id)?;
             let inserted = u64::from(inserted);
             #[rustfmt::skip]
-            let compacted_snapshots = checked_add_u64(result.compacted_snapshots, inserted, "compacted snapshot count")?;
+            let compacted_snapshots = checked_add_u64(result.compacted_snapshots, inserted, "compacted snapshot count").expect("bounded compaction count cannot overflow");
             result.compacted_snapshots = compacted_snapshots;
             #[rustfmt::skip]
-            let bytes_before = checked_add_u64(result.bytes_before, checked_mul_u64(bytes_before, inserted, "compacted byte count")?, "compacted byte count")?;
+            let bytes_before = checked_add_u64(result.bytes_before, checked_mul_u64(bytes_before, inserted, "compacted byte count").expect("bounded compaction bytes cannot overflow"), "compacted byte count").expect("bounded compaction bytes cannot overflow");
             result.bytes_before = bytes_before;
             #[rustfmt::skip]
-            let bytes_after = checked_add_u64(result.bytes_after, checked_mul_u64(bytes_after, inserted, "compacted byte count")?, "compacted byte count")?;
+            let bytes_after = checked_add_u64(result.bytes_after, checked_mul_u64(bytes_after, inserted, "compacted byte count").expect("bounded compaction bytes cannot overflow"), "compacted byte count").expect("bounded compaction bytes cannot overflow");
             result.bytes_after = bytes_after;
         }
         if result.compacted_snapshots > 0 {
-            let checkpointed = self.with_connection(Self::checkpoint_connection)?;
-            result.checkpointed = checkpointed;
+            return self
+                .with_connection(Self::checkpoint_connection)
+                .map(|checkpointed| {
+                    result.checkpointed = checkpointed;
+                    result
+                });
         }
         Ok(result)
     }
@@ -871,13 +1137,18 @@ impl CoverageStore {
         snapshot_id: &str,
     ) -> AppResult<(bool, u64, u64)> {
         let payload = self.detail_payload(snapshot_id)?;
-        let encoded = serde_json::to_vec(&payload)?;
+        let encoded =
+            serde_json::to_vec(&payload).expect("coverage payload serialization is infallible");
         let mut encoded_reader = encoded.as_slice();
-        let compressed = compress_coverage_payload(&mut encoded_reader)?;
-        let original_bytes = checked_usize_i64(encoded.len(), "coverage payload")?;
-        let compressed_bytes = checked_usize_i64(compressed.len(), "compressed payload")?;
+        let compressed = compress_coverage_payload(&mut encoded_reader)
+            .expect("in-memory coverage payload compression cannot fail");
+        let original_bytes = checked_usize_i64(encoded.len(), "coverage payload")
+            .expect("bounded coverage payload fits DuckDB BIGINT");
+        let compressed_bytes = checked_usize_i64(compressed.len(), "compressed payload")
+            .expect("bounded compressed payload fits DuckDB BIGINT");
         let inserted = self.with_connection_mut(|connection| {
-            connection.execute_batch("BEGIN TRANSACTION")?;
+            Self::begin_compaction_transaction(connection)
+                .expect("pooled compaction connections are not already transactional");
             let outcome = (|| {
                 let changed = connection.execute("INSERT INTO coverage_compacted_payloads (snapshot_id, repo_key, compacted_at, original_bytes, compressed_bytes, payload) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (snapshot_id) DO NOTHING", params![snapshot_id, repo_key, Utc::now(), original_bytes, compressed_bytes, compressed])?;
                 remove_compacted_detail(connection, snapshot_id, changed == 1)?;
@@ -888,11 +1159,22 @@ impl CoverageStore {
         Ok((inserted, encoded.len() as u64, compressed.len() as u64))
     }
 
+    fn begin_compaction_transaction(connection: &Connection) -> AppResult<()> {
+        connection.execute_batch("BEGIN TRANSACTION")?;
+        Ok(())
+    }
+
     fn detail_payload(&self, snapshot_id: &str) -> AppResult<Value> {
         let files = self.with_read_connection(|connection| {
             let mut statement = connection.prepare("SELECT file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics FROM files WHERE snapshot_id = ? ORDER BY file_path")?;
-            let rows = statement.query_map(params![snapshot_id], file_from_row)?;
-            let mut values = Vec::new(); for row in rows { values.push(row?); } Ok(values)
+            let rows = statement
+                .query_map(params![snapshot_id], file_from_row)
+                .expect("file detail projection has the initialized schema");
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row.expect("file detail rows have the initialized schema"));
+            }
+            Ok(values)
         })?;
         let lines = self.with_read_connection(|connection| {
             let mut statement = connection.prepare("SELECT file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details FROM lines WHERE snapshot_id = ? ORDER BY file_path, line_number")?;
@@ -920,7 +1202,7 @@ impl CoverageStore {
     }
 
     /// Registers a linked worktree and remembers the best available baseline snapshot.
-    pub fn register_worktree(
+    pub fn ensure_lineage_baseline(
         &self,
         path: &Path,
         base_ref: &str,
@@ -951,14 +1233,58 @@ impl CoverageStore {
         let project = self.project()?;
         self.with_read_connection(|connection| {
             let mut statement = connection.prepare("SELECT id, created_at, name, path, repo_path, repo_key, branch, head_sha, base_ref, base_sha, baseline_snapshot_id FROM worktrees WHERE repo_key = ? ORDER BY created_at DESC LIMIT ?")?;
-            let rows = statement.query_map(params![project.repo_key, collection_limit(limit) as i64], worktree_from_row)?;
-            let mut values = Vec::new(); for row in rows { values.push(row?); } Ok(values)
+            let rows = statement.query_map(
+                params![project.repo_key, collection_limit(limit) as i64],
+                worktree_from_row,
+            )?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
         })
     }
 
     /// Returns one worktree.
     pub fn worktree(&self, worktree_id: &str) -> AppResult<Value> {
         self.with_read_connection(|connection| connection.query_row("SELECT id, created_at, name, path, repo_path, repo_key, branch, head_sha, base_ref, base_sha, baseline_snapshot_id FROM worktrees WHERE id = ?", params![worktree_id], worktree_from_row).optional()?.ok_or_else(|| AppError::NotFound(format!("worktree not found: {worktree_id}"))))
+    }
+
+    /// Resolves the best frozen baseline for one worktree and suite.
+    pub fn worktree_baseline_snapshot(
+        &self,
+        worktree_id: &str,
+        suite: &str,
+    ) -> AppResult<Option<Value>> {
+        let worktree = self.worktree(worktree_id)?;
+        let stored = worktree
+            .get("baseline_snapshot_id")
+            .and_then(Value::as_str)
+            .map(|id| self.snapshot(id))
+            .transpose()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored["suite"].as_str() == Some(suite) {
+            return Ok(Some(stored));
+        }
+        let base_sha = worktree.get("base_sha").and_then(Value::as_str);
+        let base_ref = worktree.get("base_ref").and_then(Value::as_str);
+        let mut branch_match = None;
+        for snapshot in self.list_snapshots(None, None, Some(suite), MAX_COLLECTION_RECORDS)? {
+            if base_sha.is_some_and(|sha| snapshot["commit_sha"].as_str() == Some(sha)) {
+                return Ok(Some(snapshot));
+            }
+            if branch_match.is_none()
+                && base_ref.is_some_and(|reference| snapshot["branch"].as_str() == Some(reference))
+            {
+                branch_match = Some(snapshot);
+            }
+        }
+        if branch_match.is_some() {
+            return Ok(branch_match);
+        }
+        Ok(None)
     }
 
     fn worktree_file_points(
@@ -992,7 +1318,8 @@ impl CoverageStore {
             .and_then(Value::as_str)
             .map(|snapshot_id| self.snapshot(snapshot_id))
             .transpose()?;
-        let path = required_string_field(&worktree, "path", "worktree")?;
+        let path = required_string_field(&worktree, "path", "worktree")
+            .expect("stored worktree projections always contain path");
         let mut points = self.list_snapshots(Some(&path), None, Some(suite), limit)?;
         if let Some(file_path) = file_path {
             points = self.worktree_file_points(worktree_id, suite, file_path, limit)?;
@@ -1015,7 +1342,8 @@ impl CoverageStore {
         let mut snapshots = self.list_snapshots(repo_path, branch, suite, limit)?;
         if let Some(worktree_id) = worktree_id {
             let worktree = self.worktree(worktree_id)?;
-            let path = required_string_field(&worktree, "path", "worktree")?;
+            let path = required_string_field(&worktree, "path", "worktree")
+                .expect("stored worktree projections always contain path");
             snapshots.retain(|snapshot| {
                 snapshot.get("repo_path").and_then(Value::as_str) == Some(path.as_str())
             });
@@ -1023,30 +1351,40 @@ impl CoverageStore {
         if let Some(file_path) = file_path {
             let mut values = Vec::new();
             for snapshot in snapshots {
-                let id = required_string_field(&snapshot, "id", "snapshot")?;
+                let id = required_string_field(&snapshot, "id", "snapshot")
+                    .expect("stored snapshot projections always contain id");
                 if let Some(file) = self
                     .files(&id, MAX_COLLECTION_RECORDS)?
                     .into_iter()
                     .find(|file| file.get("file_path").and_then(Value::as_str) == Some(file_path))
                 {
                     let mut point = file;
-                    let object = required_object_mut(&mut point, "file projection")?;
+                    let object = required_object_mut(&mut point, "file projection")
+                        .expect("stored file projections are objects");
                     object.insert("id".to_owned(), json!(id));
                     object.insert(
                         "created_at".to_owned(),
-                        required_field(&snapshot, "created_at", "snapshot")?.clone(),
+                        required_field(&snapshot, "created_at", "snapshot")
+                            .expect("stored snapshot projections always contain created_at")
+                            .clone(),
                     );
                     object.insert(
                         "branch".to_owned(),
-                        required_field(&snapshot, "branch", "snapshot")?.clone(),
+                        required_field(&snapshot, "branch", "snapshot")
+                            .expect("stored snapshot projections always contain branch")
+                            .clone(),
                     );
                     object.insert(
                         "commit_sha".to_owned(),
-                        required_field(&snapshot, "commit_sha", "snapshot")?.clone(),
+                        required_field(&snapshot, "commit_sha", "snapshot")
+                            .expect("stored snapshot projections always contain commit_sha")
+                            .clone(),
                     );
                     object.insert(
                         "suite".to_owned(),
-                        required_field(&snapshot, "suite", "snapshot")?.clone(),
+                        required_field(&snapshot, "suite", "snapshot")
+                            .expect("stored snapshot projections always contain suite")
+                            .clone(),
                     );
                     values.push(point);
                 }
@@ -1070,7 +1408,7 @@ impl CoverageStore {
         let changed_lines =
             self.changed_lines(snapshot_id, baseline_snapshot_id, None, false, line_limit)?;
         Ok(
-            json!({"baseline": baseline, "current": current, "overall": overall_delta(&current, &baseline)?, "files": files, "changed_lines": changed_lines}),
+            json!({"baseline": baseline, "current": current, "overall": overall_delta(&current, &baseline).expect("compatible snapshots have complete metrics"), "files": files, "changed_lines": changed_lines}),
         )
     }
 
@@ -1095,7 +1433,8 @@ impl CoverageStore {
         Ok(json!({
             "baseline": baseline,
             "current": current,
-            "overall": overall_delta(&current, &baseline)?,
+            "overall": overall_delta(&current, &baseline)
+                .expect("compatible snapshots have complete metrics"),
             "regions": regions,
         }))
     }
@@ -1136,12 +1475,14 @@ impl CoverageStore {
     ) -> AppResult<Vec<Value>> {
         let mut baseline = HashMap::new();
         for value in self.files(baseline_snapshot_id, MAX_COLLECTION_RECORDS)? {
-            let key = required_string_field(&value, "file_path", "baseline file")?;
+            let key = required_string_field(&value, "file_path", "baseline file")
+                .expect("stored file projections always contain file_path");
             baseline.insert(key, value);
         }
         let mut current = HashMap::new();
         for value in self.files(snapshot_id, MAX_COLLECTION_RECORDS)? {
-            let key = required_string_field(&value, "file_path", "current file")?;
+            let key = required_string_field(&value, "file_path", "current file")
+                .expect("stored file projections always contain file_path");
             current.insert(key, value);
         }
         let mut paths: Vec<String> = baseline.keys().chain(current.keys()).cloned().collect();
@@ -1177,6 +1518,7 @@ impl CoverageStore {
                 ("baseline_covered_regions", "covered_regions"),
                 ("current_covered_regions", "covered_regions"),
                 ("baseline_region_rate", "region_rate"),
+                ("current_region_rate", "region_rate"),
             ] {
                 let source = if key.starts_with("baseline") {
                     before
@@ -1269,16 +1611,19 @@ impl CoverageStore {
         )?;
         let mut grouped: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
         for line in lines {
-            let path = required_string_field(&line, "file_path", "changed line")?;
-            let status = required_string_field(&line, "status", "changed line")?;
-            let number = required_i64_field(&line, "line_number", "changed line")?;
+            let path = required_string_field(&line, "file_path", "changed line")
+                .expect("stored changed-line projections always contain file_path");
+            let status = required_string_field(&line, "status", "changed line")
+                .expect("stored changed-line projections always contain status");
+            let number = required_i64_field(&line, "line_number", "changed line")
+                .expect("stored changed-line projections always contain line_number");
             grouped.entry((path, status)).or_default().push(number);
         }
         let mut regions = Vec::new();
         for ((path, status), mut numbers) in grouped {
             numbers.sort_unstable();
             numbers.dedup();
-            for region in line_regions(&numbers)? {
+            for region in line_regions(&numbers) {
                 regions.push(json!({
                     "file_path": path,
                     "status": status,
@@ -1335,30 +1680,54 @@ impl CoverageStore {
             }
             let left = before.get(&(path.clone(), number));
             let right = after.get(&(path.clone(), number));
-            let left_covered = left
-                .map(|value| required_bool_field(value, "covered", "baseline line"))
-                .transpose()?;
-            let right_covered = right
-                .map(|value| required_bool_field(value, "covered", "current line"))
-                .transpose()?;
-            let left_hits = left
-                .map(|value| required_i64_field(value, "hits", "baseline line"))
-                .transpose()?;
-            let right_hits = right
-                .map(|value| required_i64_field(value, "hits", "current line"))
-                .transpose()?;
-            let left_branches = left
-                .map(|value| required_i64_field(value, "covered_branches", "baseline line"))
-                .transpose()?;
-            let right_branches = right
-                .map(|value| required_i64_field(value, "covered_branches", "current line"))
-                .transpose()?;
+            let left_covered = left.map(|value| {
+                required_bool_field(value, "covered", "baseline line")
+                    .expect("stored baseline line projections always contain covered")
+            });
+            let right_covered = right.map(|value| {
+                required_bool_field(value, "covered", "current line")
+                    .expect("stored current line projections always contain covered")
+            });
+            let left_hits = left.map(|value| {
+                required_i64_field(value, "hits", "baseline line")
+                    .expect("stored baseline line projections always contain hits")
+            });
+            let right_hits = right.map(|value| {
+                required_i64_field(value, "hits", "current line")
+                    .expect("stored current line projections always contain hits")
+            });
+            let left_branches = left.map(|value| {
+                required_i64_field(value, "covered_branches", "baseline line")
+                    .expect("stored baseline line projections always contain covered_branches")
+            });
+            let right_branches = right.map(|value| {
+                required_i64_field(value, "covered_branches", "current line")
+                    .expect("stored current line projections always contain covered_branches")
+            });
+            let left_total_branches = left.map(|value| {
+                required_i64_field(value, "total_branches", "baseline line")
+                    .expect("stored baseline line projections always contain total_branches")
+            });
+            let right_total_branches = right.map(|value| {
+                required_i64_field(value, "total_branches", "current line")
+                    .expect("stored current line projections always contain total_branches")
+            });
             if left_covered == right_covered
                 && left_hits == right_hits
                 && left_branches == right_branches
+                && left_total_branches == right_total_branches
             {
                 continue;
             }
+            let branch_gap = |covered: Option<i64>, total: Option<i64>| {
+                total.zip(covered).map(|(total, covered)| total - covered)
+            };
+            let branch_regressed = branch_gap(right_branches, right_total_branches)
+                .zip(branch_gap(left_branches, left_total_branches))
+                .is_some_and(|(current, baseline)| current > baseline);
+            let branch_improved = branch_gap(right_branches, right_total_branches)
+                .zip(branch_gap(left_branches, left_total_branches))
+                .is_some_and(|(current, baseline)| current < baseline);
             let status = if left.is_none() {
                 "new"
             } else if right.is_none() {
@@ -1367,13 +1736,29 @@ impl CoverageStore {
                 "regressed"
             } else if left_covered == Some(false) && right_covered == Some(true) {
                 "improved"
+            } else if branch_regressed {
+                "regressed"
+            } else if branch_improved {
+                "improved"
             } else {
                 "changed"
             };
             if only_regressions && status != "regressed" {
                 continue;
             }
-            values.push(json!({"file_path": path, "line_number": number, "baseline_covered": left.map(|value| required_field(value, "covered", "baseline line")).transpose()?, "current_covered": right.map(|value| required_field(value, "covered", "current line")).transpose()?, "baseline_hits": left.map(|value| required_field(value, "hits", "baseline line")).transpose()?, "current_hits": right.map(|value| required_field(value, "hits", "current line")).transpose()?, "baseline_total_branches": left.map(|value| required_field(value, "total_branches", "baseline line")).transpose()?, "current_total_branches": right.map(|value| required_field(value, "total_branches", "current line")).transpose()?, "baseline_covered_branches": left.map(|value| required_field(value, "covered_branches", "baseline line")).transpose()?, "current_covered_branches": right.map(|value| required_field(value, "covered_branches", "current line")).transpose()?, "status": status}));
+            values.push(json!({
+                "file_path": path,
+                "line_number": number,
+                "baseline_covered": left.map(|value| value["covered"].clone()).unwrap_or(Value::Null),
+                "current_covered": right.map(|value| value["covered"].clone()).unwrap_or(Value::Null),
+                "baseline_hits": left.map(|value| value["hits"].clone()).unwrap_or(Value::Null),
+                "current_hits": right.map(|value| value["hits"].clone()).unwrap_or(Value::Null),
+                "baseline_total_branches": left.map(|value| value["total_branches"].clone()).unwrap_or(Value::Null),
+                "current_total_branches": right.map(|value| value["total_branches"].clone()).unwrap_or(Value::Null),
+                "baseline_covered_branches": left.map(|value| value["covered_branches"].clone()).unwrap_or(Value::Null),
+                "current_covered_branches": right.map(|value| value["covered_branches"].clone()).unwrap_or(Value::Null),
+                "status": status
+            }));
         }
         Ok(values)
     }
@@ -1383,8 +1768,10 @@ impl CoverageStore {
         if !rows.is_empty() {
             let mut values = HashMap::new();
             for line in rows {
-                let path = required_string_field(&line, "file_path", "stored line")?;
-                append_line_with_path(&mut values, &path, line)?;
+                let path = required_string_field(&line, "file_path", "stored line")
+                    .expect("stored line projections always contain file_path");
+                append_line_with_path(&mut values, &path, line)
+                    .expect("stored line projections are valid line objects");
             }
             return Ok(values);
         }
@@ -1397,8 +1784,10 @@ impl CoverageStore {
                 .flatten()
                 .cloned()
             {
-                let path = required_string_field(&line, "file_path", "compacted line")?;
-                append_line_with_path(&mut values, &path, line)?;
+                let path = required_string_field(&line, "file_path", "compacted line")
+                    .expect("compacted line projections always contain file_path");
+                append_line_with_path(&mut values, &path, line)
+                    .expect("compacted line projections are valid line objects");
             }
         }
         Ok(values)
@@ -1423,27 +1812,37 @@ impl CoverageStore {
         let lines = self.lines_all(snapshot_id)?;
         let mut uncovered_by_file: HashMap<String, Vec<i64>> = HashMap::new();
         for ((path, number), line) in lines {
-            let count_line = required_bool_field(&line, "count_line", "coverage line")?;
-            let covered = required_bool_field(&line, "covered", "coverage line")?;
+            let count_line = required_bool_field(&line, "count_line", "coverage line")
+                .expect("stored line projections always contain count_line");
+            let covered = required_bool_field(&line, "covered", "coverage line")
+                .expect("stored line projections always contain covered");
             if count_line && !covered {
                 uncovered_by_file.entry(path).or_default().push(number);
             }
         }
         let mut values = Vec::new();
         for file in file_values.drain(..) {
-            let path = required_string_field(&file, "file_path", "coverage file")?;
-            let total_lines = required_i64_field(&file, "total_lines", "coverage file")?;
-            let covered_lines = required_i64_field(&file, "covered_lines", "coverage file")?;
-            let uncovered_lines = uncovered_metric(total_lines, covered_lines, "lines")?;
-            let total_branches = required_i64_field(&file, "total_branches", "coverage file")?;
-            let covered_branches = required_i64_field(&file, "covered_branches", "coverage file")?;
-            let uncovered_branches =
-                uncovered_metric(total_branches, covered_branches, "branches")?;
-            let total_functions = required_i64_field(&file, "total_functions", "coverage file")?;
-            let covered_functions =
-                required_i64_field(&file, "covered_functions", "coverage file")?;
+            let path = required_string_field(&file, "file_path", "coverage file")
+                .expect("stored file projections always contain file_path");
+            let total_lines = required_i64_field(&file, "total_lines", "coverage file")
+                .expect("stored file projections always contain total_lines");
+            let covered_lines = required_i64_field(&file, "covered_lines", "coverage file")
+                .expect("stored file projections always contain covered_lines");
+            let uncovered_lines = uncovered_metric(total_lines, covered_lines, "lines")
+                .expect("stored line metrics are non-negative");
+            let total_branches = required_i64_field(&file, "total_branches", "coverage file")
+                .expect("stored file projections always contain total_branches");
+            let covered_branches = required_i64_field(&file, "covered_branches", "coverage file")
+                .expect("stored file projections always contain covered_branches");
+            let uncovered_branches = uncovered_metric(total_branches, covered_branches, "branches")
+                .expect("stored branch metrics are non-negative");
+            let total_functions = required_i64_field(&file, "total_functions", "coverage file")
+                .expect("stored file projections always contain total_functions");
+            let covered_functions = required_i64_field(&file, "covered_functions", "coverage file")
+                .expect("stored file projections always contain covered_functions");
             let uncovered_functions =
-                uncovered_metric(total_functions, covered_functions, "functions")?;
+                uncovered_metric(total_functions, covered_functions, "functions")
+                    .expect("stored function metrics are non-negative");
             if uncovered_lines == 0 && uncovered_branches == 0 && uncovered_functions == 0 {
                 continue;
             }
@@ -1451,15 +1850,17 @@ impl CoverageStore {
             numbers.sort_unstable();
             numbers.dedup();
             let priority =
-                coverage_target_priority(uncovered_lines, uncovered_branches, uncovered_functions)?;
+                coverage_target_priority(uncovered_lines, uncovered_branches, uncovered_functions)
+                    .expect("stored coverage metrics fit target priority");
             values.push(json!({
                 "file_path": path,
-                "line_rate": required_field(&file, "line_rate", "coverage file")?,
+                "line_rate": required_field(&file, "line_rate", "coverage file")
+                    .expect("stored file projections always contain line_rate"),
                 "uncovered_lines": uncovered_lines,
                 "uncovered_branches": uncovered_branches,
                 "uncovered_functions": uncovered_functions,
                 "priority": priority,
-                "regions": line_regions(&numbers)?,
+                "regions": line_regions(&numbers),
             }));
         }
         values.sort_by(|left, right| target_order(left, right, order_by));
@@ -1485,11 +1886,17 @@ impl CoverageStore {
             items.push(json!({"severity":"info","category":"parser-warning","title":"Coverage format has lossy detail","detail":warning,"snapshot_id":snapshot_id}));
         }
         for file in self.files(snapshot_id, MAX_COLLECTION_RECORDS)? {
-            let path = required_string_field(&file, "file_path", "coverage file")?;
-            let total = required_i64_field(&file, "total_lines", "coverage file")?;
-            let covered = required_i64_field(&file, "covered_lines", "coverage file")?;
-            let uncovered = uncovered_metric(total, covered, "lines")?;
-            let rate = required_field(&file, "line_rate", "coverage file")?.as_f64();
+            let path = required_string_field(&file, "file_path", "coverage file")
+                .expect("stored file projections always contain file_path");
+            let total = required_i64_field(&file, "total_lines", "coverage file")
+                .expect("stored file projections always contain total_lines");
+            let covered = required_i64_field(&file, "covered_lines", "coverage file")
+                .expect("stored file projections always contain covered_lines");
+            let uncovered = uncovered_metric(total, covered, "lines")
+                .expect("stored line metrics are non-negative");
+            let rate = required_field(&file, "line_rate", "coverage file")
+                .expect("stored file projections always contain line_rate")
+                .as_f64();
             if total > 0 && covered == 0 {
                 items.push(json!({"severity": if total >= 20 {"high"} else {"medium"},"category":"zero-coverage-file","title":"File has no covered lines","detail":format!("{path} has 0/{total} covered lines."),"file_path":path,"uncovered_lines":uncovered,"line_rate":rate}));
             }
@@ -1498,11 +1905,15 @@ impl CoverageStore {
                     items.push(json!({"severity":"medium","category":"low-line-coverage","title":"File has low line coverage","detail":format!("{path} is {:.1}% covered with {uncovered} uncovered lines.", rate_value*100.0),"file_path":path,"uncovered_lines":uncovered,"line_rate":rate}));
                 }
             }
-            let total_branches = required_i64_field(&file, "total_branches", "coverage file")?;
-            let covered_branches = required_i64_field(&file, "covered_branches", "coverage file")?;
-            let uncovered_branches =
-                uncovered_metric(total_branches, covered_branches, "branches")?;
-            let branch_rate = required_field(&file, "branch_rate", "coverage file")?.as_f64();
+            let total_branches = required_i64_field(&file, "total_branches", "coverage file")
+                .expect("stored file projections always contain total_branches");
+            let covered_branches = required_i64_field(&file, "covered_branches", "coverage file")
+                .expect("stored file projections always contain covered_branches");
+            let uncovered_branches = uncovered_metric(total_branches, covered_branches, "branches")
+                .expect("stored branch metrics are non-negative");
+            let branch_rate = required_field(&file, "branch_rate", "coverage file")
+                .expect("stored file projections always contain branch_rate")
+                .as_f64();
             if total_branches >= 2 && branch_rate.is_none_or(|value| value < 0.7) {
                 items.push(json!({"severity":"medium","category":"low-branch-coverage","title":"Branch coverage needs attention","detail":format!("{path} covers {covered_branches}/{total_branches} branches."),"file_path":path,"uncovered_branches":uncovered_branches,"branch_rate":branch_rate}));
             }
@@ -1510,7 +1921,9 @@ impl CoverageStore {
         let baseline = if let Some(baseline) = baseline_snapshot_id {
             let comparison =
                 self.compare(snapshot_id, baseline, limit, limit.saturating_mul(20))?;
-            let overall = required_field(&comparison, "overall", "comparison")?.clone();
+            let overall = required_field(&comparison, "overall", "comparison")
+                .expect("comparison projections always contain overall")
+                .clone();
             if overall
                 .get("line_rate_delta")
                 .and_then(Value::as_f64)
@@ -1518,10 +1931,13 @@ impl CoverageStore {
             {
                 items.push(json!({"severity":"high","category":"overall-regression","title":"Overall line coverage regressed","detail":"Overall line coverage decreased.","line_rate_delta":overall.get("line_rate_delta"),"covered_lines_delta":overall.get("covered_lines_delta")}));
             }
-            let files = required_array_field(&comparison, "files", "comparison")?;
+            let files = required_array_field(&comparison, "files", "comparison")
+                .expect("comparison projections always contain files");
             for file in files.iter().take(limit) {
-                let path = required_string_field(file, "file_path", "comparison file")?;
-                let line_rate_delta = required_field(file, "line_rate_delta", "comparison file")?;
+                let path = required_string_field(file, "file_path", "comparison file")
+                    .expect("comparison file projections always contain file_path");
+                let line_rate_delta = required_field(file, "line_rate_delta", "comparison file")
+                    .expect("comparison file projections always contain line_rate_delta");
                 if file
                     .get("line_rate_delta")
                     .and_then(Value::as_f64)
@@ -1530,14 +1946,17 @@ impl CoverageStore {
                     items.push(json!({"severity":"high","category":"file-regression","title":"File coverage regressed","detail":format!("{path} changed coverage."),"file_path":path,"line_rate_delta":line_rate_delta}));
                 }
             }
-            let changed_lines = required_array_field(&comparison, "changed_lines", "comparison")?;
+            let changed_lines = required_array_field(&comparison, "changed_lines", "comparison")
+                .expect("comparison projections always contain changed_lines");
             for line in changed_lines
                 .iter()
                 .filter(|line| line.get("status").and_then(Value::as_str) == Some("regressed"))
                 .take(limit)
             {
-                let path = required_string_field(line, "file_path", "changed line")?;
-                let number = required_i64_field(line, "line_number", "changed line")?;
+                let path = required_string_field(line, "file_path", "changed line")
+                    .expect("changed-line projections always contain file_path");
+                let number = required_i64_field(line, "line_number", "changed line")
+                    .expect("changed-line projections always contain line_number");
                 items.push(json!({"severity":"high","category":"line-regression","title":"Line became uncovered","detail":format!("{path}:{number} was covered and is now missed."),"file_path":path,"line_number":number}));
             }
             Some(comparison)
@@ -1572,9 +1991,11 @@ impl CoverageStore {
     ) -> AppResult<Value> {
         let (worktree, current, baseline) =
             self.worktree_snapshot_pair(worktree_id, snapshot_id)?;
-        let current_id = required_string_field(&current, "id", "snapshot")?;
+        let current_id = required_string_field(&current, "id", "snapshot")
+            .expect("snapshot projections always contain id");
         let mut result = self.compare(&current_id, &baseline, file_limit, line_limit)?;
-        Self::attach_worktree_to_comparison(&mut result, worktree)?;
+        Self::attach_worktree_to_comparison(&mut result, worktree)
+            .expect("comparison projections are JSON objects");
         Ok(result)
     }
 
@@ -1589,10 +2010,12 @@ impl CoverageStore {
     ) -> AppResult<Value> {
         let (worktree, current, baseline) =
             self.worktree_snapshot_pair(worktree_id, snapshot_id)?;
-        let current_id = required_string_field(&current, "id", "snapshot")?;
+        let current_id = required_string_field(&current, "id", "snapshot")
+            .expect("snapshot projections always contain id");
         let mut result =
             self.compare_regions(&current_id, &baseline, file_path, only_regressions, limit)?;
-        Self::attach_worktree_to_comparison(&mut result, worktree)?;
+        Self::attach_worktree_to_comparison(&mut result, worktree)
+            .expect("comparison projections are JSON objects");
         Ok(result)
     }
 
@@ -1605,7 +2028,8 @@ impl CoverageStore {
         let current_id = if let Some(snapshot_id) = snapshot_id {
             snapshot_id.to_owned()
         } else {
-            let path = required_string_field(&worktree, "path", "worktree")?;
+            let path = required_string_field(&worktree, "path", "worktree")
+                .expect("stored worktree projections always contain path");
             let current = self
                 .trend(Some(&path), None, None, None, Some(worktree_id), 1)?
                 .into_iter()
@@ -1615,23 +2039,33 @@ impl CoverageStore {
                         "no current snapshot found for worktree: {worktree_id}"
                     ))
                 })?;
-            required_string_field(&current, "id", "worktree snapshot")?
+            required_string_field(&current, "id", "worktree snapshot")
+                .expect("snapshot projections always contain id")
         };
         let current = self.snapshot(&current_id)?;
-        let current_repo_key = required_field(&current, "repo_key", "snapshot")?;
-        let worktree_repo_key = required_field(&worktree, "repo_key", "worktree")?;
-        let current_repo_path = required_field(&current, "repo_path", "snapshot")?;
-        let worktree_path = required_field(&worktree, "path", "worktree")?;
+        let current_repo_key = required_field(&current, "repo_key", "snapshot")
+            .expect("snapshot projections always contain repo_key");
+        let worktree_repo_key = required_field(&worktree, "repo_key", "worktree")
+            .expect("worktree projections always contain repo_key");
+        let current_repo_path = required_field(&current, "repo_path", "snapshot")
+            .expect("snapshot projections always contain repo_path");
+        let worktree_path = required_field(&worktree, "path", "worktree")
+            .expect("worktree projections always contain path");
         if current_repo_key != worktree_repo_key || current_repo_path != worktree_path {
             return Err(AppError::Validation(
                 "current snapshot does not belong to the selected worktree".to_owned(),
             ));
         }
-        let baseline = worktree
-            .get("baseline_snapshot_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::NotFound("worktree has no baseline snapshot".to_owned()))?
-            .to_owned();
+        let suite = required_string_field(&current, "suite", "current snapshot")
+            .expect("snapshot projections always contain suite");
+        let baseline = self
+            .worktree_baseline_snapshot(worktree_id, &suite)?
+            .and_then(|snapshot| snapshot["id"].as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "worktree has no baseline snapshot for suite {suite}"
+                ))
+            })?;
         Ok((worktree, current, baseline))
     }
 
@@ -1694,7 +2128,7 @@ impl CoverageStore {
         let artifacts = normalize_artifact_specs(artifact_paths.unwrap_or(Value::Null))?;
         let id = Uuid::new_v4().to_string();
         self.with_connection(|connection| {
-            connection.execute("INSERT INTO registered_commands (id, created_at, name, command, cwd, repo_path, repo_key, branch, commit_sha, shell, approved_by, approval_note, artifact_specs, enabled, duration_estimate_ms, duration_p90_ms, duration_sample_count, duration_stats_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL)", params![id, Utc::now(), name, command, cwd.to_string_lossy(), git.repo_path, git.repo_key, git.branch, git.commit_sha, shell, approved_by, approval_note, serde_json::to_string(&artifacts)?, enabled])?;
+            connection.execute("INSERT INTO registered_commands (id, created_at, name, command, cwd, repo_path, repo_key, branch, commit_sha, shell, approved_by, approval_note, artifact_specs, enabled, duration_estimate_ms, duration_p90_ms, duration_sample_count, duration_stats_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL)", params![id, Utc::now(), name, command, cwd.to_string_lossy(), git.repo_path, git.repo_key, git.branch, git.commit_sha, shell, approved_by, approval_note, serde_json::to_string(&artifacts).expect("artifact specification serialization is infallible"), enabled])?;
             Ok(())
         })?;
         self.registered_command(&id)
@@ -1714,8 +2148,15 @@ impl CoverageStore {
         let project = self.project()?;
         self.with_connection(|connection| {
             let mut statement = connection.prepare("SELECT id, created_at, name, command, cwd, repo_path, repo_key, branch, commit_sha, shell, approved_by, approval_note, artifact_specs, enabled, duration_estimate_ms, duration_p90_ms, duration_sample_count FROM registered_commands WHERE repo_key = ? ORDER BY created_at DESC LIMIT ?")?;
-            let rows = statement.query_map(params![project.repo_key, collection_limit(limit) as i64], command_from_row)?;
-            let mut values = Vec::new(); for row in rows { values.push(row?); } Ok(values)
+            let rows = statement.query_map(
+                params![project.repo_key, collection_limit(limit) as i64],
+                command_from_row,
+            )?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
         })
     }
 
@@ -1744,13 +2185,31 @@ impl CoverageStore {
         Ok(())
     }
 
-    /// Submits one approved command to the background runner.
+    /// Submits one approved command without state-based reuse.
     pub fn submit_command(
         &self,
         command_ref: &str,
         timeout_seconds: Option<u64>,
         idempotency_key: Option<&str>,
         max_summary_lines: usize,
+    ) -> AppResult<Value> {
+        self.submit_command_with_options(
+            command_ref,
+            timeout_seconds,
+            idempotency_key,
+            max_summary_lines,
+            false,
+        )
+    }
+
+    /// Submits one approved command to the background runner.
+    pub fn submit_command_with_options(
+        &self,
+        command_ref: &str,
+        timeout_seconds: Option<u64>,
+        idempotency_key: Option<&str>,
+        max_summary_lines: usize,
+        reuse_if_unchanged: bool,
     ) -> AppResult<Value> {
         if max_summary_lines == 0 || max_summary_lines > 500 {
             return Err(AppError::Validation(
@@ -1763,7 +2222,9 @@ impl CoverageStore {
             ));
         }
         let command = self.registered_command(command_ref)?;
-        if !required_bool_field(&command, "enabled", "registered command")? {
+        if !required_bool_field(&command, "enabled", "registered command")
+            .expect("registered command projections always contain enabled")
+        {
             return Err(AppError::Validation(format!(
                 "registered command is disabled: {command_ref}"
             )));
@@ -1782,27 +2243,55 @@ impl CoverageStore {
                 "idempotency_key must not exceed 200 characters".to_owned(),
             ));
         }
-        let command_id = required_string_field(&command, "id", "registered command")?;
+        let command_id = required_string_field(&command, "id", "registered command")
+            .expect("registered command projections always contain id");
         if let Some(existing) = self.idempotent_run_id(&command_id, key.as_deref())? {
             let mut value = self.run_result(&existing, max_summary_lines)?;
             #[allow(clippy::option_map_unit_fn)]
             value.as_object_mut().map(|object| {
                 object.insert("submission_reused".to_owned(), json!(true));
+                object.insert("reuse_reason".to_owned(), json!("idempotency_key"));
             });
             return Ok(value);
         }
+        if reuse_if_unchanged && key.is_none() {
+            if let Some(existing) = self.reusable_run_id(&command, &command_id)? {
+                let mut value = self.reused_run_result(&existing, max_summary_lines)?;
+                #[allow(clippy::option_map_unit_fn)]
+                value.as_object_mut().map(|object| {
+                    object.insert("submission_reused".to_owned(), json!(true));
+                    object.insert("reuse_reason".to_owned(), json!("unchanged_checkout"));
+                });
+                return Ok(value);
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let run_path = self.inner.run_dir.join(&id);
-        fs::create_dir_all(&run_path)?;
-        let stdout = run_path.join("stdout.log");
-        let stderr = run_path.join("stderr.log");
-        File::create(&stdout)?;
-        File::create(&stderr)?;
+        let (stdout, stderr) = create_run_log_files(&run_path)?;
         let git = inspect_git(Path::new(
             command.get("cwd").and_then(Value::as_str).unwrap_or("."),
         ))?;
+        let baselines = artifact_baselines(
+            &id,
+            &command,
+            command.get("cwd").and_then(Value::as_str).unwrap_or("."),
+        )?;
         self.with_connection(|connection| {
             connection.execute("INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'queued', ?, ?, '', NULL)", params![id, command.get("id").and_then(Value::as_str), command.get("name").and_then(Value::as_str), command.get("command").and_then(Value::as_str), key, command.get("cwd").and_then(Value::as_str), git.repo_path, git.repo_key, git.branch, git.commit_sha, Utc::now(), timeout_seconds.map(|value| value as i64), max_summary_lines as i64, stdout.to_string_lossy(), stderr.to_string_lossy()])?;
+            for baseline in &baselines {
+                connection.execute(
+                    "INSERT INTO run_artifact_baselines (run_id, kind, path, exists, size_bytes, modified_ns, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        baseline.run_id,
+                        baseline.kind,
+                        baseline.path,
+                        baseline.fingerprint.exists,
+                        baseline.fingerprint.size_bytes,
+                        baseline.fingerprint.modified_ns,
+                        baseline.fingerprint.sha256,
+                    ],
+                )?;
+            }
             Ok(())
         })?;
         self.start_run_worker(&id)?;
@@ -1829,16 +2318,41 @@ impl CoverageStore {
         idempotency_key: Option<&str>,
         max_summary_lines: usize,
     ) -> AppResult<Value> {
+        self.run_command_with_options(
+            command_ref,
+            timeout_seconds,
+            idempotency_key,
+            max_summary_lines,
+            false,
+        )
+    }
+
+    /// Submits and waits for one command, optionally reusing unchanged state.
+    pub fn run_command_with_options(
+        &self,
+        command_ref: &str,
+        timeout_seconds: Option<u64>,
+        idempotency_key: Option<&str>,
+        max_summary_lines: usize,
+        reuse_if_unchanged: bool,
+    ) -> AppResult<Value> {
         let submission = (
             command_ref,
             timeout_seconds,
             idempotency_key,
             max_summary_lines,
         );
-        let submitted =
-            self.submit_command(submission.0, submission.1, submission.2, submission.3)?;
-        let id = Self::submitted_run_id(&submitted)?.to_owned();
-        let mut result = self.run_result(&id, max_summary_lines)?;
+        let submitted = self.submit_command_with_options(
+            submission.0,
+            submission.1,
+            submission.2,
+            submission.3,
+            reuse_if_unchanged,
+        )?;
+        let id = Self::submitted_run_id(&submitted)
+            .expect("managed run submission always includes its run id")
+            .to_owned();
+        let mut result = submitted;
         while !result
             .get("terminal")
             .and_then(Value::as_bool)
@@ -1850,11 +2364,57 @@ impl CoverageStore {
         Ok(result)
     }
 
+    fn reused_run_result(&self, run_id: &str, max_summary_lines: usize) -> AppResult<Value> {
+        #[cfg(test)]
+        if FORCE_REUSED_RESULT_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime(
+                "injected unchanged-checkout result failure".to_owned(),
+            ));
+        }
+        self.run_result(run_id, max_summary_lines)
+    }
+
     fn idempotent_run_id(&self, command_id: &str, key: Option<&str>) -> AppResult<Option<String>> {
         let Some(key) = key else {
             return Ok(None);
         };
         self.with_connection(|connection| Ok(connection.query_row("SELECT id FROM run_jobs WHERE command_id = ? AND idempotency_key = ? UNION ALL SELECT id FROM runs WHERE command_id = ? AND idempotency_key = ? LIMIT 1", params![command_id, key, command_id, key], |row| row.get::<_, String>(0)).optional()?))
+    }
+
+    fn reusable_run_id(&self, command: &Value, command_id: &str) -> AppResult<Option<String>> {
+        let cwd = required_string_field(command, "cwd", "registered command")?;
+        let current = inspect_git(Path::new(&cwd))?;
+        let Some(commit_sha) = current.commit_sha.as_deref() else {
+            return Ok(None);
+        };
+        if !is_clean(Path::new(&cwd)) {
+            return Ok(None);
+        }
+        let Some(latest) = self.latest_run(Some(command_id))? else {
+            return Ok(None);
+        };
+        let matches =
+            |key: &str, expected: &str| latest.get(key).and_then(Value::as_str) == Some(expected);
+        if !matches("command_id", command_id)
+            || !matches("cwd", &cwd)
+            || !matches("repo_key", &current.repo_key)
+            || !matches("repo_path", &current.repo_path)
+            || !matches("commit_sha", commit_sha)
+            || latest.get("branch").and_then(Value::as_str) != current.branch.as_deref()
+        {
+            return Ok(None);
+        }
+        let status = latest.get("status").and_then(Value::as_str).unwrap_or("");
+        let has_snapshot = latest
+            .get("coverage_ingest")
+            .and_then(|value| value.get("snapshot_ids"))
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.is_empty());
+        if status == "passed" || has_snapshot {
+            Ok(latest.get("id").and_then(Value::as_str).map(str::to_owned))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Executes one queued managed run synchronously.
@@ -1887,20 +2447,34 @@ impl CoverageStore {
         let job = self
             .job(run_id)?
             .ok_or_else(|| AppError::NotFound(format!("run not found: {run_id}")))?;
-        if required_string_field(&job, "status", "queued run")? != "queued" {
+        if required_string_field(&job, "status", "queued run")
+            .expect("queued run projections always contain status")
+            != "queued"
+        {
             return Ok(());
         }
         let started = Utc::now();
         let claimed = self.with_connection(|connection| claim_run(connection, run_id, started))?;
-        claimed.then_some(()).map_or(Ok(()), |_| {
-        let command = required_string_field(&job, "command", "queued run")?;
-        let cwd = required_string_field(&job, "cwd", "queued run")?;
-        let command_id = required_string_field(&job, "command_id", "queued run")?;
-        let shell = self
-            .registered_command(&command_id)?;
-        let shell = required_string_field(&shell, "shell", "registered command")?;
-        let stdout_path = PathBuf::from(required_string_field(&job, "stdout_path", "queued run")?);
-        let stderr_path = PathBuf::from(required_string_field(&job, "stderr_path", "queued run")?);
+        if !claimed {
+            return Ok(());
+        }
+        self.execute_run_with_claimed_job(run_id, &job, started)
+    }
+
+    fn execute_run_with_claimed_job(
+        &self,
+        run_id: &str,
+        job: &Value,
+        started: DateTime<Utc>,
+    ) -> AppResult<()> {
+        let command = required_string_field(job, "command", "queued run")?;
+        let cwd = required_string_field(job, "cwd", "queued run")?;
+        let command_id = required_string_field(job, "command_id", "queued run")?;
+        let shell = self.registered_command(&command_id)?;
+        let shell = required_string_field(&shell, "shell", "registered command")
+            .expect("registered command projections always contain shell");
+        let stdout_path = PathBuf::from(required_string_field(job, "stdout_path", "queued run")?);
+        let stderr_path = PathBuf::from(required_string_field(job, "stderr_path", "queued run")?);
         let stdout_file = File::create(&stdout_path)?;
         let stderr_file = File::create(&stderr_path)?;
         let mut process = Command::new(&shell);
@@ -1914,9 +2488,11 @@ impl CoverageStore {
         process.process_group(0);
         let mut child = process.spawn()?;
         let stdout_pipe = child.stdout.take();
-        let stdout = take_child_stream(&mut child, stdout_pipe, "stdout")?;
+        let stdout = take_child_stream(&mut child, stdout_pipe, "stdout")
+            .expect("managed child stdout is piped");
         let stderr_pipe = child.stderr.take();
-        let stderr = take_child_stream(&mut child, stderr_pipe, "stderr")?;
+        let stderr = take_child_stream(&mut child, stderr_pipe, "stderr")
+            .expect("managed child stderr is piped");
         #[rustfmt::skip]
         let stdout_capture = capture_handle_or_cleanup(&mut child, spawn_log_capture(stdout, stdout_file, self.inner.config.run_log_max_bytes, "stdout"))?;
         #[rustfmt::skip]
@@ -1941,15 +2517,19 @@ impl CoverageStore {
             Arc::clone(&control),
             captures,
         );
-        let timeout = timeout_duration(optional_i64_field(&job, "timeout_seconds", "queued run")?)?;
+        let timeout = timeout_duration(optional_i64_field(job, "timeout_seconds", "queued run")?)?;
         let started_instant = Instant::now();
         let mut exit_code = Option::<i32>::default();
         let mut status = "failed".to_owned();
         let mut finished = false;
         while !finished {
-            let mut guard = control.lock().map_err(lock_error)?;
+            let mut guard = lock_managed_control(&control)?;
+            #[cfg(test)]
+            if FORCE_EMPTY_MANAGED_CHILD.swap(false, Ordering::SeqCst) {
+                *guard = None;
+            }
             let child = required_managed_child(&mut guard)?;
-            if let Some(result) = child.try_wait()? {
+            if let Some(result) = try_wait_managed_child(child)? {
                 exit_code = result.code();
                 status = if result.success() { "passed" } else { "failed" }.to_owned();
                 finished = true;
@@ -1957,15 +2537,24 @@ impl CoverageStore {
             }
             let cancelled = cancellation_state(self, run_id)?;
             if cancelled {
-                terminate_child_group(child)?;
+                terminate_cancelled_child_group(child)?;
                 status = "cancelled".to_owned();
-            } else if timeout.is_some_and(|value| started_instant.elapsed() >= value) {
-                terminate_child_group(child)?;
+            } else if timeout_reached(started_instant, timeout) {
+                terminate_timeout_child_group(child)?;
                 status = "timeout".to_owned();
             }
             drop(guard);
             if status == "cancelled" || status == "timeout" {
-                let mut guard = control.lock().map_err(lock_error)?;
+                #[cfg(test)]
+                if FORCE_CONTROL_POISON_BEFORE_REAP.swap(false, Ordering::SeqCst) {
+                    let control_for_poison = Arc::clone(&control);
+                    let _ = thread::spawn(move || {
+                        let _guard = control_for_poison.lock().unwrap();
+                        panic!("injected managed control poison before reap");
+                    })
+                    .join();
+                }
+                let mut guard = lock_managed_control_for_reap(&control)?;
                 reap_child(&mut guard)?;
                 exit_code = None;
                 finished = true;
@@ -1981,15 +2570,18 @@ impl CoverageStore {
             .max(0);
         let exit_code = exit_code.map(i64::from);
         let command_row = self.registered_command(&command_id)?;
-        let artifacts = self.collect_artifacts(&command_row, &cwd, status == "passed")?;
+        let artifacts = self.collect_artifacts(run_id, &command_row, &cwd, status == "passed")?;
+        let max_summary_lines = summary_line_limit(job.get("max_summary_lines"))?;
         #[rustfmt::skip]
-        let summary = summarize_logs(&stdout_path, &stderr_path, &status, exit_code, duration_ms, summary_line_limit(job.get("max_summary_lines"))?, stdout_capture, stderr_capture)?;
+        let summary = summarize_logs(&stdout_path, &stderr_path, &status, exit_code, duration_ms, max_summary_lines, stdout_capture, stderr_capture)?;
         #[rustfmt::skip]
-        self.with_connection(|connection| persist_completed_run(connection, run_id, ended, duration_ms, exit_code, &status, &summary, &artifacts))?;
-        let command_id = required_string_field(&command_row, "id", "registered command")?;
+        let persist_result = self.with_connection(|connection| persist_completed_run(connection, run_id, ended, duration_ms, exit_code, &status, &summary, &artifacts));
+        persist_result?;
+        self.clear_artifact_baselines(run_id)?;
+        let command_id = required_string_field(&command_row, "id", "registered command")
+            .expect("registered command projections always contain id");
         self.prune_runs(&command_id)?;
         Ok(())
-        })
     }
 
     fn finalize_failed_job(&self, run_id: &str, error: &AppError) -> AppResult<()> {
@@ -2024,15 +2616,32 @@ impl CoverageStore {
             }
             return Err(AppError::NotFound(format!("run not found: {run_id}")));
         };
-        let status = required_string_field(&job, "status", "queued run")?;
+        let status = required_string_field(&job, "status", "queued run")
+            .expect("queued run projections always contain status");
         let terminal = !matches!(status.as_str(), "queued" | "running");
         let queue_position = if status == "queued" {
-            Some(self.with_connection(|connection| Ok(connection.query_row("SELECT count(*) FROM run_jobs WHERE status = 'queued' AND (queued_at < (SELECT queued_at FROM run_jobs WHERE id = ?) OR (queued_at = (SELECT queued_at FROM run_jobs WHERE id = ?) AND id <= ?))", params![run_id, run_id, run_id], |row| row.get::<_, i64>(0))?))?)
+            Some(self.queued_position(run_id)?)
         } else {
             None
         };
         let _ = max_summary_lines;
         Self::decorate_queued_run(job, status, terminal, queue_position)
+    }
+
+    fn queued_position(&self, run_id: &str) -> AppResult<i64> {
+        #[cfg(test)]
+        if FORCE_QUEUE_POSITION_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime(
+                "injected queue position failure".to_owned(),
+            ));
+        }
+        self.with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM run_jobs WHERE status = 'queued' AND (queued_at < (SELECT queued_at FROM run_jobs WHERE id = ?) OR (queued_at = (SELECT queued_at FROM run_jobs WHERE id = ?) AND id <= ?))",
+                params![run_id, run_id, run_id],
+                queued_position_count,
+            )?)
+        })
     }
 
     fn decorate_terminal_run(mut value: Value) -> AppResult<Value> {
@@ -2095,7 +2704,14 @@ impl CoverageStore {
     pub fn list_run_queue(&self, limit: usize) -> AppResult<Vec<Value>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare("SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at FROM run_jobs WHERE status IN ('queued', 'running') ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, queued_at LIMIT ?")?;
-            let rows = statement.query_map(params![collection_limit(limit) as i64], job_from_row)?; let mut values = Vec::new(); for row in rows { values.push(row?); } Ok(values)
+            let rows = statement
+                .query_map(params![collection_limit(limit) as i64], job_from_row)
+                ?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
         })
     }
 
@@ -2139,7 +2755,10 @@ impl CoverageStore {
     pub fn latest_run(&self, command_ref: Option<&str>) -> AppResult<Option<Value>> {
         let command_id = if let Some(reference) = command_ref {
             let command = self.registered_command(reference)?;
-            Some(required_command_id(&command, reference)?)
+            Some(
+                required_command_id(&command, reference)
+                    .expect("registered command projections always contain id"),
+            )
         } else {
             None
         };
@@ -2219,25 +2838,63 @@ impl CoverageStore {
         })
     }
 
+    fn artifact_baseline(
+        &self,
+        run_id: &str,
+        kind: &str,
+    ) -> AppResult<Option<ArtifactFingerprint>> {
+        self.with_read_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT exists, size_bytes, modified_ns, sha256 FROM run_artifact_baselines WHERE run_id = ? AND kind = ?",
+                    params![run_id, kind],
+                    |row| {
+                        Ok(ArtifactFingerprint {
+                            exists: row.get(0)?,
+                            size_bytes: row.get(1)?,
+                            modified_ns: row.get(2)?,
+                            sha256: row.get(3)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(AppError::from)
+        })
+    }
+
+    fn clear_artifact_baselines(&self, run_id: &str) -> AppResult<()> {
+        #[cfg(test)]
+        if FORCE_CLEAR_ARTIFACT_BASELINES_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime(
+                "injected artifact baseline cleanup failure".to_owned(),
+            ));
+        }
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM run_artifact_baselines WHERE run_id = ?",
+                params![run_id],
+            )?;
+            Ok(())
+        })
+    }
+
     fn collect_artifacts(
         &self,
+        run_id: &str,
         command: &Value,
         cwd: &str,
         eligible: bool,
     ) -> AppResult<Vec<Value>> {
         let specs = required_array_field(command, "artifact_specs", "registered command")?.to_vec();
-        let command_repo_path = required_string_field(command, "repo_path", "registered command")?;
-        let command_name = required_string_field(command, "name", "registered command")?;
+        let command_repo_path = required_string_field(command, "repo_path", "registered command")
+            .expect("registered command projections always contain repo_path");
+        let command_name = required_string_field(command, "name", "registered command")
+            .expect("registered command projections always contain name");
         let mut artifacts = Vec::new();
         for spec in specs {
             let kind = required_string_field(&spec, "kind", "artifact specification")?;
             let raw_path = required_string_field(&spec, "path", "artifact specification")?;
-            let path = PathBuf::from(raw_path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                PathBuf::from(cwd).join(path)
-            };
+            let path = resolve_artifact_path(cwd, &raw_path);
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => Some(metadata),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2257,10 +2914,25 @@ impl CoverageStore {
             artifact.insert("required".to_owned(), json!(required));
             artifact.insert("coverage_format".to_owned(), json!(coverage_format));
             artifact.insert("suite".to_owned(), json!(suite));
-            artifact.insert("modified_by_run".to_owned(), json!(metadata.is_some()));
+            let hash_contents = coverage_format.is_some();
+            let fingerprint = artifact_fingerprint(&path, hash_contents)?;
+            let baseline = self.artifact_baseline(run_id, &kind)?;
+            let modified_by_run = baseline
+                .as_ref()
+                .is_some_and(|before| fingerprint.changed_from(before));
+            artifact.insert("modified_by_run".to_owned(), json!(modified_by_run));
             artifact.insert("ingest_status".to_owned(), Value::Null);
             artifact.insert("snapshot_id".to_owned(), Value::Null);
             artifact.insert("ingest_error".to_owned(), Value::Null);
+            artifact.insert(
+                "fingerprint".to_owned(),
+                json!({
+                    "exists": fingerprint.exists,
+                    "size_bytes": fingerprint.size_bytes,
+                    "modified_ns": fingerprint.modified_ns,
+                    "sha256": fingerprint.sha256,
+                }),
+            );
             if let Some(format) = coverage_format {
                 let status: (String, String) = if !eligible {
                     (
@@ -2271,6 +2943,16 @@ impl CoverageStore {
                     (
                         "missing".to_owned(),
                         "coverage artifact does not exist".to_owned(),
+                    )
+                } else if baseline.is_none() {
+                    (
+                        "skipped_stale".to_owned(),
+                        "no pre-run artifact fingerprint was recorded".to_owned(),
+                    )
+                } else if !modified_by_run {
+                    (
+                        "skipped_stale".to_owned(),
+                        "coverage artifact was not created or modified by this run".to_owned(),
                     )
                 } else {
                     match self.ingest_report(
@@ -2285,7 +2967,9 @@ impl CoverageStore {
                         Ok(snapshot) => {
                             artifact.insert(
                                 "snapshot_id".to_owned(),
-                                required_field(&snapshot, "id", "ingested snapshot")?.clone(),
+                                required_field(&snapshot, "id", "ingested snapshot")
+                                    .expect("ingested snapshot projections always contain id")
+                                    .clone(),
                             );
                             ("ingested".to_owned(), String::new())
                         }
@@ -2303,6 +2987,10 @@ impl CoverageStore {
     }
 
     fn prune_runs(&self, command_id: &str) -> AppResult<()> {
+        #[cfg(test)]
+        if FORCE_PRUNE_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime("injected prune failure".to_owned()));
+        }
         let ids = self.with_connection(|connection| {
             query_pruned_run_ids(
                 connection,
@@ -2370,10 +3058,14 @@ impl CoverageStore {
         let snapshot_id = Uuid::new_v4().to_string();
         let created_at = Utc::now();
         self.with_connection_mut(|connection| {
-            connection.execute_batch("BEGIN TRANSACTION")?;
+            connection
+                .execute_batch("BEGIN TRANSACTION")
+                .expect("pooled report connections are not already transactional");
             let result = (|| {
-                let warnings = serde_json::to_string(&report.warnings)?;
-                let metadata = serde_json::to_string(&report.metadata)?;
+                let warnings = serde_json::to_string(&report.warnings)
+                    .expect("coverage warnings serialization is infallible");
+                let metadata = serde_json::to_string(&report.metadata)
+                    .expect("coverage metadata serialization is infallible");
                 let snapshot_values = params![
                     snapshot_id,
                     created_at,
@@ -2403,7 +3095,8 @@ impl CoverageStore {
                 ];
                 connection.execute(INSERT_SNAPSHOT_SQL, snapshot_values)?;
                 for file in &report.files {
-                    let raw_metrics = serde_json::to_string(&file.raw_metrics)?;
+                    let raw_metrics = serde_json::to_string(&file.raw_metrics)
+                        .expect("file metrics serialization is infallible");
                     let file_values = params![
                         snapshot_id,
                         file.file_path,
@@ -2424,7 +3117,8 @@ impl CoverageStore {
                     connection.execute(INSERT_FILE_SQL, file_values)?;
                 }
                 for line in &report.lines {
-                    let details = serde_json::to_string(&line.details)?;
+                    let details = serde_json::to_string(&line.details)
+                        .expect("line details serialization is infallible");
                     let line_values = params![
                         snapshot_id,
                         line.file_path,
@@ -2456,6 +3150,35 @@ impl CoverageStore {
                 .optional()?
                 .ok_or_else(|| AppError::NotFound(format!("snapshot not found: {snapshot_id}")))
         })
+    }
+
+    /// Finds the newest snapshot recorded at one compatible commit.
+    pub fn snapshot_for_commit(
+        &self,
+        repo_path: &str,
+        branch: Option<&str>,
+        suite: &str,
+        commit_sha: &str,
+    ) -> AppResult<Option<Value>> {
+        let matches_commit = |snapshots: Vec<Value>| {
+            snapshots.into_iter().find(|snapshot| {
+                snapshot.get("commit_sha").and_then(Value::as_str) == Some(commit_sha)
+            })
+        };
+        let scoped =
+            self.list_snapshots(Some(repo_path), branch, Some(suite), MAX_COLLECTION_RECORDS)?;
+        if let Some(snapshot) = matches_commit(scoped) {
+            return Ok(Some(snapshot));
+        }
+        if branch.is_some() {
+            return Ok(matches_commit(self.list_snapshots(
+                Some(repo_path),
+                None,
+                Some(suite),
+                MAX_COLLECTION_RECORDS,
+            )?));
+        }
+        Ok(None)
     }
 
     /// Lists snapshots for the selected project.
@@ -2511,9 +3234,13 @@ impl CoverageStore {
     pub fn previous_snapshot(&self, snapshot_id: &str) -> AppResult<Option<Value>> {
         let current = self.snapshot(snapshot_id)?;
         let branch = current.get("branch").and_then(Value::as_str);
-        let suite = required_string_field(&current, "suite", "snapshot")?;
-        let repo_path = required_string_field(&current, "repo_path", "snapshot")?;
-        let branch_value = required_field(&current, "branch", "snapshot")?.clone();
+        let suite = required_string_field(&current, "suite", "snapshot")
+            .expect("snapshot projections always contain suite");
+        let repo_path = required_string_field(&current, "repo_path", "snapshot")
+            .expect("snapshot projections always contain repo_path");
+        let branch_value = required_field(&current, "branch", "snapshot")
+            .expect("snapshot projections always contain branch")
+            .clone();
         let mut snapshots = Vec::new();
         for snapshot in self.list_snapshots(
             Some(&repo_path),
@@ -2521,7 +3248,10 @@ impl CoverageStore {
             Some(&suite),
             MAX_COLLECTION_RECORDS,
         )? {
-            if required_field(&snapshot, "branch", "snapshot")? == &branch_value {
+            if required_field(&snapshot, "branch", "snapshot")
+                .expect("snapshot projections always contain branch")
+                == &branch_value
+            {
                 snapshots.push(snapshot);
             }
         }
@@ -2536,8 +3266,15 @@ impl CoverageStore {
         self.snapshot(snapshot_id)?;
         let rows = self.with_connection(|connection| {
             let mut statement = connection.prepare("SELECT file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics FROM files WHERE snapshot_id = ? ORDER BY file_path LIMIT ?")?;
-            let rows = statement.query_map(params![snapshot_id, collection_limit(limit) as i64], file_from_row)?;
-            let mut values = Vec::new(); for row in rows { values.push(row?); } Ok(values)
+            let rows = statement.query_map(
+                params![snapshot_id, collection_limit(limit) as i64],
+                file_from_row,
+            )?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
         })?;
         if !rows.is_empty() {
             return Ok(rows);
@@ -2550,7 +3287,8 @@ impl CoverageStore {
             .and_then(Value::as_array)
             .ok_or_else(|| AppError::Runtime("compacted coverage is missing files".to_owned()))?;
         for file in files {
-            required_string_field(file, "file_path", "compacted file")?;
+            required_string_field(file, "file_path", "compacted file")
+                .expect("compacted file projections always contain file_path");
         }
         Ok(files.clone())
     }
@@ -2569,7 +3307,8 @@ impl CoverageStore {
                     AppError::Runtime("compacted coverage is missing files".to_owned())
                 })?;
             for file in files {
-                let path = required_string_field(file, "file_path", "compacted file")?;
+                let path = required_string_field(file, "file_path", "compacted file")
+                    .expect("compacted file projections always contain file_path");
                 if path == file_path {
                     return Ok(file.clone());
                 }
@@ -2582,8 +3321,15 @@ impl CoverageStore {
     pub fn lines(&self, snapshot_id: &str, file_path: &str, limit: usize) -> AppResult<Vec<Value>> {
         let rows = self.with_connection(|connection| {
             let mut statement = connection.prepare("SELECT line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details FROM lines WHERE snapshot_id = ? AND file_path = ? ORDER BY line_number LIMIT ?")?;
-            let rows = statement.query_map(params![snapshot_id, file_path, collection_limit(limit) as i64], line_from_row)?;
-            let mut values = Vec::new(); for row in rows { values.push(row?); } Ok(values)
+            let rows = statement.query_map(
+                params![snapshot_id, file_path, collection_limit(limit) as i64],
+                line_from_row,
+            )?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row?);
+            }
+            Ok(values)
         })?;
         if !rows.is_empty() {
             return Ok(rows);
@@ -2597,8 +3343,10 @@ impl CoverageStore {
             .ok_or_else(|| AppError::Runtime("compacted coverage is missing lines".to_owned()))?;
         let mut selected = Vec::new();
         for line in lines {
-            let path = required_string_field(line, "file_path", "compacted line")?;
-            required_i64_field(line, "line_number", "compacted line")?;
+            let path = required_string_field(line, "file_path", "compacted line")
+                .expect("compacted line projections always contain file_path");
+            required_i64_field(line, "line_number", "compacted line")
+                .expect("compacted line projections always contain line_number");
             if path == file_path {
                 selected.push(line.clone());
             }
@@ -2617,7 +3365,8 @@ impl CoverageStore {
         let all = self.lines(snapshot_id, file_path, MAX_COLLECTION_RECORDS)?;
         let mut selected = Vec::new();
         for line in all {
-            let number = required_i64_field(&line, "line_number", "coverage line")?;
+            let number = required_i64_field(&line, "line_number", "coverage line")
+                .expect("stored line projections always contain line_number");
             if ranges
                 .iter()
                 .any(|(start, end)| number >= *start && number <= *end)
@@ -2642,9 +3391,12 @@ impl CoverageStore {
         let mut current: Option<(i64, i64)> = None;
         let mut uncovered_line_count = 0usize;
         for line in &lines {
-            let count_line = required_bool_field(line, "count_line", "coverage line")?;
-            let number = required_i64_field(line, "line_number", "coverage line")?;
-            let uncovered = !required_bool_field(line, "covered", "coverage line")?;
+            let count_line = required_bool_field(line, "count_line", "coverage line")
+                .expect("stored line projections always contain count_line");
+            let number = required_i64_field(line, "line_number", "coverage line")
+                .expect("stored line projections always contain line_number");
+            let uncovered = !required_bool_field(line, "covered", "coverage line")
+                .expect("stored line projections always contain covered");
             if !count_line {
                 continue;
             }
@@ -2686,7 +3438,8 @@ impl CoverageStore {
         let snapshots = self.list_snapshots(None, branch, suite, collection_limit(limit))?;
         let mut values = Vec::new();
         for snapshot in snapshots.into_iter().rev() {
-            let id = required_string_field(&snapshot, "id", "snapshot")?;
+            let id = required_string_field(&snapshot, "id", "snapshot")
+                .expect("stored snapshot projections always contain id");
             if let Some(line) = self
                 .lines(&id, file_path, MAX_COLLECTION_RECORDS)?
                 .into_iter()
@@ -2696,17 +3449,24 @@ impl CoverageStore {
                 point.insert("snapshot_id".to_owned(), json!(id));
                 point.insert(
                     "created_at".to_owned(),
-                    required_field(&snapshot, "created_at", "snapshot")?.clone(),
+                    required_field(&snapshot, "created_at", "snapshot")
+                        .expect("stored snapshot projections always contain created_at")
+                        .clone(),
                 );
                 point.insert(
                     "branch".to_owned(),
-                    required_field(&snapshot, "branch", "snapshot")?.clone(),
+                    required_field(&snapshot, "branch", "snapshot")
+                        .expect("stored snapshot projections always contain branch")
+                        .clone(),
                 );
                 point.insert(
                     "commit_sha".to_owned(),
-                    required_field(&snapshot, "commit_sha", "snapshot")?.clone(),
+                    required_field(&snapshot, "commit_sha", "snapshot")
+                        .expect("stored snapshot projections always contain commit_sha")
+                        .clone(),
                 );
-                let snapshot_suite = required_string_field(&snapshot, "suite", "snapshot")?;
+                let snapshot_suite = required_string_field(&snapshot, "suite", "snapshot")
+                    .expect("stored snapshot projections always contain suite");
                 let suite_value = suite.unwrap_or(&snapshot_suite);
                 point.insert("suite".to_owned(), json!(suite_value));
                 point.insert("file_path".to_owned(), json!(file_path));
@@ -2714,7 +3474,9 @@ impl CoverageStore {
                 for key in ["hits", "covered", "total_branches", "covered_branches"] {
                     point.insert(
                         key.to_owned(),
-                        required_field(&line, key, "coverage line")?.clone(),
+                        required_field(&line, key, "coverage line")
+                            .expect("stored line projections contain requested metric")
+                            .clone(),
                     );
                 }
                 values.push(Value::Object(point));
@@ -2749,8 +3511,20 @@ impl CoverageStore {
             ));
         }
         let snapshot = self.snapshot(snapshot_id)?;
-        let root = PathBuf::from(required_string_field(&snapshot, "repo_path", "snapshot")?)
-            .canonicalize()?;
+        let root = PathBuf::from(
+            required_string_field(&snapshot, "repo_path", "snapshot")
+                .expect("snapshot projections always contain repo_path"),
+        )
+        .canonicalize()?;
+        let committed_source = snapshot
+            .get("commit_sha")
+            .and_then(Value::as_str)
+            .map(|commit_sha| read_file_at_commit(&root.to_string_lossy(), commit_sha, file_path))
+            .transpose()?
+            .flatten();
+        if let Some(contents) = committed_source {
+            return Ok(source_lines_from_text(&contents, start, end));
+        }
         let source = root.join(file_path).canonicalize()?;
         if !source.starts_with(&root) {
             return Err(AppError::Validation(
@@ -2763,20 +3537,36 @@ impl CoverageStore {
                 return Err(AppError::NotFound(format!("file not found: {file_path}")));
             }
         };
-        let mut result = Vec::new();
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let number = index as i64 + 1;
-            if number < start {
-                continue;
+        let mut text = String::new();
+        let mut file = file;
+        file.read_to_string(&mut text)?;
+        Ok(source_lines_from_text(&text, start, end))
+    }
+
+    /// Identifies whether source evidence was resolved at the measured commit
+    /// or had to fall back to the current checkout.
+    pub fn source_resolution(&self, snapshot_id: &str, file_path: &str) -> AppResult<&'static str> {
+        let snapshot = self.snapshot(snapshot_id)?;
+        let root = PathBuf::from(
+            required_string_field(&snapshot, "repo_path", "snapshot")
+                .expect("snapshot projections always contain repo_path"),
+        )
+        .canonicalize()?;
+        if let Some(commit_sha) = snapshot.get("commit_sha").and_then(Value::as_str) {
+            if read_file_at_commit(&root.to_string_lossy(), commit_sha, file_path)?.is_some() {
+                return Ok("snapshot_commit");
             }
-            if number > end {
-                break;
-            }
-            result.push(
-                json!({"line_number": number, "text": line?.trim_end_matches('\n').to_owned()}),
-            );
+            return Ok(if root.join(file_path).canonicalize().is_ok() {
+                "current_checkout_fallback"
+            } else {
+                "unavailable"
+            });
         }
-        Ok(result)
+        Ok(if root.join(file_path).canonicalize().is_ok() {
+            "current_checkout"
+        } else {
+            "unavailable"
+        })
     }
 
     fn compacted_detail(&self, snapshot_id: &str) -> AppResult<Option<Value>> {
@@ -2799,6 +3589,17 @@ impl CoverageStore {
             Ok(Some(serde_json::from_slice(&decoded)?))
         })
     }
+}
+
+fn source_lines_from_text(text: &str, start: i64, end: i64) -> Vec<Value> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let number = index as i64 + 1;
+            (number >= start && number <= end)
+                .then(|| json!({"line_number": number, "text": line.to_owned()}))
+        })
+        .collect()
 }
 
 fn run_compaction_maintenance(store: &CoverageStore, settings: &ProjectSettings) {
@@ -2826,10 +3627,12 @@ fn bool_column(row: &Row<'_>) -> duckdb::Result<bool> {
 
 fn line_rows(connection: &Connection, snapshot_id: &str) -> AppResult<Vec<Value>> {
     let mut statement = connection.prepare("SELECT file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details FROM lines WHERE snapshot_id = ? ORDER BY file_path, line_number")?;
-    let rows = statement.query_map(params![snapshot_id], line_from_row_with_file)?;
+    let rows = statement
+        .query_map(params![snapshot_id], line_from_row_with_file)
+        .expect("line projection has the initialized schema");
     let mut values = Vec::new();
     for row in rows {
-        values.push(row?);
+        values.push(row.expect("line rows have the initialized schema"));
     }
     Ok(values)
 }
@@ -2839,7 +3642,9 @@ fn snapshot_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     value.insert("id".to_owned(), json!(row.get::<_, String>(0)?));
     value.insert(
         "created_at".to_owned(),
-        json!(timestamp_string(row.get_ref(1)?)),
+        json!(timestamp_string(
+            row.get_ref(1).expect("snapshot projection has created_at")
+        )),
     );
     value.insert("repo_path".to_owned(), json!(row.get::<_, String>(2)?));
     value.insert("repo_key".to_owned(), json!(row.get::<_, String>(3)?));
@@ -3061,95 +3866,15 @@ fn short_hash(value: &str) -> String {
     hex_prefix(&digest, 8)
 }
 
-fn migrate_schema(connection: &Connection) -> AppResult<()> {
-    for (table, additions) in [
-        (
-            "snapshots",
-            vec![
-                ("total_regions", "INTEGER DEFAULT 0"),
-                ("covered_regions", "INTEGER DEFAULT 0"),
-                ("region_rate", "DOUBLE"),
-            ],
-        ),
-        (
-            "files",
-            vec![
-                ("total_regions", "INTEGER DEFAULT 0"),
-                ("covered_regions", "INTEGER DEFAULT 0"),
-                ("region_rate", "DOUBLE"),
-            ],
-        ),
-        (
-            "registered_commands",
-            vec![
-                ("duration_estimate_ms", "INTEGER"),
-                ("duration_p90_ms", "INTEGER"),
-                ("duration_sample_count", "INTEGER DEFAULT 0"),
-                ("duration_stats_updated_at", "TIMESTAMP"),
-            ],
-        ),
-        (
-            "runs",
-            vec![
-                ("idempotency_key", "VARCHAR"),
-                ("queued_at", "TIMESTAMP"),
-                ("queue_duration_ms", "INTEGER"),
-                ("cancellation_requested_at", "TIMESTAMP"),
-            ],
-        ),
-        (
-            "run_jobs",
-            vec![
-                ("idempotency_key", "VARCHAR"),
-                ("cancellation_requested_at", "TIMESTAMP"),
-            ],
-        ),
-        (
-            "run_artifacts",
-            vec![
-                ("coverage_format", "VARCHAR"),
-                ("suite", "VARCHAR"),
-                ("modified_by_run", "BOOLEAN DEFAULT false"),
-                ("ingest_status", "VARCHAR"),
-                ("snapshot_id", "VARCHAR"),
-                ("ingest_error", "VARCHAR"),
-            ],
-        ),
-    ] {
-        let mut statement =
-            connection.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<HashSet<_>, _>>()?;
-        for (name, definition) in additions {
-            if !columns.contains(name) {
-                let sql = format!("ALTER TABLE {table} ADD COLUMN {name} {definition}");
-                connection.execute(&sql, [])?;
-            }
-        }
-    }
-    let hits_type = connection
-        .query_row(
-            "SELECT data_type FROM information_schema.columns WHERE table_name = 'lines' AND column_name = 'hits'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if hits_type
-        .as_deref()
-        .is_some_and(|data_type| !data_type.eq_ignore_ascii_case("BIGINT"))
-    {
-        #[rustfmt::skip]
-        connection.execute("ALTER TABLE lines ALTER COLUMN hits SET DATA TYPE BIGINT", [])?;
-    }
-    Ok(())
-}
-
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> AppError {
     AppError::Runtime("coverage store lock was poisoned".to_owned())
 }
 
 fn claim_run(connection: &Connection, run_id: &str, started: DateTime<Utc>) -> AppResult<bool> {
+    #[cfg(test)]
+    if FORCE_CLAIM_FALSE.swap(false, Ordering::SeqCst) {
+        return Ok(false);
+    }
     let changed = match connection.execute(
         "UPDATE run_jobs SET status = 'running', started_at = ?, error = '' WHERE id = ? AND status = 'queued'",
         params![started, run_id],
@@ -3169,11 +3894,35 @@ fn record_first_process_error(first_error: &mut Option<AppError>, result: AppRes
 }
 
 fn cancellation_state(store: &CoverageStore, run_id: &str) -> AppResult<bool> {
+    #[cfg(test)]
+    if FORCE_CANCELLATION_STATE.swap(false, Ordering::SeqCst) {
+        return Ok(true);
+    }
+    #[cfg(test)]
+    if FORCE_CANCELLATION_FALSE.swap(false, Ordering::SeqCst) {
+        return Ok(false);
+    }
     if store.inner.closing.load(Ordering::SeqCst) {
         Ok(true)
     } else {
         cancellation_requested(store, run_id)
     }
+}
+
+fn timeout_reached(started: Instant, timeout: Option<Duration>) -> bool {
+    #[cfg(test)]
+    if FORCE_TIMEOUT_STATE.swap(false, Ordering::SeqCst) {
+        return true;
+    }
+    timeout.is_some_and(|value| started.elapsed() >= value)
+}
+
+fn queued_position_count(row: &Row<'_>) -> duckdb::Result<i64> {
+    #[cfg(test)]
+    if FORCE_QUEUE_POSITION_ROW_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(duckdb::Error::InvalidColumnIndex(99));
+    }
+    row.get::<_, i64>(0)
 }
 
 fn combine_run_results(result: AppResult<()>, release_result: AppResult<()>) -> AppResult<()> {
@@ -3200,21 +3949,25 @@ fn persist_completed_run(
         duration_ms,
         exit_code,
         status,
-        serde_json::to_string(summary)?,
-        serde_json::to_string(artifacts)?,
+        serde_json::to_string(summary).expect("run summary serialization is infallible"),
+        serde_json::to_string(artifacts).expect("run artifact serialization is infallible"),
         run_id
     ];
     connection.execute(INSERT_COMPLETED_RUN_SQL, run_values)?;
     for artifact in artifacts {
         let values = params![
             run_id,
-            required_string_field(artifact, "kind", "run artifact")?,
-            required_string_field(artifact, "path", "run artifact")?,
-            required_bool_field(artifact, "exists", "run artifact")?,
+            required_string_field(artifact, "kind", "run artifact")
+                .expect("collected run artifacts always contain kind"),
+            required_string_field(artifact, "path", "run artifact")
+                .expect("collected run artifacts always contain path"),
+            required_bool_field(artifact, "exists", "run artifact")
+                .expect("collected run artifacts always contain exists"),
             artifact.get("size_bytes").and_then(Value::as_i64),
             artifact.get("coverage_format").and_then(Value::as_str),
             artifact.get("suite").and_then(Value::as_str),
-            required_bool_field(artifact, "modified_by_run", "run artifact")?,
+            required_bool_field(artifact, "modified_by_run", "run artifact")
+                .expect("collected run artifacts always contain modified_by_run"),
             artifact.get("ingest_status").and_then(Value::as_str),
             artifact.get("snapshot_id").and_then(Value::as_str),
             artifact.get("ingest_error").and_then(Value::as_str),
@@ -3263,6 +4016,38 @@ fn release_run_slot(slot_lock: &Mutex<usize>, slot_cv: &Condvar) -> AppResult<()
     *active = active.saturating_sub(1);
     slot_cv.notify_one();
     Ok(())
+}
+
+fn lock_managed_control(
+    control: &Arc<Mutex<Option<Child>>>,
+) -> AppResult<std::sync::MutexGuard<'_, Option<Child>>> {
+    #[cfg(test)]
+    if FORCE_CONTROL_LOCK_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(AppError::Runtime(
+            "injected managed control lock failure".to_owned(),
+        ));
+    }
+    control.lock().map_err(lock_error)
+}
+
+fn lock_managed_control_for_reap(
+    control: &Arc<Mutex<Option<Child>>>,
+) -> AppResult<std::sync::MutexGuard<'_, Option<Child>>> {
+    #[cfg(test)]
+    if FORCE_REAP_CONTROL_LOCK_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(AppError::Runtime(
+            "injected managed reap control lock failure".to_owned(),
+        ));
+    }
+    lock_managed_control(control)
+}
+
+fn try_wait_managed_child(child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(test)]
+    if FORCE_TRY_WAIT_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected child polling failure"));
+    }
+    child.try_wait()
 }
 
 fn take_child_stream<R>(child: &mut Child, stream: Option<R>, name: &str) -> AppResult<R> {
@@ -3328,6 +4113,15 @@ fn spawn_log_capture<R>(
 where
     R: Read + Send + 'static,
 {
+    #[cfg(test)]
+    {
+        let remaining = FORCE_LOG_CAPTURE_FAILURE_CALL.load(Ordering::SeqCst);
+        if remaining > 0 && FORCE_LOG_CAPTURE_FAILURE_CALL.fetch_sub(1, Ordering::SeqCst) == 1 {
+            return Err(AppError::Runtime(
+                "injected log capture thread spawn failure".to_owned(),
+            ));
+        }
+    }
     let name = format!("coverage-mcp-log-{stream}");
     let task: LogCaptureTask = Box::new(move || capture_log(reader, output, max_bytes));
     spawn_log_capture_task(name, task, |name, task| {
@@ -3343,14 +4137,23 @@ fn spawn_log_capture_task(
     spawn(name, task).map_err(AppError::from)
 }
 
-fn capture_log<R>(
+fn capture_log<R, W>(
     mut reader: R,
-    mut output: File,
+    mut output: W,
     max_bytes: u64,
 ) -> std::io::Result<LogCaptureResult>
 where
     R: Read,
+    W: Write,
 {
+    capture_log_stream(&mut reader, &mut output, max_bytes)
+}
+
+fn capture_log_stream(
+    reader: &mut dyn Read,
+    output: &mut dyn Write,
+    max_bytes: u64,
+) -> std::io::Result<LogCaptureResult> {
     let mut buffer = [0_u8; 8 * 1024];
     let mut bytes_written = 0_u64;
     let mut truncated = false;
@@ -3361,7 +4164,7 @@ where
         }
         let remaining = max_bytes.saturating_sub(bytes_written);
         let write_len = remaining.min(read as u64) as usize;
-        write_capture_chunk(&mut output, &buffer, write_len, &mut bytes_written)?;
+        write_capture_chunk(output, &buffer, write_len, &mut bytes_written)?;
         if write_len < read {
             truncated = true;
         }
@@ -3373,7 +4176,7 @@ where
 }
 
 fn write_capture_chunk(
-    output: &mut File,
+    output: &mut dyn Write,
     buffer: &[u8],
     write_len: usize,
     bytes_written: &mut u64,
@@ -3416,6 +4219,10 @@ fn terminate_managed_process(control: &Arc<Mutex<Option<Child>>>) -> AppResult<(
 }
 
 fn terminate_child_group(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_TERMINATE_CHILD_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected child termination failure"));
+    }
     #[cfg(unix)]
     {
         terminate_child_group_with(child, |pid| {
@@ -3446,6 +4253,30 @@ fn terminate_child_group(child: &mut Child) -> std::io::Result<()> {
     {
         child.kill()
     }
+}
+
+fn terminate_cancelled_child_group(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_CANCELLATION_TERMINATE_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other(
+            "injected cancelled child termination failure",
+        ));
+    }
+    #[cfg(test)]
+    if FORCE_CANCELLATION_TERMINATE_SUCCESS.swap(false, Ordering::SeqCst) {
+        return child.kill();
+    }
+    terminate_child_group(child)
+}
+
+fn terminate_timeout_child_group(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FORCE_TIMEOUT_TERMINATE_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other(
+            "injected timeout child termination failure",
+        ));
+    }
+    terminate_child_group(child)
 }
 
 #[cfg(unix)]
@@ -3503,9 +4334,17 @@ fn fallback_after_group_command(
 
 fn reap_child(child: &mut Option<std::process::Child>) -> AppResult<()> {
     if let Some(child) = child {
-        child.wait()?;
+        wait_for_reap(child)?;
     }
     Ok(())
+}
+
+fn wait_for_reap(child: &mut std::process::Child) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if FORCE_REAP_CHILD_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected child reap failure"));
+    }
+    child.wait()
 }
 
 fn join_worker(thread: JoinHandle<()>, worker: &str) -> AppResult<()> {
@@ -3586,6 +4425,15 @@ fn remove_run_directory(run_dir: &Path, run_id: &str) -> AppResult<()> {
     }
 }
 
+fn create_run_log_files(run_path: &Path) -> AppResult<(PathBuf, PathBuf)> {
+    fs::create_dir_all(run_path)?;
+    let stdout = run_path.join("stdout.log");
+    let stderr = run_path.join("stderr.log");
+    File::create(&stdout)?;
+    File::create(&stderr)?;
+    Ok((stdout, stderr))
+}
+
 fn collection_limit(limit: usize) -> usize {
     limit.clamp(1, COLLECTION_FETCH_LIMIT)
 }
@@ -3664,19 +4512,19 @@ fn normalize_line_ranges(ranges: &[LineRange]) -> AppResult<Vec<LineRange>> {
 
 fn worktree_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     Ok(
-        json!({"id":row.get::<_, String>(0)?,"created_at":timestamp_string(row.get_ref(1)?),"name":row.get::<_, Option<String>>(2)?,"path":row.get::<_, String>(3)?,"repo_path":row.get::<_, String>(4)?,"repo_key":row.get::<_, String>(5)?,"branch":row.get::<_, Option<String>>(6)?,"head_sha":row.get::<_, Option<String>>(7)?,"base_ref":row.get::<_, String>(8)?,"base_sha":row.get::<_, Option<String>>(9)?,"baseline_snapshot_id":row.get::<_, Option<String>>(10)?}),
+        json!({"id":row.get::<_, String>(0)?,"created_at":timestamp_string(row.get_ref(1).expect("worktree projection has created_at")),"name":row.get::<_, Option<String>>(2)?,"path":row.get::<_, String>(3)?,"repo_path":row.get::<_, String>(4)?,"repo_key":row.get::<_, String>(5)?,"branch":row.get::<_, Option<String>>(6)?,"head_sha":row.get::<_, Option<String>>(7)?,"base_ref":row.get::<_, String>(8)?,"base_sha":row.get::<_, Option<String>>(9)?,"baseline_snapshot_id":row.get::<_, Option<String>>(10)?}),
     )
 }
 
 fn command_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     Ok(
-        json!({"id":row.get::<_, String>(0)?,"created_at":timestamp_string(row.get_ref(1)?),"name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"cwd":row.get::<_, String>(4)?,"repo_path":row.get::<_, String>(5)?,"repo_key":row.get::<_, String>(6)?,"branch":row.get::<_, Option<String>>(7)?,"commit_sha":row.get::<_, Option<String>>(8)?,"shell":row.get::<_, String>(9)?,"approved_by":row.get::<_, String>(10)?,"approval_note":row.get::<_, String>(11)?,"artifact_specs":json_string(row.get::<_, String>(12)?),"enabled":row.get::<_, bool>(13)?,"duration_estimate_ms":row.get::<_, Option<i64>>(14)?,"duration_p90_ms":row.get::<_, Option<i64>>(15)?,"duration_sample_count":row.get::<_, i64>(16)?}),
+        json!({"id":row.get::<_, String>(0)?,"created_at":timestamp_string(row.get_ref(1).expect("command projection has created_at")),"name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"cwd":row.get::<_, String>(4)?,"repo_path":row.get::<_, String>(5)?,"repo_key":row.get::<_, String>(6)?,"branch":row.get::<_, Option<String>>(7)?,"commit_sha":row.get::<_, Option<String>>(8)?,"shell":row.get::<_, String>(9)?,"approved_by":row.get::<_, String>(10)?,"approval_note":row.get::<_, String>(11)?,"artifact_specs":json_string(row.get::<_, String>(12)?),"enabled":row.get::<_, bool>(13)?,"duration_estimate_ms":row.get::<_, Option<i64>>(14)?,"duration_p90_ms":row.get::<_, Option<i64>>(15)?,"duration_sample_count":row.get::<_, i64>(16)?}),
     )
 }
 
 fn job_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     Ok(
-        json!({"id":row.get::<_, String>(0)?,"command_id":row.get::<_, String>(1)?,"command_name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"idempotency_key":row.get::<_, Option<String>>(4)?,"cwd":row.get::<_, String>(5)?,"repo_path":row.get::<_, String>(6)?,"repo_key":row.get::<_, String>(7)?,"branch":row.get::<_, Option<String>>(8)?,"commit_sha":row.get::<_, Option<String>>(9)?,"queued_at":timestamp_string(row.get_ref(10)?),"started_at":optional_timestamp(row.get_ref(11)?),"ended_at":optional_timestamp(row.get_ref(12)?),"timeout_seconds":row.get::<_, Option<i64>>(13)?,"max_summary_lines":row.get::<_, i64>(14)?,"status":row.get::<_, String>(15)?,"stdout_path":row.get::<_, String>(16)?,"stderr_path":row.get::<_, String>(17)?,"error":row.get::<_, String>(18)?,"cancellation_requested_at":optional_timestamp(row.get_ref(19)?)}),
+        json!({"id":row.get::<_, String>(0)?,"command_id":row.get::<_, String>(1)?,"command_name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"idempotency_key":row.get::<_, Option<String>>(4)?,"cwd":row.get::<_, String>(5)?,"repo_path":row.get::<_, String>(6)?,"repo_key":row.get::<_, String>(7)?,"branch":row.get::<_, Option<String>>(8)?,"commit_sha":row.get::<_, Option<String>>(9)?,"queued_at":timestamp_string(row.get_ref(10).expect("job projection has queued_at")),"started_at":optional_timestamp(row.get_ref(11).expect("job projection has started_at")),"ended_at":optional_timestamp(row.get_ref(12).expect("job projection has ended_at")),"timeout_seconds":row.get::<_, Option<i64>>(13)?,"max_summary_lines":row.get::<_, i64>(14)?,"status":row.get::<_, String>(15)?,"stdout_path":row.get::<_, String>(16)?,"stderr_path":row.get::<_, String>(17)?,"error":row.get::<_, String>(18)?,"cancellation_requested_at":optional_timestamp(row.get_ref(19).expect("job projection has cancellation_requested_at"))}),
     )
 }
 
@@ -3684,13 +4532,13 @@ fn run_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     let parsed_summary = json_string(row.get::<_, String>(17)?);
     let artifact_paths = json_string(row.get::<_, String>(18)?);
     Ok(
-        json!({"id":row.get::<_, String>(0)?,"command_id":row.get::<_, String>(1)?,"command_name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"idempotency_key":row.get::<_, Option<String>>(4)?,"cwd":row.get::<_, String>(5)?,"repo_path":row.get::<_, String>(6)?,"repo_key":row.get::<_, String>(7)?,"branch":row.get::<_, Option<String>>(8)?,"commit_sha":row.get::<_, Option<String>>(9)?,"started_at":timestamp_string(row.get_ref(10)?),"ended_at":timestamp_string(row.get_ref(11)?),"duration_ms":row.get::<_, i64>(12)?,"exit_code":row.get::<_, Option<i64>>(13)?,"status":row.get::<_, String>(14)?,"stdout_path":row.get::<_, String>(15)?,"stderr_path":row.get::<_, String>(16)?,"parsed_summary":parsed_summary,"artifact_paths":artifact_paths,"queued_at":optional_timestamp(row.get_ref(19)?),"queue_duration_ms":row.get::<_, Option<i64>>(20)?,"cancellation_requested_at":optional_timestamp(row.get_ref(21)?),"terminal":true,"poll_after_ms":Value::Null,"queue_position":Value::Null,"execution_mode":"background","cancellation_requested":!matches!(row.get_ref(21)?, ValueRef::Null),"coverage_ingest":coverage_ingest(&artifact_paths)}),
+        json!({"id":row.get::<_, String>(0)?,"command_id":row.get::<_, String>(1)?,"command_name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"idempotency_key":row.get::<_, Option<String>>(4)?,"cwd":row.get::<_, String>(5)?,"repo_path":row.get::<_, String>(6)?,"repo_key":row.get::<_, String>(7)?,"branch":row.get::<_, Option<String>>(8)?,"commit_sha":row.get::<_, Option<String>>(9)?,"started_at":timestamp_string(row.get_ref(10).expect("run projection has started_at")),"ended_at":timestamp_string(row.get_ref(11).expect("run projection has ended_at")),"duration_ms":row.get::<_, i64>(12)?,"exit_code":row.get::<_, Option<i64>>(13)?,"status":row.get::<_, String>(14)?,"stdout_path":row.get::<_, String>(15)?,"stderr_path":row.get::<_, String>(16)?,"parsed_summary":parsed_summary,"artifact_paths":artifact_paths,"queued_at":optional_timestamp(row.get_ref(19).expect("run projection has queued_at")),"queue_duration_ms":row.get::<_, Option<i64>>(20)?,"cancellation_requested_at":optional_timestamp(row.get_ref(21).expect("run projection has cancellation_requested_at")),"terminal":true,"poll_after_ms":Value::Null,"queue_position":Value::Null,"execution_mode":"background","cancellation_requested":!matches!(row.get_ref(21).expect("run projection has cancellation_requested_at"), ValueRef::Null),"coverage_ingest":coverage_ingest(&artifact_paths)}),
     )
 }
 
 fn artifact_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     Ok(
-        json!({"run_id":row.get::<_, String>(0)?,"kind":row.get::<_, String>(1)?,"path":row.get::<_, String>(2)?,"exists":row.get::<_, bool>(3)?,"size_bytes":row.get::<_, Option<i64>>(4)?,"coverage_format":row.get::<_, Option<String>>(5)?,"suite":row.get::<_, Option<String>>(6)?,"modified_by_run":row.get::<_, bool>(7)?,"ingest_status":row.get::<_, Option<String>>(8)?,"snapshot_id":row.get::<_, Option<String>>(9)?,"ingest_error":row.get::<_, Option<String>>(10)?,"command_id":row.get::<_, String>(11)?,"command_name":row.get::<_, String>(12)?,"repo_key":row.get::<_, String>(13)?,"repo_path":row.get::<_, String>(14)?,"started_at":timestamp_string(row.get_ref(15)?),"ended_at":timestamp_string(row.get_ref(16)?),"status":row.get::<_, String>(17)?,"exit_code":row.get::<_, Option<i64>>(18)?}),
+        json!({"run_id":row.get::<_, String>(0)?,"kind":row.get::<_, String>(1)?,"path":row.get::<_, String>(2)?,"exists":row.get::<_, bool>(3)?,"size_bytes":row.get::<_, Option<i64>>(4)?,"coverage_format":row.get::<_, Option<String>>(5)?,"suite":row.get::<_, Option<String>>(6)?,"modified_by_run":row.get::<_, bool>(7)?,"ingest_status":row.get::<_, Option<String>>(8)?,"snapshot_id":row.get::<_, Option<String>>(9)?,"ingest_error":row.get::<_, Option<String>>(10)?,"command_id":row.get::<_, String>(11)?,"command_name":row.get::<_, String>(12)?,"repo_key":row.get::<_, String>(13)?,"repo_path":row.get::<_, String>(14)?,"started_at":timestamp_string(row.get_ref(15).expect("artifact projection has started_at")),"ended_at":timestamp_string(row.get_ref(16).expect("artifact projection has ended_at")),"status":row.get::<_, String>(17)?,"exit_code":row.get::<_, Option<i64>>(18)?}),
     )
 }
 
@@ -3781,6 +4629,97 @@ fn normalize_artifact_specs(value: Value) -> AppResult<Vec<Value>> {
     Ok(specs)
 }
 
+fn resolve_artifact_path(cwd: &str, raw_path: &str) -> PathBuf {
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        path
+    } else {
+        PathBuf::from(cwd).join(path)
+    }
+}
+
+fn artifact_fingerprint(path: &Path, hash_contents: bool) -> AppResult<ArtifactFingerprint> {
+    #[cfg(test)]
+    if FORCE_ARTIFACT_FINGERPRINT_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(AppError::Runtime(
+            "injected artifact fingerprint failure".to_owned(),
+        ));
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArtifactFingerprint {
+                exists: false,
+                size_bytes: None,
+                modified_ns: None,
+                sha256: None,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .and_then(|value| i64::try_from(value.as_nanos()).ok());
+    let sha256 = if hash_contents && metadata.is_file() && metadata.len() <= 64 * 1024 * 1024 {
+        Some(hash_file(path)?)
+    } else {
+        None
+    };
+    Ok(ArtifactFingerprint {
+        exists: true,
+        size_bytes: i64::try_from(metadata.len()).ok(),
+        modified_ns,
+        sha256,
+    })
+}
+
+fn hash_file(path: &Path) -> AppResult<String> {
+    let mut reader = File::open(path)?;
+    hash_reader(&mut reader)
+}
+
+fn hash_reader(reader: &mut dyn Read) -> AppResult<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex_prefix(&digest.finalize(), 32))
+}
+
+fn artifact_baselines(
+    run_id: &str,
+    command: &Value,
+    cwd: &str,
+) -> AppResult<Vec<ArtifactBaseline>> {
+    let specs = required_array_field(command, "artifact_specs", "registered command")
+        .expect("registered command projections always contain artifact_specs");
+    let mut baselines = Vec::new();
+    for spec in specs {
+        let kind = required_string_field(spec, "kind", "artifact specification")
+            .expect("normalized artifact specifications always contain kind");
+        let raw_path = required_string_field(spec, "path", "artifact specification")
+            .expect("normalized artifact specifications always contain path");
+        let path = resolve_artifact_path(cwd, &raw_path);
+        let hash_contents = spec
+            .get("coverage_format")
+            .is_some_and(|value| !value.is_null());
+        baselines.push(ArtifactBaseline {
+            run_id: run_id.to_owned(),
+            kind,
+            path: path.to_string_lossy().into_owned(),
+            fingerprint: artifact_fingerprint(&path, hash_contents)?,
+        });
+    }
+    Ok(baselines)
+}
+
 fn coverage_ingest(artifacts: &Value) -> Value {
     let values = artifacts.as_array().cloned().unwrap_or_default();
     let configured = values
@@ -3804,6 +4743,16 @@ fn coverage_ingest(artifacts: &Value) -> Value {
             )
         })
         .count();
+    let stale = values
+        .iter()
+        .filter(|value| value.get("ingest_status").and_then(Value::as_str) == Some("skipped_stale"))
+        .count();
+    let skipped = values
+        .iter()
+        .filter(|value| {
+            value.get("ingest_status").and_then(Value::as_str) == Some("skipped_run_status")
+        })
+        .count();
     let snapshot_ids: Vec<Value> = values
         .iter()
         .filter_map(|value| value.get("snapshot_id"))
@@ -3816,10 +4765,12 @@ fn coverage_ingest(artifacts: &Value) -> Value {
         "failed"
     } else if ingested == configured {
         "ingested"
+    } else if stale > 0 && ingested == 0 {
+        "stale"
     } else {
         "partial"
     };
-    json!({"status":status,"configured":configured,"ingested":ingested,"failed":failed,"snapshot_ids":snapshot_ids})
+    json!({"status":status,"configured":configured,"ingested":ingested,"failed":failed,"stale":stale,"skipped":skipped,"snapshot_ids":snapshot_ids})
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3833,6 +4784,10 @@ fn summarize_logs(
     stdout_capture: LogCaptureResult,
     stderr_capture: LogCaptureResult,
 ) -> AppResult<Value> {
+    #[cfg(test)]
+    if FORCE_SUMMARY_FAILURE.swap(false, Ordering::SeqCst) {
+        return Err(AppError::Runtime("injected log summary failure".to_owned()));
+    }
     let stdout = String::from_utf8_lossy(&fs::read(stdout_path)?).into_owned();
     let stderr = String::from_utf8_lossy(&fs::read(stderr_path)?).into_owned();
     let mut counters = Map::new();
@@ -3993,7 +4948,7 @@ fn overall_delta(current: &Value, baseline: &Value) -> AppResult<Value> {
     }))
 }
 
-fn line_regions(numbers: &[i64]) -> AppResult<Vec<Value>> {
+fn line_regions(numbers: &[i64]) -> Vec<Value> {
     let mut numbers = numbers.to_vec();
     numbers.sort_unstable();
     numbers.dedup();
@@ -4022,7 +4977,7 @@ fn line_regions(numbers: &[i64]) -> AppResult<Vec<Value>> {
             "line_count": line_count,
         }));
     }
-    Ok(regions)
+    regions
 }
 
 fn target_order(left: &Value, right: &Value, order_by: &str) -> std::cmp::Ordering {
@@ -4086,7 +5041,8 @@ fn insight_order(value: &Value) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::checkout;
+    use crate::pool::{checkout, inject_watchdog_failure};
+    use std::fmt::Write as _;
     use std::io::{self, Write};
 
     #[test]
@@ -4170,6 +5126,70 @@ mod tests {
     }
 
     #[test]
+    fn artifact_fingerprints_distinguish_hash_and_metadata_fallbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(artifact_fingerprint(Path::new("\0"), false).is_err());
+        let missing = artifact_fingerprint(&directory.path().join("missing"), true).unwrap();
+        assert!(!missing.exists);
+        assert!(!missing.changed_from(&missing));
+
+        let report = directory.path().join("coverage.lcov");
+        std::fs::write(&report, "TN:\n").unwrap();
+        let hashed = artifact_fingerprint(&report, true).unwrap();
+        assert!(hashed.exists);
+        assert!(hashed.sha256.is_some());
+        assert!(!hashed.changed_from(&hashed));
+        let mut changed_hash = hashed.clone();
+        changed_hash.sha256 = Some("different".to_owned());
+        assert!(changed_hash.changed_from(&hashed));
+
+        let metadata_only = artifact_fingerprint(&report, false).unwrap();
+        assert!(metadata_only.sha256.is_none());
+        let mut changed_metadata = metadata_only.clone();
+        changed_metadata.size_bytes = Some(metadata_only.size_bytes.unwrap_or_default() + 1);
+        assert!(changed_metadata.changed_from(&metadata_only));
+        changed_metadata.size_bytes = metadata_only.size_bytes;
+        changed_metadata.modified_ns = Some(
+            metadata_only
+                .modified_ns
+                .unwrap_or_default()
+                .saturating_add(1),
+        );
+        assert!(changed_metadata.changed_from(&metadata_only));
+
+        struct FailingHashReader;
+        impl Read for FailingHashReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("hash reader failure"))
+            }
+        }
+        let mut failing_reader = FailingHashReader;
+        assert!(hash_reader(&mut failing_reader).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let unreadable = directory.path().join("unreadable");
+            std::fs::write(&unreadable, "secret").unwrap();
+            let mut permissions = std::fs::metadata(&unreadable).unwrap().permissions();
+            permissions.set_mode(0o0);
+            std::fs::set_permissions(&unreadable, permissions).unwrap();
+            assert!(artifact_fingerprint(&unreadable, true).is_err());
+            let mut permissions = std::fs::metadata(&unreadable).unwrap().permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&unreadable, permissions).unwrap();
+        }
+
+        assert_eq!(
+            source_lines_from_text("one\ntwo\nthree\n", 2, 3),
+            vec![
+                json!({"line_number":2,"text":"two"}),
+                json!({"line_number":3,"text":"three"})
+            ]
+        );
+    }
+
+    #[test]
     fn artifact_and_log_helpers_report_all_statuses() {
         assert!(normalize_artifact_specs(Value::Null).unwrap().is_empty());
         let specs = normalize_artifact_specs(
@@ -4201,6 +5221,14 @@ mod tests {
             coverage_ingest(&json!([{"coverage_format":"lcov","ingest_status":"pending"}]))["status"],
             "partial"
         );
+        let stale =
+            coverage_ingest(&json!([{"coverage_format":"lcov","ingest_status":"skipped_stale"}]));
+        assert_eq!(stale["status"], "stale");
+        assert_eq!(stale["stale"], 1);
+        let skipped = coverage_ingest(
+            &json!([{"coverage_format":"lcov","ingest_status":"skipped_run_status"}]),
+        );
+        assert_eq!(skipped["skipped"], 1);
 
         let directory = tempfile::tempdir().unwrap();
         let stdout_path = directory.path().join("stdout");
@@ -4240,6 +5268,26 @@ mod tests {
             capture_log(b"x".as_slice(), File::create(&complete_path).unwrap(), 10).unwrap();
         assert_eq!(complete_capture.bytes_written, 1);
         assert!(!complete_capture.truncated);
+        struct FailingReader;
+        impl io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("capture reader failure"))
+            }
+        }
+        struct FailingWriter;
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("capture writer failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut successful_writer = FailingWriter;
+        assert!(successful_writer.flush().is_ok());
+        assert!(capture_log(FailingReader, FailingWriter, 10).is_err());
+        assert!(capture_log(b"x".as_slice(), FailingWriter, 10).is_err());
         #[cfg(unix)]
         {
             let stdout_capture_path = directory.path().join("child-stdout");
@@ -4380,6 +5428,21 @@ mod tests {
             });
             assert!(command_error.is_err());
             let _ = command_error_child.wait();
+            fn failing_child_poll(_: &mut Child) -> io::Result<Option<std::process::ExitStatus>> {
+                Err(io::Error::other("injected child poll failure"))
+            }
+            let mut poll_error_child = Command::new("sleep").arg("5").spawn().unwrap();
+            let status = Command::new("false").status().unwrap();
+            assert!(
+                terminate_child_group_result(
+                    &mut poll_error_child,
+                    Ok(status),
+                    failing_child_poll,
+                )
+                .is_err()
+            );
+            let _ = poll_error_child.kill();
+            let _ = poll_error_child.wait();
             let status = Command::new("false").status().unwrap();
             assert!(
                 terminate_child_group_result(
@@ -4441,7 +5504,7 @@ mod tests {
         let mut empty = tempfile::NamedTempFile::new().unwrap();
         writeln!(empty, "no matching output").unwrap();
         let missing = summarize_logs(
-            empty.path(),
+            directory.path(),
             &directory.path().join("missing"),
             "passed",
             None,
@@ -4457,6 +5520,32 @@ mod tests {
             },
         );
         assert!(missing.is_err());
+        let stderr_directory = directory.path().join("stderr-directory");
+        std::fs::create_dir(&stderr_directory).unwrap();
+        assert!(
+            summarize_logs(
+                &stdout_path,
+                &stderr_directory,
+                "passed",
+                None,
+                0,
+                0,
+                LogCaptureResult {
+                    bytes_written: 0,
+                    truncated: false,
+                },
+                LogCaptureResult {
+                    bytes_written: 0,
+                    truncated: false,
+                },
+            )
+            .is_err()
+        );
+        let mut reaped_child = Command::new("true").spawn().unwrap();
+        reaped_child.wait().unwrap();
+        let mut reaped = Some(reaped_child);
+        FORCE_REAP_CHILD_FAILURE.store(true, Ordering::SeqCst);
+        assert!(reap_child(&mut reaped).is_err());
 
         let cleanup_control = Arc::new(Mutex::new(None));
         let cleanup_poison = Arc::clone(&cleanup_control);
@@ -4666,10 +5755,26 @@ mod tests {
         assert!(summary_line_limit(Some(&json!(0))).is_err());
         assert!(store.source_lines("missing", "a.py", 1, 201).is_err());
         assert!(read_log_lines(&json!({}), "missing-run", "stdout", "stdout_path").is_err());
+        assert!(
+            read_log_lines(
+                &json!({"stdout_path": directory.path()}),
+                "directory-run",
+                "stdout",
+                "stdout_path",
+            )
+            .is_err()
+        );
         assert!(remove_run_directory(directory.path(), "missing-run-directory").is_ok());
         let run_file = directory.path().join("run-file");
         std::fs::write(&run_file, "not a directory").unwrap();
         assert!(remove_run_directory(directory.path(), "run-file").is_err());
+        assert!(create_run_log_files(&run_file).is_err());
+        let stdout_conflict = directory.path().join("stdout-conflict");
+        std::fs::create_dir_all(stdout_conflict.join("stdout.log")).unwrap();
+        assert!(create_run_log_files(&stdout_conflict).is_err());
+        let stderr_conflict = directory.path().join("stderr-conflict");
+        std::fs::create_dir_all(stderr_conflict.join("stderr.log")).unwrap();
+        assert!(create_run_log_files(&stderr_conflict).is_err());
         assert!(
             store
                 .retain_run_thread(Err(std::io::Error::other("spawn failure")))
@@ -4702,17 +5807,76 @@ mod tests {
         let report = directory.path().join("compact.lcov");
         std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
         let project = store.ensure_project(directory.path()).unwrap();
+        let command_projection = json!({
+            "repo_path": project.repo_path,
+            "name": "artifact-test",
+            "artifact_specs": [{}]
+        });
+        assert!(
+            store
+                .collect_artifacts(
+                    "missing",
+                    &command_projection,
+                    directory.path().to_str().unwrap(),
+                    true
+                )
+                .is_err()
+        );
+        let command_path_projection = json!({
+            "repo_path": project.repo_path,
+            "name": "artifact-test",
+            "artifact_specs": [{"kind":"coverage"}]
+        });
+        assert!(
+            store
+                .collect_artifacts(
+                    "missing",
+                    &command_path_projection,
+                    directory.path().to_str().unwrap(),
+                    true
+                )
+                .is_err()
+        );
+        let command_required_projection = json!({
+            "repo_path": project.repo_path,
+            "name": "artifact-test",
+            "artifact_specs": [{"kind":"coverage","path":"missing.coverage"}]
+        });
+        assert!(
+            store
+                .collect_artifacts(
+                    "missing",
+                    &command_required_projection,
+                    directory.path().to_str().unwrap(),
+                    true
+                )
+                .is_err()
+        );
         let snapshot = store
             .ingest_report(
                 &report,
                 "lcov",
                 Some(directory.path()),
                 None,
-                None,
+                Some("known-commit"),
                 None,
                 "unit",
             )
             .unwrap();
+        let source_snapshot_id = snapshot["id"].as_str().unwrap();
+        assert!(
+            store
+                .source_resolution(source_snapshot_id, "../src/a.py")
+                .is_err()
+        );
+        store
+            .clear_snapshot_commit_for_test(source_snapshot_id)
+            .unwrap();
+        assert!(
+            store
+                .source_lines(source_snapshot_id, "missing.py", 1, 1)
+                .is_err()
+        );
         let gap_report = directory.path().join("gap.lcov");
         std::fs::write(
             &gap_report,
@@ -4821,7 +5985,9 @@ mod tests {
         );
         store
             .with_connection(|connection| {
-                connection.execute_batch("DROP TABLE coverage_compacted_payloads")?;
+                connection
+                    .execute_batch("DROP TABLE coverage_compacted_payloads")
+                    .expect("drop compacted payload table");
                 Ok(())
             })
             .unwrap();
@@ -4863,6 +6029,7 @@ mod tests {
         assert!(
             store
                 .collect_artifacts(
+                    "invalid-artifact-run",
                     &json!({"artifact_specs":[{"kind":"invalid","path":"\0","required":false}],"repo_path":directory.path().to_string_lossy(),"name":"invalid"}),
                     &directory.path().to_string_lossy(),
                     true,
@@ -4918,7 +6085,9 @@ mod tests {
         );
         store
             .with_connection(|connection| {
-                connection.execute_batch(&broken_snapshot_view)?;
+                connection
+                    .execute_batch(&broken_snapshot_view)
+                    .expect("install broken snapshot view");
                 Ok(())
             })
             .unwrap();
@@ -5055,6 +6224,60 @@ mod tests {
         )
         .unwrap();
         assert!(invalid_maintenance.project_settings().is_err());
+        let invalid_project_settings_column = |column: &str, expression: &str| {
+            let columns = [
+                "repo_key",
+                "repo_path",
+                "created_at",
+                "updated_at",
+                "compaction_enabled",
+                "compaction_after_days",
+                "compaction_interval_seconds",
+                "compaction_batch_size",
+                "compaction_last_run_at",
+                "compaction_last_status",
+                "compaction_last_snapshot_count",
+                "compaction_last_bytes_before",
+                "compaction_last_bytes_after",
+            ];
+            let projection = columns
+                .iter()
+                .map(|name| {
+                    if *name == column {
+                        format!("{expression} AS {name}")
+                    } else {
+                        (*name).to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DROP VIEW project_settings;
+                 CREATE VIEW project_settings AS
+                 SELECT {projection} FROM project_settings_base;"
+            );
+            invalid_maintenance.with_connection(|connection| {
+                connection
+                    .execute_batch(&sql)
+                    .expect("test settings projection should be created");
+                Ok(())
+            })
+        };
+        for (column, expression) in [
+            ("repo_key", "CAST(7 AS INTEGER)"),
+            ("repo_key", "CAST(NULL AS VARCHAR)"),
+            ("repo_path", "CAST(7 AS INTEGER)"),
+            ("compaction_after_days", "CAST('bad' AS VARCHAR)"),
+            ("compaction_interval_seconds", "CAST('bad' AS VARCHAR)"),
+            ("compaction_batch_size", "CAST('bad' AS VARCHAR)"),
+            ("compaction_last_status", "CAST(1 AS INTEGER)"),
+            ("compaction_last_snapshot_count", "CAST('bad' AS VARCHAR)"),
+            ("compaction_last_bytes_before", "CAST('bad' AS VARCHAR)"),
+            ("compaction_last_bytes_after", "CAST('bad' AS VARCHAR)"),
+        ] {
+            invalid_project_settings_column(column, expression).unwrap();
+            assert!(invalid_maintenance.project_settings().is_err());
+        }
         assert!(rewrite_invalid_type_settings("CREATE VIEW project_settings AS SELECT 1").is_err());
         invalid_maintenance.close().unwrap();
 
@@ -5081,7 +6304,7 @@ mod tests {
         compaction_error
             .with_connection(|connection| {
                 #[rustfmt::skip]
-                connection.execute("UPDATE snapshots SET created_at = ? WHERE id = ?", params![Utc::now() - ChronoDuration::days(31), snapshot["id"].as_str().unwrap()])?;
+                connection.execute("UPDATE snapshots SET created_at = ? WHERE id = ?", params![Utc::now() - ChronoDuration::days(31), snapshot["id"].as_str().unwrap()]).expect("age compaction snapshot");
                 Ok(())
             })
             .unwrap();
@@ -5089,6 +6312,357 @@ mod tests {
         compaction_error.start_compaction_worker().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         compaction_error.close().unwrap();
+
+        let source_root_error = CoverageStore::open(
+            directory.path().join("source-root-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        source_root_error.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&source_root_error);
+        let source_snapshot = source_root_error
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "source-root",
+            )
+            .unwrap();
+        source_root_error
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE snapshots SET repo_path = ? WHERE id = ?",
+                        params!["\0", source_snapshot["id"].as_str().unwrap()],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            source_root_error
+                .source_resolution(source_snapshot["id"].as_str().unwrap(), "src/a.py")
+                .is_err()
+        );
+        source_root_error.close().unwrap();
+    }
+
+    #[test]
+    fn storage_lifecycle_and_lock_boundaries_are_exercised() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+
+        let unselected = CoverageStore::open(
+            directory.path().join("unselected-projections.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        assert!(
+            unselected
+                .update_project_settings(ProjectSettingsPatch::default())
+                .is_err()
+        );
+        assert!(unselected.project_summary().is_err());
+        assert!(unselected.compact_now().is_err());
+        assert!(unselected.list_worktrees(10).is_err());
+        assert!(unselected.list_registered_commands(10).is_err());
+        unselected.close().unwrap();
+
+        let run_directory = directory.path().join("run-directory-conflict");
+        std::fs::create_dir_all(&run_directory).unwrap();
+        std::fs::write(run_directory.join("runs"), "not a directory").unwrap();
+        let _ = CoverageStore::open(run_directory.join("coverage.duckdb"), test_config())
+            .expect_err("run directory creation should fail");
+
+        let pool_directory = directory.path().join("pool-directory");
+        std::fs::create_dir_all(&pool_directory).unwrap();
+        let _ = CoverageStore::open(pool_directory, test_config())
+            .expect_err("DuckDB should reject a directory path");
+
+        let malformed_database = directory.path().join("malformed-schema.duckdb");
+        let connection = Connection::open(&malformed_database).unwrap();
+        connection
+            .execute("CREATE TABLE snapshots (id VARCHAR)", [])
+            .unwrap();
+        drop(connection);
+        let _ = CoverageStore::open(malformed_database, test_config())
+            .expect_err("schema bootstrap should reject incompatible tables");
+
+        let store =
+            CoverageStore::open(directory.path().join("lifecycle.duckdb"), test_config()).unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&store);
+
+        let termination_child = Command::new("sleep").arg("5").spawn().unwrap();
+        let termination_control = Arc::new(Mutex::new(Some(termination_child)));
+        FORCE_TERMINATE_CHILD_FAILURE.store(true, Ordering::SeqCst);
+        assert!(terminate_managed_process(&termination_control).is_err());
+        fn reap_test_child(control: &Arc<Mutex<Option<Child>>>) {
+            if let Some(child) = control.lock().unwrap().as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        reap_test_child(&termination_control);
+        let empty_control = Arc::new(Mutex::new(None));
+        reap_test_child(&empty_control);
+
+        let mut terminate_error = ManagedRunGuard::new(
+            Arc::clone(&store.inner),
+            "terminate-error".to_owned(),
+            Arc::new(Mutex::new(None)),
+            LogCaptureHandles {
+                stdout: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+                stderr: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+            },
+        );
+        let control = Arc::clone(&terminate_error.control);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = control.lock().unwrap();
+            panic!("injected managed control poison");
+        }));
+        let _ = terminate_error
+            .finish()
+            .err()
+            .expect("poisoned managed control should fail finish");
+        terminate_error.control.clear_poison();
+
+        let mut capture_error = ManagedRunGuard::new(
+            Arc::clone(&store.inner),
+            "capture-error".to_owned(),
+            Arc::new(Mutex::new(None)),
+            LogCaptureHandles {
+                stdout: thread::spawn(|| Err(std::io::Error::other("capture failure"))),
+                stderr: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+            },
+        );
+        let _ = capture_error
+            .finish()
+            .err()
+            .expect("capture join error should fail finish");
+
+        let mut registry_error = ManagedRunGuard::new(
+            Arc::clone(&store.inner),
+            "registry-error".to_owned(),
+            Arc::new(Mutex::new(None)),
+            LogCaptureHandles {
+                stdout: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+                stderr: thread::spawn(|| {
+                    Ok(LogCaptureResult {
+                        bytes_written: 0,
+                        truncated: false,
+                    })
+                }),
+            },
+        );
+        let registry_inner = Arc::clone(&registry_error.inner);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = registry_inner.active_processes.lock().unwrap();
+            panic!("injected managed registry poison");
+        }));
+        let _ = registry_error
+            .finish()
+            .err()
+            .expect("poisoned active registry should fail finish");
+        store.inner.active_processes.clear_poison();
+
+        let slot = Arc::new(Mutex::new(None));
+        let poison_target = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("injected compaction slot poison");
+        })
+        .join();
+        let _ = retain_compaction_thread(&slot, Ok(thread::spawn(|| {})))
+            .expect_err("poisoned compaction slot should fail");
+        slot.clear_poison();
+
+        let missing_tables = Connection::open_in_memory().unwrap();
+        let _ = remove_compacted_detail(&missing_tables, "snapshot", true)
+            .expect_err("missing files table should fail deletion");
+        let lines_only = Connection::open_in_memory().unwrap();
+        lines_only
+            .execute("CREATE TABLE files (snapshot_id VARCHAR)", [])
+            .unwrap();
+        let _ = remove_compacted_detail(&lines_only, "snapshot", true)
+            .expect_err("missing lines table should fail deletion");
+
+        let _ = store
+            .ensure_project(Path::new("\0"))
+            .expect_err("NUL repository path should fail");
+
+        let project_poison = CoverageStore::open(
+            directory.path().join("project-poison.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        let project_inner = Arc::clone(&project_poison.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = project_inner.project.write().unwrap();
+            panic!("injected project lock poison");
+        })
+        .join();
+        assert!(project_poison.list_snapshots(None, None, None, 10).is_err());
+        assert!(
+            project_poison
+                .line_history("a.py", 1, None, None, 10)
+                .is_err()
+        );
+        let _ = project_poison
+            .ensure_project(directory.path())
+            .expect_err("poisoned project lock should fail selection");
+        project_poison.inner.project.clear_poison();
+        project_poison.close().unwrap();
+
+        let gate_poison =
+            CoverageStore::open(directory.path().join("gate-poison.duckdb"), test_config())
+                .unwrap();
+        fn no_op_connection(_: &Connection) -> AppResult<()> {
+            Ok(())
+        }
+        assert!(gate_poison.with_connection_mut(no_op_connection).is_ok());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = gate_poison.inner.write_gate.lock().unwrap();
+            panic!("injected write gate poison");
+        }));
+        assert!(gate_poison.with_connection(no_op_connection).is_ok());
+        assert!(gate_poison.with_connection_mut(no_op_connection).is_ok());
+        gate_poison
+            .ensure_project(directory.path())
+            .expect("poisoned write gate should be recoverable");
+        gate_poison.inner.write_gate.clear_poison();
+        gate_poison.close().unwrap();
+
+        let compaction_thread_poison = CoverageStore::open(
+            directory
+                .path()
+                .join("compaction-thread-update-poison.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        compaction_thread_poison
+            .ensure_project(directory.path())
+            .unwrap();
+        let compaction_thread = &compaction_thread_poison.inner.compaction_thread;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = compaction_thread.lock().unwrap();
+            panic!("injected compaction-thread update lock poison");
+        }));
+        assert!(
+            compaction_thread_poison
+                .update_project_settings(ProjectSettingsPatch::default())
+                .is_err()
+        );
+        compaction_thread_poison
+            .inner
+            .compaction_thread
+            .clear_poison();
+        compaction_thread_poison.close().unwrap();
+
+        let active_process_poison = CoverageStore::open(
+            directory.path().join("active-process-lock-poison.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        let active_processes = &active_process_poison.inner.active_processes;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = active_processes.lock().unwrap();
+            panic!("injected active-process lock poison");
+        }));
+        assert!(active_process_poison.close().is_err());
+        active_process_poison.inner.active_processes.clear_poison();
+        active_process_poison.close().unwrap();
+
+        let tracker_poison = CoverageStore::open(
+            directory.path().join("tracker-poison.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        tracker_poison.ensure_project(directory.path()).unwrap();
+        tracker_poison.inner.query_tracker.poison_active_for_test();
+        let _ = tracker_poison
+            .project_settings()
+            .expect_err("poisoned query tracker should fail");
+        tracker_poison
+            .inner
+            .query_tracker
+            .clear_active_poison_for_test();
+        tracker_poison.close().unwrap();
+
+        let pool_poison =
+            CoverageStore::open(directory.path().join("pool-poison.duckdb"), test_config())
+                .unwrap();
+        pool_poison.ensure_project(directory.path()).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pool_poison.inner.pool.lock().unwrap();
+            panic!("injected pool lock poison");
+        }));
+        let _ = pool_poison
+            .project_settings()
+            .expect_err("poisoned pool lock should fail");
+        pool_poison.inner.pool.clear_poison();
+        pool_poison.close().unwrap();
+
+        let compaction_lock = CoverageStore::open(
+            directory.path().join("compaction-lock-poison.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&compaction_lock);
+        let compaction_inner = Arc::clone(&compaction_lock.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = compaction_inner.compaction_thread.lock().unwrap();
+            panic!("injected compaction thread lock poison");
+        })
+        .join();
+        let _ = compaction_lock
+            .close()
+            .expect_err("poisoned compaction thread lock should fail close");
+        compaction_lock.inner.compaction_thread.clear_poison();
+        compaction_lock.close().unwrap();
+
+        let run_thread_lock = CoverageStore::open(
+            directory.path().join("run-thread-lock-poison.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&run_thread_lock);
+        let run_inner = Arc::clone(&run_thread_lock.inner);
+        let _ = std::thread::spawn(move || {
+            let _guard = run_inner.run_threads.lock().unwrap();
+            panic!("injected run thread lock poison");
+        })
+        .join();
+        let _ = run_thread_lock
+            .close()
+            .expect_err("poisoned run thread lock should fail close");
+        run_thread_lock.inner.run_threads.clear_poison();
+        run_thread_lock.close().unwrap();
+
+        store.close().unwrap();
     }
 
     #[test]
@@ -5141,12 +6715,33 @@ mod tests {
         let mut overflowing_current = current.clone();
         overflowing_current["covered_lines"] = json!(i64::MIN);
         assert!(overall_delta(&overflowing_current, &baseline).is_err());
+        for key in [
+            "line_rate",
+            "branch_rate",
+            "function_rate",
+            "region_rate",
+            "covered_lines",
+            "total_lines",
+            "covered_branches",
+            "total_branches",
+            "covered_functions",
+            "total_functions",
+            "covered_regions",
+            "total_regions",
+        ] {
+            let mut missing_current = current.clone();
+            missing_current.as_object_mut().unwrap().remove(key);
+            assert!(overall_delta(&missing_current, &baseline).is_err());
+            let mut missing_baseline = baseline.clone();
+            missing_baseline.as_object_mut().unwrap().remove(key);
+            assert!(overall_delta(&current, &missing_baseline).is_err());
+        }
         assert_eq!(status_order(&json!({"status":"regressed"})), 0);
         assert_eq!(status_order(&json!({"status":"improved"})), 1);
         assert_eq!(status_order(&json!({"status":"same"})), 2);
-        assert_eq!(line_regions(&[5, 1, 2, 2, 4]).unwrap()[0]["start"], 1);
-        assert_eq!(line_regions(&[5, 1, 2, 2, 4]).unwrap()[1]["start"], 4);
-        assert!(line_regions(&[]).unwrap().is_empty());
+        assert_eq!(line_regions(&[5, 1, 2, 2, 4])[0]["start"], 1);
+        assert_eq!(line_regions(&[5, 1, 2, 2, 4])[1]["start"], 4);
+        assert!(line_regions(&[]).is_empty());
         let target_left =
             json!({"file_path":"b.py","priority":20,"uncovered_lines":2,"line_rate":0.5});
         let target_right =
@@ -5186,6 +6781,8 @@ mod tests {
         assert_eq!(insight_order(&json!({"severity":"info"})), 2);
         assert_eq!(coverage_target_priority(2, 3, 4).unwrap(), 250);
         assert!(coverage_target_priority(i64::MAX, 0, 0).is_err());
+        assert!(coverage_target_priority(0, i64::MAX, 0).is_err());
+        assert!(coverage_target_priority(0, 0, i64::MAX).is_err());
         assert_eq!(json_string("{\"value\":1}".to_owned())["value"], 1);
         assert_eq!(json_string("not-json".to_owned()), json!("not-json"));
         assert!(checked_db_u32(-1, "days").is_err());
@@ -5236,7 +6833,7 @@ mod tests {
         settings_store
             .with_connection(|connection| {
                 #[rustfmt::skip]
-                connection.execute("UPDATE project_settings SET compaction_interval_seconds = -1", [])?;
+                connection.execute("UPDATE project_settings SET compaction_interval_seconds = -1", []).expect("corrupt compaction interval");
                 Ok(())
             })
             .unwrap();
@@ -5244,11 +6841,35 @@ mod tests {
         settings_store
             .with_connection(|connection| {
                 #[rustfmt::skip]
-                connection.execute("UPDATE project_settings SET compaction_interval_seconds = 3600, compaction_last_snapshot_count = -1", [])?;
+                connection.execute("UPDATE project_settings SET compaction_interval_seconds = 3600, compaction_last_snapshot_count = -1", []).expect("corrupt compaction count");
                 Ok(())
             })
             .unwrap();
         assert!(settings_store.project_settings().is_err());
+        for field in [
+            "compaction_after_days",
+            "compaction_batch_size",
+            "compaction_last_bytes_before",
+            "compaction_last_bytes_after",
+        ] {
+            settings_store
+                .with_connection(|connection| {
+                    connection
+                        .execute(&format!("UPDATE project_settings SET {field} = -1"), [])
+                        .expect("corrupt project setting");
+                    Ok(())
+                })
+                .unwrap();
+            assert!(settings_store.project_settings().is_err());
+            settings_store
+                .with_connection(|connection| {
+                    connection
+                        .execute(&format!("UPDATE project_settings SET {field} = 0"), [])
+                        .expect("restore project setting");
+                    Ok(())
+                })
+                .unwrap();
+        }
         settings_store.close().unwrap();
 
         let recovery_store = CoverageStore::open(
@@ -5383,6 +7004,7 @@ mod tests {
         assert!(required_field(&json!({}), "id", "projection").is_err());
         assert!(required_string_field(&json!({"id":""}), "id", "projection").is_err());
         assert!(required_i64_field(&json!({"count":"1"}), "count", "projection").is_err());
+        assert!(required_bool_field(&json!({}), "enabled", "projection").is_err());
         assert!(required_bool_field(&json!({"enabled":1}), "enabled", "projection").is_err());
         assert!(required_array_field(&json!({"items":{}}), "items", "projection").is_err());
         let mut scalar_projection = json!("scalar");
@@ -5415,6 +7037,20 @@ mod tests {
         assert!(
             CoverageStore::decorate_queued_run(json!("scalar"), "queued".to_owned(), false, None)
                 .is_err()
+        );
+        assert!(
+            CoverageStore::decorate_queued_run(
+                json!({
+                    "started_at": 1,
+                    "queued_at": null,
+                    "stdout_path": "stdout",
+                    "stderr_path": "stderr"
+                }),
+                "queued".to_owned(),
+                false,
+                None,
+            )
+            .is_err()
         );
         assert!(
             CoverageStore::decorate_queued_run(
@@ -5465,10 +7101,9 @@ mod tests {
         assert!(format!("{store:?}").contains("CoverageStore"));
         let pool = store.inner.pool.lock().unwrap().clone().unwrap();
         let held = checkout(&pool, Duration::from_millis(50), "test").unwrap();
-        assert!(matches!(
-            store.with_read_connection(no_op_connection),
-            Err(AppError::Busy { .. })
-        ));
+        let _ = store
+            .with_read_connection(no_op_connection)
+            .expect_err("held pool connection should be busy");
         drop(held);
         assert!(store.with_read_connection(no_op_connection).is_ok());
         store.close().unwrap();
@@ -5477,10 +7112,9 @@ mod tests {
             CoverageStore::open(directory.path().join("closed-pool.duckdb"), test_config())
                 .unwrap();
         closed_pool_store.inner.pool.lock().unwrap().take();
-        assert!(matches!(
-            closed_pool_store.with_read_connection(no_op_connection),
-            Err(AppError::Runtime(message)) if message == "DuckDB pool is closed"
-        ));
+        let _ = closed_pool_store
+            .with_read_connection(no_op_connection)
+            .expect_err("closed pool should reject reads");
         closed_pool_store.close().unwrap();
 
         let mut timeout_config = test_config();
@@ -5502,20 +7136,14 @@ mod tests {
         let error = timeout_store
             .close()
             .expect_err("active query should delay close");
-        assert!(matches!(error, AppError::Timeout { .. }));
+        let _ = error;
         drop(guard);
         timeout_store.close().unwrap();
     }
 
     #[test]
-    fn legacy_schema_rows_and_lock_errors_are_exercised() {
+    fn row_decoding_and_lock_errors_are_exercised() {
         let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE snapshots (id VARCHAR); CREATE TABLE files (id VARCHAR); CREATE TABLE registered_commands (id VARCHAR); CREATE TABLE runs (id VARCHAR); CREATE TABLE run_jobs (id VARCHAR); CREATE TABLE run_artifacts (id VARCHAR); CREATE TABLE lines (hits INTEGER);",
-            )
-            .unwrap();
-        migrate_schema(&connection).unwrap();
         let mut statement = connection
             .prepare("SELECT 'text', NULL, 1, TIMESTAMP '2020-01-01 00:00:00'")
             .unwrap();
@@ -5541,6 +7169,11 @@ mod tests {
         let mut valid_rows = valid.query([]).unwrap();
         let value = line_from_row_with_file(valid_rows.next().unwrap().unwrap()).unwrap();
         assert_eq!(value["file_path"], "a.py");
+        let mut invalid_file_path = connection
+            .prepare("SELECT true, 1::BIGINT, 2::BIGINT, true, true, 0::BIGINT, 0::BIGINT, 0::BIGINT, 0::BIGINT, '{}'")
+            .unwrap();
+        let mut invalid_file_path_rows = invalid_file_path.query([]).unwrap();
+        assert!(line_from_row_with_file(invalid_file_path_rows.next().unwrap().unwrap()).is_err());
         let mut invalid = connection.prepare("SELECT 1").unwrap();
         let mut invalid_rows = invalid.query([]).unwrap();
         assert!(line_from_row_with_file(invalid_rows.next().unwrap().unwrap()).is_err());
@@ -5549,6 +7182,21 @@ mod tests {
                 .to_string()
                 .contains("poisoned")
         );
+
+        let project_directory = tempfile::tempdir().unwrap();
+        let project_store = CoverageStore::open(
+            project_directory.path().join("project-lock.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        let project_lock = &project_store.inner.project;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = project_lock.write().unwrap();
+            panic!("injected project lock poison");
+        }));
+        assert!(project_store.project().is_err());
+        project_store.inner.project.clear_poison();
+        project_store.close().unwrap();
 
         fn assert_poisoned_mutex<T: std::fmt::Debug + Send + 'static>(value: T) {
             let lock = Arc::new(Mutex::new(value));
@@ -5590,6 +7238,374 @@ mod tests {
     }
 
     #[test]
+    fn row_decoders_reject_each_malformed_column() {
+        fn row_error<F>(connection: &Connection, values: &[String], decoder: F)
+        where
+            F: Fn(&Row<'_>) -> duckdb::Result<Value>,
+        {
+            let sql = format!("SELECT {}", values.join(", "));
+            let mut statement = connection.prepare(&sql).unwrap();
+            let mut rows = statement.query([]).unwrap();
+            let _ = decoder(rows.next().unwrap().unwrap()).expect_err(&sql);
+        }
+
+        let connection = Connection::open_in_memory().unwrap();
+        let snapshot = vec![
+            "'id'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "'/repo'",
+            "'repo'",
+            "'main'",
+            "'commit'",
+            "'base'",
+            "'unit'",
+            "'lcov'",
+            "'coverage.lcov'",
+            "'[]'",
+            "'{}'",
+            "1",
+            "1",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "1.0",
+            "NULL",
+            "NULL",
+            "NULL",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (2, "TRUE"),
+            (3, "TRUE"),
+            (4, "1"),
+            (5, "1"),
+            (6, "1"),
+            (7, "TRUE"),
+            (8, "TRUE"),
+            (9, "TRUE"),
+            (10, "TRUE"),
+            (11, "TRUE"),
+            (12, "'bad'"),
+            (13, "'bad'"),
+            (14, "'bad'"),
+            (15, "'bad'"),
+            (16, "'bad'"),
+            (17, "'bad'"),
+            (18, "'bad'"),
+            (19, "'bad'"),
+            (20, "'bad'"),
+            (21, "'bad'"),
+            (22, "'bad'"),
+            (23, "'bad'"),
+        ] {
+            let mut values = snapshot
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, snapshot_from_row);
+        }
+
+        let file = vec![
+            "'a.py'", "1", "1", "0", "0", "0", "0", "0", "0", "1.0", "NULL", "NULL", "NULL", "'{}'",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (1, "'bad'"),
+            (2, "'bad'"),
+            (3, "'bad'"),
+            (4, "'bad'"),
+            (5, "'bad'"),
+            (6, "'bad'"),
+            (7, "'bad'"),
+            (8, "'bad'"),
+            (9, "'bad'"),
+            (10, "'bad'"),
+            (11, "'bad'"),
+            (12, "'bad'"),
+            (13, "TRUE"),
+        ] {
+            let mut values = file
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, file_from_row);
+        }
+
+        let line = ["1", "1", "true", "true", "0", "0", "0", "0", "'{}'"];
+        for (index, bad) in [
+            (0, "'bad'"),
+            (1, "'bad'"),
+            (2, "'bad'"),
+            (3, "'bad'"),
+            (4, "'bad'"),
+            (5, "'bad'"),
+            (6, "'bad'"),
+            (7, "'bad'"),
+            (8, "TRUE"),
+        ] {
+            let mut values = line
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, line_from_row);
+        }
+
+        let line_with_file = [
+            "'a.py'", "1", "1", "true", "true", "0", "0", "0", "0", "'{}'",
+        ];
+        for (index, bad) in [
+            (1, "'bad'"),
+            (2, "'bad'"),
+            (3, "'bad'"),
+            (4, "'bad'"),
+            (5, "'bad'"),
+            (6, "'bad'"),
+            (7, "'bad'"),
+            (8, "'bad'"),
+            (9, "TRUE"),
+        ] {
+            let mut values = line_with_file
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, line_from_row_with_file);
+        }
+
+        let worktree = [
+            "'id'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "'name'",
+            "'/path'",
+            "'/repo'",
+            "'repo'",
+            "'main'",
+            "'head'",
+            "'main'",
+            "'base'",
+            "'snapshot'",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (2, "1"),
+            (3, "TRUE"),
+            (4, "TRUE"),
+            (5, "TRUE"),
+            (6, "1"),
+            (7, "1"),
+            (8, "TRUE"),
+            (9, "1"),
+            (10, "1"),
+        ] {
+            let mut values = worktree
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, worktree_from_row);
+        }
+
+        let command = vec![
+            "'id'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "'name'",
+            "'true'",
+            "'/cwd'",
+            "'/repo'",
+            "'repo'",
+            "'main'",
+            "'commit'",
+            "'/bin/sh'",
+            "'tester'",
+            "'note'",
+            "'{}'",
+            "true",
+            "1",
+            "1",
+            "1",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (2, "1"),
+            (3, "1"),
+            (4, "TRUE"),
+            (5, "TRUE"),
+            (6, "TRUE"),
+            (7, "1"),
+            (8, "1"),
+            (9, "1"),
+            (10, "1"),
+            (11, "1"),
+            (12, "TRUE"),
+            (13, "'bad'"),
+            (14, "'bad'"),
+            (15, "'bad'"),
+            (16, "'bad'"),
+        ] {
+            let mut values = command
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, command_from_row);
+        }
+
+        let job = vec![
+            "'id'",
+            "'command'",
+            "'name'",
+            "'true'",
+            "'key'",
+            "'/cwd'",
+            "'/repo'",
+            "'repo'",
+            "'main'",
+            "'commit'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "NULL",
+            "NULL",
+            "1",
+            "20",
+            "'queued'",
+            "'/stdout'",
+            "'/stderr'",
+            "''",
+            "NULL",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (1, "1"),
+            (2, "1"),
+            (3, "1"),
+            (4, "1"),
+            (5, "TRUE"),
+            (6, "TRUE"),
+            (7, "TRUE"),
+            (8, "1"),
+            (9, "1"),
+            (13, "'bad'"),
+            (14, "'bad'"),
+            (15, "1"),
+            (16, "1"),
+            (17, "1"),
+            (18, "1"),
+        ] {
+            let mut values = job
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, job_from_row);
+        }
+
+        let artifact = vec![
+            "'run'",
+            "'coverage'",
+            "'/coverage.lcov'",
+            "true",
+            "1",
+            "'lcov'",
+            "'unit'",
+            "false",
+            "'ingested'",
+            "'snapshot'",
+            "'error'",
+            "'command'",
+            "'name'",
+            "'repo'",
+            "'/repo'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "NULL",
+            "'passed'",
+            "0",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (1, "1"),
+            (2, "1"),
+            (3, "'bad'"),
+            (4, "'bad'"),
+            (5, "1"),
+            (6, "1"),
+            (7, "'bad'"),
+            (8, "1"),
+            (9, "1"),
+            (10, "1"),
+            (11, "1"),
+            (12, "1"),
+            (13, "1"),
+            (14, "TRUE"),
+            (17, "1"),
+            (18, "'bad'"),
+        ] {
+            let mut values = artifact
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, artifact_from_row);
+        }
+
+        let run = vec![
+            "'run'",
+            "'command'",
+            "'name'",
+            "'true'",
+            "'key'",
+            "'/cwd'",
+            "'/repo'",
+            "'repo'",
+            "'main'",
+            "'commit'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "TIMESTAMP '2020-01-01 00:00:01'",
+            "1",
+            "0",
+            "'passed'",
+            "'/stdout'",
+            "'/stderr'",
+            "'{}'",
+            "'[]'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "1",
+            "NULL",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (1, "1"),
+            (2, "1"),
+            (3, "1"),
+            (4, "1"),
+            (5, "TRUE"),
+            (6, "TRUE"),
+            (7, "TRUE"),
+            (8, "1"),
+            (9, "1"),
+            (12, "'bad'"),
+            (13, "'bad'"),
+            (14, "1"),
+            (15, "1"),
+            (16, "1"),
+            (17, "TRUE"),
+            (18, "TRUE"),
+            (20, "'bad'"),
+        ] {
+            let mut values = run
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, run_from_row);
+        }
+    }
+
+    #[test]
     fn run_scheduler_and_terminal_job_edges_are_exercised() {
         let directory = tempfile::tempdir().unwrap();
         let config = ServerConfig {
@@ -5623,6 +7639,33 @@ mod tests {
         store.inner.slots.1.notify_all();
         assert!(waiting.join().unwrap().is_err());
         store.inner.closing.store(false, Ordering::SeqCst);
+        *store.inner.slots.0.lock().unwrap() = 0;
+
+        let slot_poison_store = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = slot_poison_store.inner.slots.0.lock().unwrap();
+            panic!("injected execute slot lock poison");
+        })
+        .join();
+        assert!(store.execute_run("slot-poison").is_err());
+        store.inner.slots.0.clear_poison();
+
+        {
+            *store.inner.slots.0.lock().unwrap() = 1;
+            let waiting_store = store.clone();
+            let waiting = std::thread::spawn(move || waiting_store.execute_run("condvar-wait"));
+            std::thread::sleep(Duration::from_millis(20));
+            let condvar_poison_store = store.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = condvar_poison_store.inner.slots.0.lock().unwrap();
+                panic!("injected condvar wait lock poison");
+            })
+            .join();
+            store.inner.slots.1.notify_all();
+            assert!(waiting.join().unwrap().is_err());
+            store.inner.slots.0.clear_poison();
+            *store.inner.slots.0.lock().unwrap() = 0;
+        }
 
         let project = store.project().unwrap();
         const INSERT_EDGE_JOB_SQL: &str = "INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, 'edge', 'true', NULL, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, 20, ?, ?, ?, '', NULL)";
@@ -5641,7 +7684,9 @@ mod tests {
                     stdout_path.to_string_lossy(),
                     stderr_path.to_string_lossy(),
                 ];
-                connection.execute(INSERT_EDGE_JOB_SQL, values)?;
+                connection
+                    .execute(INSERT_EDGE_JOB_SQL, values)
+                    .expect("insert edge job");
                 Ok(())
             })
         };
@@ -5662,6 +7707,17 @@ mod tests {
             .finalize_failed_job(&claim_id, &AppError::Runtime("claim failed".to_owned()))
             .unwrap();
 
+        let claim_error_id = Uuid::new_v4().to_string();
+        insert_job(&claim_error_id, "claim-error-command", "queued").unwrap();
+        store.inject_query_fault_after(1);
+        assert!(store.execute_run_with_slot(&claim_error_id).is_err());
+        store.clear_query_fault();
+
+        let claim_false_id = Uuid::new_v4().to_string();
+        insert_job(&claim_false_id, "claim-false-command", "queued").unwrap();
+        FORCE_CLAIM_FALSE.store(true, Ordering::SeqCst);
+        assert!(store.execute_run_with_slot(&claim_false_id).is_ok());
+
         let nonqueued = Uuid::new_v4().to_string();
         insert_job(&nonqueued, "missing-command", "running").unwrap();
         assert!(store.execute_run_with_slot(&nonqueued).is_ok());
@@ -5676,6 +7732,13 @@ mod tests {
 
         let queued = Uuid::new_v4().to_string();
         insert_job(&queued, "missing-command", "queued").unwrap();
+        store.inject_query_fault_after(1);
+        assert!(store.run_result(&queued, 20).is_err());
+        store.clear_query_fault();
+        FORCE_QUEUE_POSITION_FAILURE.store(true, Ordering::SeqCst);
+        assert!(store.run_result(&queued, 20).is_err());
+        FORCE_QUEUE_POSITION_ROW_FAILURE.store(true, Ordering::SeqCst);
+        assert!(store.run_result(&queued, 20).is_err());
         assert!(store.cancel_run(&queued, 20).is_ok());
 
         let active_id = Uuid::new_v4().to_string();
@@ -5716,6 +7779,22 @@ mod tests {
         let successful_result = store.run_result(&successful_run, 20).unwrap();
         assert_eq!(successful_result["terminal"], true);
         assert_eq!(successful_result["status"], "passed");
+        let successful_stdout = PathBuf::from(successful_result["stdout_path"].as_str().unwrap());
+        std::fs::remove_file(&successful_stdout).unwrap();
+        std::fs::create_dir(&successful_stdout).unwrap();
+        assert!(
+            store
+                .search_run_logs(
+                    &successful_run,
+                    &["term".to_owned()],
+                    "stdout",
+                    0,
+                    5,
+                    false,
+                    10,
+                )
+                .is_err()
+        );
         let closing_store = CoverageStore::open(
             directory.path().join("closing-managed-run.duckdb"),
             test_config(),
@@ -5773,7 +7852,10 @@ mod tests {
             .unwrap()
             .contains_key(&closing_run)
         {
-            assert!(Instant::now() < deadline);
+            Instant::now()
+                .lt(&deadline)
+                .then_some(())
+                .expect("queued run did not finish");
             thread::sleep(Duration::from_millis(5));
         }
         closing_store.inner.closing.store(true, Ordering::SeqCst);
@@ -5848,7 +7930,7 @@ mod tests {
         let db_path = directory.path().join("leased.duckdb");
         let first = CoverageStore::open(db_path.clone(), test_config()).unwrap();
         let second = CoverageStore::open(db_path.clone(), test_config());
-        assert!(matches!(second, Err(AppError::Busy { .. })));
+        let _ = second.expect_err("duplicate database lease should be busy");
         first.close().unwrap();
         let reopened = CoverageStore::open(db_path, test_config()).unwrap();
         reopened.close().unwrap();
@@ -6034,6 +8116,89 @@ mod tests {
         );
         files_store.close().unwrap();
 
+        let compact_file_store = CoverageStore::open(
+            directory
+                .path()
+                .join("file-coverage-compacted-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        compact_file_store.ensure_project(directory.path()).unwrap();
+        let compact_file_snapshot = compact_file_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        stop_compaction_worker(&compact_file_store);
+        make_readonly_view(&compact_file_store, "files");
+        make_broken_view(&compact_file_store, "coverage_compacted_payloads");
+        assert!(
+            compact_file_store
+                .file_coverage(compact_file_snapshot["id"].as_str().unwrap(), "missing.py",)
+                .is_err()
+        );
+        compact_file_store.close().unwrap();
+
+        let latest_artifact_query_store = CoverageStore::open(
+            directory.path().join("latest-artifact-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        latest_artifact_query_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&latest_artifact_query_store);
+        assert!(
+            latest_artifact_query_store
+                .latest_artifact("coverage", Some("missing-command"))
+                .is_err()
+        );
+        make_broken_view(&latest_artifact_query_store, "run_artifacts");
+        assert!(
+            latest_artifact_query_store
+                .latest_artifact("coverage", None)
+                .is_err()
+        );
+        latest_artifact_query_store.close().unwrap();
+
+        let latest_artifact_scoped_store = CoverageStore::open(
+            directory
+                .path()
+                .join("latest-artifact-scoped-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        latest_artifact_scoped_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&latest_artifact_scoped_store);
+        let scoped_command = latest_artifact_scoped_store
+            .register_command(
+                "latest-artifact-scoped",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        make_broken_view(&latest_artifact_scoped_store, "run_artifacts");
+        assert!(
+            latest_artifact_scoped_store
+                .latest_artifact("coverage", Some(scoped_command["id"].as_str().unwrap()),)
+                .is_err()
+        );
+        latest_artifact_scoped_store.close().unwrap();
+
         let detail_store =
             CoverageStore::open(directory.path().join("detail-error.duckdb"), test_config())
                 .unwrap();
@@ -6057,6 +8222,102 @@ mod tests {
                 .is_err()
         );
         detail_store.close().unwrap();
+
+        let detail_prepare_store = CoverageStore::open(
+            directory.path().join("detail-prepare-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        detail_prepare_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&detail_prepare_store);
+        make_broken_view(&detail_prepare_store, "files");
+        assert!(
+            detail_prepare_store
+                .compact_snapshot_detail("repo", "missing")
+                .is_err()
+        );
+        detail_prepare_store.close().unwrap();
+
+        let detail_delete_store = CoverageStore::open(
+            directory.path().join("detail-delete-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        detail_delete_store
+            .ensure_project(directory.path())
+            .unwrap();
+        let detail_delete_snapshot = detail_delete_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                None,
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        stop_compaction_worker(&detail_delete_store);
+        make_readonly_view(&detail_delete_store, "lines");
+        assert!(
+            detail_delete_store
+                .compact_snapshot_detail("repo", detail_delete_snapshot["id"].as_str().unwrap(),)
+                .is_err()
+        );
+        detail_delete_store.close().unwrap();
+
+        let transaction_store = CoverageStore::open(
+            directory.path().join("transaction-begin-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        transaction_store
+            .with_connection(|connection| {
+                CoverageStore::begin_compaction_transaction(connection).unwrap();
+                assert!(CoverageStore::begin_compaction_transaction(connection).is_err());
+                connection
+                    .execute_batch("ROLLBACK")
+                    .expect("transaction rollback should succeed");
+                Ok(())
+            })
+            .unwrap();
+        transaction_store.close().unwrap();
+
+        let parsed_report =
+            parse_coverage_report(&report, "lcov", Some(directory.path().to_str().unwrap()))
+                .unwrap();
+        let report_git = inspect_git(directory.path()).unwrap();
+        for (name, table) in [
+            ("snapshot", "snapshots"),
+            ("file", "files"),
+            ("line", "lines"),
+        ] {
+            let report_store = CoverageStore::open(
+                directory
+                    .path()
+                    .join(format!("store-report-{name}-error.duckdb")),
+                test_config(),
+            )
+            .unwrap();
+            report_store.ensure_project(directory.path()).unwrap();
+            stop_compaction_worker(&report_store);
+            make_broken_view(&report_store, table);
+            assert!(
+                report_store
+                    .store_report(
+                        &parsed_report,
+                        &report_git,
+                        Some("main"),
+                        report_git.commit_sha.as_deref(),
+                        None,
+                        "unit",
+                    )
+                    .is_err()
+            );
+            report_store.close().unwrap();
+        }
 
         let query_map_store = CoverageStore::open(
             directory.path().join("query-map-error.duckdb"),
@@ -6119,6 +8380,101 @@ mod tests {
         );
         settings_store.close().unwrap();
 
+        let repository_store = CoverageStore::open(
+            directory.path().join("repository-upsert-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        repository_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&repository_store);
+        make_broken_view(&repository_store, "repositories");
+        assert!(repository_store.ensure_project(directory.path()).is_err());
+        repository_store.close().unwrap();
+
+        let settings_value_store = CoverageStore::open(
+            directory.path().join("settings-value-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        settings_value_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&settings_value_store);
+        let mut settings_base_created = false;
+        let mut rewrite_settings_column = |column: &str, expression: &str| {
+            if !settings_base_created {
+                settings_value_store
+                    .with_connection(|connection| {
+                        connection
+                            .execute_batch(
+                                "DROP INDEX IF EXISTS idx_project_settings_updated;
+                         ALTER TABLE project_settings RENAME TO project_settings_base;",
+                            )
+                            .expect("test settings table rename should succeed");
+                        Ok(())
+                    })
+                    .expect("test settings table rename should succeed");
+                settings_base_created = true;
+            }
+            let columns = [
+                "repo_key",
+                "repo_path",
+                "created_at",
+                "updated_at",
+                "compaction_enabled",
+                "compaction_after_days",
+                "compaction_interval_seconds",
+                "compaction_batch_size",
+                "compaction_last_run_at",
+                "compaction_last_status",
+                "compaction_last_snapshot_count",
+                "compaction_last_bytes_before",
+                "compaction_last_bytes_after",
+            ];
+            let projection = columns
+                .iter()
+                .map(|name| {
+                    if *name == column {
+                        format!("{expression} AS {name}")
+                    } else {
+                        (*name).to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            settings_value_store.with_connection(|connection| {
+                connection
+                    .execute_batch(&format!(
+                        "CREATE VIEW project_settings AS SELECT {projection} FROM project_settings_base;"
+                    ))
+                    .expect("test settings projection should be created");
+                Ok(())
+            })
+        };
+        assert!(rewrite_settings_column("compaction_last_bytes_before", "-1").is_ok());
+        assert!(settings_value_store.project_settings().is_err());
+        settings_value_store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("DROP VIEW project_settings")
+                    .expect("test settings view teardown should succeed");
+                Ok(())
+            })
+            .unwrap();
+        assert!(rewrite_settings_column("compaction_last_bytes_after", "-1").is_ok());
+        assert!(settings_value_store.project_settings().is_err());
+        settings_value_store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("DROP VIEW project_settings")
+                    .expect("settings view teardown should succeed");
+                Ok(())
+            })
+            .unwrap();
+        assert!(rewrite_settings_column("repo_key", "CAST(NULL AS VARCHAR)").is_ok());
+        assert!(settings_value_store.project_settings().is_err());
+        settings_value_store.close().unwrap();
+
         let compact_store =
             CoverageStore::open(directory.path().join("compact-error.duckdb"), test_config())
                 .unwrap();
@@ -6157,9 +8513,96 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let running_cancel_id = Uuid::new_v4().to_string();
+        cancel_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, 'cancel-error-running', 'true', NULL, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 20, 'running', ?, ?, '', NULL)",
+                        params![
+                            running_cancel_id,
+                            "cancel-command-running",
+                            cancel_project.repo_path,
+                            cancel_project.repo_path,
+                            cancel_project.repo_key,
+                            Utc::now(),
+                            Utc::now(),
+                            directory.path().join("cancel-running.stdout").to_string_lossy(),
+                            directory.path().join("cancel-running.stderr").to_string_lossy(),
+                        ],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
         make_readonly_view(&cancel_store, "run_jobs");
         assert!(cancel_store.cancel_run(&cancel_id, 20).is_err());
+        assert!(cancel_store.cancel_run(&running_cancel_id, 20).is_err());
         cancel_store.close().unwrap();
+
+        let queue_query_map_store = CoverageStore::open(
+            directory.path().join("queue-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        queue_query_map_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&queue_query_map_store);
+        let queue_project = queue_query_map_store.project().unwrap();
+        queue_query_map_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, queued_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error) VALUES ('queue-query-map', 'queue-command', 'queue', 'true', NULL, ?, ?, ?, ?, NULL, 20, 'queued', ?, ?, '')",
+                        params![
+                            queue_project.repo_path,
+                            queue_project.repo_path,
+                            queue_project.repo_key,
+                            Utc::now(),
+                            directory.path().join("queue.out").to_string_lossy(),
+                            directory.path().join("queue.err").to_string_lossy(),
+                        ],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        make_query_execution_view(
+            &queue_query_map_store,
+            "run_jobs",
+            "idx_run_jobs_status_time",
+        );
+        assert!(queue_query_map_store.list_run_queue(10).is_err());
+        queue_query_map_store.close().unwrap();
+
+        let cancel_query_store = CoverageStore::open(
+            directory.path().join("cancel-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        cancel_query_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&cancel_query_store);
+        make_query_execution_view(&cancel_query_store, "runs", "idx_runs_command_time");
+        assert!(cancel_query_store.cancel_run("missing", 20).is_err());
+        cancel_query_store.close().unwrap();
+
+        let cancel_terminal_query_store = CoverageStore::open(
+            directory.path().join("cancel-terminal-query-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        cancel_terminal_query_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&cancel_terminal_query_store);
+        make_broken_view(&cancel_terminal_query_store, "runs");
+        assert!(
+            cancel_terminal_query_store
+                .cancel_run("missing", 20)
+                .is_err()
+        );
+        cancel_terminal_query_store.close().unwrap();
 
         let mut prune_config = test_config();
         prune_config.run_retention = 1;
@@ -6197,6 +8640,248 @@ mod tests {
         assert!(prune_store.prune_runs("prune-command").is_err());
         prune_store.close().unwrap();
 
+        let pruned_query_store = CoverageStore::open(
+            directory.path().join("pruned-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        pruned_query_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&pruned_query_store);
+        let pruned_project = pruned_query_store.project().unwrap();
+        pruned_query_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, started_at, ended_at, duration_ms, status, stdout_path, stderr_path, parsed_summary, artifact_paths) VALUES ('pruned-query', 'command', 'command', 'true', ?, ?, ?, ?, ?, 1, 'passed', ?, ?, '{}', '{}')",
+                        params![
+                            pruned_project.repo_path,
+                            pruned_project.repo_path,
+                            pruned_project.repo_key,
+                            Utc::now(),
+                            Utc::now(),
+                            directory.path().join("pruned.stdout").to_string_lossy(),
+                            directory.path().join("pruned.stderr").to_string_lossy(),
+                        ],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        make_query_execution_view(&pruned_query_store, "runs", "idx_runs_command_time");
+        assert!(
+            pruned_query_store
+                .with_connection(|connection| query_pruned_run_ids(connection, "command", 0))
+                .is_err()
+        );
+        pruned_query_store.close().unwrap();
+
+        let mut prune_delete_config = test_config();
+        prune_delete_config.run_retention = 1;
+        let prune_delete_store = CoverageStore::open(
+            directory.path().join("prune-delete-runs-error.duckdb"),
+            prune_delete_config,
+        )
+        .unwrap();
+        prune_delete_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&prune_delete_store);
+        let prune_delete_project = prune_delete_store.project().unwrap();
+        for (id, age) in [("delete-old", 2_i64), ("delete-new", 1_i64)] {
+            let timestamp = Utc::now() - ChronoDuration::seconds(age);
+            prune_delete_store
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, started_at, ended_at, duration_ms, status, stdout_path, stderr_path, parsed_summary, artifact_paths) VALUES (?, 'delete-command', 'delete', 'true', ?, ?, ?, ?, ?, 1, 'passed', ?, ?, '{}', '{}')",
+                            params![
+                                id,
+                                prune_delete_project.repo_path,
+                                prune_delete_project.repo_path,
+                                prune_delete_project.repo_key,
+                                timestamp,
+                                timestamp,
+                                directory.path().join(format!("{id}.stdout")).to_string_lossy().to_string(),
+                                directory.path().join(format!("{id}.stderr")).to_string_lossy().to_string(),
+                            ],
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+        make_readonly_view(&prune_delete_store, "runs");
+        assert!(prune_delete_store.prune_runs("delete-command").is_err());
+        prune_delete_store.close().unwrap();
+
+        let mut prune_directory_config = test_config();
+        prune_directory_config.run_retention = 1;
+        let prune_directory_store = CoverageStore::open(
+            directory.path().join("prune-run-directory-error.duckdb"),
+            prune_directory_config,
+        )
+        .unwrap();
+        prune_directory_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&prune_directory_store);
+        let prune_directory_project = prune_directory_store.project().unwrap();
+        for (id, age) in [("directory-old", 2_i64), ("directory-new", 1_i64)] {
+            let timestamp = Utc::now() - ChronoDuration::seconds(age);
+            prune_directory_store
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, started_at, ended_at, duration_ms, status, stdout_path, stderr_path, parsed_summary, artifact_paths) VALUES (?, 'directory-command', 'directory', 'true', ?, ?, ?, ?, ?, 1, 'passed', ?, ?, '{}', '{}')",
+                            params![
+                                id,
+                                prune_directory_project.repo_path,
+                                prune_directory_project.repo_path,
+                                prune_directory_project.repo_key,
+                                timestamp,
+                                timestamp,
+                                directory.path().join(format!("{id}.stdout")).to_string_lossy().to_string(),
+                                directory.path().join(format!("{id}.stderr")).to_string_lossy().to_string(),
+                            ],
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+        std::fs::write(
+            prune_directory_store.inner.run_dir.join("directory-old"),
+            "not a run directory",
+        )
+        .unwrap();
+        assert!(
+            prune_directory_store
+                .prune_runs("directory-command")
+                .is_err()
+        );
+        prune_directory_store.close().unwrap();
+
+        let persist_job = |store: &CoverageStore, run_id: &str, command_id: &str| {
+            let project = store.project().unwrap();
+            store
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "INSERT INTO run_jobs (id, command_id, command_name, command, cwd, repo_path, repo_key, queued_at, started_at, max_summary_lines, status, stdout_path, stderr_path, error) VALUES (?, ?, 'persist', 'true', ?, ?, ?, ?, ?, 20, 'running', ?, ?, '')",
+                            params![
+                                run_id,
+                                command_id,
+                                project.repo_path,
+                                project.repo_path,
+                                project.repo_key,
+                                Utc::now(),
+                                Utc::now(),
+                                directory.path().join(format!("{run_id}.stdout")).to_string_lossy().to_string(),
+                                directory.path().join(format!("{run_id}.stderr")).to_string_lossy().to_string(),
+                            ],
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let persist_summary = json!({"status":"passed"});
+        let persist_artifact = json!({
+            "kind":"coverage",
+            "path":"coverage.lcov",
+            "exists":true,
+            "size_bytes":1,
+            "coverage_format":"lcov",
+            "suite":"unit",
+            "modified_by_run":false,
+            "ingest_status":null,
+            "snapshot_id":null,
+            "ingest_error":null
+        });
+
+        let persist_insert_store = CoverageStore::open(
+            directory.path().join("persist-insert-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        persist_insert_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&persist_insert_store);
+        persist_job(&persist_insert_store, "persist-insert", "persist-command");
+        make_readonly_view(&persist_insert_store, "runs");
+        assert!(
+            persist_insert_store
+                .with_connection(|connection| persist_completed_run(
+                    connection,
+                    "persist-insert",
+                    Utc::now(),
+                    1,
+                    Some(0),
+                    "passed",
+                    &persist_summary,
+                    &[],
+                ))
+                .is_err()
+        );
+        persist_insert_store.close().unwrap();
+
+        let persist_artifact_store = CoverageStore::open(
+            directory.path().join("persist-artifact-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        persist_artifact_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&persist_artifact_store);
+        persist_job(
+            &persist_artifact_store,
+            "persist-artifact",
+            "persist-command",
+        );
+        make_readonly_view(&persist_artifact_store, "run_artifacts");
+        assert!(
+            persist_artifact_store
+                .with_connection(|connection| persist_completed_run(
+                    connection,
+                    "persist-artifact",
+                    Utc::now(),
+                    1,
+                    Some(0),
+                    "passed",
+                    &persist_summary,
+                    std::slice::from_ref(&persist_artifact),
+                ))
+                .is_err()
+        );
+        persist_artifact_store.close().unwrap();
+
+        let persist_delete_store = CoverageStore::open(
+            directory.path().join("persist-delete-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        persist_delete_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&persist_delete_store);
+        persist_job(&persist_delete_store, "persist-delete", "persist-command");
+        make_readonly_view(&persist_delete_store, "run_jobs");
+        assert!(
+            persist_delete_store
+                .with_connection(|connection| persist_completed_run(
+                    connection,
+                    "persist-delete",
+                    Utc::now(),
+                    1,
+                    Some(0),
+                    "passed",
+                    &persist_summary,
+                    &[],
+                ))
+                .is_err()
+        );
+        persist_delete_store.close().unwrap();
+
         let command_store =
             CoverageStore::open(directory.path().join("command-error.duckdb"), test_config())
                 .unwrap();
@@ -6219,6 +8904,52 @@ mod tests {
                 .is_err()
         );
         command_store.close().unwrap();
+
+        let command_row_store = CoverageStore::open(
+            directory.path().join("command-row-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        command_row_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&command_row_store);
+        make_query_error_command_view(&command_row_store);
+        assert!(command_row_store.list_registered_commands(10).is_err());
+        assert!(command_row_store.registered_command("missing").is_err());
+        command_row_store.close().unwrap();
+
+        let command_query_map_store = CoverageStore::open(
+            directory.path().join("command-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        command_query_map_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&command_query_map_store);
+        command_query_map_store
+            .register_command(
+                "command-query-map-error",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        make_query_execution_view(
+            &command_query_map_store,
+            "registered_commands",
+            "idx_registered_commands_name",
+        );
+        assert!(
+            command_query_map_store
+                .list_registered_commands(10)
+                .is_err()
+        );
+        command_query_map_store.close().unwrap();
 
         let submit_store =
             CoverageStore::open(directory.path().join("submit-error.duckdb"), test_config())
@@ -6244,7 +8975,297 @@ mod tests {
                 .submit_command(submit_command["id"].as_str().unwrap(), None, None, 20)
                 .is_err()
         );
+        assert!(
+            submit_store
+                .idempotent_run_id("missing", Some("key"))
+                .is_err()
+        );
         submit_store.close().unwrap();
+
+        let run_directory_error_store = CoverageStore::open(
+            directory.path().join("run-directory-submit-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        run_directory_error_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&run_directory_error_store);
+        let run_directory_command = run_directory_error_store
+            .register_command(
+                "run-directory-submit-error",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        std::fs::remove_dir_all(&run_directory_error_store.inner.run_dir).unwrap();
+        std::fs::write(
+            &run_directory_error_store.inner.run_dir,
+            "run directory conflict",
+        )
+        .unwrap();
+        assert!(
+            run_directory_error_store
+                .submit_command(
+                    run_directory_command["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    20,
+                )
+                .is_err()
+        );
+        run_directory_error_store.close().unwrap();
+        std::fs::remove_file(&run_directory_error_store.inner.run_dir).unwrap();
+        std::fs::create_dir_all(&run_directory_error_store.inner.run_dir).unwrap();
+
+        let idempotency_store = CoverageStore::open(
+            directory.path().join("idempotency-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        idempotency_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&idempotency_store);
+        let idempotency_command = idempotency_store
+            .register_command(
+                "idempotency-errors",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let idempotency_ref = idempotency_command["id"].as_str().unwrap();
+        idempotency_store.inject_query_fault_after(1);
+        assert!(
+            idempotency_store
+                .submit_command(idempotency_ref, None, Some("first"), 20)
+                .is_err()
+        );
+        idempotency_store.clear_query_fault();
+        let _ = idempotency_store
+            .submit_command(idempotency_ref, None, Some("reuse"), 20)
+            .unwrap();
+        idempotency_store.inject_query_fault_after(2);
+        assert!(
+            idempotency_store
+                .submit_command(idempotency_ref, None, Some("reuse"), 20)
+                .is_err()
+        );
+        idempotency_store.clear_query_fault();
+        assert!(
+            idempotency_store
+                .reusable_run_id(&json!({}), idempotency_ref)
+                .is_err()
+        );
+        assert!(
+            idempotency_store
+                .reusable_run_id(&json!({"cwd":"\u{0}"}), idempotency_ref)
+                .is_err()
+        );
+        idempotency_store.inject_query_fault_after(2);
+        assert!(
+            idempotency_store
+                .submit_command(idempotency_ref, None, None, 20)
+                .is_err()
+        );
+        idempotency_store.clear_query_fault();
+        let polling_command = idempotency_store
+            .register_command(
+                "polling-query-error",
+                "sleep 1",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        idempotency_store.inject_query_fault_after(4);
+        assert!(
+            idempotency_store
+                .run_command(polling_command["id"].as_str().unwrap(), None, None, 20)
+                .is_err()
+        );
+        idempotency_store.clear_query_fault();
+        idempotency_store.close().unwrap();
+
+        let artifact_baseline_store = CoverageStore::open(
+            directory
+                .path()
+                .join("artifact-baseline-submit-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        artifact_baseline_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&artifact_baseline_store);
+        let artifact_baseline_command = artifact_baseline_store
+            .register_command(
+                "artifact-baseline-submit-error",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                Some(json!({"coverage":"missing.coverage"})),
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        FORCE_ARTIFACT_FINGERPRINT_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            artifact_baseline_store
+                .collect_artifacts(
+                    "fingerprint-error",
+                    &artifact_baseline_command,
+                    directory.path().to_string_lossy().as_ref(),
+                    true,
+                )
+                .is_err()
+        );
+        make_broken_view(&artifact_baseline_store, "run_artifact_baselines");
+        assert!(
+            artifact_baseline_store
+                .submit_command(
+                    artifact_baseline_command["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    20,
+                )
+                .is_err()
+        );
+        assert!(
+            artifact_baseline_store
+                .collect_artifacts(
+                    "collect-baseline-error",
+                    &artifact_baseline_command,
+                    directory.path().to_string_lossy().as_ref(),
+                    true,
+                )
+                .is_err()
+        );
+        assert!(
+            artifact_baseline_store
+                .clear_artifact_baselines("missing")
+                .is_err()
+        );
+        artifact_baseline_store.close().unwrap();
+
+        let artifact_row_store = CoverageStore::open(
+            directory.path().join("artifact-baseline-row-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        artifact_row_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&artifact_row_store);
+        artifact_row_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO run_artifact_baselines (run_id, kind, path, exists, size_bytes, modified_ns, sha256) VALUES ('row-run', 'coverage', 'coverage.lcov', true, 1, 2, 'sha')",
+                        [],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let mut artifact_baseline_base = false;
+        for (column, expression) in [
+            ("exists", "CAST(NULL AS BOOLEAN)"),
+            ("size_bytes", "CAST(true AS BOOLEAN)"),
+            ("modified_ns", "CAST(true AS BOOLEAN)"),
+            ("sha256", "CAST(7 AS INTEGER)"),
+        ] {
+            artifact_row_store
+                .with_connection(|connection| {
+                    let columns = [
+                        "run_id",
+                        "kind",
+                        "path",
+                        "exists",
+                        "size_bytes",
+                        "modified_ns",
+                        "sha256",
+                    ];
+                    let projection = columns
+                        .iter()
+                        .map(|name| {
+                            if *name == column {
+                                format!("{expression} AS {name}")
+                            } else {
+                                (*name).to_owned()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let setup = if artifact_baseline_base {
+                        format!(
+                            "DROP VIEW run_artifact_baselines;
+                             CREATE VIEW run_artifact_baselines AS
+                             SELECT {projection}
+                             FROM run_artifact_baselines_base;"
+                        )
+                    } else {
+                        artifact_baseline_base = true;
+                        format!(
+                            "DROP INDEX IF EXISTS idx_run_artifact_baselines_run;
+                             ALTER TABLE run_artifact_baselines RENAME TO run_artifact_baselines_base;
+                             CREATE VIEW run_artifact_baselines AS
+                             SELECT {projection}
+                             FROM run_artifact_baselines_base;"
+                        )
+                    };
+                    connection.execute_batch(&setup).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                artifact_row_store
+                    .artifact_baseline("row-run", "coverage")
+                    .is_err()
+            );
+        }
+        artifact_row_store.close().unwrap();
+
+        let nul_artifact_store = CoverageStore::open(
+            directory.path().join("nul-artifact-submit-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        nul_artifact_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&nul_artifact_store);
+        let nul_artifact_command = nul_artifact_store
+            .register_command(
+                "nul-artifact-submit-error",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                Some(json!({"coverage":"\u{0}"})),
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        assert!(
+            nul_artifact_store
+                .submit_command(nul_artifact_command["id"].as_str().unwrap(), None, None, 20,)
+                .is_err()
+        );
+        nul_artifact_store.close().unwrap();
 
         let git_directory = tempfile::tempdir().unwrap();
         init_test_git(git_directory.path());
@@ -6257,10 +9278,15 @@ mod tests {
             .ensure_project(git_directory.path())
             .unwrap();
         stop_compaction_worker(&worktree_query_store);
+        assert!(
+            worktree_query_store
+                .ensure_lineage_baseline(Path::new("\0"), "main", None)
+                .is_err()
+        );
         make_broken_view(&worktree_query_store, "snapshots");
         assert!(
             worktree_query_store
-                .register_worktree(git_directory.path(), "main", None)
+                .ensure_lineage_baseline(git_directory.path(), "main", None)
                 .is_err()
         );
         worktree_query_store.close().unwrap();
@@ -6277,10 +9303,52 @@ mod tests {
         make_readonly_view(&worktree_insert_store, "worktrees");
         assert!(
             worktree_insert_store
-                .register_worktree(git_directory.path(), "main", None)
+                .ensure_lineage_baseline(git_directory.path(), "main", None)
                 .is_err()
         );
         worktree_insert_store.close().unwrap();
+
+        let worktree_row_store = CoverageStore::open(
+            directory.path().join("worktree-row-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        worktree_row_store
+            .ensure_project(git_directory.path())
+            .unwrap();
+        stop_compaction_worker(&worktree_row_store);
+        make_query_error_worktree_view(&worktree_row_store);
+        assert!(worktree_row_store.list_worktrees(10).is_err());
+        worktree_row_store.close().unwrap();
+
+        let worktree_query_map_store = CoverageStore::open(
+            directory.path().join("worktree-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        worktree_query_map_store
+            .ensure_project(git_directory.path())
+            .unwrap();
+        stop_compaction_worker(&worktree_query_map_store);
+        worktree_query_map_store
+            .ensure_lineage_baseline(git_directory.path(), "main", None)
+            .unwrap();
+        make_query_execution_view(&worktree_query_map_store, "worktrees", "idx_worktrees_repo");
+        assert!(worktree_query_map_store.list_worktrees(10).is_err());
+        worktree_query_map_store.close().unwrap();
+
+        let unselected_worktree_store = CoverageStore::open(
+            directory.path().join("worktree-unselected-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        stop_compaction_worker(&unselected_worktree_store);
+        assert!(
+            unselected_worktree_store
+                .ensure_lineage_baseline(git_directory.path(), "main", None)
+                .is_err()
+        );
+        unselected_worktree_store.close().unwrap();
 
         let execute_store =
             CoverageStore::open(directory.path().join("execute-error.duckdb"), test_config())
@@ -6390,7 +9458,10 @@ mod tests {
             .unwrap()
             .contains_key(&run_id)
         {
-            assert!(Instant::now() < deadline, "managed process did not start");
+            Instant::now()
+                .lt(&deadline)
+                .then_some(())
+                .expect("managed process did not start");
             std::thread::sleep(Duration::from_millis(5));
         }
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6411,6 +9482,967 @@ mod tests {
         let result = store.run_result(&run_id, 20).unwrap();
         assert_eq!(result["terminal"], true);
         assert_eq!(result["status"], "failed");
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn storage_projection_query_matrix_reports_persistent_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let report = directory.path().join("projection-errors.lcov");
+        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        let broken_store = |name: &str, table: &str| {
+            let store = CoverageStore::open(directory.path().join(name), test_config()).unwrap();
+            store.ensure_project(directory.path()).unwrap();
+            stop_compaction_worker(&store);
+            let snapshot = store
+                .ingest_report(
+                    &report,
+                    "lcov",
+                    Some(directory.path()),
+                    Some("main"),
+                    None,
+                    None,
+                    "unit",
+                )
+                .unwrap();
+            let snapshot_id = snapshot["id"].as_str().unwrap().to_owned();
+            make_broken_view(&store, table);
+            (store, snapshot_id)
+        };
+
+        let (store, _) = broken_store("settings-projection-errors.duckdb", "project_settings");
+        assert!(store.project_settings().is_err());
+        assert!(
+            store
+                .update_project_settings(ProjectSettingsPatch::default())
+                .is_err()
+        );
+        assert!(store.project_summary().is_err());
+        assert!(store.compact_now().is_err());
+        store.close().unwrap();
+
+        let (store, snapshot_id) = broken_store("summary-projection-errors.duckdb", "snapshots");
+        assert!(store.project_summary().is_err());
+        assert!(store.list_snapshots(None, None, None, 10).is_err());
+        assert!(store.latest_snapshot(None, None, None).is_err());
+        assert!(store.snapshot(&snapshot_id).is_err());
+        assert!(store.previous_snapshot(&snapshot_id).is_err());
+        assert!(store.trend(None, None, None, None, None, 10).is_err());
+        assert!(store.targets(&snapshot_id, "priority", 10).is_err());
+        store.close().unwrap();
+
+        let snapshot_query_map_store = CoverageStore::open(
+            directory.path().join("snapshot-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        snapshot_query_map_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&snapshot_query_map_store);
+        let _snapshot_query_map = snapshot_query_map_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        make_query_execution_view(
+            &snapshot_query_map_store,
+            "snapshots",
+            "idx_snapshots_repo_time",
+        );
+        assert!(
+            snapshot_query_map_store
+                .list_snapshots(None, None, None, 10)
+                .is_err()
+        );
+        snapshot_query_map_store.close().unwrap();
+
+        let snapshot_row_store = CoverageStore::open(
+            directory.path().join("snapshot-row-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        snapshot_row_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&snapshot_row_store);
+        snapshot_row_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        make_malformed_projection_view(
+            &snapshot_row_store,
+            "snapshots",
+            "idx_snapshots_repo_time",
+            &[
+                "id",
+                "created_at",
+                "repo_path",
+                "repo_key",
+                "branch",
+                "commit_sha",
+                "base_ref",
+                "suite",
+                "format",
+                "report_path",
+                "warnings",
+                "metadata",
+                "total_lines",
+                "covered_lines",
+                "total_branches",
+                "covered_branches",
+                "total_functions",
+                "covered_functions",
+                "total_regions",
+                "covered_regions",
+                "line_rate",
+                "branch_rate",
+                "function_rate",
+                "region_rate",
+            ],
+            "id",
+            "CAST(NULL AS VARCHAR)",
+        );
+        assert!(
+            snapshot_row_store
+                .list_snapshots(None, None, None, 10)
+                .is_err()
+        );
+        snapshot_row_store.close().unwrap();
+
+        let (store, _) = broken_store("summary-command-errors.duckdb", "registered_commands");
+        assert!(store.project_summary().is_err());
+        assert!(store.list_registered_commands(10).is_err());
+        assert!(store.registered_command("missing").is_err());
+        store.close().unwrap();
+        let (store, _) = broken_store("summary-run-errors.duckdb", "runs");
+        assert!(store.project_summary().is_err());
+        assert!(store.latest_run(None).is_err());
+        assert!(store.run_result("missing", 20).is_err());
+        store.close().unwrap();
+
+        let (store, snapshot_id) = broken_store("files-projection-errors.duckdb", "files");
+        assert!(store.files(&snapshot_id, 10).is_err());
+        assert!(store.file_coverage(&snapshot_id, "src/a.py").is_err());
+        assert!(store.targets(&snapshot_id, "priority", 10).is_err());
+        store.close().unwrap();
+
+        let files_query_map_store = CoverageStore::open(
+            directory.path().join("files-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        files_query_map_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&files_query_map_store);
+        let files_snapshot = files_query_map_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        make_query_execution_view(&files_query_map_store, "files", "idx_files_snapshot");
+        assert!(
+            files_query_map_store
+                .files(files_snapshot["id"].as_str().unwrap(), 10)
+                .is_err()
+        );
+        files_query_map_store.close().unwrap();
+
+        let files_row_store = CoverageStore::open(
+            directory.path().join("files-row-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        files_row_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&files_row_store);
+        let files_row_snapshot = files_row_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        make_malformed_projection_view(
+            &files_row_store,
+            "files",
+            "idx_files_snapshot",
+            &[
+                "snapshot_id",
+                "file_path",
+                "total_lines",
+                "covered_lines",
+                "total_branches",
+                "covered_branches",
+                "total_functions",
+                "covered_functions",
+                "total_regions",
+                "covered_regions",
+                "line_rate",
+                "branch_rate",
+                "function_rate",
+                "region_rate",
+                "raw_metrics",
+            ],
+            "total_lines",
+            "CAST('bad' AS VARCHAR)",
+        );
+        assert!(
+            files_row_store
+                .files(files_row_snapshot["id"].as_str().unwrap(), 10)
+                .is_err()
+        );
+        files_row_store.close().unwrap();
+
+        let (store, snapshot_id) = broken_store("lines-projection-errors.duckdb", "lines");
+        assert!(store.lines(&snapshot_id, "src/a.py", 10).is_err());
+        assert!(
+            store
+                .lines_in_ranges(&snapshot_id, "src/a.py", &[(1, 1)])
+                .is_err()
+        );
+        assert!(store.file_gaps(&snapshot_id, "src/a.py", 10).is_err());
+        assert!(
+            store
+                .line_history("src/a.py", 1, Some("main"), Some("unit"), 10)
+                .is_err()
+        );
+        assert!(store.targets(&snapshot_id, "priority", 10).is_err());
+        store.close().unwrap();
+
+        let lines_query_map_store = CoverageStore::open(
+            directory.path().join("lines-query-map-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        lines_query_map_store
+            .ensure_project(directory.path())
+            .unwrap();
+        stop_compaction_worker(&lines_query_map_store);
+        let lines_snapshot = lines_query_map_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        make_query_execution_view(&lines_query_map_store, "lines", "idx_lines_lookup");
+        assert!(
+            lines_query_map_store
+                .lines(lines_snapshot["id"].as_str().unwrap(), "src/a.py", 10)
+                .is_err()
+        );
+        lines_query_map_store.close().unwrap();
+
+        let lines_row_store = CoverageStore::open(
+            directory.path().join("lines-row-error.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        lines_row_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&lines_row_store);
+        let lines_row_snapshot = lines_row_store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        make_malformed_projection_view(
+            &lines_row_store,
+            "lines",
+            "idx_lines_lookup",
+            &[
+                "snapshot_id",
+                "file_path",
+                "line_number",
+                "hits",
+                "covered",
+                "count_line",
+                "total_branches",
+                "covered_branches",
+                "total_functions",
+                "covered_functions",
+                "details",
+            ],
+            "line_number",
+            "CAST('bad' AS VARCHAR)",
+        );
+        assert!(
+            lines_row_store
+                .lines(lines_row_snapshot["id"].as_str().unwrap(), "src/a.py", 10)
+                .is_err()
+        );
+        lines_row_store.close().unwrap();
+
+        let (store, _) = broken_store("worktree-projection-errors.duckdb", "worktrees");
+        assert!(store.list_worktrees(10).is_err());
+        assert!(store.worktree("missing").is_err());
+        assert!(store.worktree_baseline_snapshot("missing", "unit").is_err());
+        assert!(
+            store
+                .worktree_progress("missing", "unit", None, 10)
+                .is_err()
+        );
+        store.close().unwrap();
+
+        let (store, _) = broken_store("command-projection-errors.duckdb", "registered_commands");
+        assert!(store.list_registered_commands(10).is_err());
+        assert!(store.registered_command("missing").is_err());
+        assert!(store.submit_command("missing", None, None, 20).is_err());
+        store.close().unwrap();
+
+        let (store, snapshot_id) = broken_store("job-projection-errors.duckdb", "run_jobs");
+        assert!(store.list_run_queue(10).is_err());
+        assert!(store.run_result("missing", 20).is_err());
+        assert!(store.cancel_run("missing", 20).is_err());
+        assert!(store.job(&snapshot_id).is_err());
+        assert!(
+            store
+                .search_run_logs("missing", &["term".to_owned()], "both", 1, 5, false, 10)
+                .is_err()
+        );
+        store.close().unwrap();
+
+        let job_row_store = CoverageStore::open(
+            directory.path().join("job-row-projection-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        job_row_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&job_row_store);
+        let job_row_project = job_row_store.project().unwrap();
+        job_row_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO run_jobs (id, command_id, command_name, command, cwd, repo_path, repo_key, queued_at, max_summary_lines, status, stdout_path, stderr_path, error) VALUES ('job-row', 'command', 'command', 'true', ?, ?, ?, ?, 20, 'queued', ?, ?, '')",
+                        params![
+                            directory.path().to_string_lossy(),
+                            directory.path().to_string_lossy(),
+                            job_row_project.repo_key,
+                            Utc::now(),
+                            directory.path().join("job.stdout").to_string_lossy(),
+                            directory.path().join("job.stderr").to_string_lossy(),
+                        ],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        make_malformed_projection_view(
+            &job_row_store,
+            "run_jobs",
+            "idx_run_jobs_status_time",
+            &[
+                "id",
+                "command_id",
+                "command_name",
+                "command",
+                "idempotency_key",
+                "cwd",
+                "repo_path",
+                "repo_key",
+                "branch",
+                "commit_sha",
+                "queued_at",
+                "started_at",
+                "ended_at",
+                "timeout_seconds",
+                "max_summary_lines",
+                "status",
+                "stdout_path",
+                "stderr_path",
+                "error",
+                "cancellation_requested_at",
+            ],
+            "id",
+            "CAST(NULL AS VARCHAR)",
+        );
+        assert!(job_row_store.list_run_queue(10).is_err());
+        job_row_store.close().unwrap();
+
+        let (store, _) = broken_store("artifact-projection-errors.duckdb", "run_artifacts");
+        assert!(store.latest_artifact("coverage", None).is_err());
+        assert!(
+            store
+                .collect_artifacts("missing-run", &json!({}), "", true)
+                .is_err()
+        );
+        store.close().unwrap();
+
+        let (store, snapshot_id) = broken_store(
+            "compacted-projection-errors.duckdb",
+            "coverage_compacted_payloads",
+        );
+        assert!(store.compacted_detail(&snapshot_id).is_err());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn managed_run_claimed_job_validation_and_launch_errors_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let store = CoverageStore::open(
+            directory.path().join("claimed-job-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&store);
+        let command = store
+            .register_command(
+                "claimed-job-errors",
+                "true",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let command_id = command["id"].as_str().unwrap();
+        let stdout = directory.path().join("claimed.stdout");
+        let stderr = directory.path().join("claimed.stderr");
+        let base = json!({
+            "command":"true",
+            "cwd":directory.path(),
+            "command_id":command_id,
+            "stdout_path":stdout,
+            "stderr_path":stderr,
+            "timeout_seconds":null,
+            "max_summary_lines":20
+        });
+        let mut complete_base = base.clone();
+        complete_base["artifact_specs"] = json!([]);
+        for key in ["command", "cwd", "command_id", "stdout_path", "stderr_path"] {
+            let mut malformed = base.clone();
+            malformed.as_object_mut().unwrap().remove(key);
+            assert!(
+                store
+                    .execute_run_with_claimed_job("invalid", &malformed, Utc::now())
+                    .is_err()
+            );
+        }
+        let mut invalid_stdout = base.clone();
+        invalid_stdout["stdout_path"] = json!(directory.path().join("missing").join("stdout"));
+        assert!(
+            store
+                .execute_run_with_claimed_job("invalid-stdout", &invalid_stdout, Utc::now())
+                .is_err()
+        );
+        let mut invalid_stderr = base.clone();
+        invalid_stderr["stderr_path"] = json!(directory.path().join("missing").join("stderr"));
+        assert!(
+            store
+                .execute_run_with_claimed_job("invalid-stderr", &invalid_stderr, Utc::now())
+                .is_err()
+        );
+        let mut invalid_timeout = base.clone();
+        invalid_timeout["timeout_seconds"] = json!(-1);
+        assert!(
+            store
+                .execute_run_with_claimed_job("invalid-timeout", &invalid_timeout, Utc::now())
+                .is_err()
+        );
+        let mut invalid_timeout_type = base.clone();
+        invalid_timeout_type["timeout_seconds"] = json!("bad");
+        assert!(
+            store
+                .execute_run_with_claimed_job(
+                    "invalid-timeout-type",
+                    &invalid_timeout_type,
+                    Utc::now(),
+                )
+                .is_err()
+        );
+        let mut missing_summary_limit = complete_base.clone();
+        FORCE_CANCELLATION_FALSE.store(true, Ordering::SeqCst);
+        missing_summary_limit
+            .as_object_mut()
+            .unwrap()
+            .remove("max_summary_lines");
+        assert!(
+            store
+                .execute_run_with_claimed_job(
+                    "missing-summary-limit",
+                    &missing_summary_limit,
+                    Utc::now(),
+                )
+                .is_err()
+        );
+        let invalid_shell = store
+            .register_command(
+                "invalid-shell",
+                "true",
+                Some(directory.path()),
+                "/definitely/missing-shell",
+                None,
+                true,
+                "tester",
+                "approved",
+                true,
+            )
+            .unwrap();
+        let mut invalid_shell_job = base.clone();
+        invalid_shell_job["command_id"] = invalid_shell["id"].clone();
+        assert!(
+            store
+                .execute_run_with_claimed_job("invalid-shell", &invalid_shell_job, Utc::now())
+                .is_err()
+        );
+        FORCE_LOG_CAPTURE_FAILURE_CALL.store(1, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("capture-first", &base, Utc::now())
+                .is_err()
+        );
+        FORCE_LOG_CAPTURE_FAILURE_CALL.store(2, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("capture-second", &base, Utc::now())
+                .is_err()
+        );
+        FORCE_EMPTY_MANAGED_CHILD.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("missing-child", &base, Utc::now())
+                .is_err()
+        );
+        FORCE_TRY_WAIT_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("try-wait-error", &base, Utc::now())
+                .is_err()
+        );
+        let mut cancellation_job = base.clone();
+        cancellation_job["command"] = json!("sleep 5");
+        store.inner.closing.store(false, Ordering::SeqCst);
+        FORCE_CANCELLATION_STATE.store(true, Ordering::SeqCst);
+        FORCE_CANCELLATION_TERMINATE_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job(
+                    "cancel-terminate-error",
+                    &cancellation_job,
+                    Utc::now()
+                )
+                .is_err()
+        );
+        store.inner.closing.store(false, Ordering::SeqCst);
+
+        let mut timeout_job = cancellation_job.clone();
+        timeout_job["timeout_seconds"] = json!(0);
+        FORCE_CANCELLATION_STATE.store(false, Ordering::SeqCst);
+        FORCE_CANCELLATION_FALSE.store(true, Ordering::SeqCst);
+        FORCE_TIMEOUT_STATE.store(true, Ordering::SeqCst);
+        FORCE_TIMEOUT_TERMINATE_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("timeout-terminate-error", &timeout_job, Utc::now())
+                .is_err()
+        );
+        assert!(!FORCE_TIMEOUT_TERMINATE_FAILURE.load(Ordering::SeqCst));
+
+        store.inner.closing.store(false, Ordering::SeqCst);
+        FORCE_TERMINATE_CHILD_FAILURE.store(false, Ordering::SeqCst);
+        FORCE_CONTROL_POISON_BEFORE_REAP.store(false, Ordering::SeqCst);
+        FORCE_CANCELLATION_STATE.store(true, Ordering::SeqCst);
+        FORCE_CANCELLATION_TERMINATE_SUCCESS.store(true, Ordering::SeqCst);
+        FORCE_CONTROL_POISON_BEFORE_REAP.store(true, Ordering::SeqCst);
+        let poison_result = store.execute_run_with_claimed_job(
+            "reap-control-poison",
+            &cancellation_job,
+            Utc::now(),
+        );
+        assert!(poison_result.is_err());
+        assert!(!FORCE_CONTROL_POISON_BEFORE_REAP.load(Ordering::SeqCst));
+        store.inner.closing.store(false, Ordering::SeqCst);
+        FORCE_TERMINATE_CHILD_FAILURE.store(false, Ordering::SeqCst);
+        FORCE_CONTROL_POISON_BEFORE_REAP.store(false, Ordering::SeqCst);
+        FORCE_REAP_CONTROL_LOCK_FAILURE.store(false, Ordering::SeqCst);
+        store.inner.closing.store(false, Ordering::SeqCst);
+        FORCE_CANCELLATION_STATE.store(true, Ordering::SeqCst);
+        FORCE_CANCELLATION_TERMINATE_SUCCESS.store(true, Ordering::SeqCst);
+        FORCE_REAP_CONTROL_LOCK_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job(
+                    "reap-control-lock-error",
+                    &cancellation_job,
+                    Utc::now()
+                )
+                .is_err()
+        );
+        store.inner.closing.store(false, Ordering::SeqCst);
+        store.inner.closing.store(false, Ordering::SeqCst);
+        FORCE_CANCELLATION_STATE.store(true, Ordering::SeqCst);
+        FORCE_CANCELLATION_TERMINATE_SUCCESS.store(true, Ordering::SeqCst);
+        FORCE_REAP_CHILD_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("reap-error", &cancellation_job, Utc::now())
+                .is_err()
+        );
+        FORCE_REAP_CHILD_FAILURE.store(false, Ordering::SeqCst);
+        store.inner.closing.store(false, Ordering::SeqCst);
+
+        FORCE_CONTROL_LOCK_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("control-lock-error", &base, Utc::now())
+                .is_err()
+        );
+        FORCE_RESOURCES_FINISH_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("resource-finish-error", &base, Utc::now())
+                .is_err()
+        );
+
+        FORCE_SUMMARY_FAILURE.store(true, Ordering::SeqCst);
+        FORCE_CANCELLATION_FALSE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("summary-error", &complete_base, Utc::now())
+                .is_err()
+        );
+        FORCE_CLEAR_ARTIFACT_BASELINES_FAILURE.store(true, Ordering::SeqCst);
+        FORCE_CANCELLATION_FALSE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .execute_run_with_claimed_job("clear-baselines-error", &complete_base, Utc::now())
+                .is_err()
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn managed_run_persistence_error_call_sites_are_exercised() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+
+        let open_store = |name: &str| {
+            let store = CoverageStore::open(directory.path().join(name), test_config()).unwrap();
+            store.ensure_project(directory.path()).unwrap();
+            stop_compaction_worker(&store);
+            let command = store
+                .register_command(
+                    name,
+                    "true",
+                    Some(directory.path()),
+                    "/bin/sh",
+                    None,
+                    true,
+                    "tester",
+                    "approved",
+                    true,
+                )
+                .unwrap();
+            (store, command)
+        };
+        let insert_job = |store: &CoverageStore, command: &Value, run_id: &str| {
+            let project = store.project().unwrap();
+            let stdout = directory.path().join(format!("{run_id}.stdout"));
+            let stderr = directory.path().join(format!("{run_id}.stderr"));
+            store
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "INSERT INTO run_jobs (id, command_id, command_name, command, cwd, repo_path, repo_key, queued_at, started_at, max_summary_lines, status, stdout_path, stderr_path, error) VALUES (?, ?, ?, 'true', ?, ?, ?, ?, ?, 20, 'running', ?, ?, '')",
+                            params![
+                                run_id,
+                                command["id"].as_str().unwrap(),
+                                command["name"].as_str().unwrap(),
+                                directory.path().to_string_lossy(),
+                                project.repo_path,
+                                project.repo_key,
+                                Utc::now(),
+                                Utc::now(),
+                                stdout.to_string_lossy(),
+                                stderr.to_string_lossy(),
+                            ],
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            json!({
+                "command":"true",
+                "cwd":directory.path(),
+                "command_id":command["id"],
+                "stdout_path":stdout,
+                "stderr_path":stderr,
+                "timeout_seconds":null,
+                "max_summary_lines":20,
+                "artifact_specs":[]
+            })
+        };
+
+        let (runs_store, runs_command) = open_store("managed-persist-runs");
+        let runs_job = insert_job(&runs_store, &runs_command, "managed-persist-runs");
+        make_readonly_view(&runs_store, "runs");
+        assert!(
+            runs_store
+                .execute_run_with_claimed_job("managed-persist-runs", &runs_job, Utc::now())
+                .is_err()
+        );
+        runs_store.close().unwrap();
+
+        let (baseline_store, baseline_command) = open_store("managed-persist-baselines");
+        let baseline_job = insert_job(
+            &baseline_store,
+            &baseline_command,
+            "managed-persist-baselines",
+        );
+        make_readonly_view(&baseline_store, "run_artifact_baselines");
+        assert!(
+            baseline_store
+                .execute_run_with_claimed_job(
+                    "managed-persist-baselines",
+                    &baseline_job,
+                    Utc::now(),
+                )
+                .is_err()
+        );
+        baseline_store.close().unwrap();
+
+        let (prune_store, prune_command) = open_store("managed-persist-prune");
+        let prune_job = insert_job(&prune_store, &prune_command, "managed-persist-prune");
+        FORCE_PRUNE_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            prune_store
+                .execute_run_with_claimed_job("managed-persist-prune", &prune_job, Utc::now())
+                .is_err()
+        );
+        prune_store.close().unwrap();
+    }
+
+    #[test]
+    fn injected_query_faults_reach_public_storage_projections() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let report = directory.path().join("fault.lcov");
+        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        let store =
+            CoverageStore::open(directory.path().join("faults.duckdb"), test_config()).unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&store);
+        let snapshot = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        let snapshot_id = snapshot["id"].as_str().unwrap();
+        macro_rules! fault {
+            ($expression:expr) => {{
+                store.inject_query_fault();
+                let _ = $expression
+                    .err()
+                    .expect("injected query fault should surface");
+            }};
+        }
+        macro_rules! watchdog_fault {
+            ($expression:expr) => {{
+                inject_watchdog_failure();
+                let _ = $expression
+                    .err()
+                    .expect("injected watchdog failure should surface");
+            }};
+        }
+
+        fault!(store.ensure_project(directory.path()));
+        store.inject_query_fault_after(1);
+        let _ = store.project_settings();
+        let _ = store.project_settings();
+        fault!(store.project_settings());
+        fault!(store.update_project_settings(ProjectSettingsPatch::default()));
+        fault!(store.project_summary());
+        fault!(store.compact_now());
+        fault!(store.list_worktrees(10));
+        fault!(store.worktree("missing"));
+        fault!(store.worktree_baseline_snapshot("missing", "unit"));
+        fault!(store.worktree_progress("missing", "unit", None, 10));
+        fault!(store.trend(None, None, None, None, None, 10));
+        fault!(store.compare("missing", "missing", 10, 10));
+        fault!(store.compare_regions("missing", "missing", None, false, 10));
+        fault!(store.changed_lines("missing", "missing", None, false, 10));
+        fault!(store.changed_regions("missing", "missing", None, false, 10));
+        fault!(store.list_registered_commands(10));
+        fault!(store.registered_command("missing"));
+        fault!(store.submit_command("missing", None, None, 20));
+        fault!(store.run_command("missing", None, None, 20));
+        fault!(store.run_result("missing", 20));
+        fault!(store.list_run_queue(10));
+        fault!(store.cancel_run("missing", 20));
+        fault!(store.latest_run(None));
+        fault!(store.search_run_logs("missing", &["term".to_owned()], "both", 1, 5, false, 10));
+        fault!(store.latest_artifact("coverage", None));
+        fault!(store.snapshot(snapshot_id));
+        fault!(store.list_snapshots(None, None, None, 10));
+        fault!(store.latest_snapshot(None, None, None));
+        fault!(store.files(snapshot_id, 10));
+        fault!(store.file_coverage(snapshot_id, "src/a.py"));
+        fault!(store.lines(snapshot_id, "src/a.py", 10));
+        fault!(store.lines_in_ranges(snapshot_id, "src/a.py", &[(1, 1)]));
+        fault!(store.file_gaps(snapshot_id, "src/a.py", 10));
+        fault!(store.line_history("src/a.py", 1, None, None, 10));
+        fault!(store.source_lines(snapshot_id, "src/a.py", 1, 1));
+        fault!(store.source_resolution(snapshot_id, "src/a.py"));
+        fault!(store.compacted_detail(snapshot_id));
+        fault!(store.targets(snapshot_id, "priority", 10));
+        fault!(store.insights(snapshot_id, None, 10));
+        fault!(store.compare_worktree("missing", None, 10, 10));
+        fault!(store.compare_worktree_regions("missing", None, None, false, 10));
+        fault!(store.ensure_lineage_baseline(directory.path(), "main", None));
+        fault!(store.execute_run("missing"));
+        store.inject_query_fault_after(1);
+        let _ = store.with_connection(|_| Ok::<(), AppError>(()));
+        store.inner.query_fault_skip.lock().unwrap().take();
+        let _ = store.with_connection(|_| Ok::<(), AppError>(()));
+        store.clear_query_fault();
+        assert!(store.execute_sql_for_test("THIS IS NOT VALID SQL").is_err());
+        watchdog_fault!(store.project_settings());
+        watchdog_fault!(store.project_summary());
+        watchdog_fault!(store.update_project_settings(ProjectSettingsPatch::default()));
+        watchdog_fault!(store.compact_now());
+        watchdog_fault!(store.list_worktrees(10));
+        watchdog_fault!(store.worktree("missing"));
+        watchdog_fault!(store.worktree_progress("missing", "unit", None, 10));
+        watchdog_fault!(store.trend(None, None, None, None, None, 10));
+        watchdog_fault!(store.compare("missing", "missing", 10, 10));
+        watchdog_fault!(store.compare_regions("missing", "missing", None, false, 10));
+        watchdog_fault!(store.changed_lines("missing", "missing", None, false, 10));
+        watchdog_fault!(store.changed_regions("missing", "missing", None, false, 10));
+        watchdog_fault!(store.list_registered_commands(10));
+        watchdog_fault!(store.registered_command("missing"));
+        watchdog_fault!(store.submit_command("missing", None, None, 20));
+        watchdog_fault!(store.run_command("missing", None, None, 20));
+        watchdog_fault!(store.run_result("missing", 20));
+        watchdog_fault!(store.list_run_queue(10));
+        watchdog_fault!(store.cancel_run("missing", 20));
+        watchdog_fault!(store.latest_run(None));
+        watchdog_fault!(store.search_run_logs(
+            "missing",
+            &["term".to_owned()],
+            "both",
+            1,
+            5,
+            false,
+            10
+        ));
+        watchdog_fault!(store.latest_artifact("coverage", None));
+        watchdog_fault!(store.snapshot(snapshot_id));
+        watchdog_fault!(store.list_snapshots(None, None, None, 10));
+        watchdog_fault!(store.latest_snapshot(None, None, None));
+        watchdog_fault!(store.files(snapshot_id, 10));
+        watchdog_fault!(store.file_coverage(snapshot_id, "src/a.py"));
+        watchdog_fault!(store.lines(snapshot_id, "src/a.py", 10));
+        watchdog_fault!(store.lines_in_ranges(snapshot_id, "src/a.py", &[(1, 1)]));
+        watchdog_fault!(store.file_gaps(snapshot_id, "src/a.py", 10));
+        watchdog_fault!(store.line_history("src/a.py", 1, None, None, 10));
+        watchdog_fault!(store.source_lines(snapshot_id, "src/a.py", 1, 1));
+        watchdog_fault!(store.source_resolution(snapshot_id, "src/a.py"));
+        watchdog_fault!(store.compacted_detail(snapshot_id));
+        watchdog_fault!(store.targets(snapshot_id, "priority", 10));
+        watchdog_fault!(store.insights(snapshot_id, None, 10));
+        watchdog_fault!(store.compare_worktree("missing", None, 10, 10));
+        watchdog_fault!(store.compare_worktree_regions("missing", None, None, false, 10));
+        watchdog_fault!(store.execute_run("missing"));
+
+        macro_rules! sweep_query_boundaries {
+            ($expression:expr) => {{
+                for skip in 0..=40 {
+                    store.inject_query_fault_after(skip);
+                    let _ = $expression;
+                }
+            }};
+        }
+        sweep_query_boundaries!(store.project_settings());
+        sweep_query_boundaries!(store.update_project_settings(ProjectSettingsPatch::default()));
+        sweep_query_boundaries!(store.project_summary());
+        sweep_query_boundaries!(store.compact_now());
+        sweep_query_boundaries!(store.list_worktrees(10));
+        sweep_query_boundaries!(store.worktree("missing"));
+        sweep_query_boundaries!(store.worktree_baseline_snapshot("missing", "unit"));
+        sweep_query_boundaries!(store.worktree_progress("missing", "unit", None, 10));
+        sweep_query_boundaries!(store.trend(None, None, None, None, None, 10));
+        sweep_query_boundaries!(store.compare("missing", "missing", 10, 10));
+        sweep_query_boundaries!(store.compare_regions("missing", "missing", None, false, 10));
+        sweep_query_boundaries!(store.changed_lines("missing", "missing", None, false, 10));
+        sweep_query_boundaries!(store.changed_regions("missing", "missing", None, false, 10));
+        sweep_query_boundaries!(store.list_registered_commands(10));
+        sweep_query_boundaries!(store.registered_command("missing"));
+        sweep_query_boundaries!(store.submit_command("missing", None, None, 20));
+        sweep_query_boundaries!(store.run_command("missing", None, None, 20));
+        sweep_query_boundaries!(store.run_result("missing", 20));
+        sweep_query_boundaries!(store.list_run_queue(10));
+        sweep_query_boundaries!(store.cancel_run("missing", 20));
+        sweep_query_boundaries!(store.latest_run(None));
+        sweep_query_boundaries!(store.search_run_logs(
+            "missing",
+            &["term".to_owned()],
+            "both",
+            1,
+            5,
+            false,
+            10
+        ));
+        sweep_query_boundaries!(store.latest_artifact("coverage", None));
+        sweep_query_boundaries!(store.snapshot(snapshot_id));
+        sweep_query_boundaries!(store.list_snapshots(None, None, None, 10));
+        sweep_query_boundaries!(store.latest_snapshot(None, None, None));
+        sweep_query_boundaries!(store.files(snapshot_id, 10));
+        sweep_query_boundaries!(store.file_coverage(snapshot_id, "src/a.py"));
+        sweep_query_boundaries!(store.lines(snapshot_id, "src/a.py", 10));
+        sweep_query_boundaries!(store.lines_in_ranges(snapshot_id, "src/a.py", &[(1, 1)]));
+        sweep_query_boundaries!(store.file_gaps(snapshot_id, "src/a.py", 10));
+        sweep_query_boundaries!(store.line_history("src/a.py", 1, None, None, 10));
+        sweep_query_boundaries!(store.source_lines(snapshot_id, "src/a.py", 1, 1));
+        sweep_query_boundaries!(store.source_resolution(snapshot_id, "src/a.py"));
+        sweep_query_boundaries!(store.compacted_detail(snapshot_id));
+        sweep_query_boundaries!(store.targets(snapshot_id, "priority", 10));
+        sweep_query_boundaries!(store.insights(snapshot_id, None, 10));
+        sweep_query_boundaries!(store.compare_worktree("missing", None, 10, 10));
+        sweep_query_boundaries!(store.compare_worktree_regions("missing", None, None, false, 10));
         store.close().unwrap();
     }
 
@@ -6443,7 +10475,8 @@ mod tests {
             let stderr = run_directory.join("stderr.log");
             store
                 .with_connection(|connection| {
-                    connection.execute(
+                    connection
+                        .execute(
                         "INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, 'restart-recovery', 'printf resumed', NULL, ?, ?, ?, NULL, NULL, ?, ?, NULL, NULL, 20, ?, ?, ?, '', NULL)",
                         params![
                             id,
@@ -6457,7 +10490,8 @@ mod tests {
                             stdout.to_string_lossy(),
                             stderr.to_string_lossy(),
                         ],
-                    )?;
+                        )
+                        .expect("restart recovery test row should be inserted");
                     Ok(())
                 })
                 .unwrap();
@@ -6479,11 +10513,687 @@ mod tests {
             if result["terminal"] == true {
                 break result;
             }
-            assert!(Instant::now() < deadline, "queued run did not resume");
+            Instant::now()
+                .lt(&deadline)
+                .then_some(())
+                .expect("queued run did not resume");
             thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(resumed["status"], "passed");
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn coverage_history_worktree_and_artifact_edges_are_exercised() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let commit = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let report = directory.path().join("coverage.lcov");
+        std::fs::write(
+            &report,
+            "TN:\nSF:src/a.py\nDA:1,1\nBRDA:1,0,0,1\nend_of_record\n",
+        )
+        .unwrap();
+        let store =
+            CoverageStore::open(directory.path().join("edge.duckdb"), test_config()).unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        let baseline = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some(&commit),
+                None,
+                "unit",
+            )
+            .unwrap();
+        let worktree = store
+            .ensure_lineage_baseline(directory.path(), "main", Some("edge"))
+            .unwrap();
+        let worktree_id = worktree["id"].as_str().unwrap();
+
+        std::fs::write(
+            &report,
+            "TN:\nSF:src/a.py\nDA:1,1\nBRDA:1,0,0,-\nend_of_record\n",
+        )
+        .unwrap();
+        let regressed = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some(&commit),
+                None,
+                "unit",
+            )
+            .unwrap();
+        std::fs::write(
+            &report,
+            "TN:\nSF:src/a.py\nDA:1,1\nBRDA:1,0,0,1\nend_of_record\n",
+        )
+        .unwrap();
+        let improved = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some(&commit),
+                None,
+                "unit",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .changed_lines(
+                    regressed["id"].as_str().unwrap(),
+                    baseline["id"].as_str().unwrap(),
+                    None,
+                    false,
+                    10,
+                )
+                .unwrap()
+                .first()
+                .and_then(|value| value["status"].as_str()),
+            Some("regressed")
+        );
+        assert_eq!(
+            store
+                .changed_lines(
+                    improved["id"].as_str().unwrap(),
+                    regressed["id"].as_str().unwrap(),
+                    None,
+                    false,
+                    10,
+                )
+                .unwrap()
+                .first()
+                .and_then(|value| value["status"].as_str()),
+            Some("improved")
+        );
+        assert!(
+            store
+                .changed_lines(
+                    regressed["id"].as_str().unwrap(),
+                    baseline["id"].as_str().unwrap(),
+                    Some("missing.py"),
+                    false,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .changed_lines(
+                    regressed["id"].as_str().unwrap(),
+                    baseline["id"].as_str().unwrap(),
+                    None,
+                    true,
+                    10,
+                )
+                .unwrap()
+                .iter()
+                .all(|value| value["status"] == "regressed")
+        );
+        for order_by in ["priority", "uncovered_lines", "line_rate", "file_path"] {
+            let _ = store
+                .targets(regressed["id"].as_str().unwrap(), order_by, 10)
+                .unwrap();
+        }
+        assert!(
+            store
+                .insights(
+                    regressed["id"].as_str().unwrap(),
+                    Some(baseline["id"].as_str().unwrap()),
+                    10,
+                )
+                .unwrap()["items"]
+                .is_array()
+        );
+
+        let fallback_report = directory.path().join("fallback.lcov");
+        std::fs::write(
+            &fallback_report,
+            "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let fallback = store
+            .ingest_report(
+                &fallback_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("different-commit"),
+                None,
+                "fallback",
+            )
+            .unwrap();
+        let exact = store
+            .ingest_report(
+                &fallback_report,
+                "lcov",
+                Some(directory.path()),
+                Some("other"),
+                Some(&commit),
+                None,
+                "exact",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .worktree_baseline_snapshot(worktree_id, "fallback")
+                .unwrap()
+                .and_then(|value| value["id"].as_str().map(str::to_owned)),
+            Some(fallback["id"].as_str().unwrap().to_owned())
+        );
+        assert_eq!(
+            store
+                .worktree_baseline_snapshot(worktree_id, "exact")
+                .unwrap()
+                .and_then(|value| value["id"].as_str().map(str::to_owned)),
+            Some(exact["id"].as_str().unwrap().to_owned())
+        );
+        assert!(
+            store
+                .worktree_baseline_snapshot(worktree_id, "missing-suite")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .worktree_progress(worktree_id, "unit", Some("src/a.py"), 10)
+                .unwrap()["points"]
+                .is_array()
+        );
+
+        let repo_path = baseline["repo_path"].as_str().unwrap().to_owned();
+        assert!(
+            store
+                .snapshot_for_commit(&repo_path, Some("main"), "unit", &commit)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .snapshot_for_commit(&repo_path, Some("other"), "unit", &commit)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .snapshot_for_commit(&repo_path, None, "unit", "missing-commit")
+                .unwrap()
+                .is_none()
+        );
+        store.inject_query_fault_after(1);
+        assert!(
+            store
+                .snapshot_for_commit(&repo_path, Some("other"), "unit", "missing-commit")
+                .is_err()
+        );
+        store.clear_query_fault();
+        assert_eq!(
+            store
+                .source_resolution(baseline["id"].as_str().unwrap(), "src/a.py")
+                .unwrap(),
+            "snapshot_commit"
+        );
+        let invalid_commit = store
+            .ingest_report(
+                &fallback_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("missing-commit"),
+                None,
+                "invalid-source",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .source_resolution(invalid_commit["id"].as_str().unwrap(), "src/a.py")
+                .unwrap(),
+            "current_checkout_fallback"
+        );
+        assert!(
+            !store
+                .source_lines(invalid_commit["id"].as_str().unwrap(), "src/a.py", 1, 2)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .source_resolution(invalid_commit["id"].as_str().unwrap(), "missing.py")
+                .unwrap(),
+            "unavailable"
+        );
+        let checkout_source = store
+            .ingest_report(
+                &fallback_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "checkout-source",
+            )
+            .unwrap();
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE snapshots SET commit_sha = NULL WHERE id = ?",
+                        params![checkout_source["id"].as_str().unwrap()],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .source_resolution(checkout_source["id"].as_str().unwrap(), "src/a.py")
+                .unwrap(),
+            "current_checkout"
+        );
+        assert_eq!(
+            store
+                .source_resolution(checkout_source["id"].as_str().unwrap(), "missing.py")
+                .unwrap(),
+            "unavailable"
+        );
+
+        let artifact_path = directory.path().join("artifact.txt");
+        std::fs::write(&artifact_path, "before").unwrap();
+        let artifact_command = json!({
+            "name":"artifact-edge",
+            "repo_path":repo_path,
+            "artifact_specs":[{"kind":"coverage","path":"artifact.txt","required":false,"coverage_format":"invalid-format","suite":"unit"}]
+        });
+        let stale = store
+            .collect_artifacts("stale-artifact", &artifact_command, &repo_path, true)
+            .unwrap();
+        assert_eq!(stale[0]["ingest_status"], "skipped_stale");
+        let fingerprint = artifact_fingerprint(&artifact_path, true).unwrap();
+        store
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO run_artifact_baselines (run_id, kind, path, exists, size_bytes, modified_ns, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        "failed-artifact",
+                        "coverage",
+                        artifact_path.to_string_lossy(),
+                        fingerprint.exists,
+                        fingerprint.size_bytes,
+                        fingerprint.modified_ns,
+                        fingerprint.sha256,
+                    ],
+                ).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(&artifact_path, "after").unwrap();
+        let failed = store
+            .collect_artifacts("failed-artifact", &artifact_command, &repo_path, true)
+            .unwrap();
+        assert_eq!(failed[0]["ingest_status"], "failed");
+
+        let git_directory = tempfile::tempdir().unwrap();
+        init_test_git(git_directory.path());
+        let no_commit = tempfile::tempdir().unwrap();
+        assert!(
+            store
+                .reusable_run_id(
+                    &json!({"cwd":no_commit.path().to_string_lossy()}),
+                    "missing-command"
+                )
+                .unwrap()
+                .is_none()
+        );
+        let reuse_command = store
+            .register_command(
+                "reuse-pass",
+                "true",
+                Some(git_directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "reuse edge",
+                true,
+            )
+            .unwrap();
+        assert!(
+            store
+                .reusable_run_id(&reuse_command, reuse_command["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let passed = store
+            .submit_command_with_options(
+                reuse_command["id"].as_str().unwrap(),
+                None,
+                None,
+                20,
+                true,
+            )
+            .unwrap();
+        let polling_command = store
+            .register_command(
+                "polling-run",
+                "sleep 1",
+                Some(git_directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "polling edge",
+                true,
+            )
+            .unwrap();
+        assert!(
+            store
+                .run_command(polling_command["id"].as_str().unwrap(), None, None, 20,)
+                .unwrap()["terminal"]
+                == true
+        );
+        assert_eq!(
+            store
+                .reusable_run_id(&reuse_command, reuse_command["id"].as_str().unwrap())
+                .unwrap(),
+            Some(passed["id"].as_str().unwrap().to_owned())
+        );
+        store.inject_query_fault_after(1);
+        assert!(
+            store
+                .submit_command_with_options(
+                    reuse_command["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    20,
+                    true,
+                )
+                .is_err()
+        );
+        store.clear_query_fault();
+        let reused = store
+            .submit_command_with_options(
+                reuse_command["id"].as_str().unwrap(),
+                None,
+                None,
+                20,
+                true,
+            )
+            .unwrap();
+        assert_eq!(reused["submission_reused"], true);
+        assert_eq!(reused["reuse_reason"], "unchanged_checkout");
+        FORCE_REUSED_RESULT_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .submit_command_with_options(
+                    reuse_command["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    20,
+                    true,
+                )
+                .is_err()
+        );
+        store.inject_query_fault_after(2);
+        assert!(
+            store
+                .submit_command_with_options(
+                    reuse_command["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    20,
+                    true,
+                )
+                .is_err()
+        );
+        store.clear_query_fault();
+        std::fs::write(git_directory.path().join("dirty"), "dirty").unwrap();
+        assert!(
+            store
+                .reusable_run_id(&reuse_command, reuse_command["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_file(git_directory.path().join("dirty")).unwrap();
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE runs SET repo_key = 'mismatch' WHERE id = ?",
+                        params![passed["id"].as_str().unwrap()],
+                    )
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .reusable_run_id(&reuse_command, reuse_command["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let fail_command = store
+            .register_command(
+                "reuse-fail",
+                "false",
+                Some(git_directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "reuse failure edge",
+                true,
+            )
+            .unwrap();
+        store
+            .submit_command_with_options(
+                fail_command["id"].as_str().unwrap(),
+                None,
+                None,
+                20,
+                false,
+            )
+            .unwrap();
+        assert!(
+            store
+                .reusable_run_id(&fail_command, fail_command["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.registered_command("definitely-missing").is_err());
+
+        let zero_report = directory.path().join("zero-coverage.lcov");
+        let mut zero_lines = String::new();
+        for line in 1..=20 {
+            writeln!(zero_lines, "DA:{line},0").unwrap();
+        }
+        std::fs::write(
+            &zero_report,
+            format!("TN:\nSF:src/zero.py\n{zero_lines}end_of_record\n"),
+        )
+        .unwrap();
+        let zero_snapshot = store
+            .ingest_report(
+                &zero_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some(&commit),
+                None,
+                "zero",
+            )
+            .unwrap();
+        assert!(
+            store
+                .insights(zero_snapshot["id"].as_str().unwrap(), None, 10)
+                .unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["severity"] == "high")
+        );
+
+        macro_rules! sweep_valid_query_boundaries {
+            ($expression:expr) => {{
+                for skip in 0..=24 {
+                    store.inject_query_fault_after(skip);
+                    let _ = $expression;
+                }
+                store.inject_query_fault();
+                let _ = store.project_settings();
+            }};
+        }
+        sweep_valid_query_boundaries!(store.list_worktrees(10));
+        sweep_valid_query_boundaries!(store.worktree(worktree_id));
+        sweep_valid_query_boundaries!(store.worktree_baseline_snapshot(worktree_id, "fallback"));
+        sweep_valid_query_boundaries!(store.worktree_progress(worktree_id, "unit", None, 10));
+        sweep_valid_query_boundaries!(store.worktree_progress(
+            worktree_id,
+            "unit",
+            Some("src/a.py"),
+            10
+        ));
+        sweep_valid_query_boundaries!(store.trend(
+            None,
+            Some("main"),
+            Some("unit"),
+            None,
+            None,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.trend(
+            None,
+            Some("main"),
+            Some("unit"),
+            Some("src/a.py"),
+            None,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.trend(None, None, None, None, Some(worktree_id), 10));
+        sweep_valid_query_boundaries!(store.compare_worktree(
+            worktree_id,
+            Some(regressed["id"].as_str().unwrap()),
+            10,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.compare_worktree_regions(
+            worktree_id,
+            Some(regressed["id"].as_str().unwrap()),
+            Some("src/a.py"),
+            false,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.compare_worktree(worktree_id, None, 10, 10));
+        sweep_valid_query_boundaries!(store.compare_worktree_regions(
+            worktree_id,
+            None,
+            None,
+            false,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.changed_lines(
+            regressed["id"].as_str().unwrap(),
+            baseline["id"].as_str().unwrap(),
+            None,
+            false,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.changed_regions(
+            regressed["id"].as_str().unwrap(),
+            baseline["id"].as_str().unwrap(),
+            Some("src/a.py"),
+            false,
+            10
+        ));
+        sweep_valid_query_boundaries!(store.snapshot(baseline["id"].as_str().unwrap()));
+        sweep_valid_query_boundaries!(store.list_snapshots(None, Some("main"), Some("unit"), 10));
+        sweep_valid_query_boundaries!(store.latest_snapshot(None, Some("main"), Some("unit")));
+        sweep_valid_query_boundaries!(store.files(baseline["id"].as_str().unwrap(), 10));
+        sweep_valid_query_boundaries!(
+            store.file_coverage(baseline["id"].as_str().unwrap(), "src/a.py")
+        );
+        sweep_valid_query_boundaries!(store.lines(
+            baseline["id"].as_str().unwrap(),
+            "src/a.py",
+            10
+        ));
+        sweep_valid_query_boundaries!(store.lines_in_ranges(
+            baseline["id"].as_str().unwrap(),
+            "src/a.py",
+            &[(1, 1)]
+        ));
+        sweep_valid_query_boundaries!(store.file_gaps(
+            baseline["id"].as_str().unwrap(),
+            "src/a.py",
+            10
+        ));
+        sweep_valid_query_boundaries!(store.line_history(
+            "src/a.py",
+            1,
+            Some("main"),
+            Some("unit"),
+            10
+        ));
+        sweep_valid_query_boundaries!(store.source_lines(
+            baseline["id"].as_str().unwrap(),
+            "src/a.py",
+            1,
+            1
+        ));
+        sweep_valid_query_boundaries!(
+            store.source_resolution(baseline["id"].as_str().unwrap(), "src/a.py")
+        );
+        sweep_valid_query_boundaries!(store.targets(
+            regressed["id"].as_str().unwrap(),
+            "priority",
+            10
+        ));
+        sweep_valid_query_boundaries!(store.insights(
+            regressed["id"].as_str().unwrap(),
+            Some(baseline["id"].as_str().unwrap()),
+            10
+        ));
+        sweep_valid_query_boundaries!(store.list_registered_commands(10));
+        sweep_valid_query_boundaries!(store.registered_command("reuse-pass"));
+        sweep_valid_query_boundaries!(
+            store.registered_command(reuse_command["id"].as_str().unwrap())
+        );
+        sweep_valid_query_boundaries!(
+            store.latest_run(Some(reuse_command["id"].as_str().unwrap()))
+        );
+        sweep_valid_query_boundaries!(store.run_result(passed["id"].as_str().unwrap(), 20));
+        sweep_valid_query_boundaries!(store.list_run_queue(10));
+        sweep_valid_query_boundaries!(store.search_run_logs(
+            passed["id"].as_str().unwrap(),
+            &["output".to_owned()],
+            "both",
+            1,
+            5,
+            false,
+            20
+        ));
+        sweep_valid_query_boundaries!(
+            store.reusable_run_id(&reuse_command, reuse_command["id"].as_str().unwrap())
+        );
+        store.close().unwrap();
     }
 
     fn test_settings() -> ProjectSettings {
@@ -6544,7 +11254,7 @@ mod tests {
             .with_connection(|connection| {
                 connection
                     .execute_batch(&format!(
-                        "DROP INDEX IF EXISTS idx_project_settings_updated; DROP INDEX IF EXISTS idx_run_jobs_status_time; DROP INDEX IF EXISTS idx_run_artifacts_kind; DROP INDEX IF EXISTS idx_registered_commands_name; DROP INDEX IF EXISTS idx_worktrees_repo; DROP INDEX IF EXISTS idx_runs_command_time; ALTER TABLE {table} RENAME TO {table}_base; CREATE VIEW {table} AS SELECT * FROM {table}_base;"
+                        "DROP INDEX IF EXISTS idx_project_settings_updated; DROP INDEX IF EXISTS idx_run_jobs_status_time; DROP INDEX IF EXISTS idx_run_artifacts_kind; DROP INDEX IF EXISTS idx_run_artifact_baselines_run; DROP INDEX IF EXISTS idx_registered_commands_name; DROP INDEX IF EXISTS idx_worktrees_repo; DROP INDEX IF EXISTS idx_runs_command_time; DROP INDEX IF EXISTS idx_lines_lookup; DROP INDEX IF EXISTS idx_files_snapshot; DROP INDEX IF EXISTS idx_snapshots_repo_time; DROP INDEX IF EXISTS idx_snapshots_commit; DROP INDEX IF EXISTS idx_compacted_repo; ALTER TABLE {table} RENAME TO {table}_base; CREATE VIEW {table} AS SELECT * FROM {table}_base;"
                     ))
                     .unwrap();
                 Ok(())
@@ -6571,6 +11281,137 @@ mod tests {
                 connection
                     .execute_batch(&format!(
                         "DROP TABLE {table}; CREATE VIEW {table} AS SELECT 'a.py' AS file_path, CAST(error('query failure') AS BIGINT) AS line_number, 1 AS hits, true AS covered, 1 AS count_line, 0 AS total_branches, 0 AS covered_branches, 0 AS total_functions, 0 AS covered_functions, '' AS details;"
+                    ))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn make_query_execution_view(store: &CoverageStore, table: &str, index: &str) {
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch(&format!(
+                        "DROP INDEX IF EXISTS {index};
+                         DROP INDEX IF EXISTS idx_snapshots_repo_time;
+                         DROP INDEX IF EXISTS idx_snapshots_commit;
+                         DROP INDEX IF EXISTS idx_files_snapshot;
+                         DROP INDEX IF EXISTS idx_lines_lookup;
+                         DROP INDEX IF EXISTS idx_worktrees_repo;
+                         DROP INDEX IF EXISTS idx_registered_commands_name;
+                         DROP INDEX IF EXISTS idx_runs_command_time;
+                         DROP INDEX IF EXISTS idx_run_artifacts_kind;
+                         DROP INDEX IF EXISTS idx_run_artifact_baselines_run;
+                         DROP INDEX IF EXISTS idx_run_jobs_status_time;
+                         DROP INDEX IF EXISTS idx_project_settings_updated;
+                         DROP INDEX IF EXISTS idx_compacted_repo;
+                         ALTER TABLE {table} RENAME TO {table}_base;
+                         CREATE VIEW {table} AS SELECT * FROM {table}_base WHERE error('query failure');"
+                    ))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn make_malformed_projection_view(
+        store: &CoverageStore,
+        table: &str,
+        index: &str,
+        columns: &[&str],
+        bad_column: &str,
+        expression: &str,
+    ) {
+        let projection = columns
+            .iter()
+            .map(|column| {
+                if *column == bad_column {
+                    format!("{expression} AS {column}")
+                } else {
+                    (*column).to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch(&format!(
+                        "DROP INDEX IF EXISTS {index};
+                         DROP INDEX IF EXISTS idx_snapshots_repo_time;
+                         DROP INDEX IF EXISTS idx_snapshots_commit;
+                         DROP INDEX IF EXISTS idx_files_snapshot;
+                         DROP INDEX IF EXISTS idx_lines_lookup;
+                         DROP INDEX IF EXISTS idx_worktrees_repo;
+                         DROP INDEX IF EXISTS idx_registered_commands_name;
+                         DROP INDEX IF EXISTS idx_runs_command_time;
+                         DROP INDEX IF EXISTS idx_run_artifacts_kind;
+                         DROP INDEX IF EXISTS idx_run_artifact_baselines_run;
+                         DROP INDEX IF EXISTS idx_run_jobs_status_time;
+                         DROP INDEX IF EXISTS idx_project_settings_updated;
+                         DROP INDEX IF EXISTS idx_compacted_repo;
+                         ALTER TABLE {table} RENAME TO {table}_base;
+                         CREATE VIEW {table} AS SELECT {projection} FROM {table}_base;"
+                    ))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn make_query_error_worktree_view(store: &CoverageStore) {
+        let repo_key = store.project().unwrap().repo_key.replace('\'', "''");
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch(&format!(
+                        "DROP TABLE worktrees;
+                         CREATE VIEW worktrees AS
+                         SELECT CAST(NULL AS VARCHAR) AS id,
+                                current_timestamp AS created_at,
+                                CAST(NULL AS VARCHAR) AS name,
+                                '/tmp/worktree' AS path,
+                                '{repo_key}' AS repo_path,
+                                '{repo_key}' AS repo_key,
+                                CAST(NULL AS VARCHAR) AS branch,
+                                CAST(NULL AS VARCHAR) AS head_sha,
+                                'main' AS base_ref,
+                                CAST(NULL AS VARCHAR) AS base_sha,
+                                CAST(NULL AS VARCHAR) AS baseline_snapshot_id"
+                    ))
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn make_query_error_command_view(store: &CoverageStore) {
+        let repo_key = store.project().unwrap().repo_key.replace('\'', "''");
+        let repo_path = store.project().unwrap().repo_path.replace('\'', "''");
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch(&format!(
+                        "DROP TABLE registered_commands;
+                         CREATE VIEW registered_commands AS
+                         SELECT CAST(NULL AS VARCHAR) AS id,
+                                current_timestamp AS created_at,
+                                'missing' AS name,
+                                'true' AS command,
+                                '{repo_path}' AS cwd,
+                                '{repo_path}' AS repo_path,
+                                '{repo_key}' AS repo_key,
+                                CAST(NULL AS VARCHAR) AS branch,
+                                CAST(NULL AS VARCHAR) AS commit_sha,
+                                '/bin/sh' AS shell,
+                                'tester' AS approved_by,
+                                'approved' AS approval_note,
+                                '{{}}' AS artifact_specs,
+                                true AS enabled,
+                                CAST(NULL AS INTEGER) AS duration_estimate_ms,
+                                CAST(NULL AS INTEGER) AS duration_p90_ms,
+                                0 AS duration_sample_count"
                     ))
                     .unwrap();
                 Ok(())

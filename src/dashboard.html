@@ -1067,8 +1067,8 @@
 
     async function getJSON(url, options) {
       const payload = await fetchJSON(url, options);
-      if (!payload || payload.context?.schema_revision !== 7 || !Object.hasOwn(payload, 'data')) {
-        throw new Error('Coverage MCP dashboard requires schema revision 7. Start the current coverage-mcp connector to replace a verified older daemon automatically, then reload.');
+      if (!payload || payload.context?.schema_revision !== 9 || !Object.hasOwn(payload, 'data')) {
+        throw new Error('Coverage MCP dashboard requires schema revision 9. Start the current coverage-mcp connector to replace a verified older daemon automatically, then reload.');
       }
       return payload.data;
     }
@@ -1081,8 +1081,8 @@
           ? `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`
           : url;
         const payload = await fetchJSON(pageUrl);
-        if (!payload || payload.context?.schema_revision !== 7 || !Array.isArray(payload.data)) {
-          throw new Error('Coverage MCP dashboard received an invalid schema revision 7 collection.');
+        if (!payload || payload.context?.schema_revision !== 9 || !Array.isArray(payload.data)) {
+          throw new Error('Coverage MCP dashboard received an invalid schema revision 9 collection.');
         }
         items.push(...payload.data);
         cursor = payload.page?.next_cursor || null;
@@ -1099,8 +1099,8 @@
           ? `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`
           : url;
         const payload = await fetchJSON(pageUrl);
-        if (!payload || payload.context?.schema_revision !== 7 || !payload.data?.file || !Array.isArray(payload.data.lines)) {
-          throw new Error('Coverage MCP dashboard received an invalid schema revision 7 file response.');
+        if (!payload || payload.context?.schema_revision !== 9 || !payload.data?.file || !Array.isArray(payload.data.lines)) {
+          throw new Error('Coverage MCP dashboard received an invalid schema revision 9 file response.');
         }
         file = payload.data.file;
         lines.push(...payload.data.lines);
@@ -1117,8 +1117,8 @@
           ? `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`
           : url;
         const payload = await fetchJSON(pageUrl);
-        if (!payload || payload.context?.schema_revision !== 7 || !Array.isArray(payload.data?.[section])) {
-          throw new Error(`Coverage MCP dashboard received an invalid schema revision 7 ${section} response.`);
+        if (!payload || payload.context?.schema_revision !== 9 || !Array.isArray(payload.data?.[section])) {
+          throw new Error(`Coverage MCP dashboard received an invalid schema revision 9 ${section} response.`);
         }
         items.push(...(payload.data?.[section] || []));
         cursor = payload.page?.next_cursor || null;

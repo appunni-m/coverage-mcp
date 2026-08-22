@@ -4,12 +4,12 @@ scope:
   mode: full
   inventory:
     authority: README.md-and-src-mcp.rs
-    revision: schema-7
+    revision: schema-9
     command_id: inventory
 oracles:
   - id: frozen-contract
-    name: Frozen schema-7 behavior contract
-    version: "1"
+    name: Schema-9 behavior contract
+    version: "9"
     runtime: specification
     identity_command_id: frozen-contract-identity
     contract: docs/rust-migration-parity.md and the input-only fixture corpus
@@ -43,7 +43,7 @@ commands:
     cwd: .
     timeout_seconds: 900
   - id: coverage
-    argv: [cargo, llvm-cov, --offline, --lib, --all-features, --locked, '--ignore-filename-regex=/src/main\.rs$', --json, --summary-only, '--output-path=target/migration/coverage-raw.json', '--fail-under-lines=100', '--fail-under-functions=100', '--fail-uncovered-lines=0', '--fail-uncovered-functions=0']
+    argv: [cargo, llvm-cov, --offline, --lib, --all-features, --locked, '--ignore-filename-regex=/src/main\.rs$', --json, --summary-only, '--output-path=target/migration/coverage-raw.json', '--fail-under-lines=100', '--fail-under-functions=100', '--fail-under-regions=100', '--fail-uncovered-lines=0', '--fail-uncovered-functions=0', '--fail-uncovered-regions=0']
     cwd: .
     timeout_seconds: 900
   - id: benchmark
@@ -95,11 +95,13 @@ coverage_components:
   - id: rust-source
     target_profile: rust-default
     paths: [src]
-    dimensions: [function, line]
+    dimensions: [function, line, region]
     thresholds:
       - dimension: function
         minimum_percent: 100
       - dimension: line
+        minimum_percent: 100
+      - dimension: region
         minimum_percent: 100
 surfaces:
   - id: coverage-mcp.parser
@@ -204,7 +206,7 @@ surfaces:
         source:
           oracle_id: frozen-contract
           path: docs/rust-migration-parity.md#compatibility-invariants
-          signature: schema-7 REST and MCP protocol surface
+          signature: schema-9 REST and MCP protocol surface
           parameters:
             - id: input
               style: positional
@@ -225,9 +227,9 @@ surfaces:
             signature: shared HTTP and native stdio JSON-RPC dispatcher
             support: {status: supported}
         requirements:
-          - id: coverage-mcp.transport.contract.schema7
+          - id: coverage-mcp.transport.contract.schema9
             dimension: protocol_variant
-            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-7 compatible.
+            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-9 compatible.
             lanes: [parity, coverage]
             target_profiles: [rust-default]
           - id: coverage-mcp.transport.contract.shared-daemon-stdio
