@@ -60,6 +60,7 @@ static FORCE_SHUTDOWN_ACCEPT_FAILURE: AtomicBool = AtomicBool::new(false);
 pub struct CoverageServer {
     config: ServerConfig,
     stores: Arc<Mutex<HashMap<String, CoverageStore>>>,
+    registry_gate: Arc<Mutex<()>>,
     store_open_gate: Arc<Mutex<()>>,
     mcp_limiter: Arc<Semaphore>,
     instance_id: Arc<str>,
@@ -90,6 +91,7 @@ impl CoverageServer {
             mcp_limiter: Arc::new(Semaphore::new(config.mcp_http_concurrency)),
             config,
             stores: Arc::new(Mutex::new(HashMap::new())),
+            registry_gate: Arc::new(Mutex::new(())),
             store_open_gate: Arc::new(Mutex::new(())),
             instance_id: Uuid::new_v4().to_string().into(),
             handoff_token: Uuid::new_v4().to_string().into(),
@@ -638,7 +640,14 @@ impl CoverageServer {
         }))
     }
 
+    fn registry_guard(&self) -> AppResult<std::sync::MutexGuard<'_, ()>> {
+        self.registry_gate
+            .lock()
+            .map_err(|_| AppError::Runtime("registry lock poisoned".to_owned()))
+    }
+
     fn register_repository(&self, repo_key: &str) -> AppResult<()> {
+        let _registry_gate = self.registry_guard()?;
         let connection = registry_connection(&self.config.common_db_path)?;
         connection.execute(
             "INSERT INTO repositories (id, repo_key, last_seen) VALUES (?, ?, current_timestamp) ON CONFLICT (repo_key) DO UPDATE SET last_seen = excluded.last_seen",
@@ -655,6 +664,7 @@ impl CoverageServer {
         if !self.config.common_db_path.exists() {
             return Ok(Vec::new());
         }
+        let _registry_gate = self.registry_guard()?;
         let connection = Connection::open(&self.config.common_db_path)?;
         let mut statement = connection
             .prepare("SELECT repo_key FROM repositories ORDER BY last_seen DESC LIMIT ?")?;
@@ -1071,6 +1081,7 @@ fn dashboard_response() -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -1811,6 +1822,54 @@ mod tests {
             .insert(project.repo_key, store.clone());
         assert!(shared_server.unscoped_projects().is_ok());
         store.close().unwrap();
+    }
+
+    #[test]
+    fn concurrent_registry_registration_is_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry_config = config();
+        registry_config.common_db_path = directory.path().join("common.duckdb");
+        let server = Arc::new(CoverageServer::new(registry_config).unwrap());
+        const WORKERS: usize = 64;
+        let barrier = Arc::new(Barrier::new(WORKERS));
+
+        let results = std::thread::scope(|scope| {
+            let handles = (0..WORKERS)
+                .map(|index| {
+                    let barrier = Arc::clone(&barrier);
+                    let server = Arc::clone(&server);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        server.register_repository(&format!("repo-{index}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("registry worker panicked"))
+                .collect::<Vec<_>>()
+        });
+
+        for result in results {
+            result.expect("registry registration failed");
+        }
+        let repositories = server
+            .registry_repositories_with_limit(WORKERS as i64)
+            .unwrap();
+        assert_eq!(repositories.len(), WORKERS);
+
+        let mut poisoned_config = config();
+        poisoned_config.common_db_path = directory.path().join("poisoned-common.duckdb");
+        let poisoned_server = CoverageServer::new(poisoned_config).unwrap();
+        poisoned_server.register_repository("poisoned").unwrap();
+        let registry_gate = poisoned_server.registry_gate.clone();
+        let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry_gate.lock().unwrap();
+            panic!("intentional registry-lock poison for error coverage");
+        }));
+        assert!(poison.is_err());
+        assert!(poisoned_server.register_repository("another").is_err());
+        assert!(poisoned_server.registry_repositories_with_limit(1).is_err());
     }
 
     #[tokio::test]
