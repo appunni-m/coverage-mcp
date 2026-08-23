@@ -827,7 +827,7 @@ fn render_documents(context: &DocumentContext<'_>) -> StatusResult<()> {
         context.manifest_sha256
     );
     let parity_page = format!(
-        "{header}# Migration parity status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Evidence: `{evidence}`\n\nRust migration tests are conformance tests against the checked-in schema-9 contract. Cross-runtime parity remains `not_proven` because no independent source oracle is configured.\n",
+        "{header}# Migration parity status\n\n- Status: **{}**\n- Target profile: `{TARGET_PROFILE}`\n- Evidence: `{evidence}`\n\nRust migration tests are conformance tests against the checked-in schema-10 contract. Cross-runtime parity remains `not_proven` because no independent source oracle is configured.\n",
         context.parity_outcome
     );
     let function = &context.coverage["function_coverage"];

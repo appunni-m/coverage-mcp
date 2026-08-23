@@ -460,6 +460,16 @@ impl CoverageServer {
                 let value = store.latest_snapshot(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"))?.ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?;
                 service.envelope(value, None, None)
             }
+            (Method::GET, ["api", "duplicate-coverage-tests"]) => service
+                .find_duplicate_coverage_tests(
+                    query_value(&query, "snapshot_id"),
+                    query_value(&query, "suite"),
+                    query_value(&query, "cursor"),
+                    query_usize(&query, "max_groups", 10)?,
+                    query_usize(&query, "max_tests_per_group", 10)?,
+                    max_words,
+                    query_usize(&query, "max_bytes", 12_000)?,
+                )?,
             (Method::GET, ["api", "snapshots", snapshot_id]) => service.envelope(store.snapshot(snapshot_id)?, None, None),
             (Method::GET, ["api", "snapshots", snapshot_id, "files"]) => {
                 if let Some(file_path) = query_value(&query, "file_path") {
@@ -2626,6 +2636,7 @@ mod tests {
             &[
                 ("GET", "/api/snapshots", ""),
                 ("GET", "/api/snapshots/latest?suite=unit", ""),
+                ("GET", "/api/duplicate-coverage-tests", ""),
                 ("GET", "/api/projects/project", ""),
                 ("GET", "/api/snapshots/missing", ""),
                 ("GET", "/api/snapshots/missing/insights", ""),

@@ -4,6 +4,18 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.11.0 - 2026-08-23
+
+### Added
+
+- Schema 10 adds `find_duplicate_coverage_tests`, a bounded, paginated read-only
+  tool that groups named tests by exact covered line/branch/function coverage
+  observations. It ignores hit counts, preserves named observations through
+  compaction, and reports unavailable evidence when the format has no test
+  names; coverage equality is not logic equality.
+
+## Unreleased
+
 ## 0.10.1 - 2026-08-23
 
 ### Changed

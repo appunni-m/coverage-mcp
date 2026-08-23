@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,26 @@ pub struct FileCoverage {
     pub raw_metrics: Value,
 }
 
+/// One covered region attributed to a named test by the source coverage artifact.
+///
+/// The observation is deliberately independent of execution hit counts. Duplicate
+/// detection compares the complete set of these normalized observations for each
+/// test, so a different branch or function identity is not collapsed into a line
+/// match. The parser only populates this field when the artifact names tests.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct TestCoverageObservation {
+    /// Test name as reported by the coverage artifact.
+    pub test_name: String,
+    /// Observation kind, currently `line`, `branch`, or `function` for LCOV.
+    pub kind: String,
+    /// Repository-relative source path.
+    pub file_path: String,
+    /// One-based source line associated with the observation.
+    pub line_number: i64,
+    /// Exact kind-specific identity, such as an LCOV branch or function name.
+    pub region_key: String,
+}
+
 impl FileCoverage {
     /// Line rate.
     pub fn line_rate(&self) -> Option<f64> {
@@ -126,6 +146,10 @@ pub struct CoverageReport {
     pub files: Vec<FileCoverage>,
     /// Normalized line rows.
     pub lines: Vec<LineCoverage>,
+    /// Distinct non-blank test names reported by the coverage artifact.
+    pub test_names: Vec<String>,
+    /// Covered line, branch, and function observations attributed to named tests.
+    pub test_coverage: Vec<TestCoverageObservation>,
     /// Parser warnings.
     pub warnings: Vec<String>,
     /// Parser metadata.
@@ -188,6 +212,8 @@ impl CoverageReport {
 pub struct CoverageBuilder {
     repo_path: Option<String>,
     lines: BTreeMap<(String, i64), LineCoverage>,
+    test_names: BTreeSet<String>,
+    test_coverage: BTreeSet<(String, String, String, i64, String)>,
     file_metrics: BTreeMap<String, serde_json::Map<String, Value>>,
     normalized_paths: BTreeMap<String, String>,
 }
@@ -198,6 +224,8 @@ impl CoverageBuilder {
         Self {
             repo_path: repo_path.map(str::to_owned),
             lines: BTreeMap::new(),
+            test_names: BTreeSet::new(),
+            test_coverage: BTreeSet::new(),
             file_metrics: BTreeMap::new(),
             normalized_paths: BTreeMap::new(),
         }
@@ -264,6 +292,43 @@ impl CoverageBuilder {
             .extend(metrics);
     }
 
+    /// Records a named test even when it has no covered observations.
+    pub fn add_test_name(&mut self, test_name: &str) {
+        let test_name = test_name.trim();
+        if !test_name.is_empty() {
+            self.test_names.insert(test_name.to_owned());
+        }
+    }
+
+    /// Adds one covered, kind-specific observation for a named test.
+    pub fn add_test_observation(
+        &mut self,
+        test_name: &str,
+        kind: &str,
+        file_path: &str,
+        line_number: i64,
+        region_key: &str,
+    ) {
+        let test_name = test_name.trim();
+        let kind = kind.trim();
+        if test_name.is_empty() || kind.is_empty() || line_number <= 0 {
+            return;
+        }
+        self.add_test_name(test_name);
+        let normalized = self
+            .normalized_paths
+            .entry(file_path.to_owned())
+            .or_insert_with(|| normalize_report_path(file_path, self.repo_path.as_deref()))
+            .clone();
+        self.test_coverage.insert((
+            test_name.to_owned(),
+            kind.to_owned(),
+            normalized,
+            line_number,
+            region_key.to_owned(),
+        ));
+    }
+
     /// Finalizes deterministic file totals and a report.
     pub fn build(
         mut self,
@@ -273,6 +338,20 @@ impl CoverageBuilder {
         metadata: Value,
     ) -> CoverageReport {
         let lines: Vec<LineCoverage> = self.lines.into_values().collect();
+        let test_names = self.test_names.into_iter().collect();
+        let test_coverage = self
+            .test_coverage
+            .into_iter()
+            .map(
+                |(test_name, kind, file_path, line_number, region_key)| TestCoverageObservation {
+                    test_name,
+                    kind,
+                    file_path,
+                    line_number,
+                    region_key,
+                },
+            )
+            .collect();
         let mut by_file: BTreeMap<String, Vec<LineCoverage>> = BTreeMap::new();
         for line in &lines {
             by_file
@@ -339,6 +418,8 @@ impl CoverageBuilder {
             report_path: report_path.to_owned(),
             files,
             lines,
+            test_names,
+            test_coverage,
             warnings,
             metadata,
         }
@@ -351,4 +432,25 @@ fn metric_i64(metrics: &mut serde_json::Map<String, Value>, key: &str, fallback:
         .and_then(|value| value.as_i64())
         .unwrap_or(fallback)
         .max(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_observation_inputs_reject_invalid_records() {
+        let mut builder = CoverageBuilder::new(Some("/repo"));
+        builder.add_test_name(" ");
+        builder.add_test_observation("", "line", "src/a.rs", 1, "line");
+        builder.add_test_observation("test-a", "", "src/a.rs", 1, "line");
+        builder.add_test_observation("test-a", "line", "src/a.rs", 0, "line");
+        builder.add_test_observation(" test-a ", " line ", "src/a.rs", 1, "line");
+
+        let report = builder.build("lcov", "coverage.lcov", Vec::new(), Value::Null);
+        assert_eq!(report.test_names, vec!["test-a"]);
+        assert_eq!(report.test_coverage.len(), 1);
+        assert_eq!(report.test_coverage[0].file_path, "src/a.rs");
+        assert_eq!(report.test_coverage[0].kind, "line");
+    }
 }

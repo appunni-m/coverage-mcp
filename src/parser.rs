@@ -177,11 +177,20 @@ fn detect_format(path: &Path) -> AppResult<String> {
 
 fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
     let mut builder = CoverageBuilder::new(repo_path);
+    let mut current_test: Option<String> = None;
     let mut current_file: Option<String> = None;
     let mut function_lines: BTreeMap<String, i64> = BTreeMap::new();
     for raw in fs::read_to_string(path)?.lines() {
         let line = raw.trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(test_name) = line.strip_prefix("TN:") {
+            let test_name = test_name.trim();
+            current_test = (!test_name.is_empty()).then(|| test_name.to_owned());
+            if let Some(test_name) = current_test.as_deref() {
+                builder.add_test_name(test_name);
+            }
             continue;
         }
         if let Some(file) = line.strip_prefix("SF:") {
@@ -190,6 +199,7 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
             continue;
         }
         if line == "end_of_record" {
+            current_test = None;
             current_file = None;
             function_lines.clear();
             continue;
@@ -207,18 +217,14 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                 .next()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| parse_error("LCOV DA record is missing hit data".to_owned()))?;
-            builder.add_line(
-                file,
-                safe_i64(Some(line_number))?,
-                safe_i64(Some(hits))?,
-                None,
-                true,
-                0,
-                0,
-                0,
-                0,
-                json!({}),
-            );
+            let line_number = safe_i64(Some(line_number))?;
+            let hits = safe_i64(Some(hits))?;
+            builder.add_line(file, line_number, hits, None, true, 0, 0, 0, 0, json!({}));
+            if hits > 0 {
+                if let Some(test_name) = current_test.as_deref() {
+                    builder.add_test_observation(test_name, "line", file, line_number, "line");
+                }
+            }
         } else if let Some(payload) = line.strip_prefix("FN:") {
             let (line_number, name) = payload
                 .split_once(',')
@@ -229,6 +235,7 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                 .split_once(',')
                 .ok_or_else(|| parse_error("LCOV FNDA record is malformed".to_owned()))?;
             if let Some(line_number) = function_lines.get(name) {
+                let hits = safe_i64(Some(hits))?;
                 builder.add_line(
                     file,
                     *line_number,
@@ -238,12 +245,23 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                     0,
                     0,
                     1,
-                    i64::from(safe_i64(Some(hits))? > 0),
+                    i64::from(hits > 0),
                     json!({}),
                 );
+                if hits > 0 {
+                    if let Some(test_name) = current_test.as_deref() {
+                        builder.add_test_observation(
+                            test_name,
+                            "function",
+                            file,
+                            *line_number,
+                            name,
+                        );
+                    }
+                }
             }
         } else if let Some(payload) = line.strip_prefix("BRDA:") {
-            add_lcov_branch(&mut builder, file, payload)?;
+            add_lcov_branch(&mut builder, file, payload, current_test.as_deref())?;
         }
     }
     let mut report = builder.build("lcov", &path.to_string_lossy(), Vec::new(), json!({}));
@@ -255,7 +273,12 @@ fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
     Ok(report)
 }
 
-fn add_lcov_branch(builder: &mut CoverageBuilder, file: &str, payload: &str) -> AppResult<()> {
+fn add_lcov_branch(
+    builder: &mut CoverageBuilder,
+    file: &str,
+    payload: &str,
+    test_name: Option<&str>,
+) -> AppResult<()> {
     let parts: Vec<&str> = payload.split(',').collect();
     if parts.len() < 4 {
         return Err(parse_error("LCOV BRDA record is malformed".to_owned()));
@@ -266,9 +289,10 @@ fn add_lcov_branch(builder: &mut CoverageBuilder, file: &str, payload: &str) -> 
     } else {
         i64::from(safe_i64(Some(taken))? > 0)
     };
+    let line_number = safe_i64(parts.first().copied())?;
     builder.add_line(
         file,
-        safe_i64(parts.first().copied())?,
+        line_number,
         0,
         Some(false),
         false,
@@ -278,6 +302,12 @@ fn add_lcov_branch(builder: &mut CoverageBuilder, file: &str, payload: &str) -> 
         0,
         json!({}),
     );
+    if covered > 0 {
+        if let Some(test_name) = test_name {
+            let region_key = format!("block={};branch={}", parts[1], parts[2]);
+            builder.add_test_observation(test_name, "branch", file, line_number, &region_key);
+        }
+    }
     Ok(())
 }
 
@@ -1107,6 +1137,41 @@ mod tests {
         assert_eq!(report.covered_lines(), 1);
         assert_eq!(report.total_branches(), 1);
         assert_eq!(report.covered_branches(), 1);
+    }
+
+    #[test]
+    fn lcov_parser_preserves_exact_named_line_branch_and_function_observations() {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        writeln!(
+            file,
+            "TN:test-a\nSF:src/a.py\nDA:1,1\nDA:2,3\nFN:1,run\nFNDA:2,run\nBRDA:2,0,0,1\nend_of_record\nTN:test-b\nSF:src/a.py\nDA:1,9\nDA:2,1\nFN:1,run\nFNDA:1,run\nBRDA:2,0,0,4\nend_of_record\nTN:test-c\nSF:src/a.py\nDA:1,1\nDA:2,1\nFN:1,run\nFNDA:1,run\nBRDA:2,0,1,1\nend_of_record"
+        )
+        .expect("write report");
+        let report = parse_coverage_report(file.path(), "lcov", None).expect("parse report");
+        assert_eq!(report.test_names, vec!["test-a", "test-b", "test-c"]);
+        assert_eq!(report.test_coverage.len(), 12);
+        assert!(report.test_coverage.iter().any(|observation| {
+            observation.test_name == "test-a"
+                && observation.kind == "line"
+                && observation.file_path == "src/a.py"
+                && observation.line_number == 1
+                && observation.region_key == "line"
+        }));
+        assert!(report.test_coverage.iter().any(|observation| {
+            observation.test_name == "test-a"
+                && observation.kind == "branch"
+                && observation.region_key == "block=0;branch=0"
+        }));
+        assert!(report.test_coverage.iter().any(|observation| {
+            observation.test_name == "test-a"
+                && observation.kind == "function"
+                && observation.region_key == "run"
+        }));
+        assert!(report.test_coverage.iter().any(|observation| {
+            observation.test_name == "test-c"
+                && observation.kind == "branch"
+                && observation.region_key == "block=0;branch=1"
+        }));
     }
 
     #[test]

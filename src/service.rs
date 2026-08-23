@@ -1002,6 +1002,126 @@ impl CoverageService {
         )
     }
 
+    /// Returns bounded groups of named tests with exactly equal coverage
+    /// observation sets.
+    ///
+    /// The selector chooses one immutable snapshot. Equality is coverage-only:
+    /// it includes normalized kind, path, line, and region identity while
+    /// ignoring hit counts and test logic. The result is a candidate list for
+    /// human or tool-assisted review, never proof that tests are semantically
+    /// interchangeable. Named observations are currently available from LCOV
+    /// `TN:` records; other formats return an explicit unavailable status.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_duplicate_coverage_tests(
+        &self,
+        snapshot_id: Option<&str>,
+        suite: Option<&str>,
+        cursor: Option<&str>,
+        max_groups: usize,
+        max_tests_per_group: usize,
+        max_words: usize,
+        max_bytes: usize,
+    ) -> AppResult<Value> {
+        if !(1..=500).contains(&max_groups) {
+            return Err(AppError::Validation(
+                "max_groups must be between 1 and 500".to_owned(),
+            ));
+        }
+        if !(2..=1_000).contains(&max_tests_per_group) {
+            return Err(AppError::Validation(
+                "max_tests_per_group must be between 2 and 1000".to_owned(),
+            ));
+        }
+        validate_max_words(max_words)?;
+        if !(1_000..=2_000_000).contains(&max_bytes) {
+            return Err(AppError::Validation(
+                "max_bytes must be between 1000 and 2000000".to_owned(),
+            ));
+        }
+        let context = self.context(suite);
+        let snapshot = if let Some(snapshot_id) = snapshot_id {
+            let snapshot = self.store.snapshot(snapshot_id)?;
+            if snapshot.get("repo_key").and_then(Value::as_str) != Some(context.repo_key.as_str()) {
+                return Err(AppError::Validation(
+                    "snapshot does not belong to the selected repository".to_owned(),
+                ));
+            }
+            if suite
+                .is_some_and(|value| snapshot.get("suite").and_then(Value::as_str) != Some(value))
+            {
+                return Err(AppError::Validation(
+                    "suite does not match the selected snapshot".to_owned(),
+                ));
+            }
+            snapshot
+        } else {
+            self.store
+                .latest_snapshot(Some(&context.checkout_path), None, suite)?
+                .ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?
+        };
+        let selected_id = snapshot
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("stored snapshot projections always contain id");
+        let selected_suite = snapshot
+            .get("suite")
+            .and_then(Value::as_str)
+            .expect("stored snapshot projections always contain suite");
+        let scope =
+            format!("duplicate-coverage:{selected_id}:{selected_suite}:{max_tests_per_group}");
+        let scope_digest = Sha256::digest(scope.as_bytes());
+        let expected_anchor = hex_prefix(&scope_digest, scope_digest.len());
+        let offset = if let Some(cursor) = cursor {
+            let (anchor, occurrence) = decode_cursor(cursor, &scope)?;
+            if anchor != expected_anchor {
+                return Err(AppError::Validation(
+                    "duplicate coverage cursor does not belong to this query".to_owned(),
+                ));
+            }
+            occurrence.saturating_sub(1)
+        } else {
+            0
+        };
+        let projection = self.store.duplicate_coverage_test_groups(
+            selected_id,
+            offset,
+            max_groups,
+            max_tests_per_group,
+        )?;
+        let returned = projection
+            .data
+            .get("duplicate_test_groups")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let next_cursor = if projection.has_more && returned > 0 {
+            Some(
+                encode_cursor(
+                    &expected_anchor,
+                    &scope,
+                    projection.offset.saturating_add(returned).saturating_add(1),
+                )
+                .expect("duplicate coverage page cursor occurrence is positive"),
+            )
+        } else {
+            None
+        };
+        let collection_words = projection
+            .data
+            .get("duplicate_test_groups")
+            .map_or(0, serialized_word_count);
+        let page = json!({
+            "returned": returned,
+            "total": projection.total_groups,
+            "word_count": collection_words,
+            "max_words": max_words,
+            "truncated": projection.has_more,
+            "next_cursor": next_cursor,
+        });
+        let response = self.envelope(projection.data, Some(selected_suite), Some(page));
+        let response = self.apply_budget(response, max_words)?;
+        self.apply_byte_budget(response, max_bytes)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn review_change(
         &self,
@@ -2737,8 +2857,8 @@ mod tests {
             default_compaction_interval_seconds: 3_600,
             default_compaction_batch_size: 100,
         };
-        let store =
-            CoverageStore::open(directory.path().join("coverage.duckdb"), config).expect("store");
+        let store = CoverageStore::open(directory.path().join("coverage.duckdb"), config.clone())
+            .expect("store");
         let project = store.ensure_project(directory.path()).expect("project");
         let baseline = store
             .ingest_report(
@@ -4679,6 +4799,239 @@ mod tests {
             600,
             12_000
         ));
+
+        std::fs::write(
+            &report,
+            "TN:duplicate-a\nSF:src/a.py\nDA:1,1\nend_of_record\nTN:duplicate-b\nSF:src/a.py\nDA:1,9\nend_of_record\nTN:duplicate-c\nSF:src/a.py\nDA:2,1\nend_of_record\nTN:duplicate-d\nSF:src/a.py\nDA:2,9\nend_of_record\n",
+        )
+        .expect("duplicate report");
+        let duplicate_snapshot = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .expect("duplicate snapshot");
+        let duplicate_id = duplicate_snapshot["id"].as_str().unwrap();
+        assert!(
+            service
+                .find_duplicate_coverage_tests(None, None, None, 0, 10, 600, 12_000)
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(None, None, None, 10, 1, 600, 12_000)
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(None, None, None, 10, 10, 600, 999)
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(None, None, None, 10, 10, 49, 12_000)
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some("missing-snapshot"),
+                    Some("unit"),
+                    None,
+                    10,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        let latest_duplicates = service
+            .find_duplicate_coverage_tests(None, Some("unit"), None, 10, 10, 600, 12_000)
+            .expect("latest duplicate snapshot");
+        assert_eq!(latest_duplicates["data"]["status"], "measured");
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    None,
+                    Some("missing-suite"),
+                    None,
+                    10,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(duplicate_id),
+                    Some("other"),
+                    None,
+                    10,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        let first_duplicate_page = service
+            .find_duplicate_coverage_tests(
+                Some(duplicate_id),
+                Some("unit"),
+                None,
+                1,
+                10,
+                600,
+                12_000,
+            )
+            .expect("first duplicate service page");
+        let duplicate_cursor = first_duplicate_page["page"]["next_cursor"]
+            .as_str()
+            .expect("duplicate cursor");
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(duplicate_id),
+                    Some("unit"),
+                    Some(duplicate_cursor),
+                    1,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_ok()
+        );
+        let duplicate_scope = format!("duplicate-coverage:{duplicate_id}:unit:10");
+        let wrong_duplicate_cursor =
+            encode_cursor(&"0".repeat(64), &duplicate_scope, 2).expect("wrong duplicate cursor");
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(duplicate_id),
+                    Some("unit"),
+                    Some(&wrong_duplicate_cursor),
+                    1,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(duplicate_id),
+                    Some("unit"),
+                    Some("invalid"),
+                    1,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        store.inject_query_fault_after(2);
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(duplicate_id),
+                    Some("unit"),
+                    None,
+                    1,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        store.clear_query_fault();
+
+        let long_test_name = (0..80)
+            .map(|index| format!("word{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let long_test_name_two = format!("{long_test_name} second");
+        let budget_report = directory.path().join("duplicate-budget.lcov");
+        std::fs::write(
+            &budget_report,
+            format!(
+                "TN:{long_test_name}\nSF:src/a.py\nDA:1,1\nend_of_record\nTN:{long_test_name_two}\nSF:src/a.py\nDA:1,9\nend_of_record\n"
+            ),
+        )
+        .expect("duplicate budget report");
+        let budget_snapshot = store
+            .ingest_report(
+                &budget_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .expect("duplicate budget snapshot");
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(budget_snapshot["id"].as_str().unwrap()),
+                    Some("unit"),
+                    None,
+                    10,
+                    10,
+                    50,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(budget_snapshot["id"].as_str().unwrap()),
+                    Some("unit"),
+                    None,
+                    10,
+                    10,
+                    600,
+                    1_000,
+                )
+                .is_err()
+        );
+
+        std::fs::write(
+            outside.path().join("report.lcov"),
+            "TN:foreign\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .expect("foreign duplicate report");
+        let foreign_snapshot = store
+            .ingest_report(
+                &outside.path().join("report.lcov"),
+                "lcov",
+                Some(outside.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .expect("foreign snapshot");
+        assert!(
+            service
+                .find_duplicate_coverage_tests(
+                    Some(foreign_snapshot["id"].as_str().unwrap()),
+                    Some("unit"),
+                    None,
+                    10,
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
 
         let closed_service = service.clone();
         store.close().expect("close store");

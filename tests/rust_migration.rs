@@ -2017,6 +2017,115 @@ fn rust_service_projection_and_mcp_contract_match() {
     assert!(review["data"]["history"].is_object());
     assert!(review["data"]["insight"].is_object());
 
+    let unavailable_duplicates = service
+        .find_duplicate_coverage_tests(
+            Some(current["id"].as_str().unwrap()),
+            Some("unit"),
+            None,
+            10,
+            10,
+            600,
+            12000,
+        )
+        .unwrap();
+    assert_eq!(unavailable_duplicates["data"]["status"], "unavailable");
+
+    let duplicate_report = write_file(
+        directory.path(),
+        "duplicate-tests.lcov",
+        "TN:service-test-a\nSF:src/a.py\nDA:1,1\nBRDA:1,0,0,1\nend_of_record\nTN:service-test-b\nSF:src/a.py\nDA:1,8\nBRDA:1,0,0,2\nend_of_record\nTN:service-test-c\nSF:src/a.py\nDA:2,1\nend_of_record\nTN:service-test-d\nSF:src/a.py\nDA:2,9\nend_of_record\n",
+    );
+    let duplicate_snapshot = store
+        .ingest_report(
+            &duplicate_report,
+            "lcov",
+            Some(directory.path()),
+            Some("main"),
+            None,
+            None,
+            "unit",
+        )
+        .unwrap();
+    let duplicate = service
+        .find_duplicate_coverage_tests(
+            Some(duplicate_snapshot["id"].as_str().unwrap()),
+            Some("unit"),
+            None,
+            10,
+            10,
+            1200,
+            12000,
+        )
+        .unwrap();
+    assert_eq!(duplicate["data"]["status"], "measured");
+    assert_eq!(duplicate["data"]["summary"]["duplicate_group_count"], 2);
+    let first_duplicate_page = service
+        .find_duplicate_coverage_tests(
+            Some(duplicate_snapshot["id"].as_str().unwrap()),
+            Some("unit"),
+            None,
+            1,
+            10,
+            1200,
+            12000,
+        )
+        .unwrap();
+    let next_cursor = first_duplicate_page["page"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_duplicate_page = service
+        .find_duplicate_coverage_tests(
+            Some(duplicate_snapshot["id"].as_str().unwrap()),
+            Some("unit"),
+            Some(&next_cursor),
+            1,
+            10,
+            1200,
+            12000,
+        )
+        .unwrap();
+    assert_eq!(
+        second_duplicate_page["data"]["duplicate_test_groups"][0]["tests"],
+        json!(["service-test-c", "service-test-d"])
+    );
+    assert_eq!(second_duplicate_page["page"]["next_cursor"], Value::Null);
+    let duplicate_mcp = mcp::call_tool(
+        &service,
+        "find_duplicate_coverage_tests",
+        &json!({
+            "snapshot_id":duplicate_snapshot["id"],
+            "suite":"unit",
+            "max_groups":10,
+            "max_tests_per_group":10,
+            "max_words":1200,
+            "max_bytes":12000
+        }),
+    )
+    .unwrap();
+    assert_eq!(duplicate_mcp["data"], duplicate["data"]);
+    let duplicate_mcp_defaults =
+        mcp::call_tool(&service, "find_duplicate_coverage_tests", &json!({})).unwrap();
+    assert_eq!(duplicate_mcp_defaults["data"]["status"], "measured");
+    for arguments in [
+        json!({"snapshot_id":7}),
+        json!({"suite":7}),
+        json!({"cursor":7}),
+        json!({"max_groups":"10"}),
+        json!({"max_tests_per_group":"10"}),
+        json!({"max_bytes":"12000"}),
+    ] {
+        assert!(mcp::call_tool(&service, "find_duplicate_coverage_tests", &arguments).is_err());
+    }
+    assert!(
+        mcp::call_tool(
+            &service,
+            "find_duplicate_coverage_tests",
+            &json!({"unexpected":true})
+        )
+        .is_err()
+    );
+
     for (task, arguments) in [
         (
             "change",
@@ -2108,6 +2217,7 @@ fn rust_service_projection_and_mcp_contract_match() {
             "cancel_run",
             "coverage_import",
             "coverage_review",
+            "find_duplicate_coverage_tests",
         ]
     );
     let wire = mcp::dispatch_json_rpc(
@@ -2147,7 +2257,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let report = write_file(
         directory.path(),
         "coverage.lcov",
-        "TN:\nSF:a.py\nDA:1,1\nend_of_record\n",
+        "TN:http-test-a\nSF:a.py\nDA:1,1\nend_of_record\nTN:http-test-b\nSF:a.py\nDA:1,7\nend_of_record\n",
     );
     let probe_listener = match TcpListener::bind(("127.0.0.1", 0)).await {
         Ok(listener) => listener,
@@ -2258,6 +2368,25 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let body = json!({"report_path":report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head"});
     let ingested = http_exchange(address, "POST", "/api/ingest", Some(&body), None).await;
     let snapshot_id = ingested["data"]["id"].as_str().unwrap().to_owned();
+    let duplicate_rest = http_exchange(
+        address,
+        "GET",
+        &format!(
+            "/api/duplicate-coverage-tests?snapshot_id={snapshot_id}&max_groups=10&max_tests_per_group=10"
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(duplicate_rest["data"]["status"], "measured");
+    assert_eq!(
+        duplicate_rest["data"]["summary"]["duplicate_group_count"],
+        1
+    );
+    assert_eq!(
+        duplicate_rest["data"]["duplicate_test_groups"][0]["tests"],
+        json!(["http-test-a", "http-test-b"])
+    );
     assert!(
         http_raw_payload(address, "POST", "/api/ingest", "not-json", None)
             .await
@@ -2837,6 +2966,13 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let _unscoped_projects = http_exchange(address, "GET", "/api/projects", None, None).await;
     for (method, path, body) in [
         ("GET", "/api/snapshots?max_words=bad", None),
+        ("GET", "/api/duplicate-coverage-tests?max_groups=bad", None),
+        (
+            "GET",
+            "/api/duplicate-coverage-tests?max_tests_per_group=bad",
+            None,
+        ),
+        ("GET", "/api/duplicate-coverage-tests?max_bytes=bad", None),
         ("POST", "/api/ingest", Some(json!({"report_path": 7}))),
         (
             "POST",
@@ -3048,12 +3184,43 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
     assert_eq!(
         tools["result"]["contract"]["schema_revision"],
         SCHEMA_REVISION
     );
-    assert_eq!(tools["result"]["contract"]["tool_count"], 7);
+    assert_eq!(tools["result"]["contract"]["tool_count"], 8);
+    let mcp_duplicates = http_exchange(
+        address,
+        "POST",
+        "/mcp/",
+        Some(&json!({
+            "jsonrpc":"2.0",
+            "id":201,
+            "method":"tools/call",
+            "params":{
+                "name":"find_duplicate_coverage_tests",
+                "arguments":{
+                    "snapshot_id":snapshot_id,
+                    "max_groups":10,
+                    "max_tests_per_group":10,
+                    "max_words":1200,
+                    "max_bytes":12000
+                }
+            }
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(mcp_duplicates["result"]["isError"], false);
+    assert_eq!(
+        mcp_duplicates["result"]["structuredContent"]["data"]["status"],
+        "measured"
+    );
+    assert_eq!(
+        mcp_duplicates["result"]["structuredContent"]["data"]["summary"]["duplicate_group_count"],
+        1
+    );
     let _resources = http_exchange(
         address,
         "POST",

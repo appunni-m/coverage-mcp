@@ -25,13 +25,15 @@ const STRUCTURED_CONTENT_HINT: &str = "See structuredContent for the bounded res
 pub const MCP_INSTRUCTIONS: &str = concat!(
     "Coverage MCP ",
     env!("CARGO_PKG_VERSION"),
-    r#" schema 9 exposes a compact, composable agent interface.
+    r#" schema 10 exposes a compact, composable agent interface.
 
 Start with project_context. Its default response is compact: max_words covers the complete data projection, including the fixed project/latest-run summary and current command page. The command page returns at most eight compact summaries per call; follow page.next_cursor only when a command outside that window is needed. In that response, page.reserved_words is the fixed-summary count, page.word_count is command-page words, page.response_word_count is their combined budget count, and page.next_cursor continues only commands. data.active_runs is capped at ten entries; data.active_runs_truncated=true means more active runs were omitted, and detailed=true does not lift that cap. Use detailed=true only for an explicit audit of command, run, or provenance fields. Register only an exact human-approved command. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...), save run_id, wait poll_after_ms, then call run_review(view=status, run_id=...). Run status never embeds a coverage review; call coverage_review explicitly after a terminal run. Use run_review(view=logs) only for targeted literal evidence and cancel_run only when the user no longer wants the run.
 
 Use coverage_review as the analysis boundary: task=change for changed-code coverage, task=history for the last two points plus an aggregate, task=insight for ranked gaps, task=source for bounded ranges, task=audit for exact records, and task=all for a bounded combination. Independent reviews may use multiple calls in parallel. Compact is the default representation; request review or audit deliberately. Normal compact limits are three files and five ranked targets; increase max_files or max_regions explicitly for wider review. Compact insight targets return at most three regions per target as [start,end,line_count], with region_count and regions_truncated; audit is the opt-in exact projection. Carry snapshot/run/baseline selectors in the structured request. Successful tools return {context,data,page} in structuredContent; the text content is only a short compatibility hint. Keep detailed=false, source ranges bounded, and max_words within 50–5000 (default 600); review, run, and import also enforce max_bytes. claim_status and reasons are authoritative. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. Legends define the short fields.
 
-Use coverage_import for an external report before coverage_review; never infer lineage from a raw report. The stdio bridge recovers one refused daemon connection without replaying ambiguous writes. Ingestion is capped at 64 MiB and malformed numeric fields are validation errors."#
+Use coverage_import for an external report before coverage_review; never infer lineage from a raw report. The stdio bridge recovers one refused daemon connection without replaying ambiguous writes. Ingestion is capped at 64 MiB and malformed numeric fields are validation errors.
+
+Use find_duplicate_coverage_tests for read-only candidate reduction of large named test inventories. It compares exact normalized covered line, branch, and function observation sets, ignores hit counts, returns only bounded groups, and paginates with page.next_cursor. This is coverage equivalence rather than logic equivalence: review candidates before deleting anything. LCOV TN records currently provide named observations; other formats return status=unavailable."#
 );
 
 /// Returns the MCP initialize result.
@@ -236,6 +238,13 @@ fn public_tools_list() -> Value {
             coverage_review_input_schema(),
             coverage_review_output_schema(),
         ),
+        tool_with_output(
+            "find_duplicate_coverage_tests",
+            "Find bounded groups of named tests whose complete normalized covered line, branch, and function observation sets are exactly equal for one immutable snapshot. Equality includes kind, repository-relative file path, one-based line, and exact region identity; hit counts and test logic are not compared. This is a read-only coverage-equivalence candidate signal, never proof that tests are interchangeable. Defaults to the latest snapshot and small group limits; use page.next_cursor for more groups. Named observations currently come from LCOV TN records, while other formats return status=unavailable.",
+            read_only(),
+            duplicate_coverage_tests_input_schema(),
+            duplicate_coverage_tests_output_schema(),
+        ),
     ])
 }
 
@@ -408,6 +417,15 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             optional_usize(args, "max_bytes")?.unwrap_or(12_000),
         ),
         "coverage_review" => coverage_review_call(service, args, max_words),
+        "find_duplicate_coverage_tests" => service.find_duplicate_coverage_tests(
+            optional_string(args, "snapshot_id")?,
+            optional_string(args, "suite")?,
+            optional_string(args, "cursor")?,
+            optional_usize(args, "max_groups")?.unwrap_or(10),
+            optional_usize(args, "max_tests_per_group")?.unwrap_or(10),
+            max_words,
+            optional_usize(args, "max_bytes")?.unwrap_or(12_000),
+        ),
         _ => Err(AppError::NotFound(format!("unknown MCP tool: {name}"))),
     }
 }
@@ -850,6 +868,15 @@ fn validate_public_tool_keys(name: &str, args: &Map<String, Value>) -> AppResult
             "max_words",
             "max_bytes",
         ],
+        "find_duplicate_coverage_tests" => &[
+            "snapshot_id",
+            "suite",
+            "cursor",
+            "max_groups",
+            "max_tests_per_group",
+            "max_words",
+            "max_bytes",
+        ],
         _ => return Ok(()),
     };
     reject_unknown_keys(args, allowed, name)
@@ -1263,6 +1290,88 @@ fn coverage_review_output_schema() -> Value {
                 "required":["focus","representation","claim_status","reasons","measurement","baseline"]
             },
             "page":{"type":["object","null"]}
+        },
+        "required":["context","data","page"]
+    })
+}
+
+fn duplicate_coverage_tests_input_schema() -> Value {
+    object_schema(
+        &[
+            (
+                "snapshot_id",
+                nullable_string(
+                    "Immutable snapshot UUID; omitted selects the latest matching snapshot.",
+                ),
+            ),
+            (
+                "suite",
+                nullable_string("Optional suite selector used with latest-snapshot selection."),
+            ),
+            (
+                "cursor",
+                nullable_string(
+                    "Opaque page.next_cursor returned by an earlier duplicate-group call.",
+                ),
+            ),
+            (
+                "max_groups",
+                bounded_integer(
+                    1,
+                    500,
+                    10,
+                    "Maximum duplicate groups returned in this page; the default is deliberately small for LLM context.",
+                ),
+            ),
+            (
+                "max_tests_per_group",
+                bounded_integer(
+                    2,
+                    1_000,
+                    10,
+                    "Maximum test names returned per group; group.test_count and tests_truncated preserve the full size.",
+                ),
+            ),
+            ("max_words", budget_schema()),
+            (
+                "max_bytes",
+                bounded_integer(1_000, 2_000_000, 12_000, "Complete response byte budget."),
+            ),
+        ],
+        &[],
+    )
+}
+
+fn duplicate_coverage_tests_output_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "context":{"type":"object","description":"Selected repository, checkout, suite, and schema context."},
+            "data":{
+                "type":"object",
+                "properties":{
+                    "status":{"type":"string","enum":["measured","unavailable"]},
+                    "reason":{"type":"string"},
+                    "duplicate_test_groups":{
+                        "type":"array",
+                        "items":{
+                            "type":"object",
+                            "properties":{
+                                "tests":{"type":"array","items":{"type":"string"}},
+                                "test_count":{"type":"integer"},
+                                "coverage_observation_count":{"type":"integer"},
+                                "tests_truncated":{"type":"boolean"}
+                            },
+                            "required":["tests","test_count","coverage_observation_count","tests_truncated"],
+                            "additionalProperties":false
+                        }
+                    },
+                    "summary":{"type":"object","description":"Global counts remain compact even when the returned group page is truncated."},
+                    "equality":{"type":"object","description":"Exact fields used for coverage-set equality; hit counts are ignored."}
+                },
+                "required":["status","duplicate_test_groups","summary","equality"]
+            },
+            "page":{"type":["object","null"],"description":"Bounded group pagination and word-budget metadata; follow next_cursor when truncated."}
         },
         "required":["context","data","page"]
     })
@@ -2089,7 +2198,7 @@ mod tests {
         let initialize = initialize_result();
         let instructions = initialize["instructions"].as_str().unwrap();
         assert_eq!(initialize["serverInfo"]["version"], VERSION);
-        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 9")));
+        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 10")));
         assert!(instructions.contains("multiple calls"));
         assert!(instructions.contains("task=source"));
         assert!(instructions.contains("last two points"));
@@ -2097,7 +2206,7 @@ mod tests {
         assert!(instructions.contains("changed_code uses + for covered"));
         assert!(instructions.contains("compact regions use + for improved/new"));
         let tools = tools_list();
-        assert_eq!(tools.as_array().unwrap().len(), 7);
+        assert_eq!(tools.as_array().unwrap().len(), 8);
         let project_context = tools
             .as_array()
             .unwrap()
@@ -2254,6 +2363,30 @@ mod tests {
             coverage_review["inputSchema"]["properties"]["representation"]["default"],
             "compact"
         );
+        let duplicate_tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "find_duplicate_coverage_tests")
+            .unwrap();
+        assert!(
+            duplicate_tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("coverage-equivalence")
+        );
+        assert_eq!(
+            duplicate_tool["inputSchema"]["properties"]["max_groups"]["default"],
+            10
+        );
+        assert_eq!(
+            duplicate_tool["inputSchema"]["properties"]["max_tests_per_group"]["default"],
+            10
+        );
+        assert_eq!(
+            duplicate_tool["outputSchema"]["properties"]["data"]["properties"]["status"]["enum"],
+            json!(["measured", "unavailable"])
+        );
         assert_eq!(run_review["inputSchema"]["additionalProperties"], false);
     }
 
@@ -2266,7 +2399,7 @@ mod tests {
 
         let tools = dispatch_json_rpc(None, &json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
             .unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
         assert_eq!(
             tools["result"]["contract"]["tools_sha256"],
             public_contract_metadata()["tools_sha256"]

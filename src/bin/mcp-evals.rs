@@ -490,11 +490,40 @@ fn write_coverage_report(path: &Path, current: bool) -> Result<(), String> {
             },
         );
     }
+    append_named_lcov_record(
+        &mut report,
+        "eval-duplicate-a",
+        "src/priority.rs",
+        &[(1, 1), (2, 1)],
+    );
+    append_named_lcov_record(
+        &mut report,
+        "eval-duplicate-b",
+        "src/priority.rs",
+        &[(1, 7), (2, 9)],
+    );
     write_text(path, &report)
 }
 
 fn append_lcov_record(output: &mut String, path: &str, lines: &[(u32, u32)]) {
     output.push_str("TN:\nSF:");
+    output.push_str(path);
+    output.push('\n');
+    for (line, hits) in lines {
+        output.push_str(&format!("DA:{line},{hits}\n"));
+    }
+    output.push_str("end_of_record\n");
+}
+
+fn append_named_lcov_record(
+    output: &mut String,
+    test_name: &str,
+    path: &str,
+    lines: &[(u32, u32)],
+) {
+    output.push_str("TN:");
+    output.push_str(test_name);
+    output.push_str("\nSF:");
     output.push_str(path);
     output.push('\n');
     for (line, hits) in lines {
@@ -558,6 +587,7 @@ fn evaluate_usability(section: &mut SectionBuilder, cases: &CaseCorpus) -> Resul
         "multiple calls",
         "max_words",
         "detailed=false",
+        "find_duplicate_coverage_tests",
     ];
     for term in instruction_terms {
         section.check(
@@ -635,6 +665,7 @@ fn evaluate_usability(section: &mut SectionBuilder, cases: &CaseCorpus) -> Resul
         "cancel_run",
         "coverage_review",
         "coverage_import",
+        "find_duplicate_coverage_tests",
     ];
     section.check(
         "public-tool-inventory-is-complete",
@@ -1014,6 +1045,29 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
         "history keeps detailed points and aggregate windows bounded",
     );
 
+    let duplicate = call_tool(
+        &fixture.service,
+        "find_duplicate_coverage_tests",
+        &json!({
+            "snapshot_id":fixture.current_snapshot_id,
+            "max_groups":10,
+            "max_tests_per_group":10,
+            "max_words":300,
+            "max_bytes":12000
+        }),
+    )?;
+    let duplicate_data = data(&duplicate)?;
+    let duplicate_words = serialized_word_count(duplicate_data);
+    section.check(
+        "duplicate-coverage-is-one-bounded-projection",
+        duplicate_data["status"] == "measured"
+            && duplicate_data["summary"]["duplicate_group_count"] == 1
+            && duplicate_data["duplicate_test_groups"][0]["tests"].is_array()
+            && duplicate_words <= 300,
+        format!("duplicate coverage returns exact candidate groups in {duplicate_words} words"),
+    );
+    section.metric("duplicate_coverage_words", json!(duplicate_words));
+
     let mut cursor = None;
     let mut seen_commands = BTreeSet::new();
     let mut page_count = 0usize;
@@ -1204,7 +1258,7 @@ fn evaluate_protocol(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         "json-rpc-tools-list",
         tools["result"]["tools"]
             .as_array()
-            .is_some_and(|items| items.len() == 7),
+            .is_some_and(|items| items.len() == 8),
         "tools/list returns the complete public inventory",
     );
     let resources = dispatch(

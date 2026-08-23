@@ -12,7 +12,7 @@
 
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
-dashboard and REST API, and provides the consolidated schema-9 projections over
+dashboard and REST API, and provides the consolidated schema-10 projections over
 loopback HTTP and native MCP stdio.
 
 The project is designed for one user-level daemon shared by agents and Git
@@ -22,7 +22,7 @@ frontend build or a separate language runtime.
 ## Status
 
 The Rust implementation is the only runtime and the checked-in Rust test suite
-is the source of truth. The public contract is schema revision 9 with seven
+is the source of truth. The public contract is schema revision 10 with eight
 agent-facing tools. The local gate is configured to require 100% region, line,
 and function coverage for the measured Rust library/runtime targets. `src/main.rs`
 is exercised by child-process smoke tests and excluded from aggregate LLVM
@@ -143,7 +143,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.10.1' --locked
+cargo install coverage-mcp --version '=0.11.0' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -270,7 +270,7 @@ dropping them.
 
 The server's `initialize` instructions and `tools/list` contract are sufficient
 for an agent to operate without this README. The public MCP surface is exactly
-the seven tools listed below. This section documents task selection and wire
+the eight tools listed below. This section documents task selection and wire
 shapes; approval, polling, freshness, lineage, and reporting policy belong in
 the marketplace's `plugins/testing/skills/coverage-review/SKILL.md` workflow in
 the [companion marketplace repository](https://github.com/appunni-m/codegen-marketplace).
@@ -368,7 +368,7 @@ require an explicit `history.summary_window` increase. Compact insight items
 return at most three `[start,end,line_count]` ranges per target, plus
 `region_count` and `regions_truncated`; use audit only when exact region
 records are required. All responses are also bounded by `max_words` and, for
-review/run/import, `max_bytes`.
+review/run/import/duplicate-group, `max_bytes`.
 
 In compact change reviews, file metrics use `p` for path and `l`/`b`/`f`/`r`
 arrays for line/branch/function/region baseline, current, and delta values;
@@ -385,6 +385,44 @@ arrays for line/branch/function/region baseline, current, and delta values;
 | `cancel_run` | Request cancellation for a run the user no longer wants. |
 | `coverage_import` | Import a repository-relative external report with format, suite, branch, commit, and base provenance. Follow with `coverage_review`. |
 | `coverage_review` | Bounded change/history/insight/source/audit/all analysis. Compact defaults to three files and five targets; history returns two points, and insight returns three ranges per target plus truncation metadata. Use audit for exact records. |
+| `find_duplicate_coverage_tests` | Read-only, bounded candidate reduction for named tests with exactly equal covered line/branch/function observation sets. Defaults to the latest snapshot, ten groups, and ten names per group; follow `page.next_cursor` for more groups. |
+
+### Exact duplicate coverage candidates
+
+`find_duplicate_coverage_tests` is designed for large test inventories, including
+100,000-test reports, without placing the full inventory in the agent context.
+The server groups in DuckDB by the complete canonical observation set and emits
+only a small page of names plus global counts. The default MCP request is:
+
+```json
+{
+  "max_groups": 10,
+  "max_tests_per_group": 10,
+  "max_words": 600,
+  "max_bytes": 12000
+}
+```
+
+Each observation is compared by `kind`, repository-relative `file_path`,
+one-based `line_number`, and the exact `region_key`. Current LCOV support
+records covered `line`, `branch`, and `function` observations from non-blank
+`TN:` records. Execution hit counts are ignored, so two tests with the same
+covered set but different counts remain in one group. Tests with zero observed
+coverage are retained as empty signatures and identified by
+`coverage_observation_count: 0`.
+
+The response has `data.status="measured"` when named observations are present,
+`summary` counts, and `duplicate_test_groups` entries containing the returned
+names, full `test_count`, and truncation state. Reports without named per-test
+observations return `data.status="unavailable"`; they do not claim that no
+duplicates exist. The REST equivalent is
+`GET /api/duplicate-coverage-tests` with the same selectors and limits.
+
+This is exact coverage equivalence, not logic equivalence. It does not inspect
+test source, assertions, inputs, side effects, or dependencies, and it never
+deletes tests. Treat every group as a review candidate before removing or
+merging any test. Compaction preserves the named test and observation data, so
+the result remains available after older snapshot detail is compressed.
 
 `project_context` budget and truncation fields:
 
@@ -414,7 +452,7 @@ Every successful tool uses this envelope:
 
 ```json
 {
-  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 9},
+  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 10},
   "data": {},
   "page": null
 }
@@ -426,7 +464,7 @@ envelope; clients should read `structuredContent` for the bounded result.
 
 ### Compatibility and errors
 
-Only the seven tools in the public reference above are part of the executable
+Only the eight tools in the public reference above are part of the executable
 MCP contract. REST resources and typed internal lineage operations are separate
 from the MCP tool inventory.
 
@@ -499,6 +537,9 @@ MCP. Important routes are:
 - `GET /api/snapshots`, `/api/snapshots/{id}`, and snapshot file/insight routes;
 - `/api/compare`, `/api/changed-lines`, `/api/line-history`, and
   `/api/source-lines` — comparisons and bounded source views;
+- `GET /api/duplicate-coverage-tests` — exact, bounded named-test coverage
+  groups with `snapshot_id`, `suite`, `max_groups`, `max_tests_per_group`,
+  and `cursor` selectors;
 - `/api/commands`, `/api/runs`, `/api/artifacts`, and `/api/worktrees` —
   approved execution, retained evidence, and baselines;
 - `POST /mcp/` — stateless JSON-RPC MCP over HTTP.

@@ -44,7 +44,7 @@ requests without replaying an operation whose commit status is ambiguous.
 | --- | --- |
 | `src/main.rs` | CLI, shared-daemon `serve`, `connect`/`stdio`, and daemon-routed `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
-| `src/mcp.rs` | Explicit schema-9 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
+| `src/mcp.rs` | Explicit schema-10 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
 | `src/storage.rs` | DuckDB schema, immutable snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
 | `src/lock.rs` | Process-lifetime daemon and per-database OS-backed exclusive leases. |
@@ -62,7 +62,7 @@ requests without replaying an operation whose commit status is ambiguous.
 - Queue state is mutable only while a managed run is queued or active.
 - Project settings are scoped to the canonical repository key, so linked
   worktrees use the same compaction policy and coverage history.
-- Every public schema-9 response carries `repo_key`, `checkout_path`,
+- Every public schema-10 response carries `repo_key`, `checkout_path`,
   `suite`, and `schema_revision` context.
 - Collections use bounded fetches, word budgets, and opaque query-scoped
   cursors. A defensive record cap fails explicitly instead of silently losing
@@ -97,6 +97,15 @@ requests without replaying an operation whose commit status is ambiguous.
   projection. Terminal run state does not calculate or embed a coverage review.
   `structuredContent` is the canonical JSON-RPC success payload; text content
   is only a compatibility hint.
+- Named per-test coverage is normalized during LCOV parsing into `test_names`
+  and `test_coverage_observations`. Duplicate candidates compare a full,
+  ordered JSON representation of each test's `{kind,file_path,line_number,
+  region_key}` set inside DuckDB; no hash-only grouping is used. The response
+  exposes global counts and small cursor pages, while other report formats
+  return `status=unavailable` because they do not provide named observations.
+- Compaction includes both named-test tables in the zstd detail payload and
+  deletes their relational rows in the same transaction as file and line
+  detail. Restored compacted payloads use the same exact signature semantics.
 
 ## Ownership, concurrency, and shutdown
 

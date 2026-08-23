@@ -560,7 +560,7 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         &mut stdout,
         serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list"}),
     );
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
     wait_for_health(port);
     let second_pid = guard.pid().expect("replacement daemon pid");
     assert_ne!(first_pid, second_pid);

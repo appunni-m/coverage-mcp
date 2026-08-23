@@ -72,7 +72,7 @@ extern crate self as coverage_mcp;
 mod rust_migration;
 
 /// Public Coverage MCP wire-contract schema revision.
-pub const SCHEMA_REVISION: u32 = 9;
+pub const SCHEMA_REVISION: u32 = 10;
 
 /// Rust daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
