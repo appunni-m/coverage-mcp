@@ -2813,9 +2813,15 @@ impl CoverageStore {
         } else {
             json!(queries)
         };
-        Ok(
-            json!({"run_id":run_id,"query":query_value,"queries":queries,"match_count":matches.len(),"returned_line_count":matches.iter().map(|item| item.get("context").and_then(Value::as_array).map_or(1, Vec::len)).sum::<usize>(),"matches":matches,"max_words":max_words,"case_sensitive":case_sensitive}),
-        )
+        Ok(json!({
+            "run_id":run_id,
+            "query":query_value,
+            "match_count":matches.len(),
+            "returned_line_count":matches.iter().map(|item| item.get("context").and_then(Value::as_array).map_or(1, Vec::len)).sum::<usize>(),
+            "matches":matches,
+            "max_words":max_words,
+            "case_sensitive":case_sensitive
+        }))
     }
 
     /// Finds the newest retained artifact of a kind.

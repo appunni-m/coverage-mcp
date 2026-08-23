@@ -714,6 +714,7 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
             "task":"change",
             "measurement":{"snapshot_id":fixture.current_snapshot_id,"file_path":"src/priority.rs"},
             "baseline":{"kind":"explicit","snapshot_id":fixture.base_snapshot_id},
+            "representation":"review",
             "limits":{"max_files":3,"max_regions":5,"max_words":1200,"max_bytes":12000}
         }),
     )?;
@@ -751,7 +752,7 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         &json!({
             "task":"history",
             "measurement":{"suite":"unit"},
-            "history":{"detail_snapshots":2,"summary_window":10},
+            "history":{"detail_snapshots":2,"summary_window":2},
             "limits":{"max_words":700,"max_bytes":12000}
         }),
     )?;
@@ -781,6 +782,17 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
                 .iter()
                 .all(|target| target["file_path"].is_string() || target["category"].is_string()),
         "insight returns bounded ranked findings without a raw line dump",
+    );
+    section.check(
+        "compact-insight-regions-are-capped",
+        broad_targets_array.iter().all(|target| {
+            target["regions"]
+                .as_array()
+                .is_some_and(|regions| regions.len() <= 3)
+                && target["region_count"].is_number()
+                && target["regions_truncated"].is_boolean()
+        }),
+        "compact insight reports only three ranges per target plus truncation metadata",
     );
     section.check(
         "targets-are-not-raw-line-dumps",
@@ -901,7 +913,7 @@ fn evaluate_outcomes(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         &json!({
             "task":"history",
             "measurement":{"suite":"unit","file_path":"src/priority.rs"},
-            "history":{"detail_snapshots":2,"summary_window":10},
+            "history":{"detail_snapshots":2,"summary_window":2},
             "limits":{"max_words":600,"max_bytes":12000}
         }),
     )?;
@@ -986,7 +998,7 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
         &json!({
             "task":"history",
             "measurement":{"suite":"unit"},
-            "history":{"detail_snapshots":2,"summary_window":10},
+            "history":{"detail_snapshots":2,"summary_window":2},
             "limits":{"max_words":600,"max_bytes":12000}
         }),
     )?;
@@ -998,7 +1010,7 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
             .is_some_and(|points| points.len() <= 2)
             && history_data["history"]["summary"]["window"]
                 .as_u64()
-                .is_some_and(|window| window <= 10),
+                .is_some_and(|window| window <= 2),
         "history keeps detailed points and aggregate windows bounded",
     );
 
@@ -1011,7 +1023,7 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
         if page_count > 100 {
             return Err("project context pagination exceeded 100 pages".to_owned());
         }
-        let mut arguments = json!({"max_words":50});
+        let mut arguments = json!({"max_words":200});
         if let Some(value) = cursor.as_deref() {
             arguments["cursor"] = json!(value);
         }
@@ -1027,13 +1039,29 @@ fn evaluate_efficiency(section: &mut SectionBuilder, fixture: &Fixture) -> Resul
         let page_metadata = page["page"]
             .as_object()
             .ok_or_else(|| "project context has no page metadata".to_owned())?;
+        let returned = page_metadata["returned"]
+            .as_u64()
+            .ok_or_else(|| "project context page has no returned count".to_owned())?;
+        section.check(
+            format!("project-context-page-{page_count}-item-cap"),
+            returned <= 8,
+            format!("project context returned {returned} command summaries"),
+        );
         let word_count = page_metadata["word_count"]
             .as_u64()
             .ok_or_else(|| "project context page has no word_count".to_owned())?;
         section.check(
             format!("project-context-page-{page_count}-bounded"),
-            word_count <= 50,
-            format!("project context page uses {word_count} words"),
+            word_count <= 200,
+            format!("project context command page uses {word_count} words"),
+        );
+        let response_word_count = page_metadata["response_word_count"]
+            .as_u64()
+            .ok_or_else(|| "project context page has no response_word_count".to_owned())?;
+        section.check(
+            format!("project-context-response-{page_count}-bounded"),
+            response_word_count <= 200,
+            format!("project context response uses {response_word_count} words"),
         );
         command_total = command_total.or_else(|| page_metadata["total"].as_u64());
         cursor = page_metadata["next_cursor"].as_str().map(str::to_owned);
@@ -1235,15 +1263,10 @@ fn evaluate_protocol(section: &mut SectionBuilder, fixture: &Fixture) -> Result<
         wire["result"]["isError"] == false && wire["result"]["structuredContent"] == direct,
         "JSON-RPC dispatch exposes the same structured result as direct service dispatch",
     );
-    let content_text = wire["result"]["content"][0]["text"]
-        .as_str()
-        .ok_or_else(|| "tools/call did not return text content".to_owned())?;
-    let content: Value = serde_json::from_str(content_text)
-        .map_err(|error| format!("tools/call content is not JSON: {error}"))?;
     section.check(
-        "structured-content-and-text-content-agree",
-        content == direct,
-        "structuredContent and text content carry the same bounded envelope",
+        "structured-content-is-canonical",
+        wire["result"]["content"][0]["text"] == "See structuredContent for the bounded result.",
+        "structuredContent carries the bounded envelope; text content is a short hint",
     );
     let context_resource = dispatch(
         Some(&fixture.service),

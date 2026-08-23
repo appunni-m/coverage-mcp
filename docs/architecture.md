@@ -82,6 +82,21 @@ requests without replaying an operation whose commit status is ambiguous.
 - HTTP and stdio MCP calls use the same daemon-side
   `mcp::dispatch_json_rpc` function and therefore cannot diverge in tool
   behavior or error handling.
+- Agent-facing projections are compact by default. `project_context` reserves
+  its fixed project/run summary before paging commands and enforces the budget
+  over the complete `data` object; `page.reserved_words` reports that fixed
+  reservation, `page.word_count` reports only the command page, and
+  `page.response_word_count` reports their combined accounting. Active runs are
+  hard-capped at ten and command pages at eight compact summaries. Compact
+  coverage reviews default to three files and five ranked targets;
+  `data.active_runs_truncated` makes omitted active runs explicit and
+  `page.next_cursor` continues commands only. Detailed mode does not lift
+  either normal page cap. Compact history keeps two points by default and
+  compact insight keeps three `[start,end,line_count]` ranges per target while
+  exposing `region_count` and `regions_truncated`; audit is the explicit exact
+  projection. Terminal run state does not calculate or embed a coverage review.
+  `structuredContent` is the canonical JSON-RPC success payload; text content
+  is only a compatibility hint.
 
 ## Ownership, concurrency, and shutdown
 

@@ -143,7 +143,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.10.0' --locked
+cargo install coverage-mcp --version '=0.10.1' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -287,7 +287,7 @@ or trustworthiness:
 | Caller must infer which run produced it | Durable approved test runs, artifact fingerprints, freshness states, and explicit run ids |
 | Repeated JSON keys and line records | Grouped ranges, compact symbols, response byte/word limits, and bounded source evidence |
 | Manual diff and baseline selection | Changed executable lines, branch gaps, compatible baselines, parent/ref lineage, and reasons for limited claims |
-| Custom history scripts | Latest two detailed points plus an aggregate window by default |
+| Custom history scripts | Latest two compatible points plus an aggregate over those points by default |
 | No execution semantics | Human approval, polling, cancellation, idempotency, and unchanged-run reuse |
 
 Use `coverage_import` when a report was produced outside the managed runner.
@@ -307,7 +307,7 @@ requires a raw report dump to answer a supported review question.
 | Question | Request |
 | --- | --- |
 | Did new code get covered? | `task="change"`; choose `baseline.kind="worktree_base"`, `"parent_commit"`, `"ref"`, `"previous_snapshot"`, `"explicit"`, or `"none"`. |
-| What happened over time? | `task="history"`; default is two detailed snapshots and a ten-point summary. |
+| What happened over time? | `task="history"`; default is the last two compatible points and an aggregate over those two points. |
 | What should be tested next? | `task="insight"`; returns ranked uncovered regions without a raw line dump. |
 | What source surrounds selected gaps? | `task="source"` with up to ten grouped `{file_path,start,end}` ranges. |
 | Which exact change records are needed? | `task="audit"` or `representation="audit"`; use deliberately because it is larger. |
@@ -320,7 +320,7 @@ Example change request:
   "task": "change",
   "measurement": {"run_id": "<terminal-run-id>"},
   "baseline": {"kind": "parent_commit"},
-  "limits": {"max_files": 10, "max_regions": 20, "max_words": 600, "max_bytes": 12000},
+  "limits": {"max_files": 3, "max_regions": 5, "max_words": 600, "max_bytes": 12000},
   "representation": "review"
 }
 ```
@@ -336,10 +336,12 @@ it into an `unchanged` claim.
 
 ### Token-efficient representations
 
-The default `review` representation is readable and groups related ranges.
-For large diffs, request `compact`. It emits each file path once per file group
+The default `compact` representation emits each file path once per file group
 and uses field-specific range legends plus short ranges such as
 `[120,127,"!"]`:
+
+Request `review` when readable grouped ranges are worth the additional context,
+or `audit` when exact records are required.
 
 | Symbol | Meaning |
 | --- | --- |
@@ -360,11 +362,13 @@ The `changed_code` legend applies to added executable-line ranges. The separate
 | `~` | region exists in both snapshots with changed coverage |
 
 `audit` keeps exact records and is reserved for verification or export. Do not
-ask for audit data merely to decide what to test next. History intentionally
-returns two detailed points plus a compact aggregate for the next eight points
-of the ten-point default window; increase limits only when the question needs
-it. All responses are also bounded by `max_words` and, for review/run/import,
-`max_bytes`.
+ask for audit data merely to decide what to test next. History defaults to the
+last two compatible points and an aggregate over those two points; older points
+require an explicit `history.summary_window` increase. Compact insight items
+return at most three `[start,end,line_count]` ranges per target, plus
+`region_count` and `regions_truncated`; use audit only when exact region
+records are required. All responses are also bounded by `max_words` and, for
+review/run/import, `max_bytes`.
 
 In compact change reviews, file metrics use `p` for path and `l`/`b`/`f`/`r`
 arrays for line/branch/function/region baseline, current, and delta values;
@@ -374,13 +378,37 @@ arrays for line/branch/function/region baseline, current, and delta values;
 
 | Tool | Purpose and important inputs |
 | --- | --- |
-| `project_context` | Read project identity, freshness, approved commands, active runs, and latest run. Paginate commands with `cursor`. |
-| `register_test_command` | Store one exact human-approved command and its artifacts. `human_approved` must be true. |
-| `run_test` | Submit an approved command. Prefer `wait=false`; use `idempotency_key` and the default `reuse_if_unchanged=true`. |
-| `run_review` | Read one explicit `run_id`; `view="status"` returns durable state and terminal coverage, while `view="logs"` returns bounded literal matches. |
+| `project_context` | Read compact project identity, freshness, up to eight approved command summaries, capped active runs, and latest run. The `max_words` budget covers the complete data projection; paginate commands with `cursor` only when needed. Use `detailed=true` only for an audit. |
+| `register_test_command` | Store one exact human-approved command and its artifacts. `human_approved` must be true; the default response is an id/name summary, and `detailed=true` returns command fields. |
+| `run_test` | Submit an approved command. Prefer `wait=false`; use `idempotency_key` and the default `reuse_if_unchanged=true`. The response is run state only; call `coverage_review` explicitly after terminal evidence. |
+| `run_review` | Read one explicit `run_id`; `view="status"` returns compact durable state and terminal ingestion evidence, while `view="logs"` returns bounded literal matches. It never embeds a coverage review. |
 | `cancel_run` | Request cancellation for a run the user no longer wants. |
 | `coverage_import` | Import a repository-relative external report with format, suite, branch, commit, and base provenance. Follow with `coverage_review`. |
-| `coverage_review` | Bounded change/history/insight/source/audit/all analysis with structured measurement, baseline, source, history, limits, and representation selectors. |
+| `coverage_review` | Bounded change/history/insight/source/audit/all analysis. Compact defaults to three files and five targets; history returns two points, and insight returns three ranges per target plus truncation metadata. Use audit for exact records. |
+
+`project_context` budget and truncation fields:
+
+| Field | Meaning and impact |
+| --- | --- |
+| `data.active_runs_truncated` | `true` means the response shows only the first ten active runs. The list is not a proof that no other active work exists; `detailed=true` does not lift this cap. |
+| `page.reserved_words` | Serialized-word count reserved for the fixed project/latest-run/active-run summary before commands are paged. |
+| `page.word_count` | Serialized-word count for the returned command page only. It is not the complete response count. |
+| `page.response_word_count` | `reserved_words + word_count`: the combined project-context budget count, which is bounded by `page.max_words`. |
+| `page.next_cursor` | Opaque continuation for more commands only; it does not paginate active runs. |
+
+Compact `coverage_review` fields are also intentionally bounded. A history
+point keeps identity, lineage, and line/branch/function/region rates while
+omitting repeated covered/total counters. An insight target's `regions` uses
+`[start,end,line_count]`, `region_count` is the untruncated number of ranges,
+and `regions_truncated=true` means only the first three ranges were returned.
+The audit representation keeps the exact object records and does not add
+these compact-only fields.
+
+The compact defaults are intentional: raw command, path, artifact, and run
+provenance fields require an explicit `detailed=true`; readable or exact
+coverage detail requires a `representation` choice, and logs require
+`run_review(view="logs")`. Terminal run state also does not include a coverage
+review; call `coverage_review` explicitly when analysis is needed.
 
 Every successful tool uses this envelope:
 
@@ -391,6 +419,10 @@ Every successful tool uses this envelope:
   "page": null
 }
 ```
+
+For JSON-RPC `tools/call`, `structuredContent` is canonical. The `content`
+array contains only a short compatibility hint and does not repeat the JSON
+envelope; clients should read `structuredContent` for the bounded result.
 
 ### Compatibility and errors
 

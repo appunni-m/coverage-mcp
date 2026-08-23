@@ -30,6 +30,23 @@ here.
 - Every successful public projection uses the `{context,data,page}` envelope.
 - Word budgets, opaque query-scoped cursors, defensive collection caps, and
   compact-by-default detailed fields remain enforced at the service boundary.
+- `project_context` reports the ten-entry active-run cap through
+  `data.active_runs_truncated`; its page distinguishes fixed-summary
+  `reserved_words`, command-page `word_count`, and combined
+  `response_word_count` so callers can account for the complete `max_words`
+  budget. Command pages contain at most eight compact summaries and continue
+  with `page.next_cursor`; detailed mode expands fields but does not lift the
+  active-run or command-page caps.
+- Compact history defaults to two points and omits repeated total/covered
+  counters. Compact insight targets return at most three
+  `[start,end,line_count]` ranges plus `region_count` and
+  `regions_truncated`; audit retains exact region records.
+- Compact review limits default to three files and five ranked targets so a
+  combined `task=all` call remains usable within the normal response budget;
+  callers can raise either limit explicitly.
+- MCP JSON-RPC clients read the bounded envelope from `structuredContent`; the
+  text content is only a compatibility hint, and terminal run state requires an
+  explicit `coverage_review` call for analysis.
 - A fresh schema is created when a store opens; incompatible database contents
   are disposable and are not repaired through compatibility migrations.
 - Compacted snapshots remain readable through file, line, source, insight, and

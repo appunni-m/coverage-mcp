@@ -19,17 +19,19 @@ use crate::error::{AppError, AppResult};
 use crate::git::{merge_base, parent_commit};
 use crate::service::{CoverageService, DEFAULT_MAX_WORDS};
 
+const STRUCTURED_CONTENT_HINT: &str = "See structuredContent for the bounded result.";
+
 /// MCP stream endpoint instructions shown during initialization.
 pub const MCP_INSTRUCTIONS: &str = concat!(
     "Coverage MCP ",
     env!("CARGO_PKG_VERSION"),
-    r#" schema 9 exposes a consolidated, composable agent interface.
+    r#" schema 9 exposes a compact, composable agent interface.
 
-Start with project_context. Run only an exact approved registration, or register a command after human approval of its command, cwd, shell, and artifacts. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...). Save the returned run_id. If submission_reused=true, use that terminal evidence instead of launching duplicate work. For every non-terminal result, wait at least poll_after_ms, then use run_review(view=status, run_id=...). Use run_review(view=logs) only for targeted, bounded literal evidence; cancel_run is only for work the user no longer wants. Setup, capture, timeout, cancellation, persistence, and shutdown failures become terminal failed jobs.
+Start with project_context. Its default response is compact: max_words covers the complete data projection, including the fixed project/latest-run summary and current command page. The command page returns at most eight compact summaries per call; follow page.next_cursor only when a command outside that window is needed. In that response, page.reserved_words is the fixed-summary count, page.word_count is command-page words, page.response_word_count is their combined budget count, and page.next_cursor continues only commands. data.active_runs is capped at ten entries; data.active_runs_truncated=true means more active runs were omitted, and detailed=true does not lift that cap. Use detailed=true only for an explicit audit of command, run, or provenance fields. Register only an exact human-approved command. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...), save run_id, wait poll_after_ms, then call run_review(view=status, run_id=...). Run status never embeds a coverage review; call coverage_review explicitly after a terminal run. Use run_review(view=logs) only for targeted literal evidence and cancel_run only when the user no longer wants the run.
 
-Use coverage_review as the analysis boundary: task=change for changed-code coverage and regressions, task=history for two detailed points plus an aggregate window, task=insight for ranked red regions, task=source for grouped ranges, task=audit for exact records, and task=all for a bounded combination. Carry snapshot/run/baseline selectors inside the structured request. Independent reviews may use multiple calls in parallel; dependent source requests wait for their ranges. Responses always use {context,data,page}, state claim_status and reasons, preserve measurement lineage, and reject requests that exceed max_words (50–5000, default 600) or max_bytes. Keep detailed=false and source ranges bounded. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. A file-metric legend defines the l/b/f/r arrays once.
+Use coverage_review as the analysis boundary: task=change for changed-code coverage, task=history for the last two points plus an aggregate, task=insight for ranked gaps, task=source for bounded ranges, task=audit for exact records, and task=all for a bounded combination. Independent reviews may use multiple calls in parallel. Compact is the default representation; request review or audit deliberately. Normal compact limits are three files and five ranked targets; increase max_files or max_regions explicitly for wider review. Compact insight targets return at most three regions per target as [start,end,line_count], with region_count and regions_truncated; audit is the opt-in exact projection. Carry snapshot/run/baseline selectors in the structured request. Successful tools return {context,data,page} in structuredContent; the text content is only a short compatibility hint. Keep detailed=false, source ranges bounded, and max_words within 50–5000 (default 600); review, run, and import also enforce max_bytes. claim_status and reasons are authoritative. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. Legends define the short fields.
 
-Raw LLVM JSON, LCOV, or another report is useful for a one-off point-in-time grep. Coverage MCP adds immutable snapshots, repository/branch/commit lineage, freshness and artifact provenance, changed-code and history analysis, source resolution, approval-aware execution, idempotent reuse, and bounded token-efficient responses. Use coverage_import for an external report and then coverage_review; never infer a historical or changed-code claim from an unregistered raw file. A stdio bridge safely recovers a refused daemon connection once; ambiguous writes are not replayed. Ingestion is capped at 64 MiB and malformed numeric fields are validation errors."#
+Use coverage_import for an external report before coverage_review; never infer lineage from a raw report. The stdio bridge recovers one refused daemon connection without replaying ambiguous writes. Ingestion is capped at 64 MiB and malformed numeric fields are validation errors."#
 );
 
 /// Returns the MCP initialize result.
@@ -63,7 +65,7 @@ fn public_tools_list() -> Value {
     Value::Array(vec![
         tool(
             "project_context",
-            "Discover project state before work: stable project id, metrics/freshness, exact approved commands, latest_run, active runs, and page metadata. The returned latest_run.id is the explicit run_id for run_review; run_review never infers the latest run: there is no implicit latest selection. Use detailed only for approval audit fields and full project chronology.",
+            "Discover compact project state before work: stable project id, freshness/metrics, up to eight approved command summaries, latest_run, capped active runs, and page metadata. max_words covers complete data, not only commands. data.active_runs_truncated=true means the ten-entry active-run cap omitted additional runs; detailed=true does not lift that cap. page.reserved_words is fixed-summary words, page.word_count is command-page words, and page.response_word_count is their combined count. Follow page.next_cursor only when another command is needed. The returned latest_run.id is the explicit run_id for run_review; there is no implicit latest selection. Use detailed=true only for approval audit fields and full chronology.",
             read_only(),
             object_schema(
                 &[
@@ -104,6 +106,7 @@ fn public_tools_list() -> Value {
                         json_schema("Coverage and artifact specifications."),
                     ),
                     ("max_words", budget_schema()),
+                    ("detailed", detailed_schema()),
                 ],
                 &[
                     "name",
@@ -116,7 +119,7 @@ fn public_tools_list() -> Value {
         ),
         tool(
             "run_test",
-            "Submit one approved command. Prefer wait=false with a stable idempotency_key; returns durable run id, queue/ETA, poll_after_ms, counters when known, and coverage_ingest. Managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use run_review(view=status, run_id=...) only after waiting the returned poll_after_ms.",
+            "Submit one approved command. Prefer wait=false with a stable idempotency_key; returns only the compact durable run state, queue/ETA, poll_after_ms, coverage_ingest, and submission_reused when compatible work is reused. It never embeds coverage_review; call that explicitly after terminal evidence. Managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use run_review(view=status, run_id=...) only after waiting poll_after_ms.",
             command_execution(),
             object_schema(
                 &[
@@ -150,7 +153,7 @@ fn public_tools_list() -> Value {
         ),
         tool_with_output(
             "run_review",
-            "Read one durable run without starting or advancing work. Use view=status for current state and terminal coverage evidence, or view=logs for targeted literal stdout/stderr matches. An explicit run_id is always required; this tool has no implicit latest selection.",
+            "Read one durable run without starting or advancing work. Use view=status for compact current state and terminal coverage-ingest evidence, or view=logs for targeted literal stdout/stderr matches. Status does not embed coverage_review; use that tool explicitly. An explicit run_id is always required; this tool has no implicit latest selection.",
             read_only(),
             object_schema(
                 &[
@@ -228,7 +231,7 @@ fn public_tools_list() -> Value {
         ),
         tool_with_output(
             "coverage_review",
-            "Return one bounded, task-oriented coverage review. Use task=change for changed-code coverage and regressions, task=history for detailed recent snapshots, line-over-time (line over time) history, plus an aggregate window, task=insight for ranked red uncovered regions, task=source for grouped source ranges, task=audit for exact records, or task=all for a compact combination. The server resolves compatible snapshots and groups regions.",
+            "Return one bounded, task-oriented coverage review. Compact is the default representation; request review for readable grouped ranges or audit for exact records. Use task=change for changed-code coverage and regressions, task=history for line over time using the last two points plus an aggregate, task=insight for ranked uncovered regions (at most three compact ranges per target), task=source for grouped ranges, or task=all for a bounded combination. Compact defaults to three files and five targets; raise limits explicitly for wider review. The server resolves compatible snapshots and groups regions.",
             read_only(),
             coverage_review_input_schema(),
             coverage_review_output_schema(),
@@ -238,7 +241,7 @@ fn public_tools_list() -> Value {
 
 /// Returns the static resource inventory.
 pub fn resources_list() -> Value {
-    json!([{"uri":"coverage://context","name":"Coverage project context","mimeType":"application/json","description":"Current project summary, compaction policy, commands, and active runs."}])
+    json!([{"uri":"coverage://context","name":"Coverage project context","mimeType":"application/json","description":"Current compact project context. Its data.active_runs list is capped at ten and data.active_runs_truncated signals omitted active runs; page.reserved_words, page.word_count, and page.response_word_count explain the complete max_words accounting."}])
 }
 
 /// Returns the static resource template inventory.
@@ -324,7 +327,7 @@ pub fn dispatch_json_rpc(service: Option<&CoverageService>, request: &Value) -> 
             match call_tool(service, name, &arguments) {
                 Ok(value) => json_rpc_result(
                     id,
-                    json!({"structuredContent":value,"content":[{"type":"text","text":value.to_string()}],"isError":false}),
+                    json!({"structuredContent":value,"content":[{"type":"text","text":STRUCTURED_CONTENT_HINT}],"isError":false}),
                 ),
                 Err(error) => json_rpc_result(
                     id,
@@ -478,9 +481,9 @@ fn coverage_review_call(
         )?);
     }
     let detail_snapshots = request.detail_snapshots.unwrap_or(2);
-    let summary_window = request.summary_window.unwrap_or(10);
-    let max_files = request.max_files.unwrap_or(10);
-    let max_regions = request.max_regions.unwrap_or(20);
+    let summary_window = request.summary_window.unwrap_or(2);
+    let max_files = request.max_files.unwrap_or(3);
+    let max_regions = request.max_regions.unwrap_or(5);
     let max_source_lines = request.max_source_lines.unwrap_or(120);
     let max_words = request.max_words.unwrap_or(max_words);
     let max_bytes = request.max_bytes.unwrap_or(12_000);
@@ -490,7 +493,7 @@ fn coverage_review_call(
         if task == "audit" {
             "audit".to_owned()
         } else {
-            "review".to_owned()
+            "compact".to_owned()
         }
     });
     if task == "source" {
@@ -1128,7 +1131,7 @@ fn json_rpc_error(id: Value, error: AppError) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":error.to_string()}})
 }
 fn output_schema() -> Value {
-    json!({"type":"object","properties":{"context":{"type":"object","description":"Request repository, checkout, suite, and schema context."},"data":{"description":"One bounded task-level projection with measurement, lineage, claim status, reasons, and a next action when applicable."},"page":{"type":["object","null"],"description":"Per-call pagination and response-budget metadata, including returned, total, word_count, max_words, truncated, and next_cursor."}},"required":["context","data","page"]})
+    json!({"type":"object","properties":{"context":{"type":"object","description":"Request repository, checkout, suite, and schema context."},"data":{"description":"One bounded task-level projection with measurement, lineage, claim status, reasons, and a next action when applicable. project_context also returns active_runs_truncated when its active-run cap omits entries."},"page":{"type":["object","null"],"description":"Per-call pagination and response-budget metadata. word_count counts returned collection items; max_words is the complete data budget. For project_context, reserved_words counts fixed summary data, response_word_count is reserved_words plus the command-page word_count, and next_cursor continues only commands."}},"required":["context","data","page"]})
 }
 fn coverage_review_input_schema() -> Value {
     object_schema(
@@ -1203,7 +1206,7 @@ fn coverage_review_input_schema() -> Value {
                     "description":"History detail and summary limits.",
                     "properties":{
                         "detail_snapshots":{"type":"integer","minimum":1,"maximum":5,"default":2},
-                        "summary_window":{"type":"integer","minimum":2,"maximum":50,"default":10}
+                        "summary_window":{"type":"integer","minimum":2,"maximum":50,"default":2}
                     },
                     "additionalProperties":false
                 }),
@@ -1212,10 +1215,10 @@ fn coverage_review_input_schema() -> Value {
                 "limits",
                 json!({
                     "type":"object",
-                    "description":"Complete response word, byte, file, region, and source limits.",
+                    "description":"Complete response word, byte, file, region, and source limits; compact defaults are three files and five targets.",
                     "properties":{
-                        "max_files":{"type":"integer","minimum":1,"maximum":50,"default":10},
-                        "max_regions":{"type":"integer","minimum":1,"maximum":100,"default":20},
+                        "max_files":{"type":"integer","minimum":1,"maximum":50,"default":3},
+                        "max_regions":{"type":"integer","minimum":1,"maximum":100,"default":5},
                         "max_source_lines":{"type":"integer","minimum":10,"maximum":500,"default":120},
                         "max_words":{"type":"integer","minimum":50,"maximum":5000,"default":600},
                         "max_bytes":{"type":"integer","minimum":1000,"maximum":2000000,"default":12000}
@@ -1227,8 +1230,8 @@ fn coverage_review_input_schema() -> Value {
                 "representation",
                 enum_default_schema(
                     &["review", "compact", "audit"],
-                    "review",
-                    "Readable grouped review, token-compressed ranges, or exact audit records.",
+                    "compact",
+                    "Token-compressed ranges by default; request review for readable groups or audit for exact records.",
                 ),
             ),
         ],
@@ -1253,8 +1256,8 @@ fn coverage_review_output_schema() -> Value {
                     "change":{"type":"object"},
                     "next_action":{"type":"object"},
                     "source":{"type":"array"},
-                    "history":{"type":"object"},
-                    "insight":{"type":"object"},
+                    "history":{"type":"object","description":"Compact history defaults to two recent points; non-compact representations may include raw counters."},
+                    "insight":{"type":"object","description":"Compact insight items use at most three [start,end,line_count] ranges per target and add region_count plus regions_truncated; audit retains exact regions."},
                     "reasons":{"type":"array","items":{"type":"string"}}
                 },
                 "required":["focus","representation","claim_status","reasons","measurement","baseline"]
@@ -1318,7 +1321,7 @@ fn enum_default_schema(values: &[&str], default: &str, description: &str) -> Val
     json!({"type":"string","enum":values,"default":default,"description":description})
 }
 fn budget_schema() -> Value {
-    json!({"type":"integer","minimum":50,"maximum":5000,"default":600,"description":"Per-call response word budget, 50–5000, default 600; use page.next_cursor for more collection items."})
+    json!({"type":"integer","minimum":50,"maximum":5000,"default":600,"description":"Serialized-word budget for the complete data projection, 50–5000, default 600. project_context reserves fixed summary words before paging commands; use page.next_cursor for more command items."})
 }
 fn detailed_schema() -> Value {
     json!({"type":"boolean","default":false,"description":"Keep false for normal work; true only for explicitly requested audit, raw-metric, or provenance fields."})
@@ -1707,14 +1710,13 @@ mod tests {
             assert!(call_tool(&service, "coverage_review", &arguments).is_ok());
         }
         assert!(call_tool(&service, "project_context", &json!({"max_words":600})).is_ok());
-        assert!(
-            call_tool(
-                &service,
-                "coverage_review",
-                &json!({"task":"change","measurement":{"snapshot_id":snapshot_id},"baseline":{"kind":"none"}}),
-            )
-            .is_ok()
-        );
+        let default_review = call_tool(
+            &service,
+            "coverage_review",
+            &json!({"task":"change","measurement":{"snapshot_id":snapshot_id},"baseline":{"kind":"none"}}),
+        )
+        .unwrap();
+        assert_eq!(default_review["data"]["representation"], "compact");
         assert!(call_tool(
             &service,
             "coverage_review",
@@ -1813,6 +1815,23 @@ mod tests {
             }),
         )
         .unwrap();
+        assert!(command["data"].get("command").is_none());
+        let detailed_command = call_tool(
+            &service,
+            "register_test_command",
+            &json!({
+                "name":"coverage-review-detailed-command",
+                "command":"printf detailed",
+                "human_approved":true,
+                "approved_by":"test",
+                "approval_note":"detailed projection test",
+                "cwd":directory.path(),
+                "shell":"/bin/sh",
+                "detailed":true
+            }),
+        )
+        .unwrap();
+        assert_eq!(detailed_command["data"]["command"], "printf detailed");
         assert!(
             call_tool(
                 &service,
@@ -2073,6 +2092,8 @@ mod tests {
         assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 9")));
         assert!(instructions.contains("multiple calls"));
         assert!(instructions.contains("task=source"));
+        assert!(instructions.contains("last two points"));
+        assert!(instructions.contains("regions_truncated"));
         assert!(instructions.contains("changed_code uses + for covered"));
         assert!(instructions.contains("compact regions use + for improved/new"));
         let tools = tools_list();
@@ -2089,6 +2110,62 @@ mod tests {
                 .unwrap()
                 .contains("latest_run.id is the explicit run_id")
         );
+        assert!(
+            project_context["description"]
+                .as_str()
+                .unwrap()
+                .contains("active_runs_truncated")
+        );
+        assert!(
+            project_context["description"]
+                .as_str()
+                .unwrap()
+                .contains("response_word_count")
+        );
+        assert!(
+            project_context["description"]
+                .as_str()
+                .unwrap()
+                .contains("up to eight")
+        );
+        let coverage_review = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "coverage_review")
+            .unwrap();
+        assert!(
+            coverage_review["description"]
+                .as_str()
+                .unwrap()
+                .contains("at most three compact ranges")
+        );
+        assert!(
+            coverage_review["outputSchema"]["properties"]["data"]["properties"]["insight"][
+                "description"
+            ]
+            .as_str()
+            .unwrap()
+            .contains("regions_truncated")
+        );
+        assert_eq!(
+            coverage_review["inputSchema"]["properties"]["history"]["properties"]["summary_window"]
+                ["default"],
+            2
+        );
+        assert_eq!(
+            coverage_review["inputSchema"]["properties"]["limits"]["properties"]["max_files"]["default"],
+            3
+        );
+        assert_eq!(
+            coverage_review["inputSchema"]["properties"]["limits"]["properties"]["max_regions"]["default"],
+            5
+        );
+        assert!(tools.as_array().unwrap().iter().any(|tool| {
+            tool["outputSchema"]["properties"]["page"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("reserved_words"))
+        }));
         let run_test = tools
             .as_array()
             .unwrap()
@@ -2098,6 +2175,16 @@ mod tests {
         assert_eq!(
             run_test["inputSchema"]["properties"]["reuse_if_unchanged"]["default"],
             true
+        );
+        let register = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "register_test_command")
+            .unwrap();
+        assert_eq!(
+            register["inputSchema"]["properties"]["detailed"]["default"],
+            false
         );
         let coverage_review = tools
             .as_array()
@@ -2163,6 +2250,10 @@ mod tests {
             false
         );
         assert_eq!(coverage_review["inputSchema"]["required"], json!(["task"]));
+        assert_eq!(
+            coverage_review["inputSchema"]["properties"]["representation"]["default"],
+            "compact"
+        );
         assert_eq!(run_review["inputSchema"]["additionalProperties"], false);
     }
 

@@ -3092,6 +3092,10 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let mcp_insight = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"insight","measurement":{"snapshot_id":second_snapshot_id},"limits":{"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
     assert_eq!(mcp_insight["result"]["isError"], false);
     assert!(mcp_insight["result"]["structuredContent"]["data"]["insight"]["items"].is_array());
+    assert_eq!(
+        mcp_insight["result"]["content"][0]["text"],
+        "See structuredContent for the bounded result."
+    );
     let mcp_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"change","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
     assert_eq!(mcp_review["result"]["isError"], false);
     assert!(

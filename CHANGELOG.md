@@ -4,6 +4,17 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.10.1 - 2026-08-23
+
+### Changed
+
+- Reduced default MCP context growth with bounded project command pages,
+  active-run projections, two-point history, and compact insight ranges.
+- Made complete response-budget accounting and compact truncation state
+  explicit so agents can request more detail only when needed.
+- Kept terminal run responses and the JSON-RPC text content minimal while
+  preserving the canonical structured MCP result over HTTP and stdio.
+
 ## 0.10.0 - 2026-08-22
 
 ### Added

@@ -27,6 +27,10 @@ use crate::{SCHEMA_REVISION, hex_prefix};
 /// Default response word budget used by compact agent-facing calls.
 pub const DEFAULT_MAX_WORDS: usize = 600;
 
+const MAX_CONTEXT_ACTIVE_RUNS: usize = 10;
+const MAX_CONTEXT_COMMANDS: usize = 8;
+const MAX_COMPACT_INSIGHT_REGIONS: usize = 3;
+
 /// Repository identity attached to every response envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestContext {
@@ -83,7 +87,12 @@ impl CoverageService {
         })
     }
 
-    /// Applies a singular response budget.
+    /// Enforces a serialized-word budget on the complete `data` projection.
+    ///
+    /// The envelope's `context` and `page` metadata are excluded from this
+    /// count. Callers that compose a paged collection with fixed summary data
+    /// must reserve the fixed data before allocating words to the collection.
+    /// [`Self::project_context`] exposes that accounting in its page metadata.
     pub fn apply_budget(&self, response: Value, max_words: usize) -> AppResult<Value> {
         validate_max_words(max_words)?;
         let data = response.get("data").cloned().unwrap_or(Value::Null);
@@ -122,6 +131,14 @@ impl CoverageService {
     }
 
     /// Pages an already bounded collection using opaque, query-scoped cursors.
+    ///
+    /// `page.word_count` is the serialized-word count of the selected
+    /// collection items only. `page.max_words` is the budget supplied to this
+    /// collection, while `page.truncated` and `page.next_cursor` describe how
+    /// to continue the collection. A caller that embeds this page alongside
+    /// fixed data must reserve that fixed data separately; `project_context`
+    /// reports the combined accounting as `reserved_words` and
+    /// `response_word_count`.
     pub fn page(
         &self,
         values: &[Value],
@@ -129,6 +146,18 @@ impl CoverageService {
         max_words: usize,
         scope: &str,
         total: Option<usize>,
+    ) -> AppResult<(Vec<Value>, Value)> {
+        self.page_with_item_limit(values, cursor, max_words, scope, total, None)
+    }
+
+    fn page_with_item_limit(
+        &self,
+        values: &[Value],
+        cursor: Option<&str>,
+        max_words: usize,
+        scope: &str,
+        total: Option<usize>,
+        max_items: Option<usize>,
     ) -> AppResult<(Vec<Value>, Value)> {
         validate_max_words(max_words)?;
         let known_total = total.unwrap_or(values.len());
@@ -161,6 +190,9 @@ impl CoverageService {
         let mut selected = Vec::new();
         let mut word_count = 0usize;
         for value in values.iter().skip(start) {
+            if max_items.is_some_and(|limit| selected.len() >= limit) {
+                break;
+            }
             let item_words = serialized_word_count(value);
             if !selected.is_empty() && word_count + item_words > max_words {
                 break;
@@ -204,39 +236,126 @@ impl CoverageService {
         ))
     }
 
-    /// Returns the project summary, command inventory, and active runs.
+    /// Returns a compact, budgeted project summary, command inventory, and run state.
+    ///
+    /// `max_words` applies to the complete `data` projection, not only the
+    /// command collection. The fixed project/latest-run/active-run summary is
+    /// reserved first, and the remaining budget is used for command pages.
+    /// In the returned `page`, `reserved_words` is the fixed-summary count,
+    /// `word_count` is the current command-page count, and
+    /// `response_word_count` is their sum for the complete response budget.
+    /// `page.next_cursor` continues only the command collection. Each page
+    /// returns at most eight compact command summaries; the cursor continues
+    /// the remaining inventory without inflating normal context responses.
+    ///
+    /// `data.active_runs` is capped at ten entries in both compact and detailed
+    /// modes. `data.active_runs_truncated` is `true` when additional active runs
+    /// were available, so callers must not interpret a complete-looking list as
+    /// proof that no other active runs exist. `detailed=true` expands raw
+    /// command, run, and provenance fields; it does not remove the active-run
+    /// cap and may require a larger `max_words` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the requested budget or cursor is
+    /// invalid, when the fixed summary cannot fit, or when too little budget
+    /// remains for a non-empty command collection. Storage failures are
+    /// propagated unchanged.
     pub fn project_context(
         &self,
         cursor: Option<&str>,
         max_words: usize,
         detailed: bool,
     ) -> AppResult<Value> {
+        validate_max_words(max_words)?;
         let context = self.context(None);
         let project = self.store.project_summary()?;
+        let project = if detailed {
+            project
+        } else {
+            compact_context_project(&project)
+        };
         let commands = self
             .store
             .list_registered_commands(COLLECTION_FETCH_LIMIT)?
             .into_iter()
             .map(|value| compact_command(&value, detailed))
             .collect::<Vec<_>>();
-        let scope = format!("project-context:{}:{detailed}", context.repo_key);
-        let (commands, page) = self.page(&commands, cursor, max_words, &scope, None)?;
         let latest = self
             .store
             .latest_run(None)?
             .map(|value| compact_run_result(&value, detailed));
-        let active = self
-            .store
-            .list_run_queue(COLLECTION_FETCH_LIMIT)?
+        let active_values = self.store.list_run_queue(COLLECTION_FETCH_LIMIT)?;
+        let active_runs_truncated = active_values.len() > MAX_CONTEXT_ACTIVE_RUNS;
+        let active = active_values
             .into_iter()
-            .map(|value| compact_run_result(&value, false))
+            .take(MAX_CONTEXT_ACTIVE_RUNS)
+            .map(|value| compact_run_result(&value, detailed))
             .collect::<Vec<_>>();
-        let project = if detailed {
-            project
+        let fixed_data = json!({
+            "project": project,
+            "commands": [],
+            "latest_run": latest,
+            "active_runs": active,
+            "active_runs_truncated": active_runs_truncated,
+        });
+        let fixed_words = serialized_word_count(&fixed_data);
+        if fixed_words > max_words {
+            return Err(AppError::Validation(format!(
+                "project context summary requires {fixed_words} words; increase max_words"
+            )));
+        }
+        let command_budget = max_words - fixed_words;
+        if !commands.is_empty() && command_budget < 50 {
+            return Err(AppError::Validation(format!(
+                "project context summary requires {fixed_words} words and leaves less than 50 words for commands; increase max_words"
+            )));
+        }
+        let scope = format!("project-context:{}:{detailed}", context.repo_key);
+        let (commands, mut page) = if commands.is_empty() {
+            self.page_with_item_limit(&commands, cursor, max_words, &scope, None, None)?
         } else {
-            compact_project(&project)
+            self.page_with_item_limit(
+                &commands,
+                cursor,
+                command_budget,
+                &scope,
+                None,
+                Some(MAX_CONTEXT_COMMANDS),
+            )?
         };
-        Ok(self.envelope(json!({"project": project, "commands": commands, "latest_run": latest, "active_runs": active}), None, Some(page)))
+        page["response_word_count"] =
+            json!(fixed_words + page["word_count"].as_u64().unwrap_or(0) as usize);
+        page["reserved_words"] = json!(fixed_words);
+        page["max_words"] = json!(max_words);
+        let project = fixed_data
+            .get("project")
+            .cloned()
+            .expect("project context fixed data always contains project");
+        let latest = fixed_data
+            .get("latest_run")
+            .cloned()
+            .expect("project context fixed data always contains latest_run");
+        let active = fixed_data
+            .get("active_runs")
+            .cloned()
+            .expect("project context fixed data always contains active_runs");
+        let active_runs_truncated = fixed_data
+            .get("active_runs_truncated")
+            .cloned()
+            .expect("project context fixed data always contains active_runs_truncated");
+        let response = self.envelope(
+            json!({
+                "project": project,
+                "commands": commands,
+                "latest_run": latest,
+                "active_runs": active,
+                "active_runs_truncated": active_runs_truncated,
+            }),
+            None,
+            Some(page),
+        );
+        self.apply_budget(response, max_words)
     }
 
     /// Registers one human-approved command.
@@ -322,9 +441,7 @@ impl CoverageService {
                 reuse_if_unchanged,
             )?
         };
-        let mut result = compact_run_result(&value, detailed);
-        self.attach_terminal_review(&mut result);
-        Ok(self.envelope(result, None, None))
+        Ok(self.envelope(compact_run_result(&value, detailed), None, None))
     }
 
     /// Returns or cancels a run.
@@ -338,11 +455,7 @@ impl CoverageService {
                 ));
             }
         };
-        let mut result = compact_run_result(&value, detailed);
-        if action == "status" {
-            self.attach_terminal_review(&mut result);
-        }
-        Ok(self.envelope(result, None, None))
+        Ok(self.envelope(compact_run_result(&value, detailed), None, None))
     }
 
     /// Reads one durable run projection or targeted log projection.
@@ -397,55 +510,6 @@ impl CoverageService {
         };
         let response = self.apply_budget(response, max_words)?;
         self.apply_byte_budget(response, max_bytes)
-    }
-
-    fn attach_terminal_review(&self, result: &mut Value) {
-        let terminal = result
-            .get("terminal")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let Some(snapshot_id) = result
-            .get("coverage_ingest")
-            .and_then(|value| value.get("snapshot_ids"))
-            .and_then(Value::as_array)
-            .and_then(|values| values.iter().find_map(Value::as_str))
-        else {
-            return;
-        };
-        if !terminal {
-            return;
-        }
-        let review = match self.coverage_review(
-            "change",
-            Some(snapshot_id),
-            None,
-            None,
-            None,
-            None,
-            None,
-            2,
-            10,
-            5,
-            8,
-            false,
-            3,
-            40,
-            800,
-            8_000,
-            "review",
-        ) {
-            Ok(value) => value
-                .get("data")
-                .cloned()
-                .expect("coverage review responses always contain data"),
-            Err(error) => {
-                json!({"claim_status":"limited","status":"unavailable","reason":error.to_string()})
-            }
-        };
-        result
-            .as_object_mut()
-            .expect("managed run projections are JSON objects")
-            .insert("coverage_review".to_owned(), review);
     }
 
     /// Searches retained run output with literal OR matching.
@@ -747,6 +811,14 @@ impl CoverageService {
     }
 
     /// Returns one bounded review for change, history, insight, or all three.
+    ///
+    /// Compact history points contain identity, lineage, and the four coverage
+    /// rates; raw covered/total counters are available only for a non-compact
+    /// representation. Compact insight items include at most three ranges per
+    /// target as `[start, end, line_count]` arrays. `region_count` reports the
+    /// full target count and `regions_truncated` reports whether those arrays
+    /// were capped; audit representation retains the exact stored regions and
+    /// omits those compact-only fields.
     #[allow(clippy::too_many_arguments)]
     pub fn coverage_review(
         &self,
@@ -884,6 +956,7 @@ impl CoverageService {
                 worktree_id,
                 detail_snapshots,
                 summary_window,
+                representation != "compact",
             )?;
             if focus == "history" && result["history"]["status"] == "measured" {
                 result["claim_status"] = json!("supported");
@@ -891,8 +964,13 @@ impl CoverageService {
         }
 
         if matches!(focus, "insight" | "all") {
-            result["insight"] =
-                self.review_insight(current_id.as_deref(), baseline_snapshot_id, max_regions)?;
+            result["insight"] = self.review_insight(
+                current_id.as_deref(),
+                baseline_snapshot_id,
+                max_regions,
+                representation == "compact",
+                representation == "audit",
+            )?;
             if focus == "insight" && result["insight"]["status"] == "measured" {
                 result["claim_status"] = json!("supported");
             }
@@ -1193,6 +1271,7 @@ impl CoverageService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn review_history(
         &self,
         branch: Option<&str>,
@@ -1201,6 +1280,7 @@ impl CoverageService {
         worktree_id: Option<&str>,
         detail_snapshots: usize,
         summary_window: usize,
+        detailed: bool,
     ) -> AppResult<Value> {
         let context = self.context(suite);
         let points = self.store.trend(
@@ -1214,7 +1294,7 @@ impl CoverageService {
         let detail = points
             .iter()
             .take(detail_snapshots)
-            .map(compact_history_snapshot)
+            .map(|value| compact_history_snapshot(value, detailed))
             .collect::<Vec<_>>();
         let summary = summarize_history(&points);
         Ok(json!({
@@ -1229,6 +1309,8 @@ impl CoverageService {
         snapshot_id: Option<&str>,
         baseline_snapshot_id: Option<&str>,
         max_regions: usize,
+        compact: bool,
+        audit_regions: bool,
     ) -> AppResult<Value> {
         let Some(snapshot_id) = snapshot_id else {
             return Ok(json!({"status":"not_measured","items":[]}));
@@ -1248,18 +1330,45 @@ impl CoverageService {
                         .expect("stored coverage targets always contain uncovered_lines");
                 let priority = required_i64_field(&target, "priority", "coverage target")
                     .expect("stored coverage targets always contain priority");
-                json!({
-                    "severity": if uncovered_lines > 0 { "high" } else { "medium" },
-                    "category": "uncovered-target",
-                    "title": "Uncovered executable region",
-                    "detail": format!("{path} has {uncovered_lines} uncovered executable lines."),
-                    "file_path": path,
-                    "priority": priority,
-                    "uncovered_lines": uncovered_lines,
-                    "uncovered_branches": target["uncovered_branches"],
-                    "uncovered_functions": target["uncovered_functions"],
-                    "regions": target["regions"]
-                })
+                let (compact_regions, region_count, regions_truncated) =
+                    compact_insight_regions(&target["regions"]);
+                let mut item = if compact {
+                    json!({
+                        "file_path": path,
+                        "priority": priority,
+                        "uncovered_lines": uncovered_lines,
+                        "uncovered_branches": target["uncovered_branches"],
+                        "uncovered_functions": target["uncovered_functions"],
+                        "regions": compact_regions,
+                        "region_count": region_count,
+                        "regions_truncated": regions_truncated,
+                    })
+                } else {
+                    json!({
+                        "severity": if uncovered_lines > 0 { "high" } else { "medium" },
+                        "category": "uncovered-target",
+                        "title": "Uncovered executable region",
+                        "detail": format!("{path} has {uncovered_lines} uncovered executable lines."),
+                        "file_path": path,
+                        "priority": priority,
+                        "uncovered_lines": uncovered_lines,
+                        "uncovered_branches": target["uncovered_branches"],
+                        "uncovered_functions": target["uncovered_functions"],
+                        "regions": compact_regions,
+                        "region_count": region_count,
+                        "regions_truncated": regions_truncated,
+                    })
+                };
+                if audit_regions {
+                    item["regions"] = target["regions"].clone();
+                    item.as_object_mut()
+                        .expect("insight items are JSON objects")
+                        .remove("region_count");
+                    item.as_object_mut()
+                        .expect("insight items are JSON objects")
+                        .remove("regions_truncated");
+                }
+                item
             })
             .collect::<Vec<_>>();
         Ok(json!({
@@ -1789,33 +1898,21 @@ fn canonical_json(value: &Value) -> String {
     }
 }
 
-fn compact_project(value: &Value) -> Value {
+fn compact_context_project(value: &Value) -> Value {
     let keys = [
         "id",
         "snapshot_count",
-        "branch_count",
         "command_count",
         "run_count",
         "latest_snapshot_id",
-        "latest_snapshot_age",
         "latest_snapshot_age_seconds",
-        "latest_run_age",
         "latest_run_age_seconds",
         "latest_branch",
         "latest_commit_sha",
         "latest_suite",
-        "latest_format",
-        "total_lines",
-        "covered_lines",
         "line_rate",
-        "total_branches",
-        "covered_branches",
         "branch_rate",
-        "total_functions",
-        "covered_functions",
         "function_rate",
-        "total_regions",
-        "covered_regions",
         "region_rate",
         "warnings",
         "compaction",
@@ -2105,6 +2202,28 @@ fn review_next_action(changed_code: &Value, regions: &[Value]) -> Value {
     }
 }
 
+fn compact_insight_regions(value: &Value) -> (Vec<Value>, usize, bool) {
+    let regions = value.as_array().map_or(&[][..], Vec::as_slice);
+    let compact = regions
+        .iter()
+        .take(MAX_COMPACT_INSIGHT_REGIONS)
+        .filter_map(|region| {
+            let start = region.get("start").and_then(Value::as_i64)?;
+            let end = region.get("end").and_then(Value::as_i64)?;
+            let line_count = region
+                .get("line_count")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| end.saturating_sub(start).saturating_add(1));
+            Some(json!([start, end, line_count]))
+        })
+        .collect::<Vec<_>>();
+    (
+        compact,
+        regions.len(),
+        regions.len() > MAX_COMPACT_INSIGHT_REGIONS,
+    )
+}
+
 fn compact_region_groups(value: &Value) -> Value {
     let Some(files) = value.as_array() else {
         return Value::Array(Vec::new());
@@ -2187,8 +2306,20 @@ fn compact_file_change(value: &Value) -> Value {
     Value::Object(result)
 }
 
-fn compact_history_snapshot(value: &Value) -> Value {
-    let keys = [
+fn compact_history_snapshot(value: &Value, detailed: bool) -> Value {
+    let compact_keys = [
+        "id",
+        "created_at",
+        "branch",
+        "commit_sha",
+        "suite",
+        "file_path",
+        "line_rate",
+        "branch_rate",
+        "function_rate",
+        "region_rate",
+    ];
+    let detailed_keys = [
         "id",
         "created_at",
         "branch",
@@ -2208,10 +2339,15 @@ fn compact_history_snapshot(value: &Value) -> Value {
         "covered_regions",
         "region_rate",
     ];
+    let keys: &[&str] = if detailed {
+        &detailed_keys
+    } else {
+        &compact_keys
+    };
     let mut result = Map::new();
     for key in keys {
         if let Some(value) = value.get(key) {
-            result.insert(key.to_owned(), value.clone());
+            result.insert((*key).to_owned(), value.clone());
         }
     }
     Value::Object(result)
@@ -2268,6 +2404,22 @@ fn summarize_history(points: &[Value]) -> Value {
 }
 
 fn compact_command(value: &Value, detailed: bool) -> Value {
+    if !detailed {
+        let artifact_count = value
+            .get("artifact_specs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        return json!({
+            "id": value.get("id").cloned().unwrap_or(Value::Null),
+            "name": value.get("name").cloned().unwrap_or(Value::Null),
+            "enabled": value.get("enabled").cloned().unwrap_or(Value::Null),
+            "created_at": value.get("created_at").cloned().unwrap_or(Value::Null),
+            "artifact_count": artifact_count,
+            "duration_estimate_ms": value.get("duration_estimate_ms").cloned().unwrap_or(Value::Null),
+            "duration_p90_ms": value.get("duration_p90_ms").cloned().unwrap_or(Value::Null),
+            "duration_sample_count": value.get("duration_sample_count").cloned().unwrap_or(Value::Null),
+        });
+    }
     let keys = [
         "id",
         "name",
@@ -2291,13 +2443,11 @@ fn compact_command(value: &Value, detailed: bool) -> Value {
     if result.get("artifact_specs").is_none_or(Value::is_null) {
         result.insert("artifact_specs".to_owned(), json!([]));
     }
-    if detailed {
-        for key in ["approved_by", "approval_note", "branch", "commit_sha"] {
-            result.insert(
-                key.to_owned(),
-                value.get(key).cloned().unwrap_or(Value::Null),
-            );
-        }
+    for key in ["approved_by", "approval_note", "branch", "commit_sha"] {
+        result.insert(
+            key.to_owned(),
+            value.get(key).cloned().unwrap_or(Value::Null),
+        );
     }
     Value::Object(result)
 }
@@ -2306,12 +2456,42 @@ fn compact_run_result(value: &Value, detailed: bool) -> Value {
     if detailed {
         return value.clone();
     }
-    let mut result = value.clone();
-    if let Some(object) = result.as_object_mut() {
-        object.remove("parsed_summary");
-        object.remove("artifact_paths");
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let keys = [
+        "id",
+        "command_id",
+        "command_name",
+        "idempotency_key",
+        "branch",
+        "commit_sha",
+        "queued_at",
+        "started_at",
+        "ended_at",
+        "duration_ms",
+        "timeout_seconds",
+        "queue_duration_ms",
+        "exit_code",
+        "status",
+        "terminal",
+        "poll_after_ms",
+        "queue_position",
+        "execution_mode",
+        "cancellation_requested",
+        "cancellation_requested_at",
+        "submission_reused",
+        "reuse_reason",
+        "coverage_ingest",
+        "error",
+    ];
+    let mut result = Map::new();
+    for key in keys {
+        if let Some(value) = object.get(key) {
+            result.insert(key.to_owned(), value.clone());
+        }
     }
-    result
+    Value::Object(result)
 }
 
 fn strip_log_metadata(value: &mut Value) {
@@ -2739,6 +2919,38 @@ mod tests {
                 .is_err()
         );
         assert!(service.project_context(None, 600, true).is_ok());
+        assert!(service.project_context(None, 49, false).is_err());
+        assert!(service.project_context(None, 50, true).is_err());
+        let compact_context = service
+            .project_context(None, 600, false)
+            .expect("compact project context");
+        assert!(serialized_word_count(&compact_context["data"]) <= 600);
+        assert!(
+            compact_context["page"]["response_word_count"]
+                .as_u64()
+                .is_some_and(|count| count <= 600)
+        );
+        assert!(
+            compact_context["page"]["returned"]
+                .as_u64()
+                .is_some_and(|count| count <= MAX_CONTEXT_COMMANDS as u64)
+        );
+        let capped_values = (0..=MAX_CONTEXT_COMMANDS)
+            .map(|index| json!({"id":index,"value":"command"}))
+            .collect::<Vec<_>>();
+        let (capped_page_values, capped_page) = service
+            .page_with_item_limit(
+                &capped_values,
+                None,
+                600,
+                "capped-page",
+                None,
+                Some(MAX_CONTEXT_COMMANDS),
+            )
+            .expect("capped page");
+        assert_eq!(capped_page_values.len(), MAX_CONTEXT_COMMANDS);
+        assert!(capped_page["truncated"].as_bool().unwrap());
+        assert!(capped_page["next_cursor"].is_string());
         assert!(service.page(&[], None, 600, "empty-page", None).is_ok());
         assert!(
             service
@@ -2912,25 +3124,6 @@ mod tests {
                 .unwrap()["data"]["claim_status"],
             "not_measured"
         );
-        let mut no_terminal = json!({"terminal":false});
-        service.attach_terminal_review(&mut no_terminal);
-        let mut successful_review = json!({
-            "terminal":true,
-            "coverage_ingest":{"snapshot_ids":[current["id"].clone()]}
-        });
-        service.attach_terminal_review(&mut successful_review);
-        assert!(successful_review["coverage_review"].is_object());
-        let mut failed_review = json!({
-            "terminal":true,
-            "coverage_ingest":{"snapshot_ids":["missing-snapshot"]}
-        });
-        service.attach_terminal_review(&mut failed_review);
-        assert_eq!(failed_review["coverage_review"]["status"], "unavailable");
-        let mut non_terminal_review = json!({
-            "terminal":false,
-            "coverage_ingest":{"snapshot_ids":["missing-snapshot"]}
-        });
-        service.attach_terminal_review(&mut non_terminal_review);
         assert!(service.source("missing", "a.py", 0, 1, None, 600).is_err());
         assert!(
             service
@@ -3453,6 +3646,64 @@ mod tests {
             .expect("insight review");
         assert_eq!(insight["data"]["insight"]["status"], "measured");
         assert!(insight["data"]["insight"]["items"].is_array());
+        let compact_insight = service
+            .coverage_review(
+                "insight",
+                Some(current_id),
+                None,
+                None,
+                Some("unit"),
+                Some("main"),
+                None,
+                2,
+                10,
+                10,
+                10,
+                false,
+                3,
+                120,
+                600,
+                12_000,
+                "compact",
+            )
+            .expect("compact insight review");
+        let compact_items = compact_insight["data"]["insight"]["items"]
+            .as_array()
+            .expect("compact insight items");
+        assert!(!compact_items.is_empty());
+        assert!(compact_items.iter().all(|item| {
+            item["regions"]
+                .as_array()
+                .is_some_and(|regions| regions.len() <= MAX_COMPACT_INSIGHT_REGIONS)
+                && item["region_count"].is_number()
+                && item["regions_truncated"].is_boolean()
+        }));
+        let audit_insight = service
+            .coverage_review(
+                "insight",
+                Some(current_id),
+                None,
+                None,
+                Some("unit"),
+                Some("main"),
+                None,
+                2,
+                10,
+                10,
+                10,
+                false,
+                3,
+                120,
+                1200,
+                20_000,
+                "audit",
+            )
+            .expect("audit insight review");
+        let audit_items = audit_insight["data"]["insight"]["items"]
+            .as_array()
+            .expect("audit insight items");
+        assert!(!audit_items.is_empty());
+        assert!(audit_items[0]["regions"][0]["start"].is_number());
         let history = service
             .coverage_review(
                 "history",
@@ -3842,25 +4093,33 @@ mod tests {
                 false,
             )
             .expect("terminal service run");
+        assert!(terminal["data"].get("coverage_review").is_none());
         assert!(
             service
                 .run_state(terminal["data"]["id"].as_str().unwrap(), "status", false)
                 .is_ok()
         );
+        let terminal_status = service
+            .run_state(terminal["data"]["id"].as_str().unwrap(), "status", false)
+            .expect("terminal service status");
+        assert!(terminal_status["data"].get("coverage_review").is_none());
+        let compact_terminal_status = service
+            .run_review(
+                terminal["data"]["id"].as_str().unwrap(),
+                "status",
+                None,
+                "both",
+                3,
+                5,
+                false,
+                600,
+                1_000,
+            )
+            .expect("compact terminal status fits the byte budget");
         assert!(
-            service
-                .run_review(
-                    terminal["data"]["id"].as_str().unwrap(),
-                    "status",
-                    None,
-                    "both",
-                    3,
-                    5,
-                    false,
-                    600,
-                    1_000,
-                )
-                .is_err()
+            compact_terminal_status["data"]
+                .get("coverage_review")
+                .is_none()
         );
         let noisy_command = service
             .command_registration(
@@ -3946,6 +4205,34 @@ mod tests {
                 .as_array()
                 .expect("active runs")
                 .is_empty()
+        );
+        assert!(
+            active_context["data"]["commands"]
+                .as_array()
+                .expect("project commands")
+                .iter()
+                .all(|command| command.get("command").is_none() && command.get("cwd").is_none())
+        );
+        assert!(
+            !active_context["data"]["commands"]
+                .as_array()
+                .expect("project commands")
+                .is_empty()
+        );
+        assert!(
+            service
+                .project_context(Some("invalid"), 600, false)
+                .is_err()
+        );
+        assert_eq!(active_context["data"]["active_runs_truncated"], false);
+        let reserved_words = active_context["page"]["reserved_words"]
+            .as_u64()
+            .expect("reserved project context words") as usize;
+        assert!(reserved_words < 4_951);
+        assert!(
+            service
+                .project_context(None, reserved_words + 49, false)
+                .is_err()
         );
         let _ = service.run_state(active_run["data"]["id"].as_str().unwrap(), "cancel", false);
         assert!(service.ensure_lineage_baseline("\0", "main", None).is_err());
@@ -4545,7 +4832,7 @@ mod tests {
 
     #[test]
     fn compact_projections_keep_public_keys_and_hide_detail_by_default() {
-        let project = compact_project(
+        let project = compact_context_project(
             &json!({"id":"project-id","snapshot_count": 2, "compaction": {"enabled": true}}),
         );
         assert_eq!(project["id"], "project-id");
@@ -4658,8 +4945,17 @@ mod tests {
             "obtain_measurement"
         );
 
-        let command = compact_command(&json!({"artifact_specs":null}), false);
-        assert_eq!(command["artifact_specs"], json!([]));
+        let context_project = compact_context_project(&json!({"id":"project-id","line_rate":0.8}));
+        assert_eq!(context_project["id"], "project-id");
+        assert!(context_project.get("total_lines").is_none());
+
+        let command = compact_command(
+            &json!({"id":"command-id","name":"unit","command":"cargo test","artifact_specs":[{"path":"coverage.lcov"}]}),
+            false,
+        );
+        assert_eq!(command["id"], "command-id");
+        assert_eq!(command["artifact_count"], 1);
+        assert!(command.get("command").is_none());
         let detailed_command = compact_command(&json!({"approved_by":"human"}), true);
         assert_eq!(detailed_command["approved_by"], "human");
 
@@ -4669,8 +4965,40 @@ mod tests {
         );
         assert!(compact_file_change_token(&json!({"line_rate_delta":0.1})).is_none());
         assert_eq!(
-            compact_history_snapshot(&json!({"id":"s","line_rate":0.8}))["id"],
+            compact_history_snapshot(&json!({"id":"s","line_rate":0.8}), false)["id"],
             "s"
+        );
+        let history_value = json!({"id":"s","line_rate":0.8,"total_lines":10});
+        assert!(
+            compact_history_snapshot(&history_value, false)
+                .get("total_lines")
+                .is_none()
+        );
+        assert_eq!(
+            compact_history_snapshot(&history_value, true)["total_lines"],
+            10
+        );
+        let (regions, region_count, regions_truncated) = compact_insight_regions(&json!([
+            {"start":1,"end":2,"line_count":2},
+            {"start":4,"end":4},
+            {"start":7,"end":7},
+            {"start":9,"end":9}
+        ]));
+        assert_eq!(regions.len(), MAX_COMPACT_INSIGHT_REGIONS);
+        assert_eq!(regions[1], json!([4, 4, 1]));
+        assert_eq!(region_count, 4);
+        assert!(regions_truncated);
+        let (invalid_regions, invalid_count, invalid_truncated) = compact_insight_regions(&json!([
+            {"end":2},
+            {"start":2},
+            {"start":3,"end":3}
+        ]));
+        assert_eq!(invalid_regions, vec![json!([3, 3, 1])]);
+        assert_eq!(invalid_count, 3);
+        assert!(!invalid_truncated);
+        assert_eq!(
+            compact_insight_regions(&json!(null)),
+            (Vec::new(), 0, false)
         );
         let history_points = vec![
             json!({"line_rate":0.8,"branch_rate":0.7,"function_rate":0.9,"region_rate":0.6}),
@@ -4685,10 +5013,25 @@ mod tests {
         assert_eq!(summarize_history(&history_points)["regression_runs"], 0);
         assert_eq!(summarize_history(&history_points)["improvement_runs"], 1);
 
-        let run = json!({"parsed_summary":{},"artifact_paths":[],"status":"passed"});
+        let run = json!({
+            "command":"cargo test --all-targets",
+            "cwd":"/repo",
+            "repo_path":"/repo",
+            "stdout_path":"/tmp/stdout",
+            "stderr_path":"/tmp/stderr",
+            "parsed_summary":{},
+            "artifact_paths":[],
+            "coverage_review":{},
+            "status":"passed"
+        });
         assert_eq!(compact_run_result(&run, true), run);
         let compact_run = compact_run_result(&run, false);
+        assert!(compact_run.get("command").is_none());
+        assert!(compact_run.get("cwd").is_none());
+        assert!(compact_run.get("repo_path").is_none());
+        assert!(compact_run.get("stdout_path").is_none());
         assert!(compact_run.get("parsed_summary").is_none());
+        assert!(compact_run.get("coverage_review").is_none());
         assert_eq!(compact_run["status"], "passed");
         assert_eq!(compact_run_result(&json!("scalar"), false), json!("scalar"));
         let mut log_scalar = json!("scalar");
