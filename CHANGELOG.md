@@ -4,6 +4,61 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.13.0 - 2026-08-25
+
+### Added
+
+- Schema 14 adds immutable composite coverage snapshots for one managed run.
+  A registered command can declare one authoritative inventory plus explicit
+  component/package-variant evidence without being registered again for each
+  coverage case.
+- Composite aggregation maps LLVM, coverage.py, Istanbul, and
+  `coverage-mcp-regions-v1` evidence to canonical regions, deduplicating only
+  through explicit logical-source aliases. Missing, stale, malformed, or
+  source-mismatched evidence leaves the composite incomplete and never lowers
+  its denominator.
+- `run_test` and `run_review` expose `composite_snapshot_id`; the
+  `coverage_review` measurement and baseline selectors accept composite IDs,
+  and `task="incremental"` automatically compares two compatible composite
+  snapshots with exact region deltas and bounded test attribution.
+
+### Changed
+
+- Composite provenance records checkout revision/cleanliness, command,
+  inventory hash, mapping version, toolchain versions, and artifact hashes.
+- Composite review returns exact combined counts and only Rust (including
+  WGSL), Python, and JavaScript component summaries. Ordinary snapshots,
+  managed command registration, child ingestion, and compaction behavior remain
+  compatible; compacted ordinary child detail is restored through the existing
+  payload path when named-test attribution is requested.
+- The GNU Make contributor interface now has a real workspace `build`, an
+  explicit clean-tree `package` check, and a complete `ci` gate that includes
+  the bundled release build; contributor and release documentation match those
+  targets.
+
+## 0.12.0 - 2026-08-25
+
+### Added
+
+- Schema 13 adds parameterized managed runs: one approved command can receive
+  bounded case-specific arguments without re-registration. The server persists
+  the arguments, explicit incremental baseline, and server-generated execution
+  fingerprint so reuse and idempotency remain case-safe.
+- Incremental managed runs automatically attach a bounded stored-snapshot
+  review after terminal coverage ingestion. Standalone
+  `coverage_review(task="incremental")` remains available for two existing
+  snapshots and never reruns tests or reparses reports.
+
+### Changed
+
+- Incremental comparisons distinguish newly covered, regressed, hit-count-only,
+  added, and removed observations, expose bounded opaque test attribution, and
+  remain valid when detail has been compacted.
+- The dashboard and REST projections expose incremental provenance, compaction
+  detail sources, progression metrics, and server-sent refresh events. The
+  dashboard checks for updates every ten seconds in the foreground and pauses
+  its stream in hidden tabs.
+
 ## 0.11.0 - 2026-08-23
 
 ### Added

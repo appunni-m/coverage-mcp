@@ -25,11 +25,11 @@ const STRUCTURED_CONTENT_HINT: &str = "See structuredContent for the bounded res
 pub const MCP_INSTRUCTIONS: &str = concat!(
     "Coverage MCP ",
     env!("CARGO_PKG_VERSION"),
-    r#" schema 10 exposes a compact, composable agent interface.
+    r#" schema 14 exposes a compact, composable agent interface.
 
-Start with project_context. Its default response is compact: max_words covers the complete data projection, including the fixed project/latest-run summary and current command page. The command page returns at most eight compact summaries per call; follow page.next_cursor only when a command outside that window is needed. In that response, page.reserved_words is the fixed-summary count, page.word_count is command-page words, page.response_word_count is their combined budget count, and page.next_cursor continues only commands. data.active_runs is capped at ten entries; data.active_runs_truncated=true means more active runs were omitted, and detailed=true does not lift that cap. Use detailed=true only for an explicit audit of command, run, or provenance fields. Register only an exact human-approved command. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...), save run_id, wait poll_after_ms, then call run_review(view=status, run_id=...). Run status never embeds a coverage review; call coverage_review explicitly after a terminal run. Use run_review(view=logs) only for targeted literal evidence and cancel_run only when the user no longer wants the run.
+Start with project_context. Its default response is compact: max_words covers the complete data projection, including the fixed project/latest-run summary and current command page. The command page returns at most eight compact summaries per call; follow page.next_cursor only when a command outside that window is needed. In that response, page.reserved_words is the fixed-summary count, page.word_count is command-page words, page.response_word_count is their combined budget count, and page.next_cursor continues only commands. data.active_runs is capped at ten entries; data.active_runs_truncated=true means more active runs were omitted, and detailed=true does not lift that cap. Use detailed=true only for an explicit audit of command, run, or provenance fields. Register one exact human-approved command once. Reuse it for case-specific runs by passing optional arguments; arguments are shell-quoted and appended to the registered command, or replace its single {{args}} placeholder. For an incremental run, pass execution.mode=incremental and baseline.kind=explicit with baseline.snapshot_id or baseline.composite_snapshot_id. The server fingerprints the effective case, persists the arguments and baseline, and automatically attaches incremental_review after terminal ingestion; composite runs automatically use composite_review. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...), save run_id, wait poll_after_ms, then call run_review(view=status, run_id=...). Standalone coverage_review(task=incremental) remains available for comparing two already stored snapshots or two immutable composite snapshots. Use run_review(view=logs) only for targeted literal evidence and cancel_run only when the user no longer wants the run.
 
-Use coverage_review as the analysis boundary: task=change for changed-code coverage, task=history for the last two points plus an aggregate, task=insight for ranked gaps, task=source for bounded ranges, task=audit for exact records, and task=all for a bounded combination. Independent reviews may use multiple calls in parallel. Compact is the default representation; request review or audit deliberately. Normal compact limits are three files and five ranked targets; increase max_files or max_regions explicitly for wider review. Compact insight targets return at most three regions per target as [start,end,line_count], with region_count and regions_truncated; audit is the opt-in exact projection. Carry snapshot/run/baseline selectors in the structured request. Successful tools return {context,data,page} in structuredContent; the text content is only a short compatibility hint. Keep detailed=false, source ranges bounded, and max_words within 50–5000 (default 600); review, run, and import also enforce max_bytes. claim_status and reasons are authoritative. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. Legends define the short fields.
+Use coverage_review as the analysis boundary: task=change for changed-code coverage, task=incremental for an explicit current snapshot versus an explicit baseline snapshot, task=history for the last two points plus an aggregate, task=insight for ranked gaps, task=source for bounded ranges, task=audit for exact records, and task=all for a bounded combination. Incremental never guesses a previous snapshot, invokes a parent runner, reparses a baseline report, or reruns tests: provide measurement.snapshot_id or measurement.composite_snapshot_id or a run_id resolving to exactly one ingested measurement and baseline.kind=explicit with the matching baseline selector. Composite reviews aggregate an authoritative inventory across Rust/WGSL, Python, and JavaScript, require explicit logical-source aliases and every declared package variant, and return one exact canonical-region denominator plus three component summaries. Composite baselines must match repository, mapping version, and inventory hash. The two ordinary snapshots must belong to the same repository and normalized coverage format; suite, branch, commit, command, cwd, and execution case are provenance only, never test identity. The result reports grouped affected lines, metric_deltas, newly_covered, regressed, hit_count_only, added, and removed categories, bounded opaque test_id added/removed observations, explicit attribution status when named observations are unavailable, and whether detail came from relational rows or a compacted payload. Independent reviews may use multiple calls in parallel. Compact is the default representation; request review or audit deliberately. Normal compact limits are three files and five ranked targets; increase max_files, max_regions, or max_test_ids explicitly for wider review. Compact insight targets return at most three regions per target as [start,end,line_count], with region_count and regions_truncated; audit is the opt-in exact projection. Carry snapshot/run/baseline selectors in the structured request. Successful tools return {context,data,page} in structuredContent; the text content is only a short compatibility hint. Keep detailed=false, source ranges bounded, and max_words within 50–5000 (default 600); review, run, and import also enforce max_bytes. claim_status and reasons are authoritative. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. Legends define the short fields.
 
 Use coverage_import for an external report before coverage_review; never infer lineage from a raw report. The stdio bridge recovers one refused daemon connection without replaying ambiguous writes. Ingestion is capped at 64 MiB and malformed numeric fields are validation errors.
 
@@ -83,7 +83,7 @@ fn public_tools_list() -> Value {
         ),
         tool(
             "register_test_command",
-            "Register one immutable command after human approval of the exact command, cwd, shell, and artifacts. The returned id/name can be passed to run_test; declare coverage artifacts with coverage_format and suite for automatic ingestion.",
+            "Register one immutable command after human approval of the exact command, cwd, shell, and artifacts. The returned id/name can be passed to run_test; declare ordinary coverage artifacts with coverage_format and suite for automatic ingestion, and set detail_retention=incremental_base on a long-lived fixed-base artifact. For composite coverage, declare exactly one required inventory artifact and one descriptor per component/package variant using composite={component_id,format,package_variant,language,inventory_artifact,logical_source_aliases,role,toolchain_versions}; aliases are explicit and never inferred from filenames.",
             local_write(),
             object_schema(
                 &[
@@ -105,7 +105,9 @@ fn public_tools_list() -> Value {
                     ("shell", string("Executable shell path.")),
                     (
                         "artifact_paths",
-                        json_schema("Coverage and artifact specifications."),
+                        json_schema(
+                            "Coverage and artifact specifications. Object values may include path, required, coverage_format, suite, and detail_retention=compactable|incremental_base. Composite descriptors must declare component_id, format, package_variant, language, inventory_artifact, role=inventory|coverage, optional toolchain_versions, and explicit logical_source_aliases for coverage artifacts.",
+                        ),
                     ),
                     ("max_words", budget_schema()),
                     ("detailed", detailed_schema()),
@@ -119,13 +121,22 @@ fn public_tools_list() -> Value {
                 ],
             ),
         ),
-        tool(
+        tool_with_output(
             "run_test",
-            "Submit one approved command. Prefer wait=false with a stable idempotency_key; returns only the compact durable run state, queue/ETA, poll_after_ms, coverage_ingest, and submission_reused when compatible work is reused. It never embeds coverage_review; call that explicitly after terminal evidence. Managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use run_review(view=status, run_id=...) only after waiting poll_after_ms.",
+            "Submit one approved command. Register the command once, then pass optional case-specific arguments on each run; the server shell-quotes them and appends them to the registered command, or substitutes its single {{args}} placeholder. For an incremental case, pass execution.mode=incremental plus baseline.kind=explicit and exactly one of baseline.snapshot_id or baseline.composite_snapshot_id; execution.identity is optional because the server fingerprints mode, arguments, and baseline and persists that context. After terminal ingestion, the response and run_review(view=status) automatically include incremental_review, and a composite run includes composite_snapshot_id and an automatic composite incremental review. Standalone coverage_review(task=incremental) remains the explicit comparison tool for two already stored snapshots or composite snapshots. Prefer wait=false with a stable idempotency_key; managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use run_review(view=status, run_id=...) after waiting poll_after_ms.",
             command_execution(),
             object_schema(
                 &[
                     ("command_ref", string("Registered command UUID or name.")),
+                    (
+                        "arguments",
+                        json!({
+                            "type":"array",
+                            "maxItems":64,
+                            "items":{"type":"string","maxLength":512},
+                            "description":"Optional case-specific string arguments. The server shell-quotes each value and appends the result to the registered command, unless the command contains one {{args}} placeholder. Total argument bytes are capped at 8192."
+                        }),
+                    ),
                     (
                         "timeout_seconds",
                         integer("Maximum execution time in seconds."),
@@ -148,14 +159,44 @@ fn public_tools_list() -> Value {
                             "description":"Reuse the latest compatible terminal run when the registered command, clean checkout, branch, and commit are unchanged; set false to force execution."
                         }),
                     ),
+                    (
+                        "execution",
+                        json!({
+                            "type":"object",
+                            "description":"Optional case-specific execution metadata. The server fingerprints mode, arguments, and baseline; identity is an optional caller label, not a required hash.",
+                            "properties":{
+                                "mode":{"type":"string","enum":["full","incremental","custom"]},
+                                "identity":{"type":"string","minLength":1,"maxLength":256,"description":"Optional caller label used as an input to the server-generated execution fingerprint."},
+                                "label":{"type":"string","maxLength":200}
+                            },
+                            "required":["mode"],
+                            "additionalProperties":false
+                        }),
+                    ),
+                    (
+                        "baseline",
+                        json!({
+                            "type":"object",
+                            "description":"Required for execution.mode=incremental. This selector is always explicit; the server never guesses the latest or previous snapshot. Use snapshot_id for an ordinary child snapshot or composite_snapshot_id for a composite baseline; provide exactly one.",
+                            "properties":{
+                                "kind":{"type":"string","enum":["explicit"]},
+                                "snapshot_id":{"type":"string","minLength":1,"maxLength":200},
+                                "composite_snapshot_id":{"type":"string","minLength":1,"maxLength":200}
+                            },
+                            "required":["kind"],
+                            "oneOf":[{"required":["snapshot_id"],"not":{"required":["composite_snapshot_id"]}},{"required":["composite_snapshot_id"],"not":{"required":["snapshot_id"]}}],
+                            "additionalProperties":false
+                        }),
+                    ),
                     ("max_words", budget_schema()),
                 ],
                 &["command_ref"],
             ),
+            run_execution_output_schema(),
         ),
         tool_with_output(
             "run_review",
-            "Read one durable run without starting or advancing work. Use view=status for compact current state and terminal coverage-ingest evidence, or view=logs for targeted literal stdout/stderr matches. Status does not embed coverage_review; use that tool explicitly. An explicit run_id is always required; this tool has no implicit latest selection.",
+            "Read one durable run without starting or advancing work. Use view=status for compact current state, terminal coverage-ingest evidence, and the automatic incremental_review attached to an incremental run, or use view=logs for targeted literal stdout/stderr matches. Standalone coverage_review(task=incremental) remains the explicit tool for comparing two already stored ordinary or composite snapshots. An explicit run_id is always required; this tool has no implicit latest selection.",
             read_only(),
             object_schema(
                 &[
@@ -221,6 +262,28 @@ fn public_tools_list() -> Value {
                     ("branch", nullable_string("Branch selector.")),
                     ("commit_sha", nullable_string("Measured commit.")),
                     ("base_ref", nullable_string("Comparison base ref.")),
+                    (
+                        "execution",
+                        json!({
+                            "type":"object",
+                            "description":"Optional opaque execution identity for the report-producing case.",
+                            "properties":{
+                                "mode":{"type":"string","enum":["full","incremental","custom"]},
+                                "identity":{"type":"string","minLength":1,"maxLength":256},
+                                "label":{"type":"string","maxLength":200}
+                            },
+                            "required":["mode","identity"],
+                            "additionalProperties":false
+                        }),
+                    ),
+                    (
+                        "detail_retention",
+                        enum_default_schema(
+                            &["compactable", "incremental_base"],
+                            "compactable",
+                            "Keep compactable for normal history; use incremental_base for a long-lived fixed comparison base.",
+                        ),
+                    ),
                     ("max_words", budget_schema()),
                     (
                         "max_bytes",
@@ -233,7 +296,7 @@ fn public_tools_list() -> Value {
         ),
         tool_with_output(
             "coverage_review",
-            "Return one bounded, task-oriented coverage review. Compact is the default representation; request review for readable grouped ranges or audit for exact records. Use task=change for changed-code coverage and regressions, task=history for line over time using the last two points plus an aggregate, task=insight for ranked uncovered regions (at most three compact ranges per target), task=source for grouped ranges, or task=all for a bounded combination. Compact defaults to three files and five targets; raise limits explicitly for wider review. The server resolves compatible snapshots and groups regions.",
+            "Return one bounded, task-oriented coverage review. Compact is the default representation; request review for readable grouped ranges or audit for exact records. Use task=change for changed-code coverage and regressions, task=incremental for an explicit current ordinary or composite snapshot versus an explicit matching baseline without invoking a parent runner, reparsing a baseline report, or rerunning tests, task=history for line over time using the last two points plus an aggregate, task=insight for ranked uncovered regions (at most three compact ranges per target), task=source for grouped ranges, or task=all for a bounded combination. Ordinary incremental comparisons require the same repository and normalized format; composite comparisons additionally require the same mapping version and inventory hash. Incremental returns grouped affected lines, metric_deltas, newly_covered/regressed/hit_count_only/added/removed categories, and bounded opaque test_id attribution with an explicit unavailable status when named observations are absent. Suite, branch, commit, command, cwd, and execution case are provenance only. Compact defaults to three files, five regions, and ten affected test IDs; raise limits explicitly for wider review. The server reads materialized or compacted snapshot detail and groups regions.",
             read_only(),
             coverage_review_input_schema(),
             coverage_review_output_schema(),
@@ -255,7 +318,10 @@ pub fn resources_list() -> Value {
 
 /// Returns the static resource template inventory.
 pub fn resource_templates_list() -> Value {
-    json!([{"uriTemplate":"coverage://snapshot/{snapshot_id}/summary","name":"Coverage snapshot summary","mimeType":"application/json","description":"Compact summary for one immutable coverage snapshot."}])
+    json!([
+        {"uriTemplate":"coverage://snapshot/{snapshot_id}/summary","name":"Coverage snapshot summary","mimeType":"application/json","description":"Compact summary for one immutable coverage snapshot."},
+        {"uriTemplate":"coverage://composite/{composite_snapshot_id}/summary","name":"Composite coverage summary","mimeType":"application/json","description":"Exact bounded summary for one immutable composite coverage snapshot."}
+    ])
 }
 
 /// Dispatches one JSON-RPC MCP request.
@@ -379,13 +445,16 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             )
             .and_then(|value| service.apply_budget(value, max_words)),
         "run_test" => service
-            .run_submission_with_options(
+            .run_submission_with_execution(
                 required_string(args, "command_ref")?,
                 optional_u64(args, "timeout_seconds")?,
                 optional_string(args, "idempotency_key")?,
                 optional_bool(args, "wait")?.unwrap_or(false),
                 optional_bool(args, "reuse_if_unchanged")?.unwrap_or(true),
                 false,
+                get("execution"),
+                get("arguments"),
+                optional_incremental_baseline(args)?.as_deref(),
             )
             .and_then(|value| service.apply_budget(value, max_words)),
         "run_review" => service.run_review(
@@ -406,7 +475,7 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             let value = service.run_state(required_string(args, "run_id")?, "cancel", detailed)?;
             service.apply_budget(value, max_words)
         }
-        "coverage_import" => service.coverage_import(
+        "coverage_import" => service.coverage_import_with_options(
             required_string(args, "report_path")?,
             optional_string(args, "format")?.unwrap_or("auto"),
             optional_string(args, "suite")?.unwrap_or("default"),
@@ -415,6 +484,8 @@ pub fn call_tool(service: &CoverageService, name: &str, args: &Value) -> AppResu
             optional_string(args, "base_ref")?,
             max_words,
             optional_usize(args, "max_bytes")?.unwrap_or(12_000),
+            get("execution"),
+            optional_string(args, "detail_retention")?.unwrap_or("compactable"),
         ),
         "coverage_review" => coverage_review_call(service, args, max_words),
         "find_duplicate_coverage_tests" => service.find_duplicate_coverage_tests(
@@ -445,26 +516,48 @@ fn coverage_review_call(
         ))?;
     if !matches!(
         task.as_str(),
-        "change" | "history" | "insight" | "source" | "audit" | "all"
+        "change" | "history" | "insight" | "source" | "audit" | "all" | "incremental"
     ) {
         return Err(AppError::Validation(
-            "coverage_review task must be change, history, insight, source, audit, or all"
+            "coverage_review task must be change, history, insight, source, audit, all, or incremental"
                 .to_owned(),
         ));
     }
     let request = validate_review_request(args, &task)?;
     let mut snapshot_id = request.measurement_snapshot;
+    let mut composite_snapshot_id = request.measurement_composite_snapshot;
     let run_id = request.measurement_run;
     if snapshot_id.is_none() {
         if let Some(run_id) = run_id.as_deref() {
             let run = service.store().run_result(run_id, 20)?;
-            snapshot_id = run
+            composite_snapshot_id = run
+                .get("composite_snapshot_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let snapshot_ids = run
                 .get("coverage_ingest")
                 .and_then(|value| value.get("snapshot_ids"))
                 .and_then(Value::as_array)
-                .and_then(|values| values.iter().find_map(Value::as_str))
-                .map(str::to_owned);
-            let _ = snapshot_id.as_ref().ok_or_else(|| {
+                .cloned()
+                .unwrap_or_default();
+            if task == "incremental" && composite_snapshot_id.is_none() && snapshot_ids.len() != 1 {
+                return Err(AppError::Validation(
+                    "incremental measurement.run_id must resolve to exactly one ingested coverage snapshot"
+                        .to_owned(),
+                ));
+            }
+            if composite_snapshot_id.is_none() {
+                snapshot_id = snapshot_ids
+                    .first()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            let _ = if composite_snapshot_id.is_some() {
+                composite_snapshot_id.as_ref()
+            } else {
+                snapshot_id.as_ref()
+            }
+            .ok_or_else(|| {
                 AppError::Validation(
                     "measurement.run_id has no ingested coverage snapshot".to_owned(),
                 )
@@ -476,14 +569,11 @@ fn coverage_review_call(
     let file_path = request.file_path;
     let baseline_kind = request.baseline_kind;
     let mut baseline_snapshot_id = request.baseline_snapshot;
+    let baseline_composite_snapshot_id = request.baseline_composite_snapshot;
     let worktree_id = request.worktree_id;
     let baseline_ref = request.baseline_ref;
     if baseline_kind.as_deref() == Some("none") {
         baseline_snapshot_id = Some("none".to_owned());
-    } else if baseline_kind.as_deref() == Some("explicit") && baseline_snapshot_id.is_none() {
-        return Err(AppError::Validation(
-            "baseline.kind=explicit requires baseline.snapshot_id".to_owned(),
-        ));
     } else if baseline_kind.as_deref() == Some("worktree_base") && worktree_id.is_none() {
         return Err(AppError::Validation(
             "baseline.kind=worktree_base requires baseline.worktree_id".to_owned(),
@@ -514,10 +604,59 @@ fn coverage_review_call(
             "compact".to_owned()
         }
     });
+    if task == "source" && composite_snapshot_id.is_some() {
+        let ranges = request
+            .source_ranges
+            .expect("source ranges are validated for source tasks");
+        return service.composite_source_review(
+            composite_snapshot_id
+                .as_deref()
+                .expect("composite snapshot selector is present"),
+            ranges,
+            max_source_lines,
+            max_words,
+            max_bytes,
+        );
+    }
+    if composite_snapshot_id.is_some() {
+        if baseline_snapshot_id.is_some() {
+            return Err(AppError::Validation(
+                "composite measurement requires baseline.composite_snapshot_id".to_owned(),
+            ));
+        }
+        let mut response = service.composite_review(
+            if task == "audit" {
+                "audit"
+            } else {
+                task.as_str()
+            },
+            composite_snapshot_id
+                .as_deref()
+                .expect("composite snapshot selector is present"),
+            baseline_composite_snapshot_id.as_deref(),
+            file_path.as_deref(),
+            max_regions,
+            max_words,
+            max_bytes,
+            &representation,
+            request.max_test_ids.unwrap_or(10),
+        )?;
+        response
+            .get_mut("data")
+            .and_then(Value::as_object_mut)
+            .expect("composite review service responses must contain an object data field")
+            .insert("task".to_owned(), json!(task));
+        return Ok(response);
+    }
+    if baseline_composite_snapshot_id.is_some() {
+        return Err(AppError::Validation(
+            "baseline.composite_snapshot_id requires measurement.composite_snapshot_id".to_owned(),
+        ));
+    }
     if task == "source" {
         let snapshot_id = snapshot_id.ok_or_else(|| {
             AppError::Validation(
-                "source review requires measurement.snapshot_id or run_id".to_owned(),
+                "source review requires measurement.snapshot_id, measurement.composite_snapshot_id, or run_id".to_owned(),
             )
         })?;
         let ranges = request
@@ -530,7 +669,7 @@ fn coverage_review_call(
     } else {
         task.as_str()
     };
-    let mut response = service.coverage_review(
+    let mut response = service.coverage_review_with_max_test_ids(
         focus,
         snapshot_id.as_deref(),
         baseline_snapshot_id.as_deref(),
@@ -548,6 +687,7 @@ fn coverage_review_call(
         max_words,
         max_bytes,
         &representation,
+        request.max_test_ids.unwrap_or(10),
     )?;
     response
         .get_mut("data")
@@ -573,12 +713,14 @@ fn selected_value<'a>(
 
 struct ReviewRequest {
     measurement_snapshot: Option<String>,
+    measurement_composite_snapshot: Option<String>,
     measurement_run: Option<String>,
     suite: Option<String>,
     branch: Option<String>,
     file_path: Option<String>,
     baseline_kind: Option<String>,
     baseline_snapshot: Option<String>,
+    baseline_composite_snapshot: Option<String>,
     worktree_id: Option<String>,
     baseline_ref: Option<String>,
     detail_snapshots: Option<usize>,
@@ -588,6 +730,7 @@ struct ReviewRequest {
     max_source_lines: Option<usize>,
     max_words: Option<usize>,
     max_bytes: Option<usize>,
+    max_test_ids: Option<usize>,
     include_source: Option<bool>,
     context_lines: Option<usize>,
     source_ranges: Option<Vec<(String, i64, i64)>>,
@@ -598,11 +741,24 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
     for (group, allowed) in [
         (
             "measurement",
-            &["snapshot_id", "run_id", "suite", "branch", "file_path"][..],
+            &[
+                "snapshot_id",
+                "composite_snapshot_id",
+                "run_id",
+                "suite",
+                "branch",
+                "file_path",
+            ][..],
         ),
         (
             "baseline",
-            &["kind", "snapshot_id", "worktree_id", "ref"][..],
+            &[
+                "kind",
+                "snapshot_id",
+                "composite_snapshot_id",
+                "worktree_id",
+                "ref",
+            ][..],
         ),
         ("source", &["ranges", "include", "context_lines"][..]),
         ("history", &["detail_snapshots", "summary_window"][..]),
@@ -614,6 +770,7 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
                 "max_source_lines",
                 "max_words",
                 "max_bytes",
+                "max_test_ids",
             ][..],
         ),
     ] {
@@ -627,10 +784,19 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
 
     let measurement_snapshot =
         selected_optional_string(args, "measurement", "snapshot_id", "snapshot_id")?;
+    let measurement_composite_snapshot = selected_optional_string(
+        args,
+        "measurement",
+        "composite_snapshot_id",
+        "composite_snapshot_id",
+    )?;
     let measurement_run = selected_optional_string(args, "measurement", "run_id", "run_id")?;
-    if measurement_snapshot.is_some() && measurement_run.is_some() {
+    if (measurement_snapshot.is_some() && measurement_composite_snapshot.is_some())
+        || (measurement_snapshot.is_some() && measurement_run.is_some())
+        || (measurement_composite_snapshot.is_some() && measurement_run.is_some())
+    {
         return Err(AppError::Validation(
-            "measurement.snapshot_id and measurement.run_id are mutually exclusive".to_owned(),
+            "measurement.snapshot_id, measurement.composite_snapshot_id, and measurement.run_id are mutually exclusive".to_owned(),
         ));
     }
 
@@ -643,8 +809,36 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
     let baseline_kind = selected_optional_string(args, "baseline", "kind", "baseline_kind")?;
     let baseline_snapshot =
         selected_optional_string(args, "baseline", "snapshot_id", "baseline_snapshot_id")?;
+    let baseline_composite_snapshot = selected_optional_string(
+        args,
+        "baseline",
+        "composite_snapshot_id",
+        "baseline_composite_snapshot_id",
+    )?;
     let worktree_id = selected_optional_string(args, "baseline", "worktree_id", "worktree_id")?;
     let baseline_ref = selected_optional_string(args, "baseline", "ref", "ref")?;
+
+    if task == "incremental" {
+        if measurement_snapshot.is_none()
+            && measurement_composite_snapshot.is_none()
+            && measurement_run.is_none()
+        {
+            return Err(AppError::Validation(
+                "incremental task requires measurement.snapshot_id, measurement.composite_snapshot_id, or measurement.run_id"
+                    .to_owned(),
+            ));
+        }
+        if baseline_kind.as_deref() != Some("explicit") {
+            return Err(AppError::Validation(
+                "incremental task requires baseline.kind=explicit".to_owned(),
+            ));
+        }
+        if baseline_snapshot.is_none() == baseline_composite_snapshot.is_none() {
+            return Err(AppError::Validation(
+                "baseline.kind=explicit requires exactly one of baseline.snapshot_id or baseline.composite_snapshot_id".to_owned(),
+            ));
+        }
+    }
 
     if let Some(kind) = baseline_kind.as_deref() {
         if !matches!(
@@ -659,6 +853,7 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
         match kind {
             "none"
                 if baseline_snapshot.is_some()
+                    || baseline_composite_snapshot.is_some()
                     || worktree_id.is_some()
                     || baseline_ref.is_some() =>
             {
@@ -667,9 +862,14 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
                         .to_owned(),
                 ));
             }
-            "explicit" if worktree_id.is_some() || baseline_ref.is_some() => {
+            "explicit"
+                if baseline_snapshot.is_some() == baseline_composite_snapshot.is_some()
+                    || worktree_id.is_some()
+                    || baseline_ref.is_some() =>
+            {
                 return Err(AppError::Validation(
-                    "baseline.kind=explicit accepts only baseline.snapshot_id".to_owned(),
+                    "baseline.kind=explicit accepts exactly one explicit snapshot selector"
+                        .to_owned(),
                 ));
             }
             "worktree_base" if baseline_snapshot.is_some() || baseline_ref.is_some() => {
@@ -677,8 +877,14 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
                     "baseline.kind=worktree_base accepts only baseline.worktree_id".to_owned(),
                 ));
             }
+            "worktree_base" if baseline_composite_snapshot.is_some() => {
+                return Err(AppError::Validation(
+                    "baseline.kind=worktree_base accepts only baseline.worktree_id".to_owned(),
+                ));
+            }
             "parent_commit"
                 if baseline_snapshot.is_some()
+                    || baseline_composite_snapshot.is_some()
                     || worktree_id.is_some()
                     || baseline_ref.is_some() =>
             {
@@ -687,13 +893,18 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
                         .to_owned(),
                 ));
             }
-            "ref" if baseline_snapshot.is_some() || worktree_id.is_some() => {
+            "ref"
+                if baseline_snapshot.is_some()
+                    || baseline_composite_snapshot.is_some()
+                    || worktree_id.is_some() =>
+            {
                 return Err(AppError::Validation(
                     "baseline.kind=ref accepts only baseline.ref".to_owned(),
                 ));
             }
             "previous_snapshot"
                 if baseline_snapshot.is_some()
+                    || baseline_composite_snapshot.is_some()
                     || worktree_id.is_some()
                     || baseline_ref.is_some() =>
             {
@@ -740,6 +951,12 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
             )));
         }
     }
+    let max_test_ids = selected_optional_usize(args, "limits", "max_test_ids", "max_test_ids")?;
+    if max_test_ids.is_some_and(|value| !(1..=100).contains(&value)) {
+        return Err(AppError::Validation(
+            "limits.max_test_ids must be between 1 and 100".to_owned(),
+        ));
+    }
     let include_source = selected_optional_bool(args, "source", "include", "include_source")?;
     let context_lines = selected_optional_usize(args, "source", "context_lines", "context_lines")?;
     if context_lines.is_some_and(|value| value > 20) {
@@ -772,12 +989,14 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
     }
     Ok(ReviewRequest {
         measurement_snapshot,
+        measurement_composite_snapshot,
         measurement_run,
         suite,
         branch,
         file_path,
         baseline_kind,
         baseline_snapshot,
+        baseline_composite_snapshot,
         worktree_id,
         baseline_ref,
         detail_snapshots,
@@ -787,6 +1006,7 @@ fn validate_review_request(args: &Map<String, Value>, task: &str) -> AppResult<R
         max_source_lines,
         max_words,
         max_bytes,
+        max_test_ids,
         include_source,
         context_lines,
         source_ranges,
@@ -829,10 +1049,13 @@ fn validate_public_tool_keys(name: &str, args: &Map<String, Value>) -> AppResult
         ],
         "run_test" => &[
             "command_ref",
+            "arguments",
             "timeout_seconds",
             "idempotency_key",
             "wait",
             "reuse_if_unchanged",
+            "execution",
+            "baseline",
             "max_words",
         ],
         "run_review" => &[
@@ -854,6 +1077,8 @@ fn validate_public_tool_keys(name: &str, args: &Map<String, Value>) -> AppResult
             "branch",
             "commit_sha",
             "base_ref",
+            "execution",
+            "detail_retention",
             "max_words",
             "max_bytes",
         ],
@@ -1057,6 +1282,23 @@ pub fn read_resource(service: &CoverageService, uri: &str) -> AppResult<Value> {
     {
         return service.snapshot_summary(snapshot_id, DEFAULT_MAX_WORDS, false);
     }
+    let prefix = "coverage://composite/";
+    if let Some(composite_snapshot_id) = uri
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix("/summary"))
+    {
+        return service.composite_review(
+            "audit",
+            composite_snapshot_id,
+            None,
+            None,
+            20,
+            DEFAULT_MAX_WORDS,
+            12_000,
+            "audit",
+            10,
+        );
+    }
     Err(AppError::NotFound(format!("unknown MCP resource: {uri}")))
 }
 
@@ -1074,6 +1316,58 @@ fn optional_string<'a>(args: &'a Map<String, Value>, key: &str) -> AppResult<Opt
             .ok_or_else(|| AppError::Validation(format!("{key} must be a string"))),
     }
 }
+
+fn optional_incremental_baseline(args: &Map<String, Value>) -> AppResult<Option<String>> {
+    let Some(value) = args.get("baseline") else {
+        return Ok(None);
+    };
+    let object = value.as_object().ok_or_else(|| {
+        AppError::Validation(
+            "baseline must be an object with kind and snapshot_id or composite_snapshot_id"
+                .to_owned(),
+        )
+    })?;
+    reject_unknown_keys(
+        object,
+        &["kind", "snapshot_id", "composite_snapshot_id"],
+        "baseline",
+    )?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::Validation("baseline.kind is required".to_owned()))?;
+    if kind != "explicit" {
+        return Err(AppError::Validation(
+            "run_test baseline.kind must be explicit".to_owned(),
+        ));
+    }
+    let snapshot_id = object
+        .get("snapshot_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let composite_snapshot_id = object
+        .get("composite_snapshot_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if snapshot_id.is_some() == composite_snapshot_id.is_some() {
+        return Err(AppError::Validation(
+            "baseline requires exactly one of snapshot_id or composite_snapshot_id".to_owned(),
+        ));
+    }
+    let selected = snapshot_id
+        .or(composite_snapshot_id)
+        .expect("one baseline selector exists");
+    if selected.len() > 200 {
+        return Err(AppError::Validation(
+            "baseline snapshot identifiers must not exceed 200 characters".to_owned(),
+        ));
+    }
+    Ok(Some(selected.to_owned()))
+}
+
 fn optional_bool(args: &Map<String, Value>, key: &str) -> AppResult<Option<bool>> {
     match args.get(key) {
         None => Ok(None),
@@ -1160,15 +1454,58 @@ fn json_rpc_error(id: Value, error: AppError) -> Value {
 fn output_schema() -> Value {
     json!({"type":"object","properties":{"context":{"type":"object","description":"Request repository, checkout, suite, and schema context."},"data":{"description":"One bounded task-level projection with measurement, lineage, claim status, reasons, and a next action when applicable. project_context also returns active_runs_truncated when its active-run cap omits entries."},"page":{"type":["object","null"],"description":"Per-call pagination and response-budget metadata. word_count counts returned collection items; max_words is the complete data budget. For project_context, reserved_words counts fixed summary data, response_word_count is reserved_words plus the command-page word_count, and next_cursor continues only commands."}},"required":["context","data","page"]})
 }
+
+fn run_execution_output_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "context":{"type":"object","description":"Request repository, checkout, suite, and schema context."},
+            "data":{
+                "type":"object",
+                "description":"Bounded durable run state. Incremental executions expose their persisted arguments and explicit baseline under execution; after terminal coverage ingestion, incremental_review is the automatic stored-snapshot diff.",
+                "properties":{
+                    "id":{"type":"string"},
+                    "status":{"type":"string"},
+                    "terminal":{"type":"boolean"},
+                    "execution":{"type":"object","description":"Persisted mode, server-generated execution fingerprint, optional arguments, and explicit baseline."},
+                    "coverage_ingest":{"type":"object","description":"Artifact ingestion status and bounded snapshot_ids."},
+                    "composite_snapshot_id":{"type":["string","null"],"description":"Immutable composite coverage snapshot produced by this run, when composite artifacts were declared."},
+                    "incremental_review":{
+                        "type":"object",
+                        "description":"Automatic incremental review for execution.mode=incremental. Pending means the run is not terminal; not_measured includes reasons; measured contains the same bounded data projection as coverage_review task=incremental.",
+                        "properties":{
+                            "status":{"type":"string","enum":["pending","measured","not_measured"]},
+                            "claim_status":{"type":"string"},
+                            "reasons":{"type":"array","items":{"type":"string"}},
+                            "incremental":{"type":"object"}
+                        },
+                        "required":["status"]
+                    }
+                }
+            },
+            "page":{"type":["object","null"]}
+        },
+        "required":["context","data","page"]
+    })
+}
+
 fn coverage_review_input_schema() -> Value {
     object_schema(
         &[
             (
                 "task",
                 enum_default_schema(
-                    &["change", "history", "insight", "source", "audit", "all"],
+                    &[
+                        "change",
+                        "incremental",
+                        "history",
+                        "insight",
+                        "source",
+                        "audit",
+                        "all",
+                    ],
                     "change",
-                    "Review task; source returns grouped source ranges and audit returns exact records.",
+                    "Review task; incremental compares one explicitly measured snapshot against one explicitly selected baseline using stored detail only, source returns grouped source ranges, and audit returns exact records.",
                 ),
             ),
             (
@@ -1178,6 +1515,7 @@ fn coverage_review_input_schema() -> Value {
                     "description":"Optional current measurement selectors.",
                     "properties":{
                         "snapshot_id":{"type":["string","null"]},
+                        "composite_snapshot_id":{"type":["string","null"],"description":"Immutable composite current measurement ID; mutually exclusive with snapshot_id and run_id."},
                         "run_id":{"type":["string","null"]},
                         "suite":{"type":["string","null"]},
                         "branch":{"type":["string","null"]},
@@ -1190,10 +1528,11 @@ fn coverage_review_input_schema() -> Value {
                 "baseline",
                 json!({
                     "type":"object",
-                    "description":"Optional compatible baseline selector.",
+                    "description":"Optional compatible baseline selector. task=incremental requires kind=explicit and exactly one snapshot_id or composite_snapshot_id; previous_snapshot and lineage-based selectors are rejected for that task.",
                     "properties":{
                         "kind":{"type":"string","enum":["worktree_base","parent_commit","ref","previous_snapshot","explicit","none"]},
                         "snapshot_id":{"type":["string","null"]},
+                        "composite_snapshot_id":{"type":["string","null"],"description":"Immutable composite baseline ID; mutually exclusive with snapshot_id."},
                         "worktree_id":{"type":["string","null"]},
                         "ref":{"type":["string","null"]}
                     },
@@ -1242,13 +1581,14 @@ fn coverage_review_input_schema() -> Value {
                 "limits",
                 json!({
                     "type":"object",
-                    "description":"Complete response word, byte, file, region, and source limits; compact defaults are three files and five targets.",
+                    "description":"Complete response word, byte, file, region, source, and affected-test limits; compact defaults are three files, five ranked targets, and ten test IDs.",
                     "properties":{
                         "max_files":{"type":"integer","minimum":1,"maximum":50,"default":3},
                         "max_regions":{"type":"integer","minimum":1,"maximum":100,"default":5},
                         "max_source_lines":{"type":"integer","minimum":10,"maximum":500,"default":120},
                         "max_words":{"type":"integer","minimum":50,"maximum":5000,"default":600},
-                        "max_bytes":{"type":"integer","minimum":1000,"maximum":2000000,"default":12000}
+                        "max_bytes":{"type":"integer","minimum":1000,"maximum":2000000,"default":12000},
+                        "max_test_ids":{"type":"integer","minimum":1,"maximum":100,"default":10,"description":"Maximum affected opaque test IDs returned by task=incremental."}
                     },
                     "additionalProperties":false
                 }),
@@ -1274,13 +1614,93 @@ fn coverage_review_output_schema() -> Value {
                 "type":"object",
                 "description":"One bounded task-level review. Change, history, and insight are present according to focus.",
                 "properties":{
-                    "focus":{"type":"string","enum":["change","history","insight","source","audit","all"]},
-                    "task":{"type":"string","enum":["change","history","insight","source","audit","all"]},
+                    "focus":{"type":"string","enum":["change","incremental","history","insight","source","audit","all"]},
+                    "task":{"type":"string","enum":["change","incremental","history","insight","source","audit","all"]},
                     "representation":{"type":"string","enum":["review","compact","audit"]},
                     "claim_status":{"type":"string","enum":["supported","limited","not_measured","stale","invalid"]},
                     "measurement":{"type":["object","null"]},
                     "baseline":{"type":["object","null"]},
+                    "composite":{"type":"object","description":"Exact composite inventory score and three component summaries when measurement.composite_snapshot_id is selected."},
                     "change":{"type":"object"},
+                    "incremental":{
+                        "type":"object",
+                        "description":"Explicit current-versus-baseline comparison from stored snapshot detail. It never invokes a parent runner, reparses a baseline report, or reruns tests.",
+                        "properties":{
+                            "status":{"type":"string","enum":["measured","not_measured"]},
+                            "baseline":{"type":["object","null"]},
+                            "current":{"type":["object","null"]},
+                            "overall":{"type":"object","description":"Backward-compatible aggregate metric deltas."},
+                            "metric_deltas":{
+                                "type":"object",
+                                "description":"Aggregate line, branch, function, and region metric deltas.",
+                                "properties":{
+                                    "line_rate_delta":{"type":["number","null"]},
+                                    "covered_lines_delta":{"type":"integer"},
+                                    "total_lines_delta":{"type":"integer"},
+                                    "branch_rate_delta":{"type":["number","null"]},
+                                    "covered_branches_delta":{"type":"integer"},
+                                    "total_branches_delta":{"type":"integer"},
+                                    "function_rate_delta":{"type":["number","null"]},
+                                    "covered_functions_delta":{"type":"integer"},
+                                    "total_functions_delta":{"type":"integer"},
+                                    "region_rate_delta":{"type":["number","null"]},
+                                    "covered_regions_delta":{"type":"integer"},
+                                    "total_regions_delta":{"type":"integer"}
+                                }
+                            },
+                            "files":{"type":"array","description":"Bounded per-file metric deltas."},
+                            "changed_lines":{"type":"array","description":"Bounded exact changed-line records in review and audit representations."},
+                            "changed_lines_truncated":{"type":"boolean"},
+                            "regions":{"type":"array","description":"Grouped affected lines; compact uses grouped path/status ranges."},
+                            "regions_truncated":{"type":"boolean"},
+                            "coverage_gain":{
+                                "type":"object",
+                                "properties":{
+                                    "newly_covered":{"type":"integer"},
+                                    "regressed":{"type":"integer"},
+                                    "hit_count_only":{"type":"integer"},
+                                    "added":{"type":"integer"},
+                                    "removed":{"type":"integer"},
+                                    "branch_state_changed":{"type":"integer"}
+                                },
+                                "required":["newly_covered","regressed","hit_count_only","added","removed"]
+                            },
+                            "test_attribution":{
+                                "type":"object",
+                                "description":"Per-opaque-test added/removed observations, or an explicit unavailable status when either report has no named observations.",
+                                "properties":{
+                                    "status":{"type":"string","enum":["measured","unavailable"]},
+                                    "affected_test_count":{"type":"integer"},
+                                    "affected_tests":{
+                                        "type":"array",
+                                        "items":{
+                                            "type":"object",
+                                            "properties":{
+                                                "test_id":{"type":"string","description":"Opaque report-provided test identifier; not a command, suite, branch, cwd, or case identity."},
+                                                "baseline_observation_count":{"type":"integer"},
+                                                "current_observation_count":{"type":"integer"},
+                                                "added":{"type":"array"},
+                                                "removed":{"type":"array"},
+                                                "observations_truncated":{"type":"boolean"}
+                                            },
+                                            "required":["test_id","baseline_observation_count","current_observation_count","added","removed","observations_truncated"]
+                                        }
+                                    },
+                                    "tests_truncated":{"type":"boolean"},
+                                    "max_test_ids":{"type":"integer"}
+                                },
+                                "required":["status","affected_test_count","affected_tests","tests_truncated"]
+                            },
+                            "detail_source":{
+                                "type":["object","null"],
+                                "description":"Whether each side was read from relational rows or a compacted payload.",
+                                "properties":{"baseline":{"type":"string","enum":["relational","compacted_payload"]},"current":{"type":"string","enum":["relational","compacted_payload"]}},
+                                "required":["baseline","current"]
+                            },
+                            "next_action":{"type":"object"}
+                        },
+                        "required":["status","baseline","current","metric_deltas","coverage_gain","regions","regions_truncated","test_attribution","detail_source"]
+                    },
                     "next_action":{"type":"object"},
                     "source":{"type":"array"},
                     "history":{"type":"object","description":"Compact history defaults to two recent points; non-compact representations may include raw counters."},
@@ -1519,6 +1939,17 @@ mod tests {
             )
             .is_err()
         );
+        for arguments in [
+            json!({"measurement":{"snapshot_id":"current","composite_snapshot_id":"composite"}}),
+            json!({"measurement":{"snapshot_id":"current","composite_snapshot_id":"composite","run_id":"run"}}),
+            json!({"baseline":{"kind":"explicit","snapshot_id":"base","composite_snapshot_id":"composite"}}),
+            json!({"baseline":{"kind":"worktree_base","composite_snapshot_id":"composite"}}),
+        ] {
+            assert!(
+                validate_review_request(&serde_json::from_value(arguments).unwrap(), "change")
+                    .is_err()
+            );
+        }
         assert!(
             validate_review_request(
                 &serde_json::from_value(json!({
@@ -1576,12 +2007,14 @@ mod tests {
 
         for arguments in [
             json!({"measurement":{"snapshot_id":7}}),
+            json!({"measurement":{"composite_snapshot_id":7}}),
             json!({"measurement":{"run_id":7}}),
             json!({"measurement":{"suite":7}}),
             json!({"measurement":{"branch":7}}),
             json!({"measurement":{"file_path":7}}),
             json!({"baseline":{"kind":7}}),
             json!({"baseline":{"snapshot_id":7}}),
+            json!({"baseline":{"composite_snapshot_id":7}}),
             json!({"baseline":{"worktree_id":7}}),
             json!({"baseline":{"ref":7}}),
             json!({"history":{"detail_snapshots":0}}),
@@ -1628,6 +2061,16 @@ mod tests {
             let arguments = serde_json::from_value(arguments).unwrap();
             assert!(validate_review_request(&arguments, "change").is_err());
         }
+        for arguments in [
+            json!({"task":"incremental"}),
+            json!({"task":"incremental","measurement":{"snapshot_id":"current"}}),
+            json!({"task":"incremental","measurement":{"run_id":"run"},"baseline":{"kind":"previous_snapshot"}}),
+            json!({"task":"incremental","measurement":{"snapshot_id":"current"},"baseline":{"kind":"explicit"}}),
+            json!({"task":"incremental","measurement":{"snapshot_id":"current"},"baseline":{"kind":"parent_commit"}}),
+        ] {
+            let arguments = serde_json::from_value(arguments).unwrap();
+            assert!(validate_review_request(&arguments, "incremental").is_err());
+        }
         for value in [
             json!(null),
             json!("not-an-array"),
@@ -1647,6 +2090,12 @@ mod tests {
             assert!(parse_review_source_ranges(Some(&value)).is_err());
         }
         assert!(parse_review_source_ranges(None).is_err());
+        let valid_composite_request = serde_json::from_value(json!({
+            "measurement":{"composite_snapshot_id":"current"},
+            "baseline":{"kind":"explicit","composite_snapshot_id":"base"}
+        }))
+        .unwrap();
+        assert!(validate_review_request(&valid_composite_request, "incremental").is_ok());
         assert!(
             selected_optional_bool(
                 &serde_json::from_value(json!({"source":{"include":"yes"}})).unwrap(),
@@ -1722,6 +2171,238 @@ mod tests {
                 suite: None,
             },
         );
+        let composite_repo = service.context(None);
+        let composite_repo_path = composite_repo.checkout_path.replace('\'', "''");
+        let composite_repo_key = composite_repo.repo_key.replace('\'', "''");
+        let current_region = json!({
+            "region_key":"python:src/a.py:1:1:line-1",
+            "component_id":"python",
+            "logical_source_id":"python:src/a.py",
+            "path":"src/a.py",
+            "start_line":1,
+            "end_line":1,
+            "discriminator":"line-1",
+            "state":"covered",
+            "variants":[{"package_variant":"cpython","state":"covered","hits":1}]
+        });
+        let baseline_region = json!({
+            "region_key":"python:src/a.py:1:1:line-1",
+            "component_id":"python",
+            "logical_source_id":"python:src/a.py",
+            "path":"src/a.py",
+            "start_line":1,
+            "end_line":1,
+            "discriminator":"line-1",
+            "state":"uncovered",
+            "variants":[{"package_variant":"cpython","state":"uncovered","hits":0}]
+        });
+        store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('composite-base', current_timestamp - INTERVAL '2 seconds', 'composite-run-base', 'composite-command', '{composite_repo_path}', '{composite_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'inventory-hash', NULL, false, 0, 1, 0.0, '[]', '{{}}', '{{}}', '{{}}', '[{{\"component\":\"python\",\"covered_regions\":0,\"total_regions\":1,\"region_rate\":0.0}}]', '[]'); INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('composite-current', current_timestamp, 'composite-run-current', 'composite-command', '{composite_repo_path}', '{composite_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'inventory-hash', NULL, false, 1, 1, 1.0, '[]', '{{}}', '{{}}', '{{}}', '[{{\"component\":\"python\",\"covered_regions\":1,\"total_regions\":1,\"region_rate\":1.0}}]', '[]'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('composite-base', 'python:src/a.py:1:1:line-1', '{{}}'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('composite-current', 'python:src/a.py:1:1:line-1', '{{}}');",
+            ))
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_regions SET region = '{}' WHERE composite_snapshot_id = 'composite-base'; UPDATE composite_regions SET region = '{}' WHERE composite_snapshot_id = 'composite-current'; INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('mcp-composite-run', 'composite-command', 'composite-command', 'true', '{composite_repo_path}', '{composite_repo_path}', '{composite_repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{\"composite_snapshot_id\":\"composite-current\"}}', '[]', current_timestamp, 0, NULL, 'incremental', 'mcp-composite', 'mcp composite'); INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('mcp-ordinary-run', 'composite-command', 'composite-command', 'true', '{composite_repo_path}', '{composite_repo_path}', '{composite_repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{}}', '[{{\"coverage_format\":\"lcov\",\"ingest_status\":\"ingested\",\"snapshot_id\":\"{}\"}}]', current_timestamp, 0, NULL, 'full', 'mcp-ordinary', 'mcp ordinary');",
+                baseline_region,
+                current_region,
+                snapshot_id,
+            ))
+            .unwrap();
+        let composite_incremental = call_tool(
+            &service,
+            "coverage_review",
+            &json!({
+                "task":"incremental",
+                "measurement":{"composite_snapshot_id":"composite-current"},
+                "baseline":{"kind":"explicit","composite_snapshot_id":"composite-base"},
+                "representation":"compact",
+                "limits":{"max_regions":10,"max_test_ids":10,"max_words":600,"max_bytes":12000}
+            }),
+        )
+        .unwrap();
+        assert_eq!(composite_incremental["data"]["task"], "incremental");
+        assert_eq!(
+            composite_incremental["data"]["incremental"]["coverage_gain"]["newly_covered"],
+            1
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"source",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "source":{"ranges":[{"file_path":"src/a.py","start":1,"end":1}]},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_ok()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"audit",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "limits":{"max_words":1200,"max_bytes":20000}
+                }),
+            )
+            .is_ok()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"history",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_ok()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "baseline":{"kind":"explicit","snapshot_id":snapshot_id},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"snapshot_id":snapshot_id},
+                    "baseline":{"kind":"explicit","composite_snapshot_id":"composite-base"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "baseline":{"kind":"explicit"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "baseline":{"kind":"previous_snapshot"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"change",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "baseline":{"kind":"worktree_base","composite_snapshot_id":"composite-base"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"composite_snapshot_id":"composite-current"},
+                    "baseline":{"kind":"explicit","composite_snapshot_id":"missing"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"run_id":"mcp-composite-run"},
+                    "baseline":{"kind":"explicit","composite_snapshot_id":"composite-base"},
+                    "limits":{"max_words":600,"max_bytes":12000}
+                }),
+            )
+            .is_ok()
+        );
+        let ordinary_run_review = call_tool(
+            &service,
+            "coverage_review",
+            &json!({
+                "task":"incremental",
+                "measurement":{"run_id":"mcp-ordinary-run"},
+                "baseline":{"kind":"explicit","snapshot_id":snapshot_id},
+                "limits":{"max_words":600,"max_bytes":12000}
+            }),
+        );
+        ordinary_run_review
+            .is_ok()
+            .then_some(())
+            .expect("ordinary run review");
+        assert!(read_resource(&service, "coverage://composite/composite-current/summary").is_ok());
+        assert!(read_resource(&service, "coverage://composite/missing/summary").is_err());
+        assert!(read_resource(&service, "coverage://unknown/value").is_err());
+        let imported = call_tool(
+            &service,
+            "coverage_import",
+            &json!({
+                "report_path":"coverage.lcov",
+                "format":"lcov",
+                "suite":"incremental-case",
+                "execution":{"mode":"incremental","identity":"case:v1","label":"case"},
+                "detail_retention":"incremental_base",
+                "max_words":1200,
+                "max_bytes":12000
+            }),
+        )
+        .unwrap();
+        assert_eq!(imported["data"]["detail_retention"], "incremental_base");
+        assert_eq!(imported["data"]["execution"]["identity"], "case:v1");
+        let default_retention_import = call_tool(
+            &service,
+            "coverage_import",
+            &json!({
+                "report_path":"coverage.lcov",
+                "format":"lcov",
+                "suite":"default-retention",
+                "max_words":1200,
+                "max_bytes":12000
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            default_retention_import["data"]["detail_retention"],
+            "compactable"
+        );
 
         assert!(call_tool(&service, "project_context", &Value::Null).is_err());
         assert!(call_tool(&service, "project_context", &json!({"detailed":"yes"})).is_err());
@@ -1759,6 +2440,16 @@ mod tests {
             json!({"command_ref":"missing","idempotency_key":7}),
             json!({"command_ref":"missing","wait":"yes"}),
             json!({"command_ref":"missing","reuse_if_unchanged":"yes"}),
+            json!({"command_ref":"missing","arguments":"not-an-array"}),
+            json!({"command_ref":"missing","baseline":"not-an-object"}),
+            json!({"command_ref":"missing","baseline":{"unexpected":"value"}}),
+            json!({"command_ref":"missing","baseline":{"kind":7}}),
+            json!({"command_ref":"missing","baseline":{"kind":" "}}),
+            json!({"command_ref":"missing","baseline":{"kind":"previous_snapshot","snapshot_id":"base"}}),
+            json!({"command_ref":"missing","baseline":{"kind":"explicit"}}),
+            json!({"command_ref":"missing","baseline":{"kind":"explicit","composite_snapshot_id":"composite"}}),
+            json!({"command_ref":"missing","baseline":{"kind":"explicit","snapshot_id":"base","composite_snapshot_id":"composite"}}),
+            json!({"command_ref":"missing","baseline":{"kind":"explicit","snapshot_id":"x".repeat(201)}}),
         ] {
             assert!(call_tool(&service, "run_test", &arguments).is_err());
         }
@@ -1787,6 +2478,7 @@ mod tests {
             json!({"report_path":"missing","branch":7}),
             json!({"report_path":"missing","commit_sha":7}),
             json!({"report_path":"missing","base_ref":7}),
+            json!({"report_path":"missing","detail_retention":7}),
             json!({"report_path":"missing","max_bytes":"12000"}),
         ] {
             assert!(call_tool(&service, "coverage_import", &arguments).is_err());
@@ -1804,6 +2496,7 @@ mod tests {
             json!({"task":"change","history":{"detail_snapshots":"2"}}),
             json!({"task":"change","history":{"summary_window":"10"}}),
             json!({"task":"change","limits":{"max_files":"10"}}),
+            json!({"task":"change","limits":{"max_test_ids":"3"}}),
             json!({"task":"change","source":{"include":"yes"}}),
             json!({"task":"change","source":{"context_lines":"3"}}),
             json!({"task":"change","representation":7}),
@@ -1818,6 +2511,55 @@ mod tests {
         ] {
             assert!(call_tool(&service, "coverage_review", &arguments).is_ok());
         }
+        let incremental = call_tool(
+            &service,
+            "coverage_review",
+            &json!({
+                "task":"incremental",
+                "measurement":{"snapshot_id":snapshot_id},
+                "baseline":{"kind":"explicit","snapshot_id":snapshot_id},
+                "limits":{"max_test_ids":3,"max_words":600,"max_bytes":12000}
+            }),
+        )
+        .unwrap();
+        assert_eq!(incremental["data"]["task"], "incremental");
+        assert_eq!(incremental["data"]["incremental"]["status"], "measured");
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "baseline":{"kind":"explicit","snapshot_id":snapshot_id}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"snapshot_id":snapshot_id},
+                    "baseline":{"kind":"none"}
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"snapshot_id":snapshot_id},
+                    "baseline":{"kind":"explicit","snapshot_id":snapshot_id},
+                    "limits":{"max_test_ids":0}
+                }),
+            )
+            .is_err()
+        );
         assert!(call_tool(&service, "project_context", &json!({"max_words":600})).is_ok());
         let default_review = call_tool(
             &service,
@@ -1956,6 +2698,18 @@ mod tests {
         )
         .unwrap();
         let run_id = run["data"]["id"].as_str().unwrap();
+        assert!(
+            call_tool(
+                &service,
+                "coverage_review",
+                &json!({
+                    "task":"incremental",
+                    "measurement":{"run_id":run_id},
+                    "baseline":{"kind":"explicit","snapshot_id":snapshot_id}
+                }),
+            )
+            .is_err()
+        );
         service.store().inject_query_fault();
         assert!(call_tool(&service, "cancel_run", &json!({"run_id":run_id}),).is_err());
         assert!(
@@ -2198,7 +2952,7 @@ mod tests {
         let initialize = initialize_result();
         let instructions = initialize["instructions"].as_str().unwrap();
         assert_eq!(initialize["serverInfo"]["version"], VERSION);
-        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 10")));
+        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 14")));
         assert!(instructions.contains("multiple calls"));
         assert!(instructions.contains("task=source"));
         assert!(instructions.contains("last two points"));
@@ -2250,6 +3004,34 @@ mod tests {
                 .contains("at most three compact ranges")
         );
         assert!(
+            coverage_review["description"]
+                .as_str()
+                .unwrap()
+                .contains("metric_deltas")
+        );
+        assert!(
+            coverage_review["description"]
+                .as_str()
+                .unwrap()
+                .contains("test_id")
+        );
+        let incremental_schema =
+            &coverage_review["outputSchema"]["properties"]["data"]["properties"]["incremental"];
+        for category in [
+            "newly_covered",
+            "regressed",
+            "hit_count_only",
+            "added",
+            "removed",
+        ] {
+            assert!(
+                incremental_schema["properties"]["coverage_gain"]["properties"][category]
+                    .is_object()
+            );
+        }
+        assert!(incremental_schema["properties"]["metric_deltas"].is_object());
+        assert!(incremental_schema["properties"]["test_attribution"].is_object());
+        assert!(
             coverage_review["outputSchema"]["properties"]["data"]["properties"]["insight"][
                 "description"
             ]
@@ -2284,6 +3066,34 @@ mod tests {
         assert_eq!(
             run_test["inputSchema"]["properties"]["reuse_if_unchanged"]["default"],
             true
+        );
+        assert_eq!(
+            run_test["inputSchema"]["properties"]["arguments"]["maxItems"],
+            64
+        );
+        assert_eq!(
+            run_test["inputSchema"]["properties"]["baseline"]["required"][0],
+            "kind"
+        );
+        assert_eq!(
+            run_test["inputSchema"]["properties"]["baseline"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            !run_test["inputSchema"]["properties"]["execution"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "identity")
+        );
+        assert!(
+            run_test["description"]
+                .as_str()
+                .unwrap()
+                .contains("automatically include incremental_review")
         );
         let register = tools
             .as_array()

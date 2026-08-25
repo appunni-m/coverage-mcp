@@ -1,4 +1,4 @@
-# Requires GNU Make 3.81 or newer.
+# Requires GNU Make 3.81 or newer and a POSIX shell.
 CARGO ?= cargo
 DUCKDB_DOWNLOAD_LIB ?= 1
 FAST_FEATURES ?= --no-default-features
@@ -17,23 +17,26 @@ MIGRATION_STATUS = $(FAST_CARGO) run $(FAST_CARGO_FLAGS) --bin migration-status 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build release fmt fmt-fix check check-diff clippy test test-bundled test-ci-compile test-ci-lib test-ci-bins test-ci-migration-status test-ci-rust-migration test-ci-benchmark test-ci-smoke test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
+.PHONY: help build package release fmt fmt-fix check check-diff clippy test test-bundled test-ci-compile test-ci-lib test-ci-bins test-ci-migration-status test-ci-rust-migration test-ci-benchmark test-ci-smoke test-ci coverage docs migration-parity migration-benchmark migration-status mcp-evals lint ci clean
 
 help:
 	@printf '%s\n' 'Coverage MCP Rust workspace'
 	@printf '%s\n' '' 'Build:'
-	@printf '%s\n' '  make build       cargo check with self-contained bundled DuckDB' '  make release      optimized self-contained release binary'
+	@printf '%s\n' '  make build       workspace build with self-contained bundled DuckDB' '  make package     package validation without rebuilding DuckDB (clean tree)' '  make release      optimized self-contained release binary'
 	@printf '%s\n' '' 'Quality:'
 	@printf '%s\n' '  make fmt         check rustfmt' '  make fmt-fix     apply rustfmt' '  make clippy      strict clippy with warnings denied' '  make lint        format + clippy'
 	@printf '%s\n' '' 'Verification:'
-	@printf '%s\n' '  make test        all workspace tests with exact prebuilt DuckDB' '  make test-bundled  all tests with self-contained bundled DuckDB' '  make test-ci-compile  compile every CI test target with one Cargo job' '  make test-ci     run each CI test target serially with retained diagnostics' '  make coverage    100% region/line/function gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate'
+	@printf '%s\n' '  make test        all workspace tests with exact prebuilt DuckDB' '  make test-bundled  all tests with self-contained bundled DuckDB' '  make test-ci-compile  compile every CI test target with one Cargo job' '  make test-ci     run each CI test target serially with retained diagnostics' '  make coverage    100% region/line/function gate + JSON evidence' '  make migration-parity  fixture-backed migration tests' '  make migration-benchmark  measured compaction workload' '  make migration-status  aggregate lane evidence and render docs' '  make mcp-evals  opt-in MCP usability/safety/efficiency evaluation (not CI)' '  make docs        warnings-denied rustdoc' '  make check-diff  whitespace/error check' '  make ci          complete local gate, including release build'
 	@printf '%s\n' '' 'Fast verification:'
-	@printf '%s\n' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  COVERAGE_MCP_TEST_BUILD_JOBS=1 bounds both CI test phases; raise it only on memory-rich hosts.' '  Set RUST_MIGRATION_TEST to run one exact migration test in its own process.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
+	@printf '%s\n' '  GNU Make 3.81+ with a POSIX shell is required.' '  DUCKDB_DOWNLOAD_LIB=1 downloads the exact matching DuckDB release once.' '  COVERAGE_MCP_TEST_BUILD_JOBS=1 bounds both CI test phases; raise it only on memory-rich hosts.' '  Set RUST_MIGRATION_TEST to run one exact migration test in its own process.' '  Override FAST_FEATURES or set DUCKDB_DOWNLOAD_LIB=0 only with a compatible system DuckDB.'
 	@printf '%s\n' '' 'Runtime:'
 	@printf '%s\n' '  cargo run --package coverage-mcp -- serve' '  cargo run --package coverage-mcp -- connect --repo .' '  cargo run --package coverage-mcp -- compact --repo .'
 
 build:
-	$(CARGO) check --workspace --all-targets --all-features --locked
+	$(CARGO) build --workspace --all-targets --all-features --locked
+
+package:
+	$(FAST_CARGO) package $(FAST_CARGO_FLAGS)
 
 release:
 	$(CARGO) build --release --locked
@@ -140,6 +143,7 @@ ci:
 	$(MAKE) coverage
 	$(MAKE) docs
 	$(MAKE) migration-status
+	$(MAKE) release
 	$(MAKE) check-diff
 
 clean:

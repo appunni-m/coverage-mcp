@@ -4,7 +4,7 @@ The migration is complete at the runtime boundary: the repository contains
 one Rust implementation, Rust tests, and input-only migration fixtures. A
 separate source runtime is not required, installed, imported, or executed.
 This document preserves the behavior-family mapping so future
-changes can be reviewed against the current schema-10 contract.
+changes can be reviewed against the current schema-14 contract.
 
 This is a maintainer document for a source checkout. Published Cargo packages
 intentionally omit the test corpus, fixtures, and generated evidence described
@@ -17,16 +17,17 @@ here.
 | Report parsing and normalization | `src/parser.rs`, `src/models.rs` | `rust_migrates_all_parser_formats_and_aliases`, model merge/rate/path tests |
 | Git identity and worktree lineage | `src/git.rs`, `src/storage.rs` | `rust_lineage_baseline_and_guards`, storage lineage tests |
 | DuckDB snapshots, queries, runs, artifacts, and compaction | `src/storage.rs`, `src/compaction.rs` | `rust_storage_queries_compare_and_compacts_old_detail`, storage tests, smoke test |
+| Composite inventory, canonical regions, variant enforcement, and exact aggregation | `src/composite.rs`, `src/storage.rs`, `src/service.rs` | composite storage/compaction regression and composite review tests |
 | Response budgets, cursors, compact projections, and service validation | `src/service.rs` | `rust_service_pagination_projection_and_mcp_contract_match` |
 | MCP inventory, schemas, resources, safety, and JSON-RPC dispatch | `src/mcp.rs` | MCP contract assertions, HTTP wire test, daemon-only CLI rejection test |
 | Shared-daemon stdio lifecycle, crash autorecovery, authenticated version handoff, and repository routing | `src/main.rs`, `src/http.rs`, `src/lock.rs` | concurrent two-repository connector smoke test, same-bridge crash/stale-file recovery, daemon-owner assertion, handoff authorization/process-exit test, and older-version replacement probe |
-| REST routing, health, dashboard, common registry, and lifecycle | `src/http.rs`, `src/dashboard.html` | live REST/dashboard/health/MCP test and browser smoke verification |
+| REST routing, health, dashboard, SSE refresh, common registry, and lifecycle | `src/http.rs`, `src/dashboard.html` | live REST/dashboard/SSE/health/MCP test and browser smoke verification |
 | Background detail compaction | `src/compaction.rs`, `src/storage.rs` | policy default/edit/manual-pass, compressed payload, transparent restore tests |
 | Named-test duplicate coverage | `src/parser.rs`, `src/models.rs`, `src/storage.rs`, `src/service.rs`, `src/mcp.rs` | exact LCOV observation parser test, DuckDB grouping/compaction test, service/MCP and live HTTP wire tests |
 
 ## Compatibility invariants
 
-- The public MCP inventory contains exactly eight tools and schema revision 10.
+- The public MCP inventory contains exactly eight tools and schema revision 14.
   Unsupported names use the ordinary unknown-tool error path.
 - Every successful public projection uses the `{context,data,page}` envelope.
 - Word budgets, opaque query-scoped cursors, defensive collection caps, and
@@ -46,12 +47,34 @@ here.
   combined `task=all` call remains usable within the normal response budget;
   callers can raise either limit explicitly.
 - MCP JSON-RPC clients read the bounded envelope from `structuredContent`; the
-  text content is only a compatibility hint, and terminal run state requires an
-  explicit `coverage_review` call for analysis.
+  text content is only a compatibility hint. Terminal incremental runs expose
+  their bounded automatic review in the run result and `run_review` status;
+  `coverage_review(task="incremental")` remains the standalone comparison for
+  two already stored snapshots.
 - A fresh schema is created when a store opens; incompatible database contents
   are disposable and are not repaired through compatibility migrations.
 - Compacted snapshots remain readable through file, line, source, insight, and
-  comparison queries.
+  comparison queries. Incremental review compares immutable stored snapshots
+  without rerunning tests or recalculating coverage; it reports aggregate
+  gain/regression, bounded regions, detail source, and named-test attribution
+  when both reports provide named observations.
+- `detail_retention=incremental_base` excludes a fixed comparison base from
+  automatic compaction. If a snapshot is compacted anyway, incremental review
+  restores files, lines, and named observations from the compressed payload.
+- Composite snapshots use `coverage-mcp-inventory-v1` and
+  `coverage-mcp-regions-v1` mappings. The inventory owns exact production
+  regions; explicit logical-source aliases alone permit deduplication. Every
+  declared variant remains required, and missing/stale/malformed/source-
+  mismatched evidence makes the immutable composite incomplete. Composite
+  incremental review requires matching repository, mapping version, and
+  inventory hash and compares all stored canonical rows before response
+  truncation.
+- Managed runs and snapshots persist a `full`, `incremental`, or `custom`
+  execution context, including optional case-specific arguments and an explicit
+  incremental baseline. Reuse and idempotency require context equality; when a
+  caller omits an identity, the server generates a stable fingerprint from the
+  mode, arguments, and baseline. It does not guess which tests an argument list
+  means.
 - `find_duplicate_coverage_tests` compares the complete normalized
   `{kind,file_path,line_number,region_key}` set for each named test, ignores hit
   counts, returns small cursor pages plus global counts, and reports
@@ -70,7 +93,7 @@ here.
 ## Fixture and evidence contract
 
 The machine-readable manifest in the source checkout at
-`tests/fixtures/manifest.yaml` identifies the schema-10 contract, Rust target
+`tests/fixtures/manifest.yaml` identifies the schema-14 contract, Rust target
 profile, public surfaces, input-only
 parity cases, coverage plan, and compaction benchmark workload. Inputs contain
 no expected outputs; generated reports, logs, and coverage artifacts are
@@ -130,7 +153,7 @@ profile. The release build still enables bundled DuckDB by default and proves
 the self-contained runtime shipped to users.
 
 The coverage gate requires 100% measured region, function, and line coverage
-for the Rust library/runtime target set. The schema-10 rewrite audit is measured
+for the Rust library/runtime target set. The schema-14 rewrite audit is measured
 by the same command above. The CLI launcher is excluded from aggregate LLVM counters
 because it is exercised in child processes; daemon-only CLI and concurrent
 shared-daemon stdio smoke tests still verify that launcher directly. Branch

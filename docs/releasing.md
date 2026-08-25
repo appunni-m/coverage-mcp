@@ -21,13 +21,15 @@ artifact.
    smoke steps with a retained log for each target. Migration correctness cases
    run in fresh processes with three-minute GitHub step deadlines so a managed
    child cannot escape a parent-process timeout; branch and tag test jobs both
-   use a 15-minute recovery bound. The release build in step 4 is the required
+   use a 15-minute recovery bound. The `make ci` release phase is the required
    bundled-linkage check.
    Retain `target/migration/status-report.json` and the generated pages as
    release evidence; a dirty or missing lane is `not_proven`.
-4. Build the bundled release binary with `cargo build --release --locked` and
-   inspect `coverage-mcp --version`. The tag workflow must additionally build
-   and execute native archives for `x86_64-unknown-linux-gnu`,
+4. Inspect the bundled binary produced by `make ci` with
+   `target/release/coverage-mcp --version` and
+   `target/release/coverage-mcp --help`. If the build output was cleaned, rerun
+   `make release`. The tag workflow must additionally build and execute native
+   archives for `x86_64-unknown-linux-gnu`,
    `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and
    `aarch64-apple-darwin` on matching hosted runners; do not substitute an
    unexecuted cross-compile for native evidence.
@@ -51,9 +53,11 @@ artifact.
    unknown port occupant, downgrade/equal-version refusal, a bounded query,
    pool saturation, and SIGTERM shutdown; verify that the database and WAL are
    left untouched after each failure.
-7. Run `cargo package --locked --allow-dirty --no-verify` only when a dirty
-   package inspection is intentional; release packaging should use a clean
-   tree.
+7. Run `make package` from the clean release tree; it uses Cargo's
+   `--no-default-features` package-verification mode, matching the release
+   workflow. Use
+   `cargo package --locked --allow-dirty --no-verify` only when a dirty package
+   inspection is intentional; it is not release evidence.
 8. Create an annotated immutable `v<version>` tag and publish through the
    configured crates.io/asset workflow. For the first crates.io version, use
    the bootstrap procedure below before pushing the tag. The workflow

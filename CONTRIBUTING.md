@@ -60,10 +60,15 @@ cargo build --release --locked
 git diff --check
 ```
 
-Convenience aliases are available through `make lint`, `make test`,
+The Makefile requires GNU Make 3.81 or newer and a POSIX shell. Convenience
+aliases are available through `make build`, `make lint`, `make test`,
 `make coverage`, `make migration-parity`, `make migration-benchmark`,
-`make migration-status`, and `make docs`. `make ci` runs the complete gate,
-including the fixture-backed migration lanes and generated evidence status.
+`make migration-status`, `make docs`, `make package`, and `make release`.
+`make package` is a clean-tree Cargo package check using the same
+`--no-default-features` verification mode as the release workflow; `make
+release` separately proves the bundled binary. `make ci` runs the complete
+local gate, including the fixture-backed migration lanes, generated evidence
+status, and the bundled release build.
 `make test-ci-compile` bounds Cargo compilation to one job, and `make test-ci`
 runs the same library, binary, migration-status, migration parity, and smoke
 targets as separate serial phases with per-target retained diagnostics; the
@@ -75,9 +80,9 @@ The fast quality, test, coverage, and documentation commands download the
 official DuckDB release matching `libduckdb-sys` once and use it only while
 Cargo runs the command. This avoids repeatedly compiling DuckDB's large C++
 amalgamation. A cold cache therefore needs network access. Default builds,
-installs, and the required release build retain the `bundled-duckdb` feature
-and produce a self-contained binary. Run `make test-bundled` when changing the
-linkage feature itself.
+installs, and the required `make build`/`make release` builds retain the
+`bundled-duckdb` feature and produce a self-contained binary. Run
+`make test-bundled` when changing the linkage feature itself.
 
 GitHub Actions runs quality, tests, coverage, and the release build as
 independent lanes. The test lane uses one Cargo process for every target and

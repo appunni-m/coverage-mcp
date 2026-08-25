@@ -2016,6 +2016,29 @@ fn rust_service_projection_and_mcp_contract_match() {
     assert!(review["data"]["change"]["files"].is_array());
     assert!(review["data"]["history"].is_object());
     assert!(review["data"]["insight"].is_object());
+    let incremental_arguments = json!({
+        "task":"incremental",
+        "measurement":{"snapshot_id":current["id"]},
+        "baseline":{"kind":"explicit","snapshot_id":baseline["id"]},
+        "limits":{"max_test_ids":3,"max_words":600,"max_bytes":12000}
+    });
+    let direct_incremental =
+        mcp::call_tool(&service, "coverage_review", &incremental_arguments).unwrap();
+    let stdio_incremental = mcp::dispatch_json_rpc(
+        Some(&service),
+        &json!({
+            "jsonrpc":"2.0",
+            "id":42,
+            "method":"tools/call",
+            "params":{"name":"coverage_review","arguments":incremental_arguments}
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        stdio_incremental["result"]["structuredContent"],
+        direct_incremental
+    );
+    assert!(direct_incremental["data"]["incremental"]["metric_deltas"].is_object());
 
     let unavailable_duplicates = service
         .find_duplicate_coverage_tests(
@@ -2364,10 +2387,26 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         .contains("400 Bad Request")
     );
     let dashboard = http_raw(address, "GET", "/", None, None).await;
-    assert!(dashboard.contains("projectSelect") && dashboard.contains("coverageViewer"));
-    let body = json!({"report_path":report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head"});
+    assert!(dashboard.contains("projectSelect") && dashboard.contains("metricsGrid"));
+    let mut events = TcpStream::connect(address).await.unwrap();
+    events
+        .write_all(
+            b"GET /api/dashboard/events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let ready = read_http_until(&mut events, "event: ready", Duration::from_secs(2)).await;
+    assert!(ready.contains("200 OK"));
+    assert!(ready.contains("text/event-stream"));
+    assert!(ready.contains("event: ready"));
+    let refresh = read_http_until(&mut events, "event: refresh", Duration::from_secs(12)).await;
+    assert!(refresh.contains("event: refresh"));
+    drop(events);
+    let body = json!({"report_path":report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head","detail_retention":"incremental_base","execution":{"mode":"full","identity":"fixed-base:v1","label":"fixed base"}});
     let ingested = http_exchange(address, "POST", "/api/ingest", Some(&body), None).await;
     let snapshot_id = ingested["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(ingested["data"]["detail_retention"], "incremental_base");
+    assert_eq!(ingested["data"]["execution"]["identity"], "fixed-base:v1");
     let duplicate_rest = http_exchange(
         address,
         "GET",
@@ -2402,9 +2441,41 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         "coverage-second.lcov",
         "TN:\nSF:a.py\nDA:1,0\nDA:2,1\nend_of_record\n",
     );
-    let second_body = json!({"report_path":second_report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head-2"});
+    let second_body = json!({"report_path":second_report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head-2","execution":{"mode":"incremental","identity":"case:branch-a:v3","label":"branch A"}});
     let second = http_exchange(address, "POST", "/api/ingest", Some(&second_body), None).await;
     let second_snapshot_id = second["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(second["data"]["execution"]["mode"], "incremental");
+    let dashboard_projection = http_exchange(
+        address,
+        "GET",
+        &format!(
+            "/api/dashboard?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}"
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        dashboard_projection["data"]["selection"]["snapshot_id"],
+        second_snapshot_id
+    );
+    assert_eq!(
+        dashboard_projection["data"]["selection"]["baseline_kind"],
+        "explicit"
+    );
+    assert_eq!(
+        dashboard_projection["data"]["incremental"]["status"],
+        "measured"
+    );
+    assert!(dashboard_projection["data"]["history"]["points"].is_array());
+    assert_eq!(
+        dashboard_projection["data"]["compaction"]["inventory"]["payload_inventory_consistent"],
+        true
+    );
+    assert_eq!(
+        dashboard_projection["data"]["files"]["source"],
+        "current_vs_baseline"
+    );
     let _default_ingest = http_exchange(
         address,
         "POST",
@@ -2428,6 +2499,9 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         json!({"report_path":report,"commit_sha":7}),
         json!({"report_path":report,"base_ref":7}),
         json!({"report_path":report,"repo_path":7}),
+        json!({"report_path":report,"detail_retention":7}),
+        json!({"report_path":report,"execution":7}),
+        json!({"report_path":report,"execution":{"mode":"incremental"}}),
     ] {
         assert!(
             http_raw(address, "POST", "/api/ingest", Some(&body), None)
@@ -2588,6 +2662,35 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     let compare_query =
         format!("/api/compare?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}");
     let _compare = http_exchange(address, "GET", &compare_query, None, None).await;
+    let incremental_query = format!(
+        "/api/incremental?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}&max_files=4&max_regions=8&max_test_ids=3"
+    );
+    let incremental = http_exchange(address, "GET", &incremental_query, None, None).await;
+    assert_eq!(
+        incremental["data"]["detail_source"]["baseline"],
+        "relational"
+    );
+    assert_eq!(incremental["data"]["coverage_gain"]["added"], 1);
+    for invalid_limit in [
+        "max_files=bad",
+        "max_files=0",
+        "max_regions=0",
+        "max_test_ids=0",
+    ] {
+        assert!(
+            http_raw(
+                address,
+                "GET",
+                &format!(
+                    "/api/incremental?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}&{invalid_limit}"
+                ),
+                None,
+                None,
+            )
+            .await
+            .contains("400 Bad Request")
+        );
+    }
     let _compare_post = http_exchange(
         address,
         "POST",
@@ -2773,6 +2876,46 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         mcp_run_review["result"]["structuredContent"]["data"]["id"],
         run_id
     );
+    let mcp_incremental_run = http_exchange(
+        address,
+        "POST",
+        "/mcp/",
+        Some(&json!({
+            "jsonrpc":"2.0",
+            "id":32,
+            "method":"tools/call",
+            "params":{
+                "name":"run_test",
+                "arguments":{
+                    "command_ref":command_id,
+                    "arguments":["case-specific-filter"],
+                    "execution":{"mode":"incremental","label":"http-case"},
+                    "baseline":{"kind":"explicit","snapshot_id":snapshot_id},
+                    "wait":true,
+                    "idempotency_key":"http-incremental-case"
+                }
+            }
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(mcp_incremental_run["result"]["isError"], false);
+    assert_eq!(
+        mcp_incremental_run["result"]["structuredContent"]["data"]["execution"]["mode"],
+        "incremental"
+    );
+    assert_eq!(
+        mcp_incremental_run["result"]["structuredContent"]["data"]["execution"]["arguments"][0],
+        "case-specific-filter"
+    );
+    assert_eq!(
+        mcp_incremental_run["result"]["structuredContent"]["data"]["execution"]["baseline"]["snapshot_id"],
+        snapshot_id
+    );
+    assert_eq!(
+        mcp_incremental_run["result"]["structuredContent"]["data"]["incremental_review"]["status"],
+        "not_measured"
+    );
     let mcp_run_logs = http_exchange(
         address,
         "POST",
@@ -2921,10 +3064,26 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
             .contains("400 Bad Request")
     );
     assert!(
+        http_raw(address, "GET", "/api/incremental", None, None)
+            .await
+            .contains("400 Bad Request")
+    );
+    assert!(
         http_raw(
             address,
             "GET",
             &format!("/api/compare?snapshot_id={second_snapshot_id}"),
+            None,
+            None,
+        )
+        .await
+        .contains("400 Bad Request")
+    );
+    assert!(
+        http_raw(
+            address,
+            "GET",
+            &format!("/api/incremental?snapshot_id={second_snapshot_id}"),
             None,
             None,
         )
@@ -3269,6 +3428,37 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         mcp_review["result"]["structuredContent"]["data"]["change"]["changed_code"]["status"]
             .is_string()
     );
+    let mcp_incremental = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"incremental","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_test_ids":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
+    assert_eq!(mcp_incremental["result"]["isError"], false);
+    assert_eq!(
+        mcp_incremental["result"]["structuredContent"]["data"]["task"],
+        "incremental"
+    );
+    assert_eq!(
+        mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["status"],
+        "measured"
+    );
+    assert!(
+        mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["metric_deltas"]
+            .is_object()
+    );
+    for category in [
+        "newly_covered",
+        "regressed",
+        "hit_count_only",
+        "added",
+        "removed",
+    ] {
+        assert!(
+            mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["coverage_gain"]
+                [category]
+                .is_number()
+        );
+    }
+    assert!(
+        mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["regions_truncated"]
+            .is_boolean()
+    );
     let mcp_compact_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"change","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"representation":"compact","limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
     assert_eq!(mcp_compact_review["result"]["isError"], false);
     assert!(mcp_compact_review["result"]["structuredContent"]["data"]["change"]["changed_code"]["legend"].is_object());
@@ -3520,6 +3710,26 @@ async fn http_raw_payload(
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await.unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+async fn read_http_until(stream: &mut TcpStream, needle: &str, timeout: Duration) -> String {
+    tokio::time::timeout(timeout, async {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                panic!("HTTP stream closed before receiving {needle}");
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            let text = String::from_utf8_lossy(&bytes);
+            if text.contains(needle) {
+                return text.into_owned();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("HTTP stream did not receive {needle} before timeout"))
 }
 
 async fn http_exchange(

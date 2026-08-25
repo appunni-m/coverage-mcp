@@ -3,1935 +3,284 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Coverage MCP</title>
+  <title>Coverage MCP · Project pulse</title>
   <style>
     :root {
       color-scheme: light;
-      --bg: #f7f8fa;
-      --panel: #ffffff;
+      --bg: #f4f6f8;
+      --panel: #fff;
       --ink: #17202a;
       --muted: #687385;
-      --border: #d8dde6;
-      --accent: #0f766e;
-      --accent-2: #2563eb;
-      --danger: #b42318;
+      --line: #dfe4eb;
+      --soft: #f8fafc;
+      --accent: #176b63;
       --good: #067647;
+      --bad: #b42318;
       --warn: #b54708;
-      --danger-soft: #fff1f0;
-      --good-soft: #ecfdf3;
-      --warn-soft: #fff8eb;
-      --blue-soft: #eff6ff;
-      --code-bg: #fbfcfe;
+      --shadow: 0 1px 2px rgba(15, 23, 42, .05);
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--ink);
-      font-size: 14px;
-    }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 16px 24px;
-      background: #ffffff;
-      border-bottom: 1px solid var(--border);
-      position: sticky;
-      top: 0;
-      z-index: 10;
-    }
-    h1 {
-      font-size: 20px;
-      line-height: 1.2;
-      margin: 0;
-      letter-spacing: 0;
-    }
-    main {
-      max-width: 1600px;
-      margin: 0 auto;
-      padding: 20px 24px 32px;
-    }
-    button, input, select {
-      font: inherit;
-      border: 1px solid var(--border);
-      background: #ffffff;
-      color: var(--ink);
-      border-radius: 6px;
-      min-height: 36px;
-    }
-    button {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 0 12px;
-      cursor: pointer;
-    }
-    button.primary {
-      background: var(--accent);
-      color: #ffffff;
-      border-color: var(--accent);
-    }
-    button:disabled {
-      color: var(--muted);
-      cursor: not-allowed;
-    }
-    input, select {
-      padding: 0 10px;
-      min-width: 160px;
-    }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px;
-    }
-    .grid {
-      display: grid;
-      gap: 16px;
-    }
-    .metrics {
-      grid-template-columns: repeat(5, minmax(150px, 1fr));
-    }
-    .metric, .panel {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-    }
-    .metric {
-      padding: 14px 16px;
-      min-height: 92px;
-    }
-    .metric .label, .muted {
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .metric .value {
-      font-size: 28px;
-      line-height: 1.15;
-      margin-top: 8px;
-      font-weight: 700;
-    }
-    .metric .sub {
-      margin-top: 6px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .panel {
-      overflow: hidden;
-    }
-    .panel-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--border);
-    }
-    .panel-head h2 {
-      margin: 0;
-      font-size: 14px;
-      letter-spacing: 0;
-    }
-    .panel-body {
-      padding: 12px 14px;
-    }
-    .two-col {
-      grid-template-columns: minmax(0, 1fr) 360px;
-      align-items: start;
-    }
-    .overview-grid {
-      grid-template-columns: minmax(0, 1fr) 420px;
-      align-items: stretch;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    th, td {
-      padding: 9px 10px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-      vertical-align: middle;
-      white-space: nowrap;
-    }
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-    }
-    td.path {
-      max-width: 520px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    tr.clickable {
-      cursor: pointer;
-    }
-    tr.clickable:hover {
-      background: #f2f5f8;
-    }
-    .bar {
-      width: 120px;
-      height: 8px;
-      background: #edf1f5;
-      border-radius: 999px;
-      overflow: hidden;
-    }
-    .bar span {
-      display: block;
-      height: 100%;
-      background: var(--accent);
-    }
-    .status-regressed { color: var(--danger); font-weight: 700; }
-    .status-improved { color: var(--good); font-weight: 700; }
-    .status-new, .status-removed, .status-changed { color: var(--warn); font-weight: 700; }
-    .insight-list {
-      display: grid;
-      gap: 8px;
-      margin: 0;
-      padding: 0;
-      list-style: none;
-    }
-    .insight {
-      display: grid;
-      gap: 4px;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .insight:last-child {
-      border-bottom: 0;
-    }
-    .insight-top {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-width: 0;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 48px;
-      height: 22px;
-      padding: 0 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .badge-high { color: #ffffff; background: var(--danger); }
-    .badge-medium { color: #1f2937; background: #f7c948; }
-    .badge-info { color: #ffffff; background: var(--accent-2); }
-    .insight-title {
-      font-weight: 700;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .insight-detail {
-      color: var(--muted);
-      line-height: 1.35;
-    }
-    #trend {
-      display: block;
-      width: 100%;
-      min-height: 240px;
-    }
-    .trend-meta {
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      flex-wrap: wrap;
-      gap: 8px 14px;
-      min-width: 0;
-    }
-    .trend-scope {
-      min-width: 190px;
-      min-height: 30px;
-      height: 30px;
-      padding: 0 8px;
-      font-size: 12px;
-    }
-    .trend-legend {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 6px 12px;
-    }
-    .trend-key {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      color: #475467;
-      font-size: 11px;
-      white-space: nowrap;
-    }
-    .trend-swatch {
-      width: 16px;
-      height: 3px;
-      border-radius: 2px;
-      background: var(--series-color);
-    }
-    code {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-    }
-    .investigation-panel {
-      min-height: 660px;
-    }
-    .investigation-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--border);
-    }
-    .investigation-title {
-      display: flex;
-      align-items: baseline;
-      gap: 10px;
-      min-width: 0;
-    }
-    .investigation-title h2,
-    .source-title h3,
-    .pane-heading h3,
-    .diagnosis-section h3 {
-      margin: 0;
-      letter-spacing: 0;
-    }
-    .investigation-title h2 {
-      font-size: 15px;
-    }
-    .investigation-title code {
-      color: var(--muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .comparison-banner {
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) repeat(4, auto);
-      gap: 18px;
-      align-items: center;
-      padding: 10px 14px;
-      color: #344054;
-      background: #f8fafc;
-      border-bottom: 1px solid var(--border);
-    }
-    .comparison-banner[hidden] {
-      display: none;
-    }
-    .comparison-label {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .comparison-stat {
-      display: flex;
-      align-items: baseline;
-      gap: 5px;
-      white-space: nowrap;
-    }
-    .comparison-stat strong {
-      font-size: 14px;
-    }
-    .investigation-grid {
-      display: grid;
-      grid-template-columns: 300px minmax(520px, 1fr) 290px;
-      min-height: 610px;
-    }
-    .file-pane,
-    .source-pane,
-    .diagnosis-pane {
-      min-width: 0;
-    }
-    .file-pane {
-      border-right: 1px solid var(--border);
-      background: #ffffff;
-    }
-    .pane-heading,
-    .source-titlebar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-height: 52px;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
-    }
-    .pane-heading h3,
-    .diagnosis-section h3 {
-      font-size: 12px;
-      color: #344054;
-      text-transform: uppercase;
-    }
-    .file-controls {
-      display: grid;
-      gap: 8px;
-      padding: 10px;
-      border-bottom: 1px solid var(--border);
-      background: #fbfcfe;
-    }
-    .file-controls input,
-    .file-controls select {
-      width: 100%;
-      min-width: 0;
-      min-height: 32px;
-    }
-    .file-list {
-      max-height: 540px;
-      overflow: auto;
-    }
-    .file-item {
-      display: grid;
-      gap: 7px;
-      width: 100%;
-      min-height: 76px;
-      padding: 11px 12px;
-      border: 0;
-      border-bottom: 1px solid #e8edf3;
-      border-radius: 0;
-      text-align: left;
-      background: #ffffff;
-    }
-    .file-item:hover {
-      background: #f8fafc;
-    }
-    .file-item.selected {
-      background: var(--blue-soft);
-      box-shadow: inset 3px 0 0 var(--accent-2);
-    }
-    .file-row,
-    .file-meta,
-    .source-titlebar,
-    .line-toolbar,
-    .line-summary,
-    .source-actions {
-      display: flex;
-      align-items: center;
-    }
-    .file-row {
-      justify-content: space-between;
-      gap: 8px;
-      min-width: 0;
-    }
-    .file-name {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      color: #253044;
-      font-weight: 650;
-    }
-    .file-rate {
-      font-variant-numeric: tabular-nums;
-      font-weight: 750;
-    }
-    .file-meta {
-      justify-content: space-between;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 11px;
-    }
-    .file-delta.negative { color: var(--danger); }
-    .file-delta.positive { color: var(--good); }
-    .file-bar {
-      height: 4px;
-      overflow: hidden;
-      background: #e7ebf0;
-      border-radius: 2px;
-    }
-    .file-bar span {
-      display: block;
-      height: 100%;
-      background: var(--good);
-    }
-    .file-item.attention .file-bar span {
-      background: var(--warn);
-    }
-    .file-item.critical .file-bar span {
-      background: var(--danger);
-    }
-    .source-pane {
-      display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr);
-      background: var(--code-bg);
-    }
-    .source-title {
-      min-width: 0;
-    }
-    .source-title h3 {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      font-size: 14px;
-    }
-    .source-title code {
-      display: block;
-      margin-top: 3px;
-      color: var(--muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .health-badge {
-      flex: 0 0 auto;
-      padding: 5px 8px;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      font-size: 12px;
-      font-weight: 750;
-      background: #ffffff;
-    }
-    .health-badge.good { color: var(--good); border-color: #a6e3c5; background: var(--good-soft); }
-    .health-badge.warn { color: var(--warn); border-color: #fedf89; background: var(--warn-soft); }
-    .health-badge.danger { color: var(--danger); border-color: #fda29b; background: var(--danger-soft); }
-    .line-toolbar {
-      justify-content: space-between;
-      gap: 10px;
-      min-height: 50px;
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--border);
-      background: #ffffff;
-    }
-    .line-summary {
-      flex-wrap: wrap;
-      gap: 6px 12px;
-      min-width: 0;
-    }
-    .summary-item {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      color: var(--muted);
-      font-size: 11px;
-      white-space: nowrap;
-    }
-    .summary-mark {
-      width: 7px;
-      height: 7px;
-      border-radius: 2px;
-      background: #98a2b3;
-    }
-    .summary-mark.covered { background: var(--good); }
-    .summary-mark.missed { background: var(--danger); }
-    .summary-mark.branch { background: var(--warn); }
-    .summary-mark.changed { background: var(--accent-2); }
-    .source-actions {
-      gap: 6px;
-      flex: 0 0 auto;
-    }
-    .icon-button {
-      width: 30px;
-      min-width: 30px;
-      min-height: 30px;
-      justify-content: center;
-      padding: 0;
-      font-weight: 800;
-    }
-    .segmented {
-      display: inline-flex;
-      align-items: center;
-      gap: 2px;
-      padding: 3px;
-      border: 1px solid var(--border);
-      border-radius: 7px;
-      background: #f8fafc;
-    }
-    .segmented button {
-      min-height: 26px;
-      padding: 0 8px;
-      border: 0;
-      border-radius: 5px;
-      background: transparent;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-    }
-    .segmented button.active {
-      color: var(--ink);
-      background: #ffffff;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12);
-    }
-    .coverage-stage {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 16px;
-      min-height: 0;
-      max-height: 540px;
-      overflow: hidden;
-      background: var(--code-bg);
-    }
-    .coverage-viewer {
-      min-width: 0;
-      overflow: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-      line-height: 20px;
-      scroll-behavior: smooth;
-    }
-    .source-line {
-      display: grid;
-      grid-template-columns: 50px 7px minmax(300px, 1fr) 58px;
-      min-height: 24px;
-      color: #273447;
-      border-bottom: 1px solid #edf0f4;
-      cursor: pointer;
-    }
-    .source-line:hover {
-      background: #f0f4f8;
-    }
-    .source-line.selected {
-      box-shadow: inset 0 0 0 1px #84adff;
-      background: #eef4ff;
-    }
-    .source-line.missed {
-      background: var(--danger-soft);
-    }
-    .source-line.branch-risk:not(.missed) {
-      background: var(--warn-soft);
-    }
-    .source-line.regressed {
-      box-shadow: inset 4px 0 0 var(--danger);
-    }
-    .source-line.improved {
-      box-shadow: inset 4px 0 0 var(--good);
-    }
-    .source-line.new {
-      box-shadow: inset 4px 0 0 var(--accent-2);
-    }
-    .source-line-number,
-    .source-line-meta {
-      display: flex;
-      align-items: center;
-      color: #7b8798;
-      font-size: 11px;
-      font-variant-numeric: tabular-nums;
-      user-select: none;
-    }
-    .source-line-number {
-      justify-content: flex-end;
-      padding-right: 9px;
-      border-right: 1px solid #e2e7ed;
-    }
-    .coverage-gutter {
-      background: transparent;
-    }
-    .covered .coverage-gutter { background: var(--good); }
-    .missed .coverage-gutter { background: var(--danger); }
-    .branch-risk .coverage-gutter {
-      background: var(--warn);
-    }
-    .line-code {
-      display: block;
-      min-width: 0;
-      padding: 2px 10px;
-      overflow: visible;
-      white-space: pre;
-    }
-    .source-line-meta {
-      justify-content: flex-end;
-      padding: 0 7px;
-      border-left: 1px solid #e2e7ed;
-      white-space: nowrap;
-    }
-    .source-line.missed .source-line-meta {
-      color: var(--danger);
-      font-weight: 800;
-    }
-    .context-break {
-      padding: 3px 12px 3px 67px;
-      color: var(--muted);
-      background: #f3f5f8;
-      border-bottom: 1px solid #e2e7ed;
-      font-family: ui-sans-serif, system-ui, sans-serif;
-      font-size: 11px;
-    }
-    .coverage-map {
-      position: relative;
-      background: #eef1f5;
-      border-left: 1px solid var(--border);
-    }
-    .map-mark {
-      position: absolute;
-      left: 2px;
-      width: 11px;
-      min-height: 3px;
-      padding: 0;
-      border: 0;
-      border-radius: 1px;
-      background: var(--danger);
-      cursor: pointer;
-    }
-    .map-mark.branch { background: var(--warn); }
-    .map-mark.regressed { background: #7a271a; }
-    .diagnosis-pane {
-      overflow: auto;
-      max-height: 610px;
-      border-left: 1px solid var(--border);
-      background: #ffffff;
-    }
-    .diagnosis-section {
-      padding: 14px;
-      border-bottom: 1px solid var(--border);
-    }
-    .diagnosis-section h3 {
-      margin-bottom: 10px;
-    }
-    .coverage-score {
-      display: grid;
-      grid-template-columns: 72px minmax(0, 1fr);
-      gap: 12px;
-      align-items: center;
-    }
-    .score-ring {
-      display: grid;
-      place-items: center;
-      width: 72px;
-      height: 72px;
-      border-radius: 50%;
-      background: conic-gradient(var(--good) calc(var(--coverage) * 1%), #e7ebf0 0);
-    }
-    .score-ring::before {
-      content: "";
-      grid-area: 1 / 1;
-      width: 54px;
-      height: 54px;
-      border-radius: 50%;
-      background: #ffffff;
-    }
-    .score-ring strong {
-      grid-area: 1 / 1;
-      z-index: 1;
-      font-size: 15px;
-    }
-    .diagnosis-copy {
-      color: #344054;
-      line-height: 1.45;
-    }
-    .diagnosis-copy strong {
-      display: block;
-      margin-bottom: 3px;
-      color: var(--ink);
-    }
-    .gap-list {
-      display: grid;
-      gap: 6px;
-    }
-    .gap-button {
-      display: grid;
-      grid-template-columns: 8px minmax(0, 1fr) auto;
-      gap: 8px;
-      align-items: center;
-      width: 100%;
-      min-height: 34px;
-      padding: 5px 7px;
-      text-align: left;
-      border-color: #e2e7ed;
-    }
-    .gap-button:hover {
-      background: #f8fafc;
-    }
-    .gap-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 2px;
-      background: var(--danger);
-    }
-    .gap-button.branch .gap-dot { background: var(--warn); }
-    .gap-button code {
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .line-facts {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px;
-      margin-bottom: 10px;
-    }
-    .line-fact {
-      padding: 8px;
-      background: #f8fafc;
-      border: 1px solid #e2e7ed;
-      border-radius: 6px;
-    }
-    .line-fact span {
-      display: block;
-      color: var(--muted);
-      font-size: 10px;
-      text-transform: uppercase;
-    }
-    .line-fact strong {
-      display: block;
-      margin-top: 3px;
-      font-size: 13px;
-    }
-    .history-track {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      min-height: 18px;
-      margin: 9px 0 5px;
-      overflow: hidden;
-    }
-    .history-point {
-      flex: 1;
-      max-width: 12px;
-      height: 8px;
-      border-radius: 2px;
-      background: var(--danger);
-    }
-    .history-point.covered { background: var(--good); }
-    .history-caption {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 10px;
-    }
-    .line-empty-source {
-      color: #98a2b3;
-      font-style: italic;
-    }
-    .empty {
-      padding: 28px;
-      color: var(--muted);
-      text-align: center;
-    }
-    .maintenance-grid {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 10px 16px;
-    }
-    .maintenance-grid label {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      color: #344054;
-      white-space: nowrap;
-    }
-    .maintenance-grid input[type="number"] {
-      width: 84px;
-      min-width: 84px;
-      min-height: 32px;
-    }
-    .maintenance-grid input[type="checkbox"] {
-      width: 16px;
-      min-width: 16px;
-      min-height: 16px;
-    }
-    @media (max-width: 900px) {
-      header { align-items: flex-start; flex-direction: column; }
-      main { padding: 16px; }
-      .metrics {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 10px;
-      }
-      .metrics .metric {
-        min-height: 82px;
-        padding: 11px 12px;
-      }
-      .metrics .metric:last-child {
-        grid-column: 1 / -1;
-      }
-      .metric .value {
-        font-size: 23px;
-      }
-      .two-col, .overview-grid { grid-template-columns: 1fr; }
-      td.path { max-width: 220px; }
-      .toolbar { width: 100%; }
-      input, select { min-width: 0; width: 100%; }
-      .investigation-head,
-      .line-toolbar {
-        align-items: stretch;
-        flex-direction: column;
-      }
-      .overview-grid .panel-head {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-      .trend-meta {
-        justify-content: flex-start;
-      }
-      .comparison-banner {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-      .comparison-label {
-        grid-column: 1 / -1;
-      }
-      .investigation-grid {
-        grid-template-columns: 1fr;
-      }
-      .file-pane,
-      .diagnosis-pane {
-        border: 0;
-        border-bottom: 1px solid var(--border);
-      }
-      .file-list {
-        max-height: 260px;
-      }
-      .diagnosis-pane {
-        max-height: none;
-      }
-      .source-actions {
-        flex-wrap: wrap;
-      }
-      .segmented {
-        flex: 1;
-      }
-      .segmented button {
-        flex: 1;
-      }
-      .source-line {
-        grid-template-columns: 42px 6px minmax(240px, 1fr) 50px;
-      }
-    }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, input, select { font: inherit; min-height: 32px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+    button { padding: 0 10px; cursor: pointer; }
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button:disabled { cursor: default; opacity: .55; }
+    input, select { min-width: 0; padding: 0 8px; }
+    code { font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    header { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 22px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.96); backdrop-filter: blur(8px); }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .brand h1 { margin: 0; font-size: 16px; line-height: 1.1; }
+    .brand p { margin: 3px 0 0; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #98a2b3; }
+    .live.on { color: var(--good); }
+    .live.on::before { background: var(--good); box-shadow: 0 0 0 3px #dcfae6; }
+    .live.busy::before { background: var(--warn); }
+    .toolbar { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .toolbar select { width: min(340px, 30vw); }
+    main { max-width: 1500px; margin: 0 auto; padding: 16px 22px 34px; }
+    .stack { display: grid; gap: 12px; }
+    .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
+    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .panel-head h2 { margin: 0; font-size: 13px; }
+    .panel-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+    .panel-body { padding: 12px 14px; }
+    .muted { color: var(--muted); }
+    .empty { padding: 24px 12px; color: var(--muted); text-align: center; }
+    .metricsGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .metric { padding: 12px 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
+    .metric-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; }
+    .metric-value { margin-top: 5px; font-size: 25px; font-weight: 750; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+    .metric-sub { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .delta { font-weight: 700; white-space: nowrap; }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    .neutral { color: var(--muted); }
+    .overview { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(300px, .9fr); gap: 12px; align-items: start; }
+    .chart-wrap { padding: 8px 12px 12px; }
+    #progressChart { display: block; width: 100%; height: 230px; }
+    .chart-grid { stroke: #e9edf2; stroke-width: 1; }
+    .chart-axis { fill: var(--muted); font-size: 10px; }
+    .chart-line { fill: none; stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
+    .chart-dot { stroke: #fff; stroke-width: 1.5; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 12px; padding: 0 14px 10px; color: var(--muted); font-size: 11px; }
+    .legend span { display: inline-flex; align-items: center; gap: 5px; }
+    .legend i { width: 9px; height: 3px; border-radius: 3px; }
+    .progress-table, .file-table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid #edf0f3; text-align: left; vertical-align: middle; white-space: nowrap; }
+    th { color: var(--muted); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.path { max-width: 330px; overflow: hidden; text-overflow: ellipsis; }
+    .progress-table tbody tr:last-child td, .file-table tbody tr:last-child td { border-bottom: 0; }
+    .progress-table tbody tr.selected { background: #f0fdf9; }
+    .progress-table .suite { color: var(--muted); font-size: 11px; }
+    .snapshot-bar { display: flex; flex-wrap: wrap; gap: 7px 16px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--soft); }
+    .snapshot-bar label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+    .snapshot-bar select { max-width: 330px; }
+    .composite-bar { border-top: 1px solid var(--line); }
+    .composite-grid { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(0, 1.5fr); gap: 12px; align-items: start; }
+    .composite-summary { display: grid; grid-template-columns: repeat(3, minmax(90px, 1fr)); gap: 6px; }
+    .component-list { display: grid; gap: 5px; }
+    .component-row { display: grid; grid-template-columns: minmax(90px, .8fr) minmax(0, 1.3fr) auto; gap: 8px; align-items: center; padding: 7px 8px; border: 1px solid #edf0f3; border-radius: 5px; }
+    .component-row strong { font-size: 12px; }
+    .component-row small { color: var(--muted); }
+    .composite-reasons { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .composite-reason { padding: 5px 7px; border-radius: 5px; background: #fff8eb; color: var(--warn); font-size: 10px; }
+    .provenance { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+    .fact { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
+    .fact span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+    .fact strong, .fact code { display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .delta-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, .9fr); gap: 12px; }
+    .category-grid { display: grid; grid-template-columns: repeat(6, minmax(75px, 1fr)); gap: 6px; }
+    .category { padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
+    .category span { display: block; color: var(--muted); font-size: 10px; }
+    .category strong { display: block; margin-top: 2px; font-size: 19px; font-variant-numeric: tabular-nums; }
+    .case-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 9px; }
+    .case { min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; }
+    .case h3 { margin: 0 0 6px; font-size: 11px; }
+    .case dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; margin: 0; font-size: 11px; }
+    .case dt { color: var(--muted); }
+    .case dd { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detail-source { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+    .pill { display: inline-flex; align-items: center; min-height: 22px; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--soft); color: var(--muted); font-size: 10px; }
+    .pill.good { border-color: #a6e3c5; background: #ecfdf3; }
+    .pill.warn { border-color: #fedf89; background: #fff8eb; }
+    .pill.bad { border-color: #fda29b; background: #fff1f0; }
+    .region-list, .test-list { display: grid; gap: 5px; max-height: 230px; overflow: auto; }
+    .region { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 7px 8px; border: 1px solid #edf0f3; border-radius: 5px; font-size: 11px; }
+    .region code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .region-ranges { color: var(--muted); text-align: right; }
+    .test { display: grid; gap: 2px; padding: 7px 8px; border: 1px solid #edf0f3; border-radius: 5px; }
+    .test small { color: var(--muted); }
+    .maintenance-grid { display: grid; grid-template-columns: auto repeat(3, minmax(90px, 1fr)) auto auto; gap: 7px; align-items: end; }
+    .maintenance-grid label { display: grid; gap: 3px; color: var(--muted); font-size: 10px; }
+    .maintenance-grid label.check { display: flex; align-items: center; gap: 6px; min-height: 32px; }
+    .maintenance-grid input[type="checkbox"] { min-height: auto; }
+    .maintenance-message { grid-column: 1 / -1; min-height: 16px; color: var(--muted); font-size: 11px; }
+    .inventory { display: grid; grid-template-columns: repeat(5, minmax(90px, 1fr)); gap: 6px; margin-bottom: 9px; }
+    .inventory .fact { background: #fff; }
+    .inventory strong { font-size: 16px; }
+    .files-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+    .files-head h2 { margin: 0; font-size: 13px; }
+    .files-table-wrap { overflow-x: auto; }
+    .file-table tbody tr { cursor: pointer; }
+    .file-table tbody tr:hover { background: #f8fafc; }
+    .rate-cell { min-width: 110px; }
+    .rate-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-variant-numeric: tabular-nums; }
+    .bar { height: 4px; margin-top: 4px; overflow: hidden; border-radius: 3px; background: #edf0f3; }
+    .bar i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+    .run-line { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #edf0f3; }
+    .run-line:last-child { border-bottom: 0; }
+    .status { display: inline-flex; align-items: center; min-height: 20px; padding: 0 6px; border-radius: 999px; background: #eef2f6; color: var(--muted); font-size: 10px; }
+    .status.passed, .status.completed, .status.running { background: #ecfdf3; color: var(--good); }
+    .status.failed, .status.cancelled { background: #fff1f0; color: var(--bad); }
+    .status.warning { background: #fff8eb; color: var(--warn); }
+    .drawer { position: fixed; inset: 0; z-index: 8; display: flex; justify-content: flex-end; background: rgba(15,23,42,.3); }
+    .drawer[hidden] { display: none; }
+    .drawer-card { width: min(720px, 96vw); height: 100%; overflow: auto; padding: 15px; background: var(--panel); box-shadow: -8px 0 28px rgba(15,23,42,.16); }
+    .drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .drawer-head h2 { margin: 0; font-size: 14px; }
+    .line-table { width: 100%; margin-top: 12px; border-collapse: collapse; }
+    .line-table td { padding: 5px 7px; }
+    .line-table .line-no { color: var(--muted); text-align: right; }
+    .line-table .covered { color: var(--good); }
+    .line-table .missed { color: var(--bad); }
+    .toast { position: fixed; right: 18px; bottom: 18px; z-index: 10; max-width: min(460px, calc(100vw - 36px)); padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--ink); color: #fff; box-shadow: 0 5px 18px rgba(15,23,42,.2); }
+    .toast[hidden] { display: none; }
+    @media (max-width: 1050px) { .overview, .delta-layout { grid-template-columns: 1fr; } .maintenance-grid { grid-template-columns: repeat(3, minmax(90px, 1fr)); } .inventory { grid-template-columns: repeat(3, minmax(90px, 1fr)); } }
+    @media (max-width: 760px) { header { align-items: flex-start; flex-direction: column; padding: 11px 14px; } .toolbar, .toolbar select { width: 100%; } main { padding: 12px 10px 24px; } .metricsGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .provenance, .case-grid { grid-template-columns: 1fr; } .category-grid { grid-template-columns: repeat(3, minmax(75px, 1fr)); } .maintenance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .maintenance-grid .check, .maintenance-grid .maintenance-message { grid-column: 1 / -1; } .maintenance-grid button { width: 100%; } .inventory { grid-template-columns: repeat(2, minmax(90px, 1fr)); } .panel-head { flex-direction: column; } .snapshot-bar { align-items: stretch; flex-direction: column; } .snapshot-bar label, .snapshot-bar select { width: 100%; } }
   </style>
 </head>
 <body>
   <header>
-    <h1>Coverage MCP</h1>
-    <div class="toolbar">
-      <select id="projectSelect" title="Project"></select>
-      <select id="snapshotSelect" title="Snapshot"></select>
-      <input id="reportPath" placeholder="external coverage report path">
-      <select id="format">
-        <option value="auto">auto</option>
-        <option value="lcov">lcov</option>
-        <option value="coveragepy">coverage.py JSON</option>
-        <option value="cobertura">Cobertura XML</option>
-        <option value="jacoco">JaCoCo XML</option>
-        <option value="istanbul">Istanbul JSON</option>
-        <option value="go">Go coverprofile</option>
-        <option value="llvm">LLVM JSON</option>
-      </select>
-      <button class="primary" id="ingestBtn" title="Ingest external report">Ingest external</button>
-      <button id="refreshBtn" title="Refresh">Refresh</button>
-    </div>
+    <div class="brand"><div><h1>Coverage MCP</h1><p id="projectMeta">Choose a repository to inspect its coverage progression.</p></div><span id="liveState" class="live">connecting</span></div>
+    <div class="toolbar"><select id="projectSelect" aria-label="Project"></select><button id="refreshBtn" type="button">Refresh</button></div>
   </header>
-  <main class="grid">
-    <section class="grid metrics">
-      <div class="metric"><div class="label">Project</div><div id="projectName" class="value" style="font-size:16px">--</div><div id="projectSub" class="sub"></div></div>
-      <div class="metric"><div class="label">Line Coverage</div><div id="lineRate" class="value">--</div><div id="lineSub" class="sub"></div></div>
-      <div class="metric"><div class="label">Branch Coverage</div><div id="branchRate" class="value">--</div><div id="branchSub" class="sub"></div></div>
-      <div class="metric"><div class="label">Files</div><div id="fileCount" class="value">--</div><div class="sub">tracked in selected snapshot</div></div>
-      <div class="metric"><div class="label">Snapshot</div><div id="snapshotTime" class="value" style="font-size:16px">--</div><div id="snapshotSub" class="sub"></div></div>
+  <main class="stack">
+    <section id="metricsGrid" class="metricsGrid" aria-label="Coverage metrics"></section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>Production region coverage</h2><p id="compositeMeta">Combined immutable Rust, Python, and JavaScript production regions.</p></div><span id="compositeStatus" class="status">not measured</span></div>
+      <div class="snapshot-bar composite-bar"><label>Composite current <select id="compositeCurrentSelect" aria-label="Current composite snapshot"></select></label><label>Composite baseline <select id="compositeBaselineSelect" aria-label="Baseline composite snapshot"></select></label><span id="compositeSelectionStatus" class="muted"></span></div>
+      <div id="compositeBody" class="panel-body"></div>
     </section>
-    <section id="compactionPanel" class="panel">
-      <div class="panel-head">
-        <h2>Project maintenance</h2>
-        <span id="compactionStatus" class="muted">Select a project</span>
-      </div>
-      <div class="panel-body maintenance-grid">
-        <label><input id="compactionEnabled" type="checkbox"> Background compaction</label>
-        <label>Compact after <input id="compactionAfterDays" type="number" min="1" step="1"> days</label>
-        <label>Every <input id="compactionIntervalSeconds" type="number" min="60" step="60"> seconds</label>
-        <label>Batch <input id="compactionBatchSize" type="number" min="1" step="1"> events</label>
-        <button id="saveCompactionBtn" class="primary" type="button">Save policy</button>
-        <button id="compactNowBtn" type="button">Compact now</button>
-        <span id="maintenanceMessage" class="muted" role="status"></span>
-      </div>
+    <section class="overview">
+      <div class="panel"><div class="panel-head"><div><h2>Progress over time</h2><p id="progressMeta">The selected snapshot is the right edge; all four metric families stay visible.</p></div><span id="historyStatus" class="muted"></span></div><div class="chart-wrap"><svg id="progressChart" viewBox="0 0 900 230" role="img" aria-label="Coverage progression chart"></svg></div><div id="chartLegend" class="legend"></div></div>
+      <div class="panel"><div class="panel-head"><div><h2>Run activity</h2><p>Coverage evidence and execution status in one place.</p></div><span id="runSummary" class="muted"></span></div><div id="runActivity" class="panel-body"></div></div>
     </section>
-    <section class="grid overview-grid">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>Coverage Trend</h2>
-          <div class="trend-meta">
-            <select id="trendScope" class="trend-scope" title="Trend lineage"></select>
-            <div id="trendLegend" class="trend-legend"></div>
-            <span class="muted" id="trendLabel"></span>
-          </div>
-        </div>
-        <div class="panel-body"><svg id="trend" viewBox="0 0 900 240" role="img" aria-label="Coverage trend"></svg></div>
-      </div>
-      <div class="panel">
-        <div class="panel-head"><h2>What To Investigate</h2><span class="muted" id="insightCount"></span></div>
-        <div class="panel-body"><ul id="insightsBody" class="insight-list"></ul></div>
-      </div>
+    <section class="panel">
+      <div class="snapshot-bar"><label>Current <select id="currentSelect" aria-label="Current snapshot"></select></label><label>Baseline <select id="baselineSelect" aria-label="Baseline snapshot"></select></label><span id="selectionStatus" class="muted"></span></div>
+      <div class="panel-head"><div><h2>Selected measurement</h2><p>Suite, branch, commit, and execution identity are provenance. They are never treated as test identity.</p></div><span id="measurementStatus" class="status">unmeasured</span></div>
+      <div id="measurementFacts" class="panel-body provenance"></div>
     </section>
-    <section class="panel investigation-panel">
-      <div class="investigation-head">
-        <div class="investigation-title">
-          <h2>Coverage Investigation</h2>
-          <code id="selectedFile">Select a file</code>
-        </div>
-        <div class="toolbar">
-          <select id="baselineSelect" title="Baseline snapshot"></select>
-          <button id="compareBtn" title="Compare with selected baseline">Compare</button>
-        </div>
-      </div>
-      <div id="comparisonBanner" class="comparison-banner" hidden></div>
-      <div class="investigation-grid">
-        <aside class="file-pane">
-          <div class="pane-heading">
-            <h3>Files</h3>
-            <span id="fileListCount" class="muted"></span>
-          </div>
-          <div class="file-controls">
-            <input id="fileSearch" type="search" placeholder="Filter paths" aria-label="Filter files">
-            <select id="fileSort" aria-label="Sort files">
-              <option value="attention">Needs attention</option>
-              <option value="coverage">Lowest coverage</option>
-              <option value="path">Path</option>
-            </select>
-          </div>
-          <div id="fileList" class="file-list"></div>
-        </aside>
-        <section class="source-pane">
-          <div class="source-titlebar">
-            <div class="source-title">
-              <h3 id="fileName">Choose a file</h3>
-              <code id="filePath">Coverage details will appear here</code>
-            </div>
-            <span id="fileHealth" class="health-badge">--</span>
-          </div>
-          <div class="line-toolbar">
-            <div id="fileLineSummary" class="line-summary"></div>
-            <div class="source-actions">
-              <button id="prevGap" class="icon-button" type="button" title="Previous uncovered region" disabled>&#8593;</button>
-              <button id="nextGap" class="icon-button" type="button" title="Next uncovered region" disabled>&#8595;</button>
-              <div id="lineFilter" class="segmented">
-                <button type="button" class="active" data-filter="source">Source</button>
-                <button type="button" data-filter="missed">Misses</button>
-                <button type="button" data-filter="branches">Branches</button>
-                <button type="button" data-filter="changed">Changed</button>
-              </div>
-            </div>
-          </div>
-          <div class="coverage-stage">
-            <div id="coverageViewer" class="coverage-viewer"><div class="empty">Select a file to inspect its coverage.</div></div>
-            <div id="coverageMap" class="coverage-map" aria-label="Coverage overview"></div>
-          </div>
-        </section>
-        <aside id="diagnosisPane" class="diagnosis-pane">
-          <div class="diagnosis-section">
-            <h3>Diagnosis</h3>
-            <div id="diagnosisContent" class="diagnosis-copy muted">Select a file.</div>
-          </div>
-          <div class="diagnosis-section">
-            <h3>Uncovered Regions</h3>
-            <div id="gapList" class="gap-list"><div class="muted">No file selected.</div></div>
-          </div>
-          <div class="diagnosis-section">
-            <h3>Line History</h3>
-            <div id="lineInspector" class="muted">Select a source line.</div>
-          </div>
-        </aside>
-      </div>
+    <section class="panel">
+      <div class="panel-head"><div><h2>Incremental progression</h2><p>Stored current-versus-baseline detail; no parent runner, report reparse, or test rerun.</p></div><span id="incrementalSafety" class="pill">waiting for two snapshots</span></div>
+      <div id="incrementalBody" class="panel-body"></div>
+    </section>
+    <section class="panel">
+      <div class="files-head"><div><h2>Files needing attention</h2><span id="filesMeta" class="muted"></span></div><span class="muted">Click a row for line detail</span></div>
+      <div class="files-table-wrap"><table class="file-table"><thead><tr><th>Path</th><th class="num">Lines</th><th class="num">Branches</th><th class="num">Functions</th><th class="num">Regions</th><th>Delta</th><th>Retention</th></tr></thead><tbody id="fileRows"></tbody></table></div>
+    </section>
+    <section class="overview">
+      <div class="panel"><div class="panel-head"><div><h2>Compaction health</h2><p>Compressed payloads preserve incremental detail after relational rows are removed.</p></div><span id="compactionHealth" class="status">unknown</span></div><div class="panel-body"><div id="compactionInventory" class="inventory"></div><div class="maintenance-grid"><label class="check"><input id="compactionEnabled" type="checkbox"> Background compaction</label><label>After days<input id="compactionAfterDays" type="number" min="1" step="1"></label><label>Interval seconds<input id="compactionIntervalSeconds" type="number" min="60" step="60"></label><label>Batch size<input id="compactionBatchSize" type="number" min="1" step="1"></label><button id="saveCompactionBtn" class="primary" type="button">Save policy</button><button id="compactNowBtn" type="button">Compact now</button><span id="maintenanceMessage" class="maintenance-message" role="status"></span></div></div></div>
+      <div class="panel"><div class="panel-head"><div><h2>Snapshot timeline</h2><p id="timelineMeta">Newest measurements are shown first.</p></div></div><div class="panel-body" style="padding-top:4px"><table class="progress-table"><thead><tr><th>When / suite</th><th class="num">Lines</th><th class="num">Branches</th><th class="num">Functions</th><th class="num">Regions</th></tr></thead><tbody id="timelineRows"></tbody></table></div></div>
     </section>
   </main>
+  <div id="fileDrawer" class="drawer" hidden><aside class="drawer-card"><div class="drawer-head"><div><h2 id="drawerTitle">File detail</h2><code id="drawerPath"></code></div><button id="closeDrawer" type="button" aria-label="Close file detail">Close</button></div><div id="drawerSummary" class="panel-body" style="padding-left:0;padding-right:0"></div><div id="drawerLines"></div></aside></div>
+  <div id="toast" class="toast" hidden role="status"></div>
   <script>
-    const state = {
-      projects: [],
-      snapshots: [],
-      worktrees: [],
-      projectKey: null,
-      selected: null,
-      files: [],
-      lineFilter: 'source',
-      fileQuery: '',
-      selectedFile: null,
-      selectedPayload: null,
-      sourceByLine: new Map(),
-      trendScope: null,
-      comparison: null,
-      changedByFile: new Map(),
-      fileComparison: new Map(),
-      focusLines: [],
-      currentLine: null
-    };
-    const pct = value => value === null || value === undefined ? '--' : `${(value * 100).toFixed(1)}%`;
+    const SCHEMA_REVISION = 14;
+    const state = {projects:[], projectKey:null, repoPath:null, dashboard:null, currentId:null, baselineId:null, compositeCurrentId:null, compositeBaselineId:null, refreshPending:false, refreshTimer:null, refreshing:false, refreshAgain:false, eventSource:null, streamRepoPath:null, toastTimer:null};
+    const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    const shortPath = value => {
-      const parts = String(value || '').split('/').filter(Boolean);
-      return parts.slice(-2).join('/') || value || 'unknown';
-    };
+    const short = value => { const parts = String(value || '').split('/').filter(Boolean); return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : (value || '—'); };
+    const numeric = value => value === null || value === undefined || value === '' ? NaN : Number(value);
+    const pct = value => Number.isFinite(numeric(value)) ? `${(numeric(value) * 100).toFixed(1)}%` : '—';
+    const signedPct = value => Number.isFinite(numeric(value)) ? `${numeric(value) >= 0 ? '+' : ''}${(numeric(value) * 100).toFixed(1)} pp` : '—';
+    const int = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString() : '—';
+    const commit = value => value ? String(value).slice(0, 10) : '—';
+    const safeRate = value => Math.max(0, Math.min(1, Number(value) || 0));
+    const execution = snapshot => snapshot?.execution || {};
+    const currentProject = () => state.projects.find(project => project.repo_key === state.projectKey) || null;
+    const isForeground = () => document.visibilityState === 'visible';
 
-    async function fetchJSON(url, options) {
-      const requestOptions = {...(options || {})};
-      const headers = new Headers(requestOptions.headers || {});
-      const isProjectList = /^\/api\/projects(?:\?|$)/.test(url);
-      if (url.startsWith('/api/') && !isProjectList && state.projectKey) {
-        const project = currentProject();
-        headers.set('X-Coverage-MCP-Repo', project?.repo_path || state.projectKey);
-      }
-      requestOptions.headers = headers;
-      const response = await fetch(url, requestOptions);
-      if (!response.ok) throw new Error(await response.text());
-      return response.json();
-    }
-
-    async function getJSON(url, options) {
-      const payload = await fetchJSON(url, options);
-      if (!payload || payload.context?.schema_revision !== 10 || !Object.hasOwn(payload, 'data')) {
-        throw new Error('Coverage MCP dashboard requires schema revision 10. Start the current coverage-mcp connector to replace a verified older daemon automatically, then reload.');
-      }
+    async function api(url, options = {}, includeRepository = true) {
+      const request = {...options}; const headers = new Headers(request.headers || {});
+      if (includeRepository && state.repoPath) headers.set('X-Coverage-MCP-Repo', state.repoPath);
+      if (request.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      request.headers = headers;
+      const response = await fetch(url, request); const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+      if (payload.context?.schema_revision !== SCHEMA_REVISION || !Object.hasOwn(payload, 'data')) throw new Error(`Dashboard needs schema revision ${SCHEMA_REVISION}; reload the current coverage-mcp daemon.`);
       return payload.data;
     }
-
-    async function getAllJSON(url) {
-      const items = [];
-      let cursor = null;
-      do {
-        const pageUrl = cursor
-          ? `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`
-          : url;
-        const payload = await fetchJSON(pageUrl);
-        if (!payload || payload.context?.schema_revision !== 10 || !Array.isArray(payload.data)) {
-          throw new Error('Coverage MCP dashboard received an invalid schema revision 10 collection.');
-        }
-        items.push(...payload.data);
-        cursor = payload.page?.next_cursor || null;
-      } while (cursor);
-      return items;
+    function notify(message) { const toast = $('toast'); toast.textContent = message; toast.hidden = false; clearTimeout(state.toastTimer); state.toastTimer = setTimeout(() => { toast.hidden = true; }, 3800); }
+    function setLive(label, mode = '') { const live = $('liveState'); live.textContent = label; live.className = `live ${mode}`; }
+    async function loadProjects() {
+      const data = await api('/api/projects?max_words=5000', {}, false); state.projects = Array.isArray(data) ? data : [];
+      if (!state.projectKey || !state.projects.some(project => project.repo_key === state.projectKey)) state.projectKey = (state.projects.find(project => Number(project.snapshot_count) > 0) || state.projects[0])?.repo_key || null;
+      state.repoPath = currentProject()?.repo_path || null; $('projectSelect').innerHTML = state.projects.map(project => `<option value="${esc(project.repo_key)}">${esc(short(project.repo_path))}</option>`).join('') || '<option value="">No projects</option>'; $('projectSelect').value = state.projectKey || '';
     }
-
-    async function getAllFileJSON(url) {
-      let file = null;
-      const lines = [];
-      let cursor = null;
-      do {
-        const pageUrl = cursor
-          ? `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`
-          : url;
-        const payload = await fetchJSON(pageUrl);
-        if (!payload || payload.context?.schema_revision !== 10 || !payload.data?.file || !Array.isArray(payload.data.lines)) {
-          throw new Error('Coverage MCP dashboard received an invalid schema revision 10 file response.');
-        }
-        file = payload.data.file;
-        lines.push(...payload.data.lines);
-        cursor = payload.page?.next_cursor || null;
-      } while (cursor);
-      return {file, lines};
+    async function loadDashboard() {
+      if (!state.repoPath) { state.dashboard = null; renderEmpty('No repository is registered yet. Import or ingest a coverage report to start the timeline.'); return; }
+      const params = new URLSearchParams({repo_path:state.repoPath, history_limit:'18'}); if (state.currentId) params.set('snapshot_id', state.currentId); if (state.baselineId) params.set('baseline_snapshot_id', state.baselineId); if (state.compositeCurrentId) params.set('composite_snapshot_id', state.compositeCurrentId); if (state.compositeBaselineId) params.set('baseline_composite_snapshot_id', state.compositeBaselineId);
+      state.dashboard = await api(`/api/dashboard?${params}`, {}, false); state.currentId = state.dashboard.selection?.snapshot_id || null; state.compositeCurrentId = state.dashboard.selection?.composite_snapshot_id || null; if (!state.baselineId && state.dashboard.selection?.baseline_kind === 'explicit') state.baselineId = state.dashboard.selection.baseline_snapshot_id; if (!state.compositeBaselineId && state.dashboard.selection?.composite_baseline_kind === 'explicit') state.compositeBaselineId = state.dashboard.selection.baseline_composite_snapshot_id; render(state.dashboard); connectStream();
     }
-
-    async function getAllSectionJSON(url, section) {
-      const items = [];
-      let cursor = null;
-      do {
-        const pageUrl = cursor
-          ? `${url}${url.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}`
-          : url;
-        const payload = await fetchJSON(pageUrl);
-        if (!payload || payload.context?.schema_revision !== 10 || !Array.isArray(payload.data?.[section])) {
-          throw new Error(`Coverage MCP dashboard received an invalid schema revision 10 ${section} response.`);
-        }
-        items.push(...(payload.data?.[section] || []));
-        cursor = payload.page?.next_cursor || null;
-      } while (cursor);
-      return items;
+    async function refresh({silent = false} = {}) {
+      if (!isForeground()) return;
+      if (state.refreshing) { state.refreshAgain = true; return; } state.refreshing = true; if (!silent) setLive('refreshing', 'busy');
+      try { await loadProjects(); await loadDashboard(); setLive('live', 'on'); } catch (error) { setLive('error', 'busy'); notify(error.message); } finally { state.refreshing = false; if (state.refreshAgain) { state.refreshAgain = false; queueRefresh(); } }
     }
-
-    function currentProject() {
-      return state.projects.find(project => project.repo_key === state.projectKey || project.repo_path === state.projectKey) || null;
+    function queueRefresh() { if (!isForeground() || state.refreshPending) return; state.refreshPending = true; state.refreshTimer = setTimeout(() => { state.refreshTimer = null; state.refreshPending = false; if (isForeground()) refresh({silent:true}); }, 180); }
+    function closeStream() { if (state.eventSource) state.eventSource.close(); state.eventSource = null; state.streamRepoPath = null; }
+    function connectStream() {
+      if (!isForeground() || !state.repoPath) { closeStream(); return; }
+      if (state.eventSource && state.streamRepoPath === state.repoPath) return;
+      closeStream(); state.streamRepoPath = state.repoPath;
+      state.eventSource = new EventSource(`/api/dashboard/events?repo_path=${encodeURIComponent(state.repoPath)}`);
+      state.eventSource.addEventListener('ready', () => setLive('live', 'on')); state.eventSource.addEventListener('refresh', () => { setLive('updated', 'busy'); queueRefresh(); }); state.eventSource.addEventListener('dashboard-error', event => { try { notify(JSON.parse(event.data).detail || 'Dashboard stream error'); } catch (_) { notify('Dashboard stream error'); } }); state.eventSource.onerror = () => setLive('reconnecting', 'busy');
     }
-
-    function currentProjectId() {
-      return currentProject()?.id || 'project';
+    function renderEmpty(message) {
+      $('metricsGrid').innerHTML = `<div class="panel empty" style="grid-column:1/-1">${esc(message)}</div>`; $('progressChart').innerHTML = ''; $('chartLegend').innerHTML = ''; $('runActivity').innerHTML = '<div class="empty">No run activity.</div>'; $('measurementFacts').innerHTML = '<div class="empty" style="grid-column:1/-1">No selected measurement.</div>'; $('incrementalBody').innerHTML = '<div class="empty">Ingest two compatible snapshots to see progression without rerunning the base.</div>'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot.</div>'; $('fileRows').innerHTML = '<tr><td colspan="7" class="empty">No coverage files.</td></tr>'; $('timelineRows').innerHTML = '<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; $('compactionInventory').innerHTML = '<div class="empty" style="grid-column:1/-1">No compaction inventory.</div>'; $('projectMeta').textContent = message;
     }
-
-    function projectSnapshots() {
-      return state.snapshots;
+    function metricCard(label, snapshot, definition, delta) { const rate = snapshot?.[definition.rate]; const deltaClass = Number(delta) > 0 ? 'good' : Number(delta) < 0 ? 'bad' : 'neutral'; return `<article class="metric"><div class="metric-top"><span>${label}</span><span class="delta ${deltaClass}">${signedPct(delta)}</span></div><div class="metric-value">${pct(rate)}</div><div class="metric-sub"><span>${int(snapshot?.[definition.covered])} / ${int(snapshot?.[definition.total])}</span><span>${definition.unit}</span></div></article>`; }
+    function renderMetrics(data) {
+      const snapshot = data.current; const delta = data.incremental?.status === 'measured' ? data.incremental.metric_deltas || {} : {};
+      const definitions = [['Lines',{rate:'line_rate',covered:'covered_lines',total:'total_lines',unit:'executable lines'},'line_rate_delta'],['Branches',{rate:'branch_rate',covered:'covered_branches',total:'total_branches',unit:'branch outcomes'},'branch_rate_delta'],['Functions',{rate:'function_rate',covered:'covered_functions',total:'total_functions',unit:'functions'},'function_rate_delta'],['Regions',{rate:'region_rate',covered:'covered_regions',total:'total_regions',unit:'regions'},'region_rate_delta']];
+      $('metricsGrid').innerHTML = snapshot ? definitions.map(([label, definition, key]) => metricCard(label, snapshot, definition, delta[key])).join('') : '<div class="panel empty" style="grid-column:1/-1">Select a snapshot to see metrics.</div>'; $('progressMeta').textContent = snapshot ? `${snapshot.suite || 'unknown suite'} · ${snapshot.branch || 'no branch'} · ${commit(snapshot.commit_sha)} · ${snapshot.detail_retention || 'compactable'}` : 'No selected measurement.';
     }
-
-    function projectWorktrees() {
-      return state.worktrees;
+    function renderControls(data) {
+      const points = [...(data.history?.points || [])]; const snapshots = new Map(points.map(point => [point.id, point])); if (data.current?.id) snapshots.set(data.current.id, data.current); if (data.baseline?.id) snapshots.set(data.baseline.id, data.baseline); const options = [...snapshots.values()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at))); const option = point => `<option value="${esc(point.id)}">${esc(new Date(point.created_at).toLocaleString())} · ${esc(point.suite || 'default')} · ${pct(point.line_rate)}</option>`;
+      $('currentSelect').innerHTML = options.map(option).join('') || '<option value="">No snapshots</option>'; $('baselineSelect').innerHTML = `<option value="">Rolling previous</option>${options.map(option).join('')}`; $('currentSelect').value = state.currentId || data.current?.id || ''; $('baselineSelect').value = state.baselineId || ''; const kind = data.selection?.baseline_kind || 'none'; $('selectionStatus').textContent = kind === 'explicit' ? 'Explicit fixed baseline' : kind === 'rolling_previous' ? 'Rolling previous for dashboard context' : 'No comparison baseline';
     }
-
-    function referenceBranches() {
-      const snapshots = projectSnapshots();
-      const available = new Set(snapshots.map(snapshot => snapshot.branch).filter(Boolean));
-      const configured = projectWorktrees().map(worktree => worktree.base_ref).filter(branch => available.has(branch));
-      const preferred = ['main', 'master'].filter(branch => available.has(branch));
-      const references = [...new Set([...configured, ...preferred])];
-      if (references.length) return references;
-      return [state.selected?.base_ref, state.selected?.branch, snapshots[0]?.branch].filter(Boolean).slice(0, 1);
+    function renderCompositeControls(data) {
+      const composite = data.composite || {}, points = [...(composite.history?.points || [])]; const snapshots = new Map(points.map(point => [point.id, point])); if (composite.current?.id) snapshots.set(composite.current.id, composite.current); if (composite.baseline?.id) snapshots.set(composite.baseline.id, composite.baseline); const options = [...snapshots.values()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at))); const option = point => `<option value="${esc(point.id)}">${esc(new Date(point.created_at).toLocaleString())} · ${pct(point.region_rate)} · ${esc(point.status || 'incomplete')}</option>`;
+      $('compositeCurrentSelect').innerHTML = options.map(option).join('') || '<option value="">No composite snapshots</option>'; $('compositeBaselineSelect').innerHTML = `<option value="">Rolling previous</option>${options.map(option).join('')}`; $('compositeCurrentSelect').value = state.compositeCurrentId || composite.current?.id || ''; $('compositeBaselineSelect').value = state.compositeBaselineId || ''; const kind = data.selection?.composite_baseline_kind || 'none'; $('compositeSelectionStatus').textContent = kind === 'explicit' ? 'Explicit fixed composite baseline' : kind === 'rolling_previous' ? 'Rolling previous composite context' : 'No composite comparison';
     }
-
-    function renderTrendScopes() {
-      const select = document.getElementById('trendScope');
-      const references = referenceBranches();
-      const worktrees = projectWorktrees();
-      const options = [
-        ...references.map(branch => ({
-          value: `reference:${branch}`,
-          label: `Reference: ${branch}`
-        })),
-        ...worktrees.map(worktree => ({
-          value: `worktree:${worktree.id}`,
-          label: `Worktree: ${worktree.name || worktree.branch || shortPath(worktree.path)}`
-        }))
-      ];
-      if (!options.some(option => option.value === state.trendScope)) {
-        state.trendScope = options[0]?.value || null;
-      }
-      select.innerHTML = options.map(option => `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('')
-        || '<option>No lineage available</option>';
-      if (state.trendScope) select.value = state.trendScope;
+    function renderChart(points) {
+      const svg = $('progressChart'); const legend = $('chartLegend'); const colors = {line_rate:'#176b63',branch_rate:'#2563eb',function_rate:'#6941c6',region_rate:'#b54708'}; const labels = {line_rate:'Lines',branch_rate:'Branches',function_rate:'Functions',region_rate:'Regions'}; legend.innerHTML = Object.entries(colors).map(([key,color]) => `<span><i style="background:${color}"></i>${labels[key]}</span>`).join(''); if (!points.length) { svg.innerHTML = '<text x="450" y="115" text-anchor="middle" class="chart-axis">No history yet</text>'; return; }
+      const width=900,height=230,pad={left:38,right:14,top:15,bottom:32},innerWidth=width-pad.left-pad.right,innerHeight=height-pad.top-pad.bottom; const x=index => points.length === 1 ? pad.left + innerWidth / 2 : pad.left + (index / (points.length - 1)) * innerWidth; const y=value => pad.top + (1-safeRate(value))*innerHeight; const grid=[0,.25,.5,.75,1].map(level => `<line class="chart-grid" x1="${pad.left}" x2="${width-pad.right}" y1="${y(level)}" y2="${y(level)}"></line><text class="chart-axis" x="${pad.left-7}" y="${y(level)+3}" text-anchor="end">${Math.round(level*100)}%</text>`).join(''); const step=Math.max(1,Math.ceil(points.length/6)); const xLabels=points.map((point,index) => index%step===0 ? `<text class="chart-axis" x="${x(index)}" y="${height-9}" text-anchor="middle">${esc(new Date(point.created_at).toLocaleDateString(undefined,{month:'short',day:'numeric'}))}</text>` : '').join('');
+      const lines=Object.entries(colors).map(([key,color]) => { const path=points.map((point,index) => `${index?'L':'M'} ${x(index).toFixed(1)} ${y(point[key]).toFixed(1)}`).join(' '); const dots=points.map((point,index) => `<circle class="chart-dot" cx="${x(index)}" cy="${y(point[key])}" r="3" fill="${color}"><title>${labels[key]} ${pct(point[key])}</title></circle>`).join(''); return `<path class="chart-line" stroke="${color}" d="${path}"></path>${dots}`; }).join(''); svg.innerHTML=`${grid}${xLabels}${lines}`;
     }
-
-    function optionLabel(snapshot) {
-      const date = new Date(snapshot.created_at).toLocaleString();
-      const branch = snapshot.branch || 'no branch';
-      return `${date} | ${branch} / ${snapshot.suite} | ${pct(snapshot.line_rate)}`;
+    function renderRuns(data) { const runs=data.active_runs||[],latest=data.latest_run; $('runSummary').textContent=runs.length?`${runs.length}${data.active_runs_truncated?'+':''} active`:latest?`last ${latest.status||'run'}`:'no runs'; const lines=[]; if(latest) lines.push(`<div class="run-line"><span class="status ${esc(latest.status)}">${esc(latest.status||'latest')}</span><span class="path">${esc(latest.command_name||latest.id||'latest run')}</span><span class="muted">${esc(latest.execution_mode||'')}</span></div>`); runs.forEach(run=>lines.push(`<div class="run-line"><span class="status ${esc(run.status)}">${esc(run.status||'active')}</span><span class="path">${esc(run.command_name||run.id)}</span><span class="muted">${run.queue_position==null?'running':`#${esc(run.queue_position)}`}</span></div>`)); $('runActivity').innerHTML=lines.join('')||'<div class="empty">No managed run activity.</div>'; }
+    function fact(label,value,isCode=false) { return `<div class="fact"><span>${esc(label)}</span>${isCode?`<code title="${esc(value)}">${esc(value||'—')}</code>`:`<strong title="${esc(value)}">${esc(value||'—')}</strong>`}</div>`; }
+    function renderMeasurement(data) { const current=data.current,base=data.baseline,inc=data.incremental||{},status=inc.status==='measured'?'measured':'unmeasured'; $('measurementStatus').textContent=status; $('measurementStatus').className=`status ${status==='measured'?'completed':''}`; if(!current){ $('measurementFacts').innerHTML='<div class="empty" style="grid-column:1/-1">No snapshot selected.</div>'; return; } const exec=execution(current); $('measurementFacts').innerHTML=[fact('Snapshot',current.id,true),fact('Captured',new Date(current.created_at).toLocaleString()),fact('Suite',current.suite),fact('Format',current.format),fact('Branch',current.branch),fact('Commit',commit(current.commit_sha),true),fact('Execution mode',exec.mode||'not recorded'),fact('Execution identity',exec.identity||'not recorded',true),fact('Retention',current.detail_retention),fact('Report checkout',short(current.measurement_checkout_path),true),fact('Baseline',base?.id?`${base.suite} · ${commit(base.commit_sha)}`:'none'),fact('Baseline policy',data.selection?.baseline_kind||'none')].join(''); }
+    function renderCase(title,snapshot,source) { if(!snapshot) return `<div class="case"><h3>${title}</h3><div class="muted">No snapshot selected.</div></div>`; const exec=execution(snapshot); return `<div class="case"><h3>${title}</h3><dl><dt>suite</dt><dd>${esc(snapshot.suite)}</dd><dt>format</dt><dd>${esc(snapshot.format)}</dd><dt>branch</dt><dd>${esc(snapshot.branch||'—')}</dd><dt>commit</dt><dd><code>${esc(commit(snapshot.commit_sha))}</code></dd><dt>mode</dt><dd>${esc(exec.mode||'not recorded')}</dd><dt>identity</dt><dd title="${esc(exec.identity)}"><code>${esc(exec.identity||'not recorded')}</code></dd><dt>retention</dt><dd>${esc(snapshot.detail_retention)}</dd><dt>detail</dt><dd>${esc(source||'unknown')}</dd></dl></div>`; }
+    function rangeLabel(ranges) { return (ranges||[]).slice(0,4).map(range=>range[0]===range[1]?`${range[0]}`:`${range[0]}–${range[1]}`).join(', ')||'—'; }
+    function renderIncremental(data) { const inc=data.incremental||{}; if(inc.status!=='measured'){ $('incrementalSafety').textContent=inc.reason||'Choose two compatible snapshots'; $('incrementalSafety').className='pill warn'; $('incrementalBody').innerHTML=`<div class="empty">${esc(inc.reason||'Select a current measurement and baseline.')}</div>`; return; } const gain=inc.coverage_gain||{},source=inc.detail_source||{},baseProtected=data.baseline?.detail_retention==='incremental_base',compacted=source.baseline==='compacted_payload'||source.current==='compacted_payload'; $('incrementalSafety').textContent=baseProtected?'fixed base protected':compacted?'read after compaction':'stored detail read'; $('incrementalSafety').className=`pill ${baseProtected||compacted?'good':'warn'}`; const categories=[['newly covered','newly_covered','good'],['regressed','regressed','bad'],['hit-only','hit_count_only','neutral'],['added','added','good'],['removed','removed','bad'],['branch state','branch_state_changed','neutral']]; const categoryHtml=categories.map(([label,key,tone])=>`<div class="category"><span>${label}</span><strong class="${tone}">${int(gain[key]||0)}</strong></div>`).join(''); const regions=(inc.regions||[]).flatMap(group=>Object.entries(group).filter(([key])=>key!=='path').flatMap(([key,ranges])=>[`<div class="region"><code title="${esc(group.path)}">${esc(group.path)}</code><span class="region-ranges ${key==='regressed'||key==='removed'?'bad':key==='newly_covered'||key==='added'?'good':''}">${esc(key.replaceAll('_',' '))}: ${esc(rangeLabel(ranges))}</span></div>`])); const attribution=inc.test_attribution||{}; const tests=attribution.status==='unavailable'?`<div class="empty">${esc(attribution.reason||'Named test attribution is unavailable for this format.')}</div>`:(attribution.affected_tests||[]).map(test=>`<div class="test"><code title="${esc(test.test_id)}">${esc(test.test_id)}</code><small>+${int(test.added?.length)} / −${int(test.removed?.length)} observations</small></div>`).join('')||'<div class="empty">No affected named test observations.</div>'; const delta=inc.metric_deltas||{}; const deltaFacts=[fact('Line rate',signedPct(delta.line_rate_delta)),fact('Branch rate',signedPct(delta.branch_rate_delta)),fact('Function rate',signedPct(delta.function_rate_delta)),fact('Region rate',signedPct(delta.region_rate_delta)),fact('Covered lines',`${delta.covered_lines_delta>=0?'+':''}${int(delta.covered_lines_delta)}`),fact('Covered branches',`${delta.covered_branches_delta>=0?'+':''}${int(delta.covered_branches_delta)}`)].join(''); $('incrementalBody').innerHTML=`<div class="category-grid">${categoryHtml}</div><div class="detail-source"><span class="pill ${source.baseline==='compacted_payload'?'good':''}">base: ${esc(source.baseline||'unknown')}</span><span class="pill ${source.current==='compacted_payload'?'good':''}">current: ${esc(source.current||'unknown')}</span><span class="pill">${inc.regions_truncated?'regions truncated':`${regions.length} region groups`}</span><span class="pill">${attribution.status==='measured'?`${int(attribution.affected_test_count)} affected tests`:'test IDs unavailable'}</span></div><div class="case-grid">${renderCase('Current case',data.current,source.current)}${renderCase('Baseline',data.baseline,source.baseline)}</div><div class="provenance" style="margin-top:9px">${deltaFacts}</div><div class="delta-layout" style="margin-top:10px"><div><h3 style="margin:0 0 6px;font-size:11px">Affected regions</h3><div class="region-list">${regions.join('')||'<div class="empty">No changed regions.</div>'}</div></div><div><h3 style="margin:0 0 6px;font-size:11px">Affected test IDs</h3><div class="test-list">${tests}</div></div></div>`; }
+    function renderComposite(data) {
+      const composite = data.composite || {}, current = composite.current, inc = composite.incremental || {}, complete = current?.complete === true; $('compositeStatus').textContent = current ? (complete ? 'complete' : 'incomplete') : 'not measured'; $('compositeStatus').className = `status ${current ? (complete ? 'completed' : 'warning') : ''}`; renderCompositeControls(data); if (!current) { $('compositeMeta').textContent = 'Combined immutable Rust, Python, and JavaScript production regions.'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot has been produced by a managed run.</div>'; return; }
+      const delta = inc.metric_deltas || {}, gain = inc.coverage_gain || {}, components = current.components || [], componentDeltas = new Map((inc.components || []).map(component => [component.component, component])); const componentRows = components.map(component => { const componentDelta = componentDeltas.get(component.component) || {}; const deltaText = Number.isFinite(Number(componentDelta.covered_regions_delta)) ? `${Number(componentDelta.covered_regions_delta) >= 0 ? '+' : ''}${int(componentDelta.covered_regions_delta)}` : '—'; return `<div class="component-row"><strong>${esc(component.component || 'other')}</strong><span>${pct(component.region_rate)} <small>${int(component.covered_regions)}/${int(component.total_regions)} regions</small></span><span class="delta ${Number(componentDelta.covered_regions_delta) > 0 ? 'good' : Number(componentDelta.covered_regions_delta) < 0 ? 'bad' : 'neutral'}">${deltaText}</span></div>`; }).join('') || '<div class="empty">No component summaries.</div>'; const categories = [['newly covered','newly_covered','good'],['regressed','regressed','bad'],['hit-only','hit_count_only','neutral'],['added','added','good'],['removed','removed','bad']].map(([label,key,tone]) => `<div class="category"><span>${label}</span><strong class="${tone}">${int(gain[key] || 0)}</strong></div>`).join(''); const reasons = (current.blocking_reasons || []).map(reason => `<span class="composite-reason">${esc(reason)}</span>`).join(''); const remediation = Object.entries(current.remediation || {}).map(([key,value]) => `<span class="pill">${esc(key)}: ${int(value)}</span>`).join(''); $('compositeMeta').textContent = `${int(current.covered_regions)}/${int(current.total_regions)} canonical regions · mapping ${esc(current.mapping_version || 'unknown')} · ${current.checkout_dirty ? 'dirty checkout' : `revision ${commit(current.checkout_revision)}`}`; $('compositeBody').innerHTML = `<div class="composite-grid"><div><div class="composite-summary">${fact('Coverage',pct(current.region_rate))}${fact('Covered',`${int(current.covered_regions)}/${int(current.total_regions)}`)}${fact('Delta',signedPct(delta.region_rate_delta))}${fact('Snapshot',current.id,true)}${fact('Inventory',current.inventory_hash ? String(current.inventory_hash).slice(0,10) : '—',true)}${fact('Source',inc.detail_source || 'stored')}</div>${reasons ? `<div class="composite-reasons">${reasons}</div>` : ''}${remediation ? `<div class="detail-source">${remediation}</div>` : ''}</div><div><h3 style="margin:0 0 6px;font-size:11px">Component coverage</h3><div class="component-list">${componentRows}</div></div></div><div class="category-grid" style="margin-top:10px">${categories}</div><div class="detail-source"><span class="pill ${inc.status === 'measured' ? 'good' : 'warn'}">${inc.status === 'measured' ? 'exact stored diff' : esc(inc.reason || 'no composite baseline')}</span><span class="pill">base: ${esc(inc.baseline?.id || 'none')}</span><span class="pill">current: ${esc(inc.current?.id || current.id)}</span><span class="pill">${inc.test_attribution?.status === 'unavailable' ? 'test IDs unavailable' : `${int(inc.test_attribution?.affected_test_count)} affected tests`}</span></div>`;
     }
-
-    function projectOptionLabel(project) {
-      return `${shortPath(project.repo_path)} | ${pct(project.line_rate)} | ${project.snapshot_count} snapshots`;
-    }
-
-    function renderCompaction(project) {
-      const compaction = project?.compaction || null;
-      const controls = [
-        'compactionEnabled',
-        'compactionAfterDays',
-        'compactionIntervalSeconds',
-        'compactionBatchSize',
-        'saveCompactionBtn',
-        'compactNowBtn'
-      ].map(id => document.getElementById(id));
-      controls.forEach(control => { control.disabled = !compaction; });
-      const status = document.getElementById('compactionStatus');
-      const message = document.getElementById('maintenanceMessage');
-      if (!compaction) {
-        status.textContent = project ? 'No policy data' : 'Select a project';
-        message.textContent = '';
-        return;
-      }
-      document.getElementById('compactionEnabled').checked = Boolean(compaction.compaction_enabled);
-      document.getElementById('compactionAfterDays').value = compaction.compaction_after_days ?? '';
-      document.getElementById('compactionIntervalSeconds').value = compaction.compaction_interval_seconds ?? '';
-      document.getElementById('compactionBatchSize').value = compaction.compaction_batch_size ?? '';
-      const last = compaction.compaction_last_status || 'never_run';
-      const count = compaction.compaction_last_snapshot_count || 0;
-      status.textContent = `${last} · ${count} snapshots last compacted`;
-    }
-
-    async function refresh() {
-      state.projects = await getAllJSON('/api/projects?max_words=5000');
-      if (!state.projects.some(project => project.repo_key === state.projectKey)) {
-        state.projectKey = state.projects.find(project => Number(project.snapshot_count) > 0)?.repo_key
-          || state.projects[0]?.repo_key
-          || null;
-      }
-      if (!state.projectKey) {
-        state.snapshots = [];
-        state.worktrees = [];
-        state.selected = null;
-        renderSnapshotSelectors();
-        renderProjectSelector();
-        await renderSelected();
-        return;
-      }
-      state.snapshots = await getAllJSON('/api/snapshots?max_words=5000');
-      state.worktrees = await getAllJSON('/api/worktrees?max_words=5000');
-      renderSnapshotSelectors();
-      state.selected = projectSnapshots()[0] || state.snapshots[0] || null;
-      if (state.selected && !state.projectKey) state.projectKey = state.selected.repo_key;
-      renderProjectSelector();
-      if (state.selected) document.getElementById('snapshotSelect').value = state.selected.id;
-      await renderSelected();
-    }
-
-    function renderProjectSelector() {
-      const select = document.getElementById('projectSelect');
-      select.innerHTML = state.projects.map(project => `<option value="${esc(project.repo_key)}">${esc(projectOptionLabel(project))}</option>`).join('') || '<option>No projects</option>';
-      if (state.projectKey) select.value = state.projectKey;
-    }
-
-    function renderSnapshotSelectors() {
-      const snapshots = projectSnapshots();
-      const options = snapshots.map(snapshot => `<option value="${snapshot.id}">${esc(optionLabel(snapshot))}</option>`).join('');
-      document.getElementById('snapshotSelect').innerHTML = options || '<option>No snapshots</option>';
-      document.getElementById('baselineSelect').innerHTML = options || '<option>No snapshots</option>';
-    }
-
-    async function renderSelected() {
-      const snapshot = state.selected;
-      renderCompaction(currentProject());
-      if (!snapshot) {
-        document.getElementById('fileList').innerHTML = '<div class="empty">Ingest a coverage report to populate the dashboard.</div>';
-        document.getElementById('insightsBody').innerHTML = '<li class="empty">No coverage snapshots yet.</li>';
-        return;
-      }
-      const project = currentProject();
-      document.getElementById('projectName').textContent = project ? shortPath(project.repo_path) : shortPath(snapshot.repo_path);
-      document.getElementById('projectSub').textContent = project ? `${project.snapshot_count} snapshots across ${project.branch_count} branches` : snapshot.repo_path;
-      document.getElementById('lineRate').textContent = pct(snapshot.line_rate);
-      document.getElementById('lineSub').textContent = `${snapshot.covered_lines} / ${snapshot.total_lines} covered lines`;
-      document.getElementById('branchRate').textContent = pct(snapshot.branch_rate);
-      document.getElementById('branchSub').textContent = `${snapshot.covered_branches} / ${snapshot.total_branches} covered branches`;
-      document.getElementById('snapshotTime').textContent = new Date(snapshot.created_at).toLocaleString();
-      document.getElementById('snapshotSub').textContent = `${snapshot.branch || 'no branch'} ${snapshot.commit_sha ? snapshot.commit_sha.slice(0, 12) : ''}`;
-      state.files = await getAllJSON(`/api/snapshots/${snapshot.id}/files?max_words=5000`);
-      document.getElementById('fileCount').textContent = state.files.length;
-      if (!state.files.some(file => file.file_path === state.selectedFile)) state.selectedFile = null;
-      renderTrendScopes();
-      await loadComparison(false, true);
-      renderFiles();
-      await renderInsights(document.getElementById('baselineSelect').value);
-      await loadScopedTrend();
-      if (state.files.length) await loadFile(state.selectedFile || state.files[0].file_path);
-    }
-
-    async function renderInsights(baselineId) {
-      const body = document.getElementById('insightsBody');
-      if (!state.selected) return;
-      const baseline = baselineId && baselineId !== state.selected.id ? `&baseline_snapshot_id=${encodeURIComponent(baselineId)}` : '';
-      const payload = await getJSON(`/api/snapshots/${state.selected.id}/insights?limit=8${baseline}`);
-      document.getElementById('insightCount').textContent = `${payload.summary.high_count} high, ${payload.summary.medium_count} medium`;
-      if (!payload.items.length) {
-        body.innerHTML = '<li class="empty">No obvious investigation items for this snapshot.</li>';
-        return;
-      }
-      body.innerHTML = payload.items.slice(0, 12).map(item => `
-        <li class="insight${item.file_path ? ' clickable' : ''}" ${item.file_path ? `data-file="${esc(item.file_path)}" data-line="${item.line_number || ''}"` : ''}>
-          <div class="insight-top">
-            <span class="badge badge-${esc(item.severity)}">${esc(item.severity)}</span>
-            <span class="insight-title">${esc(item.title)}</span>
-          </div>
-          <div class="insight-detail">${esc(item.detail)}</div>
-          ${item.file_path ? `<code>${esc(item.file_path)}${item.line_number ? ':' + item.line_number : ''}</code>` : ''}
-        </li>
-      `).join('');
-      body.querySelectorAll('[data-file]').forEach(item => item.addEventListener('click', () => {
-        loadFile(item.dataset.file, Number(item.dataset.line) || null);
-      }));
-    }
-
-    function missingLines(file) {
-      return Math.max(0, Number(file.total_lines || 0) - Number(file.covered_lines || 0));
-    }
-
-    function missingBranches(file) {
-      return Math.max(0, Number(file.total_branches || 0) - Number(file.covered_branches || 0));
-    }
-
-    function coverageTone(rate) {
-      if (rate === null || rate === undefined || rate < 0.6) return 'critical';
-      if (rate < 0.85) return 'attention';
-      return '';
-    }
-
-    function formatPointDelta(delta) {
-      if (delta === null || delta === undefined) return '';
-      const points = delta * 100;
-      return `${points > 0 ? '+' : ''}${points.toFixed(1)} pp`;
-    }
-
-    function filePriority(file) {
-      const comparison = state.fileComparison.get(file.file_path);
-      const regressionPenalty = comparison && comparison.line_rate_delta < 0 ? Math.abs(comparison.line_rate_delta) * 100 : 0;
-      return missingLines(file) * 2 + missingBranches(file) * 3 + regressionPenalty * 5;
-    }
-
-    function renderFiles() {
-      const list = document.getElementById('fileList');
-      const query = state.fileQuery.toLowerCase();
-      const sort = document.getElementById('fileSort').value;
-      const files = state.files
-        .filter(file => file.file_path.toLowerCase().includes(query))
-        .sort((left, right) => {
-          if (sort === 'path') return left.file_path.localeCompare(right.file_path);
-          if (sort === 'coverage') return (left.line_rate ?? 1) - (right.line_rate ?? 1) || left.file_path.localeCompare(right.file_path);
-          return filePriority(right) - filePriority(left) || (left.line_rate ?? 1) - (right.line_rate ?? 1);
-        });
-      document.getElementById('fileListCount').textContent = `${files.length} / ${state.files.length}`;
-      if (!files.length) {
-        list.innerHTML = '<div class="empty">No matching files.</div>';
-        return;
-      }
-      list.innerHTML = files.map(file => {
-        const missed = missingLines(file);
-        const branchGaps = missingBranches(file);
-        const comparison = state.fileComparison.get(file.file_path);
-        const delta = comparison ? comparison.line_rate_delta : null;
-        const deltaClass = delta < 0 ? 'negative' : delta > 0 ? 'positive' : '';
-        return `
-        <button class="file-item ${coverageTone(file.line_rate)}${state.selectedFile === file.file_path ? ' selected' : ''}" data-file="${esc(file.file_path)}" type="button">
-          <span class="file-row">
-            <span class="file-name" title="${esc(file.file_path)}">${esc(file.file_path)}</span>
-            <span class="file-rate">${pct(file.line_rate)}</span>
-          </span>
-          <span class="file-bar"><span style="width:${Math.max(0, Math.min(100, (file.line_rate || 0) * 100))}%"></span></span>
-          <span class="file-meta">
-            <span>${missed} missed${branchGaps ? `, ${branchGaps} branch gaps` : ''}</span>
-            <span class="file-delta ${deltaClass}">${formatPointDelta(delta)}</span>
-          </span>
-        </button>
-      `;
-      }).join('');
-      list.querySelectorAll('[data-file]').forEach(item => item.addEventListener('click', () => loadFile(item.dataset.file)));
-    }
-
-    function lineStatus(line) {
-      if (!line || !line.count_line) return 'neutral';
-      return line.covered ? 'covered' : 'missed';
-    }
-
-    function changedLinesForFile(filePath) {
-      return state.changedByFile.get(filePath) || new Map();
-    }
-
-    function lineSummary(payload) {
-      const lines = payload.lines || [];
-      const covered = lines.filter(line => line.count_line && line.covered).length;
-      const missed = lines.filter(line => line.count_line && !line.covered).length;
-      const branchRisk = lines.filter(line => Number(line.total_branches || 0) > Number(line.covered_branches || 0)).length;
-      const changed = changedLinesForFile(payload.file.file_path).size;
-      document.getElementById('fileLineSummary').innerHTML = `
-        <span class="summary-item"><span class="summary-mark covered"></span>${covered} covered</span>
-        <span class="summary-item"><span class="summary-mark missed"></span>${missed} missed</span>
-        <span class="summary-item"><span class="summary-mark branch"></span>${branchRisk} branch gaps</span>
-        <span class="summary-item"><span class="summary-mark changed"></span>${changed} changed</span>
-      `;
-    }
-
-    async function loadSourceLines(filePath, lines) {
-      if (!lines.length) return new Map();
-      const numbers = lines.map(line => line.line_number);
-      const end = Math.min(2000, Math.max(...numbers));
-      const requests = [];
-      for (let start = 1; start <= end; start += 200) {
-        requests.push(
-          getAllSectionJSON(`/api/source-lines?snapshot_id=${state.selected.id}&file_path=${encodeURIComponent(filePath)}&start=${start}&end=${Math.min(end, start + 199)}&max_words=5000`, 'lines')
-            .catch(() => [])
-        );
-      }
-      const chunks = await Promise.all(requests);
-      return new Map(chunks.flat().map(line => [line.line_number, line.text]));
-    }
-
-    function focusLines(payload) {
-      const changed = changedLinesForFile(payload.file.file_path);
-      if (state.lineFilter === 'missed') {
-        return payload.lines.filter(line => line.count_line && !line.covered).map(line => line.line_number);
-      }
-      if (state.lineFilter === 'branches') {
-        return payload.lines
-          .filter(line => Number(line.total_branches || 0) > Number(line.covered_branches || 0))
-          .map(line => line.line_number);
-      }
-      if (state.lineFilter === 'changed') return [...changed.keys()];
-      const attention = payload.lines
-        .filter(line => (line.count_line && !line.covered) || Number(line.total_branches || 0) > Number(line.covered_branches || 0))
-        .map(line => line.line_number);
-      return [...new Set([...attention, ...changed.keys()])].sort((a, b) => a - b);
-    }
-
-    function contextualLineSet(focus, maxLine) {
-      const visible = new Set();
-      focus.forEach(line => {
-        for (let current = Math.max(1, line - 2); current <= Math.min(maxLine, line + 2); current += 1) visible.add(current);
-      });
-      return visible;
-    }
-
-    function renderCoverageMap(payload, maxLine) {
-      const map = document.getElementById('coverageMap');
-      const changed = changedLinesForFile(payload.file.file_path);
-      const marks = payload.lines.filter(line => {
-        const missed = line.count_line && !line.covered;
-        const branchRisk = Number(line.total_branches || 0) > Number(line.covered_branches || 0);
-        return missed || branchRisk || changed.has(line.line_number);
-      }).slice(0, 600);
-      map.innerHTML = marks.map(line => {
-        const change = changed.get(line.line_number);
-        const missed = line.count_line && !line.covered;
-        const className = change?.status === 'regressed' ? 'regressed' : missed ? '' : 'branch';
-        const top = Math.max(0, Math.min(99.5, ((line.line_number - 1) / Math.max(1, maxLine)) * 100));
-        return `<button class="map-mark ${className}" data-line="${line.line_number}" style="top:${top}%" title="Line ${line.line_number}"></button>`;
-      }).join('');
-      map.querySelectorAll('[data-line]').forEach(mark => mark.addEventListener('click', () => {
-        showLine(Number(mark.dataset.line));
-      }));
-    }
-
-    function renderCoverageViewer(payload, sourceByLine) {
-      const viewer = document.getElementById('coverageViewer');
-      const coverageByLine = new Map(payload.lines.map(line => [line.line_number, line]));
-      const sourceNumbers = [...sourceByLine.keys()];
-      const coverageNumbers = payload.lines.map(line => line.line_number);
-      const maxLine = Math.min(2000, Math.max(0, ...sourceNumbers, ...coverageNumbers));
-      const allNumbers = sourceNumbers.length
-        ? Array.from({length: maxLine}, (_, index) => index + 1)
-        : [...new Set(coverageNumbers)].filter(line => line <= maxLine).sort((a, b) => a - b);
-      const focus = focusLines(payload);
-      state.focusLines = focus;
-      const contextual = state.lineFilter === 'source' ? null : contextualLineSet(focus, maxLine);
-      const visible = contextual ? allNumbers.filter(line => contextual.has(line)) : allNumbers;
-      if (!visible.length) {
-        const label = state.lineFilter === 'changed' ? 'No line-level changes against this baseline.' : `No ${state.lineFilter} coverage gaps.`;
-        viewer.innerHTML = `<div class="empty">${esc(label)}</div>`;
-        renderCoverageMap(payload, maxLine);
-        updateNavigation();
-        return;
-      }
-      const changed = changedLinesForFile(payload.file.file_path);
-      let previous = null;
-      viewer.innerHTML = visible.map(lineNumber => {
-        const line = coverageByLine.get(lineNumber);
-        const status = lineStatus(line);
-        const branchRisk = Number(line?.total_branches || 0) > Number(line?.covered_branches || 0);
-        const change = changed.get(lineNumber);
-        const source = sourceByLine.get(lineNumber);
-        const sourceText = source === undefined ? '<span class="line-empty-source">source unavailable</span>' : esc(source);
-        const breakRow = previous !== null && lineNumber - previous > 1
-          ? `<div class="context-break">${lineNumber - previous - 1} lines hidden</div>`
-          : '';
-        previous = lineNumber;
-        let meta = '';
-        if (line?.count_line && !line.covered) meta = 'MISS';
-        else if (branchRisk) meta = `B ${line.covered_branches}/${line.total_branches}`;
-        else if (line?.count_line) meta = `${line.hits}x`;
-        const title = [
-          line?.count_line ? `${line.hits} hits` : 'not executable',
-          branchRisk ? `${line.covered_branches}/${line.total_branches} branches` : '',
-          change ? `${change.status} vs baseline` : ''
-        ].filter(Boolean).join(', ');
-        return `${breakRow}
-          <div id="source-line-${lineNumber}" class="source-line ${status}${branchRisk ? ' branch-risk' : ''}${change ? ` ${change.status}` : ''}" data-line="${lineNumber}" title="${esc(title)}">
-            <span class="source-line-number">${lineNumber}</span>
-            <span class="coverage-gutter"></span>
-            <code class="line-code">${sourceText}</code>
-            <span class="source-line-meta">${esc(meta)}</span>
-          </div>
-        `;
-      }).join('');
-      viewer.querySelectorAll('[data-line]').forEach(row => row.addEventListener('click', () => {
-        inspectLine(Number(row.dataset.line));
-      }));
-      renderCoverageMap(payload, maxLine);
-      updateNavigation();
-    }
-
-    function clusterLines(numbers) {
-      const sorted = [...new Set(numbers)].sort((a, b) => a - b);
-      const clusters = [];
-      for (const line of sorted) {
-        const current = clusters[clusters.length - 1];
-        if (current && line === current.end + 1) current.end = line;
-        else clusters.push({start: line, end: line});
-      }
-      return clusters;
-    }
-
-    function renderDiagnosis(payload) {
-      const file = payload.file;
-      const missed = payload.lines.filter(line => line.count_line && !line.covered).map(line => line.line_number);
-      const branchGaps = payload.lines
-        .filter(line => Number(line.total_branches || 0) > Number(line.covered_branches || 0))
-        .map(line => line.line_number);
-      const changed = changedLinesForFile(file.file_path);
-      const regressions = [...changed.values()].filter(line => line.status === 'regressed');
-      const clusters = clusterLines(missed);
-      const comparison = state.fileComparison.get(file.file_path);
-      let title = 'Coverage is complete';
-      let detail = 'No executable line or branch gaps are reported for this file.';
-      if (regressions.length) {
-        title = `${regressions.length} regression${regressions.length === 1 ? '' : 's'} to recover`;
-        detail = `Start at line ${regressions[0].line_number}; it was covered in the baseline and is missed now.`;
-      } else if (missed.length) {
-        const first = clusters[0];
-        title = `${missed.length} executable line${missed.length === 1 ? '' : 's'} missed`;
-        detail = `Start with the uncovered region at ${first.start === first.end ? `line ${first.start}` : `lines ${first.start}-${first.end}`}.`;
-      } else if (branchGaps.length) {
-        title = `${branchGaps.length} partial branch line${branchGaps.length === 1 ? '' : 's'}`;
-        detail = `Line ${branchGaps[0]} is executed, but not every condition outcome is tested.`;
-      }
-      const rate = Math.round((file.line_rate || 0) * 1000) / 10;
-      const delta = comparison ? formatPointDelta(comparison.line_rate_delta) : '';
-      document.getElementById('diagnosisContent').innerHTML = `
-        <div class="coverage-score">
-          <div class="score-ring" style="--coverage:${Math.max(0, Math.min(100, rate))}"><strong>${rate.toFixed(1)}%</strong></div>
-          <div><strong>${esc(title)}</strong><span>${esc(detail)}</span>${delta ? `<div class="file-delta ${comparison.line_rate_delta < 0 ? 'negative' : 'positive'}" style="margin-top:6px">${esc(delta)} vs baseline</div>` : ''}</div>
-        </div>
-      `;
-      const gapItems = [
-        ...clusters.map(cluster => ({kind: 'missed', start: cluster.start, end: cluster.end})),
-        ...branchGaps.filter(line => !missed.includes(line)).map(line => ({kind: 'branch', start: line, end: line}))
-      ].slice(0, 10);
-      document.getElementById('gapList').innerHTML = gapItems.length ? gapItems.map(item => {
-        const label = item.start === item.end ? `Line ${item.start}` : `Lines ${item.start}-${item.end}`;
-        const count = item.end - item.start + 1;
-        return `
-          <button class="gap-button ${item.kind === 'branch' ? 'branch' : ''}" type="button" data-line="${item.start}" data-filter="${item.kind === 'branch' ? 'branches' : 'missed'}">
-            <span class="gap-dot"></span><code>${label}</code><span class="muted">${item.kind === 'branch' ? 'branch' : `${count} line${count === 1 ? '' : 's'}`}</span>
-          </button>
-        `;
-      }).join('') : '<div class="muted">No uncovered regions in this file.</div>';
-      document.querySelectorAll('#gapList [data-line]').forEach(button => button.addEventListener('click', () => {
-        setLineFilter(button.dataset.filter);
-        showLine(Number(button.dataset.line));
-      }));
-    }
-
-    function updateNavigation() {
-      const enabled = state.focusLines.length > 0;
-      document.getElementById('prevGap').disabled = !enabled;
-      document.getElementById('nextGap').disabled = !enabled;
-    }
-
-    function showLine(lineNumber) {
-      const row = document.getElementById(`source-line-${lineNumber}`);
-      if (!row && state.lineFilter !== 'source') {
-        setLineFilter('source');
-        requestAnimationFrame(() => showLine(lineNumber));
-        return;
-      }
-      row?.scrollIntoView({block: 'center', behavior: 'smooth'});
-      if (row) inspectLine(lineNumber);
-    }
-
-    function navigateGap(direction) {
-      if (!state.focusLines.length) return;
-      const current = state.currentLine || (direction > 0 ? 0 : Number.MAX_SAFE_INTEGER);
-      const ordered = [...state.focusLines].sort((a, b) => a - b);
-      let target = direction > 0
-        ? ordered.find(line => line > current)
-        : [...ordered].reverse().find(line => line < current);
-      if (target === undefined) target = direction > 0 ? ordered[0] : ordered[ordered.length - 1];
-      showLine(target);
-    }
-
-    async function inspectLine(lineNumber) {
-      if (!state.selectedPayload || !state.selectedFile) return;
-      state.currentLine = lineNumber;
-      document.querySelectorAll('.source-line.selected').forEach(row => row.classList.remove('selected'));
-      document.getElementById(`source-line-${lineNumber}`)?.classList.add('selected');
-      const metric = state.selectedPayload.lines.find(line => line.line_number === lineNumber);
-      const change = changedLinesForFile(state.selectedFile).get(lineNumber);
-      const inspector = document.getElementById('lineInspector');
-      inspector.innerHTML = '<div class="muted">Loading history...</div>';
-      const history = await getJSON(
-        `/api/line-history?file_path=${encodeURIComponent(state.selectedFile)}&line_number=${lineNumber}&repo_path=${encodeURIComponent(currentProject()?.repo_path || '')}&suite=${encodeURIComponent(state.selected.suite)}&max_words=5000`
-      ).catch(() => []);
-      if (state.currentLine !== lineNumber) return;
-      const status = !metric?.count_line ? 'Not executable' : metric.covered ? 'Covered' : 'Missed';
-      const branches = metric?.total_branches ? `${metric.covered_branches}/${metric.total_branches}` : 'None';
-      inspector.innerHTML = `
-        <div class="line-facts">
-          <div class="line-fact"><span>Line</span><strong>${lineNumber}</strong></div>
-          <div class="line-fact"><span>Status</span><strong>${status}</strong></div>
-          <div class="line-fact"><span>Hits</span><strong>${metric?.hits ?? 0}</strong></div>
-          <div class="line-fact"><span>Branches</span><strong>${branches}</strong></div>
-        </div>
-        ${change ? `<div class="file-delta ${change.status === 'regressed' ? 'negative' : change.status === 'improved' ? 'positive' : ''}">${esc(change.status)} against baseline</div>` : ''}
-        ${history.length ? `
-          <div class="history-track" title="${history.length} snapshots">
-            ${history.map(point => `<span class="history-point${point.covered ? ' covered' : ''}"></span>`).join('')}
-          </div>
-          <div class="history-caption">
-            <span>${new Date(history[0].created_at).toLocaleDateString()}</span>
-            <span>${history.length} snapshots</span>
-            <span>${new Date(history[history.length - 1].created_at).toLocaleDateString()}</span>
-          </div>
-        ` : '<div class="muted" style="margin-top:8px">No earlier line history.</div>'}
-      `;
-    }
-
-    function setLineFilter(filter) {
-      state.lineFilter = filter;
-      document.querySelectorAll('#lineFilter button').forEach(button => button.classList.toggle('active', button.dataset.filter === filter));
-      if (state.selectedPayload) renderCoverageViewer(state.selectedPayload, state.sourceByLine);
-    }
-
-    async function loadFile(filePath, targetLine = null) {
-      state.selectedFile = filePath;
-      state.currentLine = null;
-      document.getElementById('selectedFile').textContent = filePath;
-      document.getElementById('fileName').textContent = filePath.split('/').pop();
-      document.getElementById('filePath').textContent = filePath;
-      renderFiles();
-      const payload = await getAllFileJSON(`/api/snapshots/${state.selected.id}/files/${encodeURIComponent(filePath).replaceAll('%2F', '/')}?max_words=5000`);
-      if (state.selectedFile !== filePath) return;
-      state.selectedPayload = payload;
-      lineSummary(payload);
-      const sourceByLine = await loadSourceLines(filePath, payload.lines);
-      if (state.selectedFile !== filePath) return;
-      state.sourceByLine = sourceByLine;
-      renderCoverageViewer(payload, sourceByLine);
-      renderDiagnosis(payload);
-      const rate = payload.file.line_rate;
-      const health = document.getElementById('fileHealth');
-      health.textContent = pct(rate);
-      health.className = `health-badge ${rate >= 0.85 ? 'good' : rate >= 0.6 ? 'warn' : 'danger'}`;
-      if (targetLine) requestAnimationFrame(() => showLine(targetLine));
-    }
-
-    function trendDeltaSummary(deltas) {
-      const metrics = [
-        ['line_rate', 'Line'],
-        ['branch_rate', 'Branch'],
-        ['function_rate', 'Function'],
-        ['region_rate', 'Region']
-      ];
-      return metrics
-        .filter(([key]) => deltas[key] !== null && deltas[key] !== undefined)
-        .map(([key, label]) => `${label} ${formatPointDelta(deltas[key])}`)
-        .join(' · ');
-    }
-
-    async function loadScopedTrend() {
-      if (!state.selected || !state.trendScope) {
-        renderTrend([], 'No lineage selected');
-        return;
-      }
-      const [kind, reference] = state.trendScope.split(':', 2);
-      if (kind === 'worktree') {
-        const params = new URLSearchParams({suite: state.selected.suite, limit: '200'});
-        let progress;
-        try {
-          progress = await getJSON(`/api/worktrees/${encodeURIComponent(reference)}/progress?${params}`);
-        } catch {
-          renderTrend([], `No frozen ${state.selected.suite} baseline for this worktree`);
-          return;
-        }
-        const worktree = progress.worktree;
-        const deltas = Object.values(progress.deltas).filter(value => value !== null && value !== undefined);
-        const verdict = deltas.some(value => value < 0)
-          ? 'regressed'
-          : deltas.some(value => value > 0) ? 'improved' : 'unchanged';
-        const name = worktree.name || worktree.branch || shortPath(worktree.path);
-        const summary = trendDeltaSummary(progress.deltas);
-        renderTrend(
-          progress.points,
-          `${name} vs frozen ${worktree.base_ref} · ${verdict}${summary ? ` · ${summary}` : ''}`
-        );
-        return;
-      }
-      const params = new URLSearchParams({
-        repo_path: currentProject()?.repo_path || '',
-        branch: reference,
-        suite: state.selected.suite,
-        limit: '200'
-      });
-      const points = await getAllJSON(`/api/trend?${params}&max_words=5000`);
-      renderTrend(points, `Reference ${reference} · ${state.selected.suite}`);
-    }
-
-    function renderTrend(points, label) {
-      const svg = document.getElementById('trend');
-      const legend = document.getElementById('trendLegend');
-      document.getElementById('trendLabel').textContent = label || 'overall';
-      svg.innerHTML = '';
-      const series = [
-        {key: 'line_rate', label: 'Line', color: '#0f766e'},
-        {key: 'branch_rate', label: 'Branch', color: '#d97706'},
-        {key: 'function_rate', label: 'Function', color: '#2563eb'},
-        {key: 'region_rate', label: 'Region', color: '#c0265e'}
-      ].filter(item => points.some(point => point[item.key] !== null && point[item.key] !== undefined));
-      legend.innerHTML = series.map(item => {
-        const latest = [...points].reverse().find(point => point[item.key] !== null && point[item.key] !== undefined);
-        return `
-          <span class="trend-key" style="--series-color:${item.color}">
-            <span class="trend-swatch"></span>${item.label} <strong>${pct(latest?.[item.key])}</strong>
-          </span>
-        `;
-      }).join('');
-      const width = 900, height = 240, padX = 36, padY = 24;
-      const grid = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-      for (let i = 0; i <= 4; i++) {
-        const y = padY + (height - padY * 2) * i / 4;
-        grid.innerHTML += `<line x1="${padX}" y1="${y}" x2="${width - padX}" y2="${y}" stroke="#d8dde6" stroke-width="1"/><text x="2" y="${y + 4}" fill="#687385" font-size="11">${100 - i * 25}%</text>`;
-      }
-      svg.appendChild(grid);
-      if (!points.length || !series.length) return;
-      const xFor = index => padX + (width - padX * 2) * (points.length === 1 ? 0.5 : index / (points.length - 1));
-      const yFor = value => height - padY - (value * (height - padY * 2));
-      const baselineIndex = points.findIndex(point => point.point_kind === 'baseline');
-      if (baselineIndex >= 0) {
-        const x = xFor(baselineIndex);
-        svg.innerHTML += `
-          <line x1="${x}" y1="${padY}" x2="${x}" y2="${height - padY}" stroke="#98a2b3" stroke-width="1" stroke-dasharray="4 4"/>
-          <text x="${x + 5}" y="${padY + 11}" fill="#667085" font-size="10">frozen baseline</text>
-        `;
-      }
-      for (const item of series) {
-        let segment = [];
-        const segments = [];
-        const circles = [];
-        points.forEach((point, index) => {
-          const value = point[item.key];
-          if (value === null || value === undefined) {
-            if (segment.length) segments.push(segment);
-            segment = [];
-            return;
-          }
-          const x = xFor(index);
-          const y = yFor(value);
-          segment.push(`${x},${y}`);
-          const isBaseline = point.point_kind === 'baseline';
-          circles.push(
-            `<circle cx="${x}" cy="${y}" r="${isBaseline ? 4.5 : 3.25}" fill="${item.color}" stroke="${isBaseline ? '#344054' : '#ffffff'}" stroke-width="${isBaseline ? 2 : 1.5}"><title>${isBaseline ? 'Frozen baseline | ' : ''}${item.label}: ${pct(value)} | ${new Date(point.created_at).toLocaleString()}</title></circle>`
-          );
-        });
-        if (segment.length) segments.push(segment);
-        for (const coordinates of segments) {
-          if (coordinates.length > 1) {
-            svg.innerHTML += `<polyline fill="none" stroke="${item.color}" stroke-width="2.75" stroke-linecap="round" stroke-linejoin="round" points="${coordinates.join(' ')}"/>`;
-          }
-        }
-        svg.innerHTML += circles.join('');
-      }
-    }
-
-    async function ingest() {
-      const reportPath = document.getElementById('reportPath').value.trim();
-      if (!reportPath) return;
-      await getJSON('/api/ingest', {
-        method: 'POST',
-        headers: {'content-type': 'application/json'},
-        body: JSON.stringify({
-          report_path: reportPath,
-          format: document.getElementById('format').value,
-          repo_path: currentProject()?.repo_path || undefined
-        })
-      });
-      await refresh();
-    }
-
-    async function saveCompaction() {
-      if (!state.projectKey) return;
-      const body = {
-        compaction: {
-          compaction_enabled: document.getElementById('compactionEnabled').checked,
-          compaction_after_days: Number(document.getElementById('compactionAfterDays').value),
-          compaction_interval_seconds: Number(document.getElementById('compactionIntervalSeconds').value),
-          compaction_batch_size: Number(document.getElementById('compactionBatchSize').value)
-        }
-      };
-      const settings = await getJSON(`/api/projects/${encodeURIComponent(currentProjectId())}`, {
-        method: 'PATCH',
-        headers: {'content-type': 'application/json'},
-        body: JSON.stringify(body)
-      });
-      const project = currentProject();
-      if (project) project.compaction = settings;
-      renderCompaction(project);
-      document.getElementById('maintenanceMessage').textContent = 'Policy saved.';
-    }
-
-    async function compactNow() {
-      if (!state.projectKey) return;
-      const result = await getJSON(`/api/projects/${encodeURIComponent(currentProjectId())}/compact`, {method: 'POST'});
-      document.getElementById('maintenanceMessage').textContent =
-        `${result.status || 'completed'} · ${result.compacted_snapshots || 0} snapshots · ${result.bytes_after || 0} compressed bytes`;
-      await refresh();
-    }
-
-    function preferredBaselineId() {
-      if (!state.selected) return '';
-      const candidates = projectSnapshots().filter(snapshot => snapshot.id !== state.selected.id);
-      const worktree = state.worktrees.find(item =>
-        item.repo_path === state.selected.repo_path &&
-        item.baseline_snapshot_id &&
-        (!item.branch || item.branch === state.selected.branch)
-      );
-      if (worktree && candidates.some(snapshot => snapshot.id === worktree.baseline_snapshot_id)) {
-        return worktree.baseline_snapshot_id;
-      }
-      const ranked = candidates.map((snapshot, index) => {
-        let score = -index;
-        if (snapshot.suite === state.selected.suite) score += 100;
-        if (snapshot.branch === state.selected.branch) score += 200;
-        if (state.selected.base_ref && snapshot.branch === state.selected.base_ref) score += 400;
-        return {snapshot, score};
-      }).sort((left, right) => right.score - left.score);
-      return ranked[0]?.snapshot.id || '';
-    }
-
-    async function loadComparison(refreshInsightList = true, chooseDefault = false) {
-      const select = document.getElementById('baselineSelect');
-      if (chooseDefault || !select.value || select.value === state.selected?.id) select.value = preferredBaselineId();
-      const baselineId = select.value;
-      const banner = document.getElementById('comparisonBanner');
-      if (!state.selected || !baselineId || baselineId === state.selected.id) {
-        state.comparison = null;
-        state.changedByFile = new Map();
-        state.fileComparison = new Map();
-        banner.hidden = true;
-        return;
-      }
-      const baseUrl = `/api/compare?snapshot_id=${state.selected.id}&baseline_snapshot_id=${baselineId}&max_words=5000`;
-      const result = await getJSON(`${baseUrl}&view=overview`);
-      result.files = await getAllSectionJSON(`${baseUrl}&view=files`, 'files');
-      result.changed_lines = await getAllSectionJSON(
-        `/api/changed-lines?snapshot_id=${state.selected.id}&baseline_snapshot_id=${baselineId}&max_words=5000`,
-        'lines'
-      );
-      state.comparison = result;
-      state.fileComparison = new Map(result.files.map(file => [file.file_path, file]));
-      state.changedByFile = new Map();
-      result.changed_lines.forEach(line => {
-        if (!state.changedByFile.has(line.file_path)) state.changedByFile.set(line.file_path, new Map());
-        state.changedByFile.get(line.file_path).set(line.line_number, line);
-      });
-      const statusCount = status => result.changed_lines.filter(line => line.status === status).length;
-      const baseline = state.snapshots.find(snapshot => snapshot.id === baselineId);
-      banner.hidden = false;
-      banner.innerHTML = `
-        <div class="comparison-label"><strong>Compared with</strong> ${esc(baseline ? optionLabel(baseline) : baselineId)}</div>
-        <div class="comparison-stat"><strong class="${result.overall.line_rate_delta < 0 ? 'status-regressed' : result.overall.line_rate_delta > 0 ? 'status-improved' : ''}">${formatPointDelta(result.overall.line_rate_delta) || '0.0 pp'}</strong><span class="muted">overall</span></div>
-        <div class="comparison-stat"><strong class="status-regressed">${statusCount('regressed')}</strong><span class="muted">regressed</span></div>
-        <div class="comparison-stat"><strong class="status-improved">${statusCount('improved')}</strong><span class="muted">improved</span></div>
-        <div class="comparison-stat"><strong>${result.changed_lines.length}</strong><span class="muted">line changes</span></div>
-      `;
-      renderFiles();
-      if (state.selectedPayload && state.selectedPayload.file.file_path === state.selectedFile) {
-        lineSummary(state.selectedPayload);
-        renderCoverageViewer(state.selectedPayload, state.sourceByLine);
-        renderDiagnosis(state.selectedPayload);
-      }
-      if (refreshInsightList) await renderInsights(baselineId);
-    }
-
-    async function compare() {
-      await loadComparison(true);
-    }
-
-    document.getElementById('refreshBtn').addEventListener('click', refresh);
-    document.getElementById('ingestBtn').addEventListener('click', ingest);
-    document.getElementById('saveCompactionBtn').addEventListener('click', () => {
-      saveCompaction().catch(error => { document.getElementById('maintenanceMessage').textContent = error.message; });
-    });
-    document.getElementById('compactNowBtn').addEventListener('click', () => {
-      compactNow().catch(error => { document.getElementById('maintenanceMessage').textContent = error.message; });
-    });
-    document.getElementById('compareBtn').addEventListener('click', compare);
-    document.getElementById('lineFilter').addEventListener('click', event => {
-      if (!event.target.matches('button[data-filter]') || !state.selectedFile) return;
-      setLineFilter(event.target.dataset.filter);
-    });
-    document.getElementById('prevGap').addEventListener('click', () => navigateGap(-1));
-    document.getElementById('nextGap').addEventListener('click', () => navigateGap(1));
-    document.getElementById('fileSearch').addEventListener('input', event => {
-      state.fileQuery = event.target.value;
-      renderFiles();
-    });
-    document.getElementById('fileSort').addEventListener('change', renderFiles);
-    document.getElementById('trendScope').addEventListener('change', async event => {
-      state.trendScope = event.target.value;
-      await loadScopedTrend();
-    });
-    document.getElementById('projectSelect').addEventListener('change', async event => {
-      state.projectKey = event.target.value;
-      state.trendScope = null;
-      await refresh();
-    });
-    document.getElementById('snapshotSelect').addEventListener('change', async event => {
-      state.selected = state.snapshots.find(snapshot => snapshot.id === event.target.value) || null;
-      if (state.selected) state.projectKey = state.selected.repo_key;
-      renderProjectSelector();
-      await renderSelected();
-    });
-    refresh().catch(error => {
-      document.getElementById('fileList').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
-    });
+    function rateCell(rate,covered,total) { return `<div class="rate-cell"><div class="rate-line"><span>${pct(rate)}</span><span class="muted">${int(covered)}/${int(total)}</span></div><div class="bar"><i style="width:${safeRate(rate)*100}%"></i></div></div>`; }
+    function renderFiles(data) { const items=data.files?.items||[]; $('filesMeta').textContent=data.files?`${int(data.files.total)} files · ${data.files.source==='current_vs_baseline'?'sorted by delta':'lowest current coverage first'}${data.files.truncated?' · showing a bounded slice':''}`:''; if(!items.length){$('fileRows').innerHTML='<tr><td colspan="7" class="empty">No coverage files in the selected snapshot.</td></tr>';return;} const measured=data.incremental?.status==='measured'; $('fileRows').innerHTML=items.map(file=>{const lineRate=measured?file.current_line_rate:file.line_rate,branchRate=measured?file.current_branch_rate:file.branch_rate,functionRate=measured?file.current_function_rate:file.function_rate,regionRate=measured?file.current_region_rate:file.region_rate,delta=measured?file.line_rate_delta:null; return `<tr data-file="${esc(file.file_path)}"><td class="path"><code title="${esc(file.file_path)}">${esc(file.file_path)}</code></td><td>${rateCell(lineRate,measured?file.current_covered_lines:file.covered_lines,measured?file.current_total_lines:file.total_lines)}</td><td class="num">${pct(branchRate)}</td><td class="num">${pct(functionRate)}</td><td class="num">${pct(regionRate)}</td><td class="${Number(delta)<0?'bad':Number(delta)>0?'good':'neutral'}">${signedPct(delta)}</td><td>${esc(data.current?.detail_retention||'compactable')}</td></tr>`;}).join(''); }
+    function renderCompaction(data) { const policy=data.compaction?.policy||{},inventory=data.compaction?.inventory||{},ratio=Number.isFinite(Number(inventory.compression_ratio))?`${(Number(inventory.compression_ratio)*100).toFixed(0)}%`:'—'; $('compactionInventory').innerHTML=[fact('Snapshots',int(inventory.snapshot_count)),fact('Payloads',int(inventory.compacted_snapshot_count)),fact('Relational',int(inventory.relational_snapshot_count)),fact('Protected bases',int(inventory.retained_incremental_base_count)),fact('Eligible now',int(inventory.eligible_snapshot_count)),fact('Original bytes',`${int(inventory.original_bytes)} B`),fact('Compressed bytes',`${int(inventory.compressed_bytes)} B`),fact('Saved',`${int(inventory.bytes_saved)} B`),fact('Compression',ratio),fact('Orphans',int(inventory.orphan_payload_count)),fact('Last payload',inventory.last_compacted_at?new Date(inventory.last_compacted_at).toLocaleString():'never')].join(''); $('compactionEnabled').checked=Boolean(policy.compaction_enabled); $('compactionAfterDays').value=policy.compaction_after_days??''; $('compactionIntervalSeconds').value=policy.compaction_interval_seconds??''; $('compactionBatchSize').value=policy.compaction_batch_size??''; const consistent=inventory.payload_inventory_consistent!==false; $('compactionHealth').textContent=!consistent?'inventory error':inventory.compacted_snapshot_count?'payloads verified':'no payloads yet'; $('compactionHealth').className=`status ${consistent&&inventory.compacted_snapshot_count?'completed':consistent?'':'failed'}`; }
+    function renderTimeline(data) { const points=[...(data.history?.points||[])]; $('historyStatus').textContent=data.history?.truncated?`showing ${data.history.returned} of more snapshots`:`${data.history?.returned||0} snapshots`; $('timelineMeta').textContent=points.length?`${points.length} measurements · newest selected in the controls above`:'No measurements yet.'; $('timelineRows').innerHTML=points.slice().reverse().map(point=>`<tr class="${point.id===data.current?.id?'selected':''}"><td><strong>${esc(new Date(point.created_at).toLocaleString())}</strong><br><span class="suite">${esc(point.suite)} · ${esc(point.format)}</span></td><td class="num">${pct(point.line_rate)}<br><span class="muted">${int(point.covered_lines)}/${int(point.total_lines)}</span></td><td class="num">${pct(point.branch_rate)}<br><span class="muted">${int(point.covered_branches)}/${int(point.total_branches)}</span></td><td class="num">${pct(point.function_rate)}<br><span class="muted">${int(point.covered_functions)}/${int(point.total_functions)}</span></td><td class="num">${pct(point.region_rate)}<br><span class="muted">${int(point.covered_regions)}/${int(point.total_regions)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; }
+    function render(data) { const project=data.project||{}; $('projectMeta').textContent=`${short(project.repo_path)} · ${int(project.snapshot_count)} snapshots · ${int(project.composite_snapshot_count)} composite · ${int(project.run_count)} runs`; renderControls(data); renderMetrics(data); renderChart(data.history?.points||[]); renderRuns(data); renderMeasurement(data); renderIncremental(data); renderComposite(data); renderFiles(data); renderCompaction(data); renderTimeline(data); }
+    async function openFile(filePath) { if(!state.currentId)return; $('fileDrawer').hidden=false; $('drawerTitle').textContent='Loading file detail…'; $('drawerPath').textContent=filePath; $('drawerSummary').innerHTML=''; $('drawerLines').innerHTML=''; try { const data=await api(`/api/snapshots/${encodeURIComponent(state.currentId)}/files?file_path=${encodeURIComponent(filePath)}&max_words=5000`),file=data.file||{}; $('drawerTitle').textContent=`${pct(file.line_rate)} line coverage`; $('drawerSummary').innerHTML=`<div class="provenance">${fact('Lines',`${int(file.covered_lines)}/${int(file.total_lines)}`)}${fact('Branches',`${int(file.covered_branches)}/${int(file.total_branches)}`)}${fact('Functions',`${int(file.covered_functions)}/${int(file.total_functions)}`)}${fact('Regions',`${int(file.covered_regions)}/${int(file.total_regions)}`)}</div>`; const lines=data.lines||[]; $('drawerLines').innerHTML=lines.length?`<table class="line-table"><thead><tr><th>Line</th><th>Hits</th><th>State</th><th>Branches</th><th>Functions</th></tr></thead><tbody>${lines.slice(0,160).map(line=>`<tr><td class="line-no">${int(line.line_number)}</td><td>${int(line.hits)}</td><td class="${line.covered?'covered':'missed'}">${line.covered?'covered':'missed'}</td><td>${int(line.covered_branches)}/${int(line.total_branches)}</td><td>${int(line.covered_functions)}/${int(line.total_functions)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No line detail returned for this file.</div>'; } catch(error) { $('drawerTitle').textContent='File detail unavailable'; $('drawerLines').innerHTML=`<div class="empty">${esc(error.message)}</div>`; } }
+    async function saveCompaction() { const body={compaction:{compaction_enabled:$('compactionEnabled').checked,compaction_after_days:Number($('compactionAfterDays').value),compaction_interval_seconds:Number($('compactionIntervalSeconds').value),compaction_batch_size:Number($('compactionBatchSize').value)}}; try { await api('/api/projects/project?repo_path='+encodeURIComponent(state.repoPath),{method:'PATCH',body:JSON.stringify(body)}); $('maintenanceMessage').textContent='Policy saved.'; queueRefresh(); } catch(error) { $('maintenanceMessage').textContent=error.message; } }
+    async function compactNow() { $('compactNowBtn').disabled=true; $('maintenanceMessage').textContent='Compaction pass running…'; try { const result=await api('/api/projects/project/compact?repo_path='+encodeURIComponent(state.repoPath),{method:'POST'}); $('maintenanceMessage').textContent=`${int(result.compacted_snapshots)} snapshot payload(s) written.`; queueRefresh(); } catch(error) { $('maintenanceMessage').textContent=error.message; } finally { $('compactNowBtn').disabled=false; } }
+    $('refreshBtn').addEventListener('click',()=>refresh()); $('projectSelect').addEventListener('change',()=>{state.projectKey=$('projectSelect').value||null;state.repoPath=currentProject()?.repo_path||null;state.currentId=null;state.baselineId=null;state.compositeCurrentId=null;state.compositeBaselineId=null;refresh();}); $('currentSelect').addEventListener('change',()=>{state.currentId=$('currentSelect').value||null;state.baselineId=$('baselineSelect').value||null;refresh();}); $('baselineSelect').addEventListener('change',()=>{state.baselineId=$('baselineSelect').value||null;refresh();}); $('compositeCurrentSelect').addEventListener('change',()=>{state.compositeCurrentId=$('compositeCurrentSelect').value||null;state.compositeBaselineId=$('compositeBaselineSelect').value||null;refresh();}); $('compositeBaselineSelect').addEventListener('change',()=>{state.compositeBaselineId=$('compositeBaselineSelect').value||null;refresh();}); $('saveCompactionBtn').addEventListener('click',saveCompaction); $('compactNowBtn').addEventListener('click',compactNow); $('closeDrawer').addEventListener('click',()=>{$('fileDrawer').hidden=true;}); $('fileDrawer').addEventListener('click',event=>{if(event.target===$('fileDrawer'))$('fileDrawer').hidden=true;}); $('fileRows').addEventListener('click',event=>{const row=event.target.closest('[data-file]');if(row)openFile(row.dataset.file);}); document.addEventListener('keydown',event=>{if(event.key==='Escape')$('fileDrawer').hidden=true;}); document.addEventListener('visibilitychange',()=>{if(isForeground()){refresh({silent:true});}else{if(state.refreshTimer)clearTimeout(state.refreshTimer);state.refreshTimer=null;state.refreshPending=false;closeStream();setLive('paused');}}); refresh();
   </script>
 </body>
 </html>

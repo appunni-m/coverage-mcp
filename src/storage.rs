@@ -26,6 +26,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::compaction::{CompactionPolicy, CompactionResult};
+use crate::composite::{
+    self, CompositeArtifactDescriptor, CompositeComponentInput, MAPPING_VERSION, REGIONS_SCHEMA,
+};
 use crate::config::{MAX_RUN_LOG_MAX_BYTES, MIN_RUN_LOG_MAX_BYTES, ServerConfig};
 use crate::error::{AppError, AppResult};
 use crate::git::{GitInfo, inspect_git, is_clean, merge_base, read_file_at_commit};
@@ -46,6 +49,8 @@ pub const MAX_RUN_CONCURRENCY: usize = 32;
 static FORCE_ARTIFACT_FINGERPRINT_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_CLAIM_FALSE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_CLAIM_RUN_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_CONTROL_POISON_BEFORE_REAP: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
@@ -68,6 +73,18 @@ static FORCE_REAP_CHILD_FAILURE: AtomicBool = AtomicBool::new(false);
 static FORCE_REAP_CONTROL_LOCK_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_RESOURCES_FINISH_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_RUN_COMMAND_POLL_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_EXECUTION_CONTEXT_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_SCHEMA_SNAPSHOT_MIGRATION_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_SCHEMA_RUN_MIGRATION_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_TEST_NAMES_QUERY_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_TEST_OBSERVATIONS_QUERY_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_SUMMARY_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
@@ -92,19 +109,32 @@ static FORCE_CLEAR_ARTIFACT_BASELINES_FAILURE: AtomicBool = AtomicBool::new(fals
 static FORCE_DUPLICATE_GROUP_QUERY_MODE: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
 static FORCE_DUPLICATE_SUMMARY_QUERY_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_COMPOSITE_COMPOSE_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_COMPOSITE_PREVIOUS_SNAPSHOT_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_COMPOSITE_QUERY_MAP_FAILURE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static FORCE_COMPOSITE_EXECUTION_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_COMPOSITE_PERSIST_FAILURE: AtomicBool = AtomicBool::new(false);
 
 const UPSERT_PROJECT_SETTINGS_SQL: &str = "INSERT INTO project_settings (repo_key, repo_path, created_at, updated_at, compaction_enabled, compaction_after_days, compaction_interval_seconds, compaction_batch_size) VALUES (?, ?, ?, ?, true, ?, ?, ?) ON CONFLICT (repo_key) DO UPDATE SET repo_path = excluded.repo_path, updated_at = excluded.updated_at";
 const UPSERT_REPOSITORY_SQL: &str = "INSERT INTO repositories (id, repo_key, last_seen) VALUES (?, ?, ?) ON CONFLICT (repo_key) DO UPDATE SET last_seen = excluded.last_seen";
 const UPDATE_PROJECT_SETTINGS_SQL: &str = "UPDATE project_settings SET updated_at = ?, compaction_enabled = ?, compaction_after_days = ?, compaction_interval_seconds = ?, compaction_batch_size = ? WHERE repo_key = ?";
 const UPDATE_COMPACTION_STATUS_SQL: &str = "UPDATE project_settings SET compaction_last_run_at = ?, compaction_last_status = ?, compaction_last_snapshot_count = ?, compaction_last_bytes_before = ?, compaction_last_bytes_after = ?, updated_at = ? WHERE repo_key = ?";
 const INSERT_RUN_ARTIFACT_SQL: &str = "INSERT INTO run_artifacts (run_id, kind, path, exists, size_bytes, coverage_format, suite, modified_by_run, ingest_status, snapshot_id, ingest_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-const INSERT_COMPLETED_RUN_SQL: &str = "INSERT INTO runs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at) SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ?, ?, ?, ?, stdout_path, stderr_path, ?, ?, queued_at, date_diff('millisecond', queued_at, started_at), cancellation_requested_at FROM run_jobs WHERE id = ?";
-const INSERT_SNAPSHOT_SQL: &str = "INSERT INTO snapshots (id, created_at, minute_bucket, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_COMPLETED_RUN_SQL: &str = "INSERT INTO runs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ?, ?, ?, ?, stdout_path, stderr_path, ?, ?, queued_at, date_diff('millisecond', queued_at, started_at), cancellation_requested_at, execution_mode, execution_identity, execution_label FROM run_jobs WHERE id = ?";
+const INSERT_SNAPSHOT_SQL: &str = "INSERT INTO snapshots (id, created_at, minute_bucket, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, detail_retention) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_FILE_SQL: &str = "INSERT INTO files (snapshot_id, file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_LINE_SQL: &str = "INSERT INTO lines (snapshot_id, file_path, line_number, hits, covered, count_line, total_branches, covered_branches, total_functions, covered_functions, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 const INSERT_TEST_COVERAGE_TEST_SQL: &str =
     "INSERT INTO test_coverage_tests (snapshot_id, test_name) VALUES (?, ?)";
 const INSERT_TEST_COVERAGE_OBSERVATION_SQL: &str = "INSERT INTO test_coverage_observations (snapshot_id, test_name, kind, file_path, line_number, region_key) VALUES (?, ?, ?, ?, ?, ?)";
+const INSERT_COMPOSITE_SNAPSHOT_SQL: &str = "INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_COMPOSITE_REGION_SQL: &str =
+    "INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES (?, ?, ?)";
 
 // The list is converted to JSON before grouping so equality is over the complete
 // ordered observation set, not a lossy digest or a delimiter-ambiguous string.
@@ -236,6 +266,36 @@ fn test_coverage_observation_from_row(row: &Row<'_>) -> duckdb::Result<Value> {
     }))
 }
 
+fn test_coverage_observation_tuple_from_row(
+    row: &Row<'_>,
+) -> duckdb::Result<(String, String, String, i64, String)> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, i64>(3)?,
+        row.get::<_, String>(4)?,
+    ))
+}
+
+type ExecutionContextRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn execution_context_values_from_row(row: &Row<'_>) -> duckdb::Result<ExecutionContextRow> {
+    Ok((
+        row.get::<_, Option<String>>(0)?,
+        row.get::<_, Option<String>>(1)?,
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+    ))
+}
+
 /// Mutable project-settings fields accepted by REST and the CLI.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ProjectSettingsPatch {
@@ -361,6 +421,39 @@ struct ArtifactBaseline {
     kind: String,
     path: String,
     fingerprint: ArtifactFingerprint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutionContext {
+    mode: String,
+    identity: String,
+    label: Option<String>,
+    arguments: Vec<String>,
+    baseline_snapshot_id: Option<String>,
+}
+
+type TestObservation = (String, String, i64, String);
+type TestObservationSets = BTreeMap<String, BTreeSet<TestObservation>>;
+
+impl ExecutionContext {
+    fn value(&self) -> Value {
+        let mut value = Map::new();
+        value.insert("mode".to_owned(), json!(self.mode));
+        value.insert("identity".to_owned(), json!(self.identity));
+        if let Some(label) = &self.label {
+            value.insert("label".to_owned(), json!(label));
+        }
+        if !self.arguments.is_empty() {
+            value.insert("arguments".to_owned(), json!(self.arguments));
+        }
+        if let Some(snapshot_id) = &self.baseline_snapshot_id {
+            value.insert(
+                "baseline".to_owned(),
+                json!({"kind":"explicit","snapshot_id":snapshot_id}),
+            );
+        }
+        Value::Object(value)
+    }
 }
 
 struct LogCaptureResult {
@@ -904,7 +997,7 @@ impl CoverageStore {
                     covered_lines INTEGER NOT NULL, total_branches INTEGER NOT NULL, covered_branches INTEGER NOT NULL,
                     total_functions INTEGER NOT NULL, covered_functions INTEGER NOT NULL, total_regions INTEGER NOT NULL,
                     covered_regions INTEGER NOT NULL, line_rate DOUBLE, branch_rate DOUBLE, function_rate DOUBLE,
-                    region_rate DOUBLE
+                    region_rate DOUBLE, detail_retention VARCHAR NOT NULL DEFAULT 'compactable'
                 );
                 CREATE TABLE IF NOT EXISTS files (
                     snapshot_id VARCHAR NOT NULL, file_path VARCHAR NOT NULL, total_lines INTEGER NOT NULL,
@@ -944,7 +1037,8 @@ impl CoverageStore {
                     branch VARCHAR, commit_sha VARCHAR, started_at TIMESTAMP NOT NULL, ended_at TIMESTAMP NOT NULL,
                     duration_ms INTEGER NOT NULL, exit_code INTEGER, status VARCHAR NOT NULL, stdout_path VARCHAR NOT NULL,
                     stderr_path VARCHAR NOT NULL, parsed_summary VARCHAR NOT NULL, artifact_paths VARCHAR NOT NULL,
-                    queued_at TIMESTAMP, queue_duration_ms INTEGER, cancellation_requested_at TIMESTAMP
+                    queued_at TIMESTAMP, queue_duration_ms INTEGER, cancellation_requested_at TIMESTAMP,
+                    execution_mode VARCHAR, execution_identity VARCHAR, execution_label VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS run_artifacts (
                     run_id VARCHAR NOT NULL, kind VARCHAR NOT NULL, path VARCHAR NOT NULL, exists BOOLEAN NOT NULL,
@@ -956,12 +1050,17 @@ impl CoverageStore {
                     size_bytes BIGINT, modified_ns BIGINT, sha256 VARCHAR,
                     PRIMARY KEY (run_id, kind)
                 );
+                CREATE TABLE IF NOT EXISTS run_execution_context (
+                    run_id VARCHAR PRIMARY KEY, arguments VARCHAR NOT NULL DEFAULT '[]',
+                    baseline_snapshot_id VARCHAR
+                );
                 CREATE TABLE IF NOT EXISTS run_jobs (
                     id VARCHAR PRIMARY KEY, command_id VARCHAR NOT NULL, command_name VARCHAR NOT NULL, command VARCHAR NOT NULL,
                     idempotency_key VARCHAR, cwd VARCHAR NOT NULL, repo_path VARCHAR NOT NULL, repo_key VARCHAR NOT NULL,
                     branch VARCHAR, commit_sha VARCHAR, queued_at TIMESTAMP NOT NULL, started_at TIMESTAMP, ended_at TIMESTAMP,
                     timeout_seconds INTEGER, max_summary_lines INTEGER NOT NULL, status VARCHAR NOT NULL, stdout_path VARCHAR NOT NULL,
-                    stderr_path VARCHAR NOT NULL, error VARCHAR NOT NULL, cancellation_requested_at TIMESTAMP
+                    stderr_path VARCHAR NOT NULL, error VARCHAR NOT NULL, cancellation_requested_at TIMESTAMP,
+                    execution_mode VARCHAR, execution_identity VARCHAR, execution_label VARCHAR
                 );
                 CREATE TABLE IF NOT EXISTS project_settings (
                     repo_key VARCHAR PRIMARY KEY, repo_path VARCHAR NOT NULL, created_at TIMESTAMP NOT NULL,
@@ -974,6 +1073,19 @@ impl CoverageStore {
                 CREATE TABLE IF NOT EXISTS coverage_compacted_payloads (
                     snapshot_id VARCHAR PRIMARY KEY, repo_key VARCHAR NOT NULL, compacted_at TIMESTAMP NOT NULL,
                     original_bytes BIGINT NOT NULL, compressed_bytes BIGINT NOT NULL, payload BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS composite_snapshots (
+                    id VARCHAR PRIMARY KEY, created_at TIMESTAMP NOT NULL, run_id VARCHAR NOT NULL,
+                    command_id VARCHAR NOT NULL, repo_path VARCHAR NOT NULL, repo_key VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL, mapping_version VARCHAR NOT NULL, inventory_hash VARCHAR,
+                    checkout_revision VARCHAR, checkout_dirty BOOLEAN NOT NULL, covered_regions BIGINT NOT NULL,
+                    total_regions BIGINT NOT NULL, region_rate DOUBLE, reasons VARCHAR NOT NULL,
+                    remediation VARCHAR NOT NULL, inventory VARCHAR NOT NULL, provenance VARCHAR NOT NULL,
+                    components VARCHAR NOT NULL, component_evidence VARCHAR NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS composite_regions (
+                    composite_snapshot_id VARCHAR NOT NULL, region_key VARCHAR NOT NULL,
+                    region VARCHAR NOT NULL, PRIMARY KEY (composite_snapshot_id, region_key)
                 );
                 CREATE TABLE IF NOT EXISTS repositories (
                     id VARCHAR PRIMARY KEY, repo_key VARCHAR UNIQUE NOT NULL, last_seen TIMESTAMP NOT NULL
@@ -990,12 +1102,41 @@ impl CoverageStore {
                 CREATE INDEX IF NOT EXISTS idx_runs_command_time ON runs(command_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_run_artifacts_kind ON run_artifacts(kind);
                 CREATE INDEX IF NOT EXISTS idx_run_artifact_baselines_run ON run_artifact_baselines(run_id);
+                CREATE INDEX IF NOT EXISTS idx_run_execution_context_baseline ON run_execution_context(baseline_snapshot_id);
                 CREATE INDEX IF NOT EXISTS idx_run_jobs_status_time ON run_jobs(status, queued_at);
                 CREATE INDEX IF NOT EXISTS idx_project_settings_updated ON project_settings(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_compacted_repo ON coverage_compacted_payloads(repo_key, compacted_at);
+                CREATE INDEX IF NOT EXISTS idx_composite_snapshots_repo_time ON composite_snapshots(repo_key, created_at);
+                CREATE INDEX IF NOT EXISTS idx_composite_snapshots_run ON composite_snapshots(run_id);
+                CREATE INDEX IF NOT EXISTS idx_composite_regions_snapshot ON composite_regions(composite_snapshot_id);
                 "#;
         self.with_connection(|connection| {
             connection.execute_batch(schema)?;
+            #[cfg(test)]
+            let snapshot_migration = if FORCE_SCHEMA_SNAPSHOT_MIGRATION_FAILURE
+                .swap(false, Ordering::SeqCst)
+            {
+                "THIS IS NOT VALID SQL"
+            } else {
+                "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS detail_retention VARCHAR; UPDATE snapshots SET detail_retention = 'compactable' WHERE detail_retention IS NULL;"
+            };
+            #[cfg(not(test))]
+            let snapshot_migration = "ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS detail_retention VARCHAR; UPDATE snapshots SET detail_retention = 'compactable' WHERE detail_retention IS NULL;";
+            connection.execute_batch(
+                snapshot_migration,
+            )?;
+            #[cfg(test)]
+            let run_migration = if FORCE_SCHEMA_RUN_MIGRATION_FAILURE.swap(false, Ordering::SeqCst)
+            {
+                "THIS IS NOT VALID SQL"
+            } else {
+                "ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_mode VARCHAR; ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_identity VARCHAR; ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_label VARCHAR; ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS execution_mode VARCHAR; ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS execution_identity VARCHAR; ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS execution_label VARCHAR;"
+            };
+            #[cfg(not(test))]
+            let run_migration = "ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_mode VARCHAR; ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_identity VARCHAR; ALTER TABLE runs ADD COLUMN IF NOT EXISTS execution_label VARCHAR; ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS execution_mode VARCHAR; ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS execution_identity VARCHAR; ALTER TABLE run_jobs ADD COLUMN IF NOT EXISTS execution_label VARCHAR;";
+            connection.execute_batch(
+                run_migration,
+            )?;
             Ok(())
         })
     }
@@ -1116,6 +1257,7 @@ impl CoverageStore {
         let settings = self.project_settings()?;
         self.with_read_connection(|connection| {
             let snapshot_count: i64 = connection.query_row("SELECT count(*) FROM snapshots WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
+            let composite_snapshot_count: i64 = connection.query_row("SELECT count(*) FROM composite_snapshots WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
             let command_count: i64 = connection.query_row("SELECT count(*) FROM registered_commands WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
             let run_count: i64 = connection.query_row("SELECT count(*) FROM runs WHERE repo_key = ?", params![project.repo_key], |row| row.get(0))?;
             let latest = connection
@@ -1131,6 +1273,10 @@ impl CoverageStore {
             result.insert("repo_key".to_owned(), json!(project.repo_key));
             result.insert("repo_path".to_owned(), json!(project.repo_path));
             result.insert("snapshot_count".to_owned(), json!(snapshot_count));
+            result.insert(
+                "composite_snapshot_count".to_owned(),
+                json!(composite_snapshot_count),
+            );
             result.insert(
                 "branch_count".to_owned(),
                 json!(connection
@@ -1151,6 +1297,17 @@ impl CoverageStore {
             result.insert(
                 "latest_snapshot_id".to_owned(),
                 latest_id.unwrap_or(Value::Null),
+            );
+            let latest_composite_id = connection
+                .query_row(
+                    "SELECT id FROM composite_snapshots WHERE repo_key = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                    params![project.repo_key],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            result.insert(
+                "latest_composite_snapshot_id".to_owned(),
+                latest_composite_id.map_or(Value::Null, |value| json!(value)),
             );
             if let Some(latest) = latest {
                 for key in [
@@ -1183,6 +1340,110 @@ impl CoverageStore {
                     .expect("ProjectSettings serialization must be infallible"),
             );
             Ok(Value::Object(result))
+        })
+    }
+
+    /// Returns bounded compaction observability for the selected project.
+    ///
+    /// The counts deliberately distinguish relational detail from compressed
+    /// payload detail and retained incremental bases. A successful compaction
+    /// pass is not the same thing as every snapshot being compacted: retained
+    /// bases and snapshots newer than the age threshold are intentionally left
+    /// relational.
+    pub fn compaction_summary(&self) -> AppResult<Value> {
+        let project = self.project()?;
+        let settings = self.project_settings()?;
+        let cutoff = Utc::now() - ChronoDuration::days(i64::from(settings.compaction_after_days));
+        self.with_read_connection(|connection| {
+            // These are aggregate projections over schema-owned BIGINT values. Counts are
+            // inherently non-negative; the byte sums are guarded in SQL so a corrupt negative
+            // payload value fails the query instead of producing an invalid inventory.
+            let raw = connection.query_row(
+                "SELECT
+                    (SELECT count(*) FROM snapshots WHERE repo_key = ?) AS snapshot_count,
+                    (SELECT count(*) FROM snapshots WHERE repo_key = ? AND detail_retention = 'incremental_base') AS retained_incremental_base_count,
+                    (SELECT count(*) FROM snapshots WHERE repo_key = ? AND detail_retention <> 'incremental_base') AS compactable_snapshot_count,
+                    (SELECT count(*) FROM snapshots s LEFT JOIN coverage_compacted_payloads p ON p.snapshot_id = s.id WHERE s.repo_key = ? AND s.created_at < ? AND s.detail_retention <> 'incremental_base' AND p.snapshot_id IS NULL) AS eligible_snapshot_count,
+                    (SELECT count(*) FROM coverage_compacted_payloads WHERE repo_key = ?) AS compacted_snapshot_count,
+                    (SELECT CASE WHEN coalesce(sum(original_bytes), 0) >= 0 THEN coalesce(sum(original_bytes), 0) ELSE error('negative compacted original bytes') END FROM coverage_compacted_payloads WHERE repo_key = ?) AS original_bytes,
+                    (SELECT CASE WHEN coalesce(sum(compressed_bytes), 0) >= 0 THEN coalesce(sum(compressed_bytes), 0) ELSE error('negative compacted bytes') END FROM coverage_compacted_payloads WHERE repo_key = ?) AS compressed_bytes,
+                    (SELECT max(compacted_at) FROM coverage_compacted_payloads WHERE repo_key = ?) AS last_compacted_at,
+                    (SELECT count(*) FROM coverage_compacted_payloads p LEFT JOIN snapshots s ON s.id = p.snapshot_id WHERE (p.repo_key = ? OR s.repo_key = ?) AND (s.id IS NULL OR s.repo_key <> ? OR p.repo_key <> ?)) AS orphan_payload_count",
+                params![
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    cutoff,
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key.clone(),
+                    project.repo_key,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)
+                            .expect("compaction summary snapshot count is BIGINT"),
+                        row.get::<_, i64>(1)
+                            .expect("compaction summary retained count is BIGINT"),
+                        row.get::<_, i64>(2)
+                            .expect("compaction summary compactable count is BIGINT"),
+                        row.get::<_, i64>(3)
+                            .expect("compaction summary eligible count is BIGINT"),
+                        row.get::<_, i64>(4)
+                            .expect("compaction summary compacted count is BIGINT"),
+                        row.get::<_, i64>(5)
+                            .expect("compaction summary original bytes are BIGINT"),
+                        row.get::<_, i64>(6)
+                            .expect("compaction summary compressed bytes are BIGINT"),
+                        optional_timestamp(
+                            row.get_ref(7)
+                                .expect("compaction summary projection has compacted_at"),
+                        ),
+                        row.get::<_, i64>(8)
+                            .expect("compaction summary orphan count is BIGINT"),
+                    ))
+                },
+            )?;
+            let snapshot_count = checked_db_u64(raw.0, "snapshot count")
+                .expect("snapshot count aggregate cannot be negative");
+            let retained_incremental_base_count = checked_db_u64(raw.1, "retained snapshot count")
+                .expect("retained snapshot count aggregate cannot be negative");
+            let compactable_snapshot_count = checked_db_u64(raw.2, "compactable snapshot count")
+                .expect("compactable snapshot count aggregate cannot be negative");
+            let eligible_snapshot_count = checked_db_u64(raw.3, "eligible snapshot count")
+                .expect("eligible snapshot count aggregate cannot be negative");
+            let compacted_snapshot_count = checked_db_u64(raw.4, "compacted snapshot count")
+                .expect("compacted snapshot count aggregate cannot be negative");
+            let original_bytes = checked_db_u64(raw.5, "compacted original bytes")
+                .expect("compacted original byte aggregate cannot be negative");
+            let compressed_bytes = checked_db_u64(raw.6, "compacted bytes")
+                .expect("compacted byte aggregate cannot be negative");
+            let orphan_payload_count = checked_db_u64(raw.8, "orphan payload count")
+                .expect("orphan payload count aggregate cannot be negative");
+            let relational_snapshot_count = snapshot_count.saturating_sub(compacted_snapshot_count);
+            let bytes_saved = original_bytes.saturating_sub(compressed_bytes);
+            let compression_ratio = (original_bytes > 0)
+                .then_some(compressed_bytes as f64 / original_bytes as f64);
+            Ok(json!({
+                "snapshot_count": snapshot_count,
+                "relational_snapshot_count": relational_snapshot_count,
+                "compacted_snapshot_count": compacted_snapshot_count,
+                "compactable_snapshot_count": compactable_snapshot_count,
+                "eligible_snapshot_count": eligible_snapshot_count,
+                "retained_incremental_base_count": retained_incremental_base_count,
+                "original_bytes": original_bytes,
+                "compressed_bytes": compressed_bytes,
+                "bytes_saved": bytes_saved,
+                "compression_ratio": compression_ratio,
+                "last_compacted_at": raw.7,
+                "orphan_payload_count": orphan_payload_count,
+                "payload_inventory_consistent": compacted_snapshot_count <= snapshot_count && orphan_payload_count == 0,
+            }))
         })
     }
 
@@ -1250,6 +1511,25 @@ impl CoverageStore {
         Ok(serde_json::to_value(result).expect("CompactionResult serialization is infallible"))
     }
 
+    /// Marks one snapshot as a retained incremental baseline or restores the
+    /// default compaction policy.
+    pub fn set_snapshot_detail_retention(
+        &self,
+        snapshot_id: &str,
+        retention: &str,
+    ) -> AppResult<Value> {
+        validate_detail_retention(retention)?;
+        self.snapshot(snapshot_id)?;
+        self.with_connection(|connection| {
+            connection.execute(
+                "UPDATE snapshots SET detail_retention = ? WHERE id = ?",
+                params![retention, snapshot_id],
+            )?;
+            Ok(())
+        })?;
+        self.snapshot(snapshot_id)
+    }
+
     fn compact_project(
         &self,
         project: &GitInfo,
@@ -1257,7 +1537,7 @@ impl CoverageStore {
     ) -> AppResult<CompactionResult> {
         let cutoff = Utc::now() - ChronoDuration::days(i64::from(policy.older_than_days));
         let ids = self.with_read_connection(|connection| {
-            let mut statement = connection.prepare("SELECT s.id FROM snapshots s LEFT JOIN coverage_compacted_payloads p ON p.snapshot_id = s.id WHERE s.repo_key = ? AND s.created_at < ? AND p.snapshot_id IS NULL ORDER BY s.created_at ASC LIMIT ?")?;
+            let mut statement = connection.prepare("SELECT s.id FROM snapshots s LEFT JOIN coverage_compacted_payloads p ON p.snapshot_id = s.id WHERE s.repo_key = ? AND s.created_at < ? AND p.snapshot_id IS NULL AND s.detail_retention <> 'incremental_base' ORDER BY s.created_at ASC LIMIT ?")?;
             let rows = statement
                 .query_map(params![project.repo_key, cutoff, policy.batch_size as i64], |row| {
                     row.get::<_, String>(0)
@@ -1604,6 +1884,192 @@ impl CoverageStore {
         )
     }
 
+    /// Compares two explicitly selected snapshots without requiring the same
+    /// suite. This is the fast incremental projection: aggregate coverage is
+    /// compared immediately, while named test attribution is included when
+    /// both snapshots carry compatible named observations.
+    pub fn incremental_compare(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        file_limit: usize,
+        line_limit: usize,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        let current = self.snapshot(snapshot_id)?;
+        let baseline = self.snapshot(baseline_snapshot_id)?;
+        if current.get("repo_key") != baseline.get("repo_key") {
+            return Err(AppError::Validation(
+                "incremental comparisons require snapshots from the same repository".to_owned(),
+            ));
+        }
+        if current.get("format") != baseline.get("format") {
+            return Err(AppError::Validation(
+                "incremental comparisons require snapshots with the same coverage format"
+                    .to_owned(),
+            ));
+        }
+        let files = self.compare_files(snapshot_id, baseline_snapshot_id, file_limit)?;
+        let all_changed_lines = self.changed_line_values_with_suite(
+            snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            false,
+            false,
+        )?;
+        let categorized_lines = all_changed_lines
+            .iter()
+            .map(|line| {
+                let category = incremental_line_category(line);
+                let mut line = line.clone();
+                let object = line
+                    .as_object_mut()
+                    .expect("stored changed-line projections are objects");
+                object.insert("category".to_owned(), json!(category));
+                line
+            })
+            .collect::<Vec<_>>();
+        let changed_lines = categorized_lines
+            .iter()
+            .take(collection_limit(line_limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        let all_regions = changed_line_regions(&categorized_lines, MAX_COLLECTION_RECORDS);
+        let regions_truncated = all_regions.len() > collection_limit(line_limit);
+        let regions = all_regions
+            .into_iter()
+            .take(collection_limit(line_limit))
+            .collect::<Vec<_>>();
+        let changed_lines_truncated = categorized_lines.len() > collection_limit(line_limit);
+        let test_attribution =
+            self.incremental_test_attribution(baseline_snapshot_id, snapshot_id, max_test_ids)?;
+        let mut summary = BTreeMap::<String, usize>::new();
+        for category in [
+            "newly_covered",
+            "regressed",
+            "hit_count_only",
+            "added",
+            "removed",
+            "branch_state_changed",
+        ] {
+            summary.insert(category.to_owned(), 0);
+        }
+        for line in &categorized_lines {
+            let category = incremental_line_category(line);
+            *summary.entry(category.to_owned()).or_default() += 1;
+        }
+        let baseline_source = self.detail_source(baseline_snapshot_id)?;
+        let current_source = self.detail_source(snapshot_id)?;
+        let metric_deltas = overall_delta(&current, &baseline)
+            .expect("incremental snapshots have complete metrics");
+        Ok(json!({
+            "baseline": baseline,
+            "current": current,
+            "overall": metric_deltas.clone(),
+            "metric_deltas": metric_deltas,
+            "files": files,
+            "changed_lines": changed_lines,
+            "changed_lines_truncated": changed_lines_truncated,
+            "regions": regions,
+            "regions_truncated": regions_truncated,
+            "coverage_gain": summary,
+            "test_attribution": test_attribution,
+            "detail_source": {"baseline": baseline_source, "current": current_source},
+        }))
+    }
+
+    /// Compares named test observations carried by the child snapshots of two
+    /// composite snapshots. Composite evidence without named child observations
+    /// is reported as unavailable rather than inferred from command identity.
+    pub fn composite_test_attribution(
+        &self,
+        baseline_composite_snapshot_id: &str,
+        current_composite_snapshot_id: &str,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        let baseline = self.composite_child_test_sets(baseline_composite_snapshot_id)?;
+        let current = self.composite_child_test_sets(current_composite_snapshot_id)?;
+        let (Some(baseline), Some(current)) = (baseline, current) else {
+            return Ok(json!({
+                "status": "unavailable",
+                "reason": "composite reports do not all provide named test observations",
+                "affected_test_count": 0,
+                "affected_tests": [],
+                "tests_truncated": false,
+                "max_test_ids": max_test_ids,
+            }));
+        };
+        let mut test_ids = baseline
+            .keys()
+            .chain(current.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        test_ids.sort();
+        test_ids.dedup();
+        let mut affected = Vec::new();
+        for test_id in test_ids {
+            let before = baseline.get(&test_id).cloned().unwrap_or_default();
+            let after = current.get(&test_id).cloned().unwrap_or_default();
+            if before == after {
+                continue;
+            }
+            let mut added = after.difference(&before).cloned().collect::<Vec<_>>();
+            let mut removed = before.difference(&after).cloned().collect::<Vec<_>>();
+            let observations_truncated = added.len() > 50 || removed.len() > 50;
+            added.truncate(50);
+            removed.truncate(50);
+            affected.push(json!({
+                "test_id": test_id,
+                "baseline_observation_count": before.len(),
+                "current_observation_count": after.len(),
+                "added": added.into_iter().map(test_observation_value).collect::<Vec<_>>(),
+                "removed": removed.into_iter().map(test_observation_value).collect::<Vec<_>>(),
+                "observations_truncated": observations_truncated,
+            }));
+        }
+        let affected_test_count = affected.len();
+        let tests_truncated = affected.len() > max_test_ids;
+        affected.truncate(max_test_ids);
+        Ok(json!({
+            "status": "measured",
+            "affected_test_count": affected_test_count,
+            "affected_tests": affected,
+            "tests_truncated": tests_truncated,
+            "max_test_ids": max_test_ids,
+        }))
+    }
+
+    fn composite_child_test_sets(
+        &self,
+        composite_snapshot_id: &str,
+    ) -> AppResult<Option<TestObservationSets>> {
+        let composite = self.composite_snapshot(composite_snapshot_id)?;
+        let evidence = composite
+            .get("component_evidence")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::Runtime("composite evidence is not an array".to_owned()))?;
+        if evidence.is_empty() {
+            return Ok(None);
+        }
+        let mut combined = BTreeMap::new();
+        for component in evidence {
+            let Some(snapshot_id) = component.get("snapshot_id").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            let Some(sets) = self.test_observation_sets(snapshot_id)? else {
+                return Ok(None);
+            };
+            for (test_id, observations) in sets {
+                combined
+                    .entry(test_id)
+                    .or_insert_with(BTreeSet::new)
+                    .extend(observations);
+            }
+        }
+        Ok(Some(combined))
+    }
+
     /// Compares snapshots using grouped changed regions instead of line records.
     pub fn compare_regions(
         &self,
@@ -1848,6 +2314,23 @@ impl CoverageStore {
         file_path: Option<&str>,
         only_regressions: bool,
     ) -> AppResult<Vec<Value>> {
+        self.changed_line_values_with_suite(
+            snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            only_regressions,
+            true,
+        )
+    }
+
+    fn changed_line_values_with_suite(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        only_regressions: bool,
+        require_suite: bool,
+    ) -> AppResult<Vec<Value>> {
         let current_snapshot = self.snapshot(snapshot_id)?;
         let baseline_snapshot = self.snapshot(baseline_snapshot_id)?;
         if current_snapshot.get("repo_key") != baseline_snapshot.get("repo_key") {
@@ -1855,7 +2338,7 @@ impl CoverageStore {
                 "changed lines require snapshots from the same repository".to_owned(),
             ));
         }
-        if current_snapshot.get("suite") != baseline_snapshot.get("suite") {
+        if require_suite && current_snapshot.get("suite") != baseline_snapshot.get("suite") {
             return Err(AppError::Validation(
                 "changed lines require snapshots from the same suite".to_owned(),
             ));
@@ -1983,6 +2466,147 @@ impl CoverageStore {
             }
         }
         Ok(values)
+    }
+
+    fn detail_source(&self, snapshot_id: &str) -> AppResult<&'static str> {
+        let compacted = self.with_read_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM coverage_compacted_payloads WHERE snapshot_id = ?",
+                params![snapshot_id],
+                |row| row.get::<_, i64>(0),
+            )? > 0)
+        })?;
+        Ok(if compacted {
+            "compacted_payload"
+        } else {
+            "relational"
+        })
+    }
+
+    fn incremental_test_attribution(
+        &self,
+        baseline_snapshot_id: &str,
+        current_snapshot_id: &str,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        let baseline = self.test_observation_sets(baseline_snapshot_id)?;
+        let current = self.test_observation_sets(current_snapshot_id)?;
+        let (Some(baseline), Some(current)) = (baseline, current) else {
+            return Ok(json!({
+                "status": "unavailable",
+                "reason": "both snapshots need named test observations; LCOV TN records currently provide them",
+                "affected_test_count": 0,
+                "affected_tests": [],
+                "tests_truncated": false,
+                "max_test_ids": max_test_ids,
+            }));
+        };
+        let mut test_ids = baseline
+            .keys()
+            .chain(current.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        test_ids.sort();
+        test_ids.dedup();
+        let mut affected = Vec::new();
+        for test_id in test_ids {
+            let before = baseline.get(&test_id).cloned().unwrap_or_default();
+            let after = current.get(&test_id).cloned().unwrap_or_default();
+            if before == after {
+                continue;
+            }
+            let mut added = after.difference(&before).cloned().collect::<Vec<_>>();
+            let mut removed = before.difference(&after).cloned().collect::<Vec<_>>();
+            let observations_truncated = added.len() > 50 || removed.len() > 50;
+            added.truncate(50);
+            removed.truncate(50);
+            affected.push(json!({
+                "test_id": test_id,
+                "baseline_observation_count": before.len(),
+                "current_observation_count": after.len(),
+                "added": added.into_iter().map(test_observation_value).collect::<Vec<_>>(),
+                "removed": removed.into_iter().map(test_observation_value).collect::<Vec<_>>(),
+                "observations_truncated": observations_truncated,
+            }));
+        }
+        let affected_test_count = affected.len();
+        let tests_truncated = affected.len() > max_test_ids;
+        affected.truncate(max_test_ids);
+        Ok(json!({
+            "status": "measured",
+            "affected_test_count": affected_test_count,
+            "affected_tests": affected,
+            "tests_truncated": tests_truncated,
+            "max_test_ids": max_test_ids,
+        }))
+    }
+
+    fn test_observation_sets(&self, snapshot_id: &str) -> AppResult<Option<TestObservationSets>> {
+        let names = self.with_read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT test_name FROM test_coverage_tests WHERE snapshot_id = ? ORDER BY test_name",
+            )?;
+            #[cfg(test)]
+            let force_query_failure =
+                FORCE_TEST_NAMES_QUERY_FAILURE.swap(false, Ordering::SeqCst);
+            #[cfg(not(test))]
+            let force_query_failure = false;
+            let rows = if force_query_failure {
+                statement.query_map(
+                    params![snapshot_id, snapshot_id],
+                    test_coverage_name_from_row,
+                )
+            } else {
+                statement.query_map(params![snapshot_id], test_coverage_name_from_row)
+            }?;
+            let mut names = Vec::new();
+            for row in rows {
+                names.push(row?);
+            }
+            Ok(names)
+        })?;
+        if !names.is_empty() {
+            let mut sets = names
+                .into_iter()
+                .map(|name| (name, BTreeSet::new()))
+                .collect::<BTreeMap<_, _>>();
+            self.with_read_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT test_name, kind, file_path, line_number, region_key FROM test_coverage_observations WHERE snapshot_id = ? ORDER BY test_name, kind, file_path, line_number, region_key",
+                )?;
+                #[cfg(test)]
+                let force_query_failure =
+                    FORCE_TEST_OBSERVATIONS_QUERY_FAILURE.swap(false, Ordering::SeqCst);
+                #[cfg(not(test))]
+                let force_query_failure = false;
+                let rows = if force_query_failure {
+                    statement.query_map(
+                        params![snapshot_id, snapshot_id],
+                        test_coverage_observation_tuple_from_row,
+                    )
+                } else {
+                    statement.query_map(
+                        params![snapshot_id],
+                        test_coverage_observation_tuple_from_row,
+                    )
+                }?;
+                for row in rows {
+                    let (test_name, kind, file_path, line_number, region_key) = row?;
+                    sets.entry(test_name).or_default().insert((
+                        kind,
+                        file_path,
+                        line_number,
+                        region_key,
+                    ));
+                }
+                Ok::<(), AppError>(())
+            })?;
+            return Ok(Some(sets));
+        }
+        let Some(payload) = self.compacted_detail(snapshot_id)? else {
+            return Ok(None);
+        };
+        test_observation_sets_from_payload(&payload)
     }
 
     /// Returns ranked file and uncovered-line targets without raw line JSON.
@@ -2403,6 +3027,36 @@ impl CoverageStore {
         max_summary_lines: usize,
         reuse_if_unchanged: bool,
     ) -> AppResult<Value> {
+        self.submit_command_with_execution(
+            command_ref,
+            timeout_seconds,
+            idempotency_key,
+            max_summary_lines,
+            reuse_if_unchanged,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Submits one approved command with optional structured arguments and an
+    /// automatic incremental-review baseline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_command_with_execution(
+        &self,
+        command_ref: &str,
+        timeout_seconds: Option<u64>,
+        idempotency_key: Option<&str>,
+        max_summary_lines: usize,
+        reuse_if_unchanged: bool,
+        execution: Option<&Value>,
+        arguments: Option<&Value>,
+        baseline_snapshot_id: Option<&str>,
+    ) -> AppResult<Value> {
+        let arguments = normalize_arguments(arguments)?;
+        let baseline_snapshot_id = normalize_baseline_snapshot_id(baseline_snapshot_id)?;
+        let execution =
+            normalize_run_execution(execution, &arguments, baseline_snapshot_id.as_deref())?;
         if max_summary_lines == 0 || max_summary_lines > 500 {
             return Err(AppError::Validation(
                 "max_summary_lines must be between 1 and 500".to_owned(),
@@ -2421,6 +3075,29 @@ impl CoverageStore {
                 "registered command is disabled: {command_ref}"
             )));
         }
+        let registered_command = required_string_field(&command, "command", "registered command")
+            .expect("registered command projections always contain command");
+        let effective_command = render_command(&registered_command, &arguments)?;
+        if let Some(baseline_snapshot_id) = baseline_snapshot_id.as_deref() {
+            let baseline_repo_key = match self.snapshot(baseline_snapshot_id) {
+                Ok(baseline) => baseline
+                    .get("repo_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                Err(AppError::NotFound(_)) => self
+                    .composite_snapshot(baseline_snapshot_id)?
+                    .get("repo_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                Err(error) => return Err(error),
+            };
+            if baseline_repo_key.as_deref() != command.get("repo_key").and_then(Value::as_str) {
+                return Err(AppError::Validation(
+                    "incremental run baseline must belong to the registered command repository"
+                        .to_owned(),
+                ));
+            }
+        }
         let key = idempotency_key
             .map(str::trim)
             .filter(|key| !key.is_empty())
@@ -2438,6 +3115,11 @@ impl CoverageStore {
         let command_id = required_string_field(&command, "id", "registered command")
             .expect("registered command projections always contain id");
         if let Some(existing) = self.idempotent_run_id(&command_id, key.as_deref())? {
+            if self.execution_context_for_run(&existing)? != execution {
+                return Err(AppError::Validation(
+                    "idempotency_key conflicts with the existing run execution context".to_owned(),
+                ));
+            }
             let mut value = self.run_result(&existing, max_summary_lines)?;
             #[allow(clippy::option_map_unit_fn)]
             value.as_object_mut().map(|object| {
@@ -2447,7 +3129,9 @@ impl CoverageStore {
             return Ok(value);
         }
         if reuse_if_unchanged && key.is_none() {
-            if let Some(existing) = self.reusable_run_id(&command, &command_id)? {
+            if let Some(existing) =
+                self.reusable_run_id_with_execution(&command, &command_id, execution.as_ref())?
+            {
                 let mut value = self.reused_run_result(&existing, max_summary_lines)?;
                 #[allow(clippy::option_map_unit_fn)]
                 value.as_object_mut().map(|object| {
@@ -2469,7 +3153,16 @@ impl CoverageStore {
             command.get("cwd").and_then(Value::as_str).unwrap_or("."),
         )?;
         self.with_connection(|connection| {
-            connection.execute("INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'queued', ?, ?, '', NULL)", params![id, command.get("id").and_then(Value::as_str), command.get("name").and_then(Value::as_str), command.get("command").and_then(Value::as_str), key, command.get("cwd").and_then(Value::as_str), git.repo_path, git.repo_key, git.branch, git.commit_sha, Utc::now(), timeout_seconds.map(|value| value as i64), max_summary_lines as i64, stdout.to_string_lossy(), stderr.to_string_lossy()])?;
+            connection.execute("INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'queued', ?, ?, '', NULL, ?, ?, ?)", params![id, command.get("id").and_then(Value::as_str), command.get("name").and_then(Value::as_str), effective_command, key, command.get("cwd").and_then(Value::as_str), git.repo_path, git.repo_key, git.branch, git.commit_sha, Utc::now(), timeout_seconds.map(|value| value as i64), max_summary_lines as i64, stdout.to_string_lossy(), stderr.to_string_lossy(), execution.as_ref().map(|value| value.mode.as_str()), execution.as_ref().map(|value| value.identity.as_str()), execution.as_ref().and_then(|value| value.label.as_deref())])?;
+            connection.execute(
+                "INSERT INTO run_execution_context (run_id, arguments, baseline_snapshot_id) VALUES (?, ?, ?)",
+                params![
+                    id,
+                    serde_json::to_string(&arguments)
+                        .expect("run argument serialization is infallible"),
+                    baseline_snapshot_id,
+                ],
+            )?;
             for baseline in &baselines {
                 connection.execute(
                     "INSERT INTO run_artifact_baselines (run_id, kind, path, exists, size_bytes, modified_ns, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2528,18 +3221,47 @@ impl CoverageStore {
         max_summary_lines: usize,
         reuse_if_unchanged: bool,
     ) -> AppResult<Value> {
+        self.run_command_with_execution(
+            command_ref,
+            timeout_seconds,
+            idempotency_key,
+            max_summary_lines,
+            reuse_if_unchanged,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Submits and waits for one command with a caller-owned execution
+    /// identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_command_with_execution(
+        &self,
+        command_ref: &str,
+        timeout_seconds: Option<u64>,
+        idempotency_key: Option<&str>,
+        max_summary_lines: usize,
+        reuse_if_unchanged: bool,
+        execution: Option<&Value>,
+        arguments: Option<&Value>,
+        baseline_snapshot_id: Option<&str>,
+    ) -> AppResult<Value> {
         let submission = (
             command_ref,
             timeout_seconds,
             idempotency_key,
             max_summary_lines,
         );
-        let submitted = self.submit_command_with_options(
+        let submitted = self.submit_command_with_execution(
             submission.0,
             submission.1,
             submission.2,
             submission.3,
             reuse_if_unchanged,
+            execution,
+            arguments,
+            baseline_snapshot_id,
         )?;
         let id = Self::submitted_run_id(&submitted)
             .expect("managed run submission always includes its run id")
@@ -2551,7 +3273,15 @@ impl CoverageStore {
             .unwrap_or(false)
         {
             thread::sleep(Duration::from_millis(20));
-            result = self.run_result(&id, max_summary_lines)?;
+            #[cfg(test)]
+            let poll_id = if FORCE_RUN_COMMAND_POLL_FAILURE.swap(false, Ordering::SeqCst) {
+                "missing-poll-run"
+            } else {
+                id.as_str()
+            };
+            #[cfg(not(test))]
+            let poll_id = id.as_str();
+            result = self.run_result(poll_id, max_summary_lines)?;
         }
         Ok(result)
     }
@@ -2573,7 +3303,58 @@ impl CoverageStore {
         self.with_connection(|connection| Ok(connection.query_row("SELECT id FROM run_jobs WHERE command_id = ? AND idempotency_key = ? UNION ALL SELECT id FROM runs WHERE command_id = ? AND idempotency_key = ? LIMIT 1", params![command_id, key, command_id, key], |row| row.get::<_, String>(0)).optional()?))
     }
 
+    fn execution_context_for_run(&self, run_id: &str) -> AppResult<Option<ExecutionContext>> {
+        self.with_read_connection(|connection| {
+            let row = connection
+                .query_row(
+                    "SELECT r.execution_mode, r.execution_identity, r.execution_label, c.arguments, c.baseline_snapshot_id FROM run_jobs r LEFT JOIN run_execution_context c ON c.run_id = r.id WHERE r.id = ? UNION ALL SELECT r.execution_mode, r.execution_identity, r.execution_label, c.arguments, c.baseline_snapshot_id FROM runs r LEFT JOIN run_execution_context c ON c.run_id = r.id WHERE r.id = ? LIMIT 1",
+                    params![run_id, run_id],
+                    execution_context_values_from_row,
+                )
+                .optional()?;
+            let Some((mode, identity, label, arguments, baseline_snapshot_id)) = row else {
+                return Ok(None);
+            };
+            let arguments = arguments
+                .map(|value| {
+                    let parsed = serde_json::from_str::<Value>(&value).map_err(|error| {
+                        AppError::Runtime(format!(
+                            "stored run arguments are not valid JSON: {error}"
+                        ))
+                    })?;
+                    normalize_arguments(Some(&parsed))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            match (mode, identity) {
+                (None, None) if arguments.is_empty() && baseline_snapshot_id.is_none() => {
+                    Ok(None)
+                }
+                (Some(mode), Some(identity)) => Ok(Some(ExecutionContext {
+                    mode,
+                    identity,
+                    label,
+                    arguments,
+                    baseline_snapshot_id,
+                })),
+                _ => Err(AppError::Runtime(
+                    "stored run execution identity is incomplete".to_owned(),
+                )),
+            }
+        })
+    }
+
+    #[allow(dead_code)]
     fn reusable_run_id(&self, command: &Value, command_id: &str) -> AppResult<Option<String>> {
+        self.reusable_run_id_with_execution(command, command_id, None)
+    }
+
+    fn reusable_run_id_with_execution(
+        &self,
+        command: &Value,
+        command_id: &str,
+        execution: Option<&ExecutionContext>,
+    ) -> AppResult<Option<String>> {
         let cwd = required_string_field(command, "cwd", "registered command")?;
         let current = inspect_git(Path::new(&cwd))?;
         let Some(commit_sha) = current.commit_sha.as_deref() else {
@@ -2603,7 +3384,27 @@ impl CoverageStore {
             .and_then(Value::as_array)
             .is_some_and(|values| !values.is_empty());
         if status == "passed" || has_snapshot {
-            Ok(latest.get("id").and_then(Value::as_str).map(str::to_owned))
+            let run_id = required_string_field(&latest, "id", "latest run")
+                .expect("latest run projections always contain an id");
+            let stored_execution = {
+                #[cfg(test)]
+                if FORCE_EXECUTION_CONTEXT_FAILURE.swap(false, Ordering::SeqCst) {
+                    Err(AppError::Runtime(
+                        "injected execution context failure".to_owned(),
+                    ))
+                } else {
+                    self.execution_context_for_run(&run_id)
+                }
+                #[cfg(not(test))]
+                {
+                    self.execution_context_for_run(&run_id)
+                }
+            }?;
+            if stored_execution == execution.cloned() {
+                Ok(Some(run_id.to_owned()))
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
@@ -2646,7 +3447,13 @@ impl CoverageStore {
             return Ok(());
         }
         let started = Utc::now();
-        let claimed = self.with_connection(|connection| claim_run(connection, run_id, started))?;
+        let claimed = self.with_connection(|connection| {
+            #[cfg(test)]
+            if FORCE_CLAIM_RUN_FAILURE.swap(false, Ordering::SeqCst) {
+                return Err(AppError::Runtime("injected claim failure".to_owned()));
+            }
+            claim_run(connection, run_id, started)
+        })?;
         if !claimed {
             return Ok(());
         }
@@ -2762,18 +3569,453 @@ impl CoverageStore {
             .max(0);
         let exit_code = exit_code.map(i64::from);
         let command_row = self.registered_command(&command_id)?;
-        let artifacts = self.collect_artifacts(run_id, &command_row, &cwd, status == "passed")?;
+        let artifacts = self.collect_artifacts_with_execution(
+            run_id,
+            &command_row,
+            &cwd,
+            status == "passed",
+            job.get("execution"),
+        )?;
         let max_summary_lines = summary_line_limit(job.get("max_summary_lines"))?;
         #[rustfmt::skip]
-        let summary = summarize_logs(&stdout_path, &stderr_path, &status, exit_code, duration_ms, max_summary_lines, stdout_capture, stderr_capture)?;
+        let mut summary = summarize_logs(&stdout_path, &stderr_path, &status, exit_code, duration_ms, max_summary_lines, stdout_capture, stderr_capture)?;
+        #[cfg(test)]
+        let composite_result = if FORCE_COMPOSITE_EXECUTION_FAILURE.swap(false, Ordering::SeqCst) {
+            Err(AppError::Runtime(
+                "injected managed composite execution failure".to_owned(),
+            ))
+        } else {
+            self.compose_composite_snapshot(run_id, &command_row, &cwd, &artifacts)
+        };
+        #[cfg(not(test))]
+        let composite_result =
+            self.compose_composite_snapshot(run_id, &command_row, &cwd, &artifacts);
+        if let Some(composite) = composite_result? {
+            let composite_id = required_string_field(&composite, "id", "composite snapshot")
+                .expect("stored composite snapshot projections always contain id")
+                .clone();
+            summary
+                .as_object_mut()
+                .expect("run log summary is an object")
+                .insert("composite_snapshot_id".to_owned(), json!(composite_id));
+        }
         #[rustfmt::skip]
-        let persist_result = self.with_connection(|connection| persist_completed_run(connection, run_id, ended, duration_ms, exit_code, &status, &summary, &artifacts));
+        #[cfg(test)]
+        let persist_result = if FORCE_COMPOSITE_PERSIST_FAILURE.swap(false, Ordering::SeqCst) {
+            Err(AppError::Runtime(
+                "injected managed run persistence failure".to_owned(),
+            ))
+        } else {
+            self.with_connection(|connection| persist_completed_run(connection, run_id, ended, duration_ms, exit_code, &status, &summary, &artifacts))
+        };
+        #[cfg(not(test))]
+        let persist_result = self.with_connection(|connection| {
+            persist_completed_run(
+                connection,
+                run_id,
+                ended,
+                duration_ms,
+                exit_code,
+                &status,
+                &summary,
+                &artifacts,
+            )
+        });
         persist_result?;
         self.clear_artifact_baselines(run_id)?;
         let command_id = required_string_field(&command_row, "id", "registered command")
             .expect("registered command projections always contain id");
         self.prune_runs(&command_id)?;
         Ok(())
+    }
+
+    fn compose_composite_snapshot(
+        &self,
+        run_id: &str,
+        command: &Value,
+        cwd: &str,
+        artifacts: &[Value],
+    ) -> AppResult<Option<Value>> {
+        #[cfg(test)]
+        if FORCE_COMPOSITE_COMPOSE_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime(
+                "injected composite composition failure".to_owned(),
+            ));
+        }
+        let composite_artifacts = artifacts
+            .iter()
+            .filter(|artifact| artifact.get("composite").is_some())
+            .collect::<Vec<_>>();
+        if composite_artifacts.is_empty() {
+            return Ok(None);
+        }
+        let command_id = required_string_field(command, "id", "registered command")?;
+        let repo_path = required_string_field(command, "repo_path", "registered command")?;
+        let repo_key = required_string_field(command, "repo_key", "registered command")?;
+        let checkout = inspect_git(Path::new(&repo_path))?;
+        let checkout_dirty = !is_clean(Path::new(&repo_path));
+        let inventory_artifact = composite_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact
+                    .get("composite")
+                    .and_then(|value| value.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("inventory")
+            })
+            .copied();
+        let inventory_path = inventory_artifact
+            .and_then(|artifact| artifact.get("path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| {
+                composite_artifacts
+                    .first()
+                    .and_then(|artifact| artifact.get("composite"))
+                    .and_then(|value| value.get("inventory_artifact"))
+                    .and_then(Value::as_str)
+                    .map(|path| resolve_artifact_path(cwd, path))
+            });
+        let inventory_hash = inventory_path
+            .as_deref()
+            .filter(|path| path.is_file())
+            .and_then(|path| hash_file(path).ok());
+        let reusable_baseline =
+            self.composite_baseline_for_run(run_id, &repo_key, inventory_hash.as_deref())?;
+        let mut provenance = json!({
+            "mapping_version": MAPPING_VERSION,
+            "command_id": command_id,
+            "command_name": command.get("name"),
+            "checkout_revision": checkout.commit_sha,
+            "checkout_dirty": checkout_dirty,
+            "inventory_hash": inventory_hash,
+        });
+        let inventory_value = inventory_path
+            .as_deref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| json!({"schema": composite::INVENTORY_SCHEMA}));
+        let mut build = match inventory_path.as_deref() {
+            Some(path) => match composite::parse_inventory(path) {
+                Ok(inventory) => {
+                    let mut inputs = Vec::new();
+                    let mut parse_errors = Vec::new();
+                    for artifact in &composite_artifacts {
+                        let descriptor = self.composite_descriptor_from_artifact(artifact)?;
+                        if descriptor.role != "coverage" {
+                            continue;
+                        }
+                        let artifact_path =
+                            required_string_field(artifact, "path", "run artifact")?;
+                        let artifact_path = PathBuf::from(artifact_path);
+                        let artifact_status = artifact
+                            .get("ingest_status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("missing")
+                            .to_owned();
+                        let mut normalized_status = artifact_status.clone();
+                        let mut source_revision = None;
+                        let regions = if artifact_status == "ingested" {
+                            let parsed = if descriptor.format == REGIONS_SCHEMA {
+                                composite::parse_region_artifact_with_revision(&artifact_path).map(
+                                    |(revision, regions)| {
+                                        source_revision = Some(revision);
+                                        regions
+                                    },
+                                )
+                            } else {
+                                composite::derive_standard_regions(
+                                    &artifact_path,
+                                    &descriptor.format,
+                                    Some(&repo_path),
+                                )
+                            };
+                            match parsed {
+                                Ok(regions) => regions,
+                                Err(error) => {
+                                    normalized_status = "malformed".to_owned();
+                                    parse_errors.push(format!(
+                                        "malformed composite artifact {}:{}: {error}",
+                                        descriptor.component_id, descriptor.package_variant
+                                    ));
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let artifact_hash = artifact
+                            .get("fingerprint")
+                            .and_then(|value| value.get("sha256"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                artifact_path
+                                    .is_file()
+                                    .then(|| hash_file(&artifact_path).ok())
+                                    .flatten()
+                            });
+                        inputs.push(CompositeComponentInput {
+                            descriptor,
+                            artifact_path,
+                            artifact_hash,
+                            snapshot_id: artifact
+                                .get("snapshot_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            source_revision,
+                            artifact_status: normalized_status,
+                            reused_from_snapshot_id: None,
+                            regions,
+                        });
+                    }
+                    if let Some((baseline_id, baseline, baseline_regions)) =
+                        reusable_baseline.as_ref()
+                    {
+                        Self::reuse_stale_composite_inputs(
+                            &mut inputs,
+                            baseline_id,
+                            baseline,
+                            baseline_regions,
+                        )?;
+                    }
+                    let mut build = composite::assemble(
+                        &inventory,
+                        &inputs,
+                        Path::new(&repo_path),
+                        checkout.commit_sha.as_deref(),
+                        checkout_dirty,
+                    );
+                    build.reasons.extend(parse_errors);
+                    build.reasons.sort();
+                    build.reasons.dedup();
+                    if !build.reasons.is_empty() {
+                        build.status = "incomplete".to_owned();
+                    }
+                    build
+                }
+                Err(error) => composite::incomplete_build(
+                    format!("invalid composite inventory: {error}"),
+                    inventory_value.clone(),
+                    provenance.clone(),
+                ),
+            },
+            None => composite::incomplete_build(
+                "composite inventory artifact is missing".to_owned(),
+                inventory_value.clone(),
+                provenance.clone(),
+            ),
+        };
+        let provenance_object = provenance
+            .as_object_mut()
+            .expect("composite provenance is always an object");
+        provenance_object.insert(
+            "inventory_hash".to_owned(),
+            inventory_hash.clone().map_or(Value::Null, Value::String),
+        );
+        provenance_object.insert("run_id".to_owned(), json!(run_id));
+        let object = build
+            .provenance
+            .as_object_mut()
+            .expect("composite build provenance is always an object");
+        for (key, value) in provenance.as_object().into_iter().flatten() {
+            object.insert(key.clone(), value.clone());
+        }
+        let snapshot_id = Uuid::new_v4().to_string();
+        let created_at = Utc::now();
+        let region_rate = (build.total_regions > 0)
+            .then_some(build.covered_regions as f64 / build.total_regions as f64);
+        let reasons = serde_json::to_string(&build.reasons)
+            .expect("composite reasons serialization is infallible");
+        let remediation = serde_json::to_string(&build.remediation)
+            .expect("composite remediation serialization is infallible");
+        let inventory = serde_json::to_string(&build.inventory)
+            .expect("composite inventory serialization is infallible");
+        let provenance = serde_json::to_string(&build.provenance)
+            .expect("composite provenance serialization is infallible");
+        let components = serde_json::to_string(&build.components)
+            .expect("composite components serialization is infallible");
+        let component_evidence = serde_json::to_string(&build.component_evidence)
+            .expect("composite evidence serialization is infallible");
+        self.with_connection_mut(|connection| {
+            connection.execute_batch("BEGIN TRANSACTION")?;
+            let result = (|| {
+                connection.execute(
+                    INSERT_COMPOSITE_SNAPSHOT_SQL,
+                    params![
+                        snapshot_id,
+                        created_at,
+                        run_id,
+                        command_id,
+                        repo_path,
+                        repo_key,
+                        build.status,
+                        MAPPING_VERSION,
+                        inventory_hash,
+                        checkout.commit_sha,
+                        checkout_dirty,
+                        build.covered_regions,
+                        build.total_regions,
+                        region_rate,
+                        reasons,
+                        remediation,
+                        inventory,
+                        provenance,
+                        components,
+                        component_evidence,
+                    ],
+                )?;
+                for region in &build.regions {
+                    let region_key =
+                        required_string_field(region, "region_key", "composite region")
+                            .expect("assembled composite regions contain region_key");
+                    connection.execute(
+                        INSERT_COMPOSITE_REGION_SQL,
+                        params![
+                            snapshot_id,
+                            region_key,
+                            serde_json::to_string(region)
+                                .expect("composite region serialization is infallible"),
+                        ],
+                    )?;
+                }
+                Ok::<(), AppError>(())
+            })();
+            finish_transaction(connection, result)
+        })?;
+        self.composite_snapshot(&snapshot_id).map(Some)
+    }
+
+    fn composite_baseline_for_run(
+        &self,
+        run_id: &str,
+        repo_key: &str,
+        inventory_hash: Option<&str>,
+    ) -> AppResult<Option<(String, Value, Vec<Value>)>> {
+        let Some(execution) = self.execution_context_for_run(run_id)? else {
+            return Ok(None);
+        };
+        if execution.mode != "incremental" {
+            return Ok(None);
+        }
+        let Some(baseline_id) = execution.baseline_snapshot_id else {
+            return Ok(None);
+        };
+        if !self.baseline_is_composite_snapshot(&baseline_id)? {
+            return Ok(None);
+        }
+        let baseline = self.composite_snapshot(&baseline_id)?;
+        let compatible = baseline.get("repo_key").and_then(Value::as_str) == Some(repo_key)
+            && baseline.get("mapping_version").and_then(Value::as_str) == Some(MAPPING_VERSION)
+            && inventory_hash.is_some()
+            && baseline.get("inventory_hash").and_then(Value::as_str) == inventory_hash;
+        if !compatible {
+            return Ok(None);
+        }
+        let regions = self.composite_regions_all(&baseline_id)?;
+        Ok(Some((baseline_id, baseline, regions)))
+    }
+
+    fn reuse_stale_composite_inputs(
+        inputs: &mut [CompositeComponentInput],
+        baseline_id: &str,
+        baseline: &Value,
+        baseline_regions: &[Value],
+    ) -> AppResult<()> {
+        let mut measured = BTreeMap::<(String, String), bool>::new();
+        if let Some(evidence) = baseline.get("component_evidence").and_then(Value::as_array) {
+            for value in evidence {
+                let Some(component) = value.get("component_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(variant) = value.get("package_variant").and_then(Value::as_str) else {
+                    continue;
+                };
+                measured.insert(
+                    (component.to_owned(), variant.to_owned()),
+                    value.get("status").and_then(Value::as_str) == Some("measured"),
+                );
+            }
+        }
+        let mut regions = BTreeMap::<(String, String), Vec<composite::CanonicalRegion>>::new();
+        for value in baseline_regions {
+            let component = required_string_field(value, "component_id", "composite region")?;
+            let logical_source_id =
+                required_string_field(value, "logical_source_id", "composite region")?;
+            let path = required_string_field(value, "path", "composite region")?;
+            let start_line = required_i64_field(value, "start_line", "composite region")?;
+            let end_line = required_i64_field(value, "end_line", "composite region")?;
+            let discriminator = required_string_field(value, "discriminator", "composite region")?;
+            let source_hash = value
+                .get("source_hash")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let variants = value
+                .get("variants")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    AppError::Runtime("stored composite region is missing variants".to_owned())
+                })?;
+            for variant in variants {
+                let package_variant =
+                    required_string_field(variant, "package_variant", "composite region variant")?;
+                let state = required_string_field(variant, "state", "composite region variant")?;
+                if !matches!(state.as_str(), "covered" | "uncovered") {
+                    continue;
+                }
+                let hits = required_i64_field(variant, "hits", "composite region variant")?;
+                regions
+                    .entry((component.to_owned(), package_variant.to_owned()))
+                    .or_default()
+                    .push(composite::CanonicalRegion {
+                        path: path.to_owned(),
+                        logical_source_id: Some(logical_source_id.to_owned()),
+                        start_line,
+                        end_line,
+                        discriminator: discriminator.to_owned(),
+                        hits,
+                        covered: state == "covered",
+                        source_hash: source_hash.clone(),
+                    });
+            }
+        }
+        let source_revision = baseline
+            .get("checkout_revision")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        for input in inputs {
+            if input.artifact_status != "skipped_stale" {
+                continue;
+            }
+            let key = (
+                input.descriptor.component_id.clone(),
+                input.descriptor.package_variant.clone(),
+            );
+            if !measured.get(&key).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(previous_regions) = regions.get(&key) else {
+                continue;
+            };
+            input.artifact_status = "ingested".to_owned();
+            input.source_revision = source_revision.clone();
+            input.reused_from_snapshot_id = Some(baseline_id.to_owned());
+            input.regions = previous_regions.clone();
+        }
+        Ok(())
+    }
+
+    fn composite_descriptor_from_artifact(
+        &self,
+        artifact: &Value,
+    ) -> AppResult<CompositeArtifactDescriptor> {
+        let metadata = artifact.get("composite").ok_or_else(|| {
+            AppError::Runtime("composite artifact is missing descriptor metadata".to_owned())
+        })?;
+        Ok(
+            composite::composite_descriptor(&json!({"composite": metadata}))?
+                .expect("composite metadata always produces a descriptor"),
+        )
     }
 
     fn finalize_failed_job(&self, run_id: &str, error: &AppError) -> AppResult<()> {
@@ -2794,7 +4036,17 @@ impl CoverageStore {
     }
 
     fn job(&self, run_id: &str) -> AppResult<Option<Value>> {
-        self.with_connection(|connection| Ok(connection.query_row("SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at FROM run_jobs WHERE id = ?", params![run_id], job_from_row).optional()?))
+        let job = self.with_connection(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at FROM run_jobs WHERE id = ?",
+                    params![run_id],
+                    job_from_row,
+                )
+                .optional()?)
+        })?;
+        job.map(|value| self.attach_execution(value, run_id))
+            .transpose()
     }
 
     /// Fetches current or terminal run state without advancing it.
@@ -2804,7 +4056,7 @@ impl CoverageStore {
         } else {
             let terminal = self.with_connection(|connection| Ok(connection.query_row("SELECT id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at FROM runs WHERE id = ?", params![run_id], run_from_row).optional()?))?;
             if let Some(value) = terminal {
-                return Self::decorate_terminal_run(value);
+                return Self::decorate_terminal_run(self.attach_execution(value, run_id)?);
             }
             return Err(AppError::NotFound(format!("run not found: {run_id}")));
         };
@@ -2818,6 +4070,32 @@ impl CoverageStore {
         };
         let _ = max_summary_lines;
         Self::decorate_queued_run(job, status, terminal, queue_position)
+    }
+
+    fn attach_execution(&self, mut value: Value, run_id: &str) -> AppResult<Value> {
+        if let Some(execution) = self.execution_context_for_run(run_id)? {
+            let mut execution_value = execution.value();
+            if let Some(baseline_id) = execution.baseline_snapshot_id.as_deref() {
+                if self.baseline_is_composite_snapshot(baseline_id)? {
+                    execution_value["baseline"] =
+                        json!({"kind":"explicit","composite_snapshot_id":baseline_id});
+                }
+            }
+            value["execution"] = execution_value;
+        }
+        Ok(value)
+    }
+
+    fn baseline_is_composite_snapshot(&self, snapshot_id: &str) -> AppResult<bool> {
+        self.with_read_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM composite_snapshots WHERE id = ?)",
+                    params![snapshot_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(AppError::from)
+        })
     }
 
     fn queued_position(&self, run_id: &str) -> AppResult<i64> {
@@ -2875,6 +4153,7 @@ impl CoverageStore {
             "coverage_ingest".to_owned(),
             json!({"status":"pending","snapshot_ids":[],"configured":0,"ingested":0,"failed":0}),
         );
+        object.insert("composite_snapshot_id".to_owned(), Value::Null);
         object.insert(
             "queue_position".to_owned(),
             queue_position.map_or(Value::Null, |value| json!(value)),
@@ -3076,6 +4355,7 @@ impl CoverageStore {
         })
     }
 
+    #[allow(dead_code)]
     fn collect_artifacts(
         &self,
         run_id: &str,
@@ -3083,7 +4363,19 @@ impl CoverageStore {
         cwd: &str,
         eligible: bool,
     ) -> AppResult<Vec<Value>> {
+        self.collect_artifacts_with_execution(run_id, command, cwd, eligible, None)
+    }
+
+    fn collect_artifacts_with_execution(
+        &self,
+        run_id: &str,
+        command: &Value,
+        cwd: &str,
+        eligible: bool,
+        execution: Option<&Value>,
+    ) -> AppResult<Vec<Value>> {
         let specs = required_array_field(command, "artifact_specs", "registered command")?.to_vec();
+        let snapshot_execution = execution.map(execution_metadata_for_snapshot);
         let command_repo_path = required_string_field(command, "repo_path", "registered command")
             .expect("registered command projections always contain repo_path");
         let command_name = required_string_field(command, "name", "registered command")
@@ -3099,8 +4391,19 @@ impl CoverageStore {
                 Err(error) => return Err(error.into()),
             };
             let coverage_format = spec.get("coverage_format").and_then(Value::as_str);
+            let composite_metadata = spec.get("composite").cloned();
+            let composite_role = composite_metadata
+                .as_ref()
+                .and_then(|value| value.get("role"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let required = required_bool_field(&spec, "required", "artifact specification")?;
             let suite = spec.get("suite").and_then(Value::as_str);
+            let detail_retention = spec
+                .get("detail_retention")
+                .and_then(Value::as_str)
+                .unwrap_or("compactable");
+            validate_detail_retention(detail_retention)?;
             let mut artifact = Map::new();
             artifact.insert("kind".to_owned(), json!(kind));
             artifact.insert("path".to_owned(), json!(path.to_string_lossy()));
@@ -3112,6 +4415,10 @@ impl CoverageStore {
             artifact.insert("required".to_owned(), json!(required));
             artifact.insert("coverage_format".to_owned(), json!(coverage_format));
             artifact.insert("suite".to_owned(), json!(suite));
+            artifact.insert("detail_retention".to_owned(), json!(detail_retention));
+            if let Some(composite) = composite_metadata {
+                artifact.insert("composite".to_owned(), composite);
+            }
             let hash_contents = coverage_format.is_some();
             let fingerprint = artifact_fingerprint(&path, hash_contents)?;
             let baseline = self.artifact_baseline(run_id, &kind)?;
@@ -3132,6 +4439,12 @@ impl CoverageStore {
                 }),
             );
             if let Some(format) = coverage_format {
+                let composite_format = composite::normalize_composite_format(format);
+                let inventory_artifact = composite_role.as_deref() == Some("inventory")
+                    && composite_format == composite::INVENTORY_FORMAT;
+                let composite_only = (composite_role.as_deref() == Some("inventory")
+                    && composite_format == composite::INVENTORY_FORMAT)
+                    || composite_format == REGIONS_SCHEMA;
                 let status: (String, String) = if !eligible {
                     (
                         "skipped_run_status".to_owned(),
@@ -3142,6 +4455,13 @@ impl CoverageStore {
                         "missing".to_owned(),
                         "coverage artifact does not exist".to_owned(),
                     )
+                } else if inventory_artifact && baseline.is_some() {
+                    // The inventory is the authoritative declaration, not a
+                    // per-case coverage observation. Reuse an unchanged
+                    // inventory across full and incremental runs; checkout
+                    // revision and source hashes are revalidated during
+                    // composite assembly.
+                    ("ingested".to_owned(), String::new())
                 } else if baseline.is_none() {
                     (
                         "skipped_stale".to_owned(),
@@ -3152,8 +4472,10 @@ impl CoverageStore {
                         "skipped_stale".to_owned(),
                         "coverage artifact was not created or modified by this run".to_owned(),
                     )
+                } else if composite_only {
+                    ("ingested".to_owned(), String::new())
                 } else {
-                    match self.ingest_report(
+                    match self.ingest_report_with_execution(
                         &path,
                         format,
                         Some(Path::new(&command_repo_path)),
@@ -3161,6 +4483,8 @@ impl CoverageStore {
                         command.get("commit_sha").and_then(Value::as_str),
                         None,
                         suite.unwrap_or(&command_name),
+                        snapshot_execution.as_ref(),
+                        detail_retention,
                     ) {
                         Ok(snapshot) => {
                             artifact.insert(
@@ -3202,6 +4526,10 @@ impl CoverageStore {
         self.with_connection(|connection| {
             for id in &ids {
                 connection.execute("DELETE FROM run_artifacts WHERE run_id = ?", params![id])?;
+                connection.execute(
+                    "DELETE FROM run_execution_context WHERE run_id = ?",
+                    params![id],
+                )?;
                 connection.execute("DELETE FROM runs WHERE id = ?", params![id])?;
             }
             Ok(())
@@ -3224,22 +4552,81 @@ impl CoverageStore {
         base_ref: Option<&str>,
         suite: &str,
     ) -> AppResult<Value> {
+        self.ingest_report_with_options(
+            report_path,
+            format,
+            repo_path,
+            branch,
+            commit_sha,
+            base_ref,
+            suite,
+            "compactable",
+        )
+    }
+
+    /// Parses and stores one snapshot with an explicit detail-retention
+    /// policy. Incremental bases can opt out of background compaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_report_with_options(
+        &self,
+        report_path: &Path,
+        format: &str,
+        repo_path: Option<&Path>,
+        branch: Option<&str>,
+        commit_sha: Option<&str>,
+        base_ref: Option<&str>,
+        suite: &str,
+        detail_retention: &str,
+    ) -> AppResult<Value> {
+        self.ingest_report_with_execution(
+            report_path,
+            format,
+            repo_path,
+            branch,
+            commit_sha,
+            base_ref,
+            suite,
+            None,
+            detail_retention,
+        )
+    }
+
+    /// Parses and stores one snapshot with both detail-retention and the
+    /// opaque execution identity that produced it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_report_with_execution(
+        &self,
+        report_path: &Path,
+        format: &str,
+        repo_path: Option<&Path>,
+        branch: Option<&str>,
+        commit_sha: Option<&str>,
+        base_ref: Option<&str>,
+        suite: &str,
+        execution: Option<&Value>,
+        detail_retention: &str,
+    ) -> AppResult<Value> {
+        validate_detail_retention(detail_retention)?;
+        let execution = normalize_execution(execution)?;
         let selected_path = repo_path.unwrap_or(report_path.parent().unwrap_or(Path::new(".")));
         let git = self.ensure_project(selected_path)?;
         let report = parse_coverage_report(report_path, format, Some(&git.repo_path))?;
         let selected_branch = branch.map(str::to_owned).or(git.branch.clone());
         let selected_commit = commit_sha.map(str::to_owned).or(git.commit_sha.clone());
-        let snapshot_id = self.store_report(
+        let snapshot_id = self.store_report_with_execution(
             &report,
             &git,
             selected_branch.as_deref(),
             selected_commit.as_deref(),
             base_ref,
             suite,
+            execution.as_ref(),
+            detail_retention,
         )?;
         self.snapshot(&snapshot_id)
     }
 
+    #[allow(dead_code)]
     fn store_report(
         &self,
         report: &CoverageReport,
@@ -3248,6 +4635,52 @@ impl CoverageStore {
         commit_sha: Option<&str>,
         base_ref: Option<&str>,
         suite: &str,
+    ) -> AppResult<String> {
+        self.store_report_with_options(
+            report,
+            git,
+            branch,
+            commit_sha,
+            base_ref,
+            suite,
+            "compactable",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_report_with_options(
+        &self,
+        report: &CoverageReport,
+        git: &GitInfo,
+        branch: Option<&str>,
+        commit_sha: Option<&str>,
+        base_ref: Option<&str>,
+        suite: &str,
+        detail_retention: &str,
+    ) -> AppResult<String> {
+        self.store_report_with_execution(
+            report,
+            git,
+            branch,
+            commit_sha,
+            base_ref,
+            suite,
+            None,
+            detail_retention,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_report_with_execution(
+        &self,
+        report: &CoverageReport,
+        git: &GitInfo,
+        branch: Option<&str>,
+        commit_sha: Option<&str>,
+        base_ref: Option<&str>,
+        suite: &str,
+        execution: Option<&ExecutionContext>,
+        detail_retention: &str,
     ) -> AppResult<String> {
         let suite = suite.trim();
         if suite.is_empty() {
@@ -3262,7 +4695,18 @@ impl CoverageStore {
             let result = (|| {
                 let warnings = serde_json::to_string(&report.warnings)
                     .expect("coverage warnings serialization is infallible");
-                let metadata = serde_json::to_string(&report.metadata)
+                let mut metadata_value = report.metadata.clone();
+                if let Some(execution) = execution {
+                    if let Some(object) = metadata_value.as_object_mut() {
+                        object.insert("execution".to_owned(), execution.value());
+                    } else {
+                        metadata_value = json!({
+                            "parser_metadata": metadata_value,
+                            "execution": execution.value(),
+                        });
+                    }
+                }
+                let metadata = serde_json::to_string(&metadata_value)
                     .expect("coverage metadata serialization is infallible");
                 let snapshot_values = params![
                     snapshot_id,
@@ -3289,7 +4733,8 @@ impl CoverageStore {
                     report.line_rate(),
                     report.branch_rate(),
                     report.function_rate(),
-                    report.region_rate()
+                    report.region_rate(),
+                    detail_retention
                 ];
                 connection.execute(INSERT_SNAPSHOT_SQL, snapshot_values)?;
                 for file in &report.files {
@@ -3364,6 +4809,159 @@ impl CoverageStore {
                 .query_row(&sql, params![snapshot_id], snapshot_from_row)
                 .optional()?
                 .ok_or_else(|| AppError::NotFound(format!("snapshot not found: {snapshot_id}")))
+        })
+    }
+
+    /// Reads one immutable composite coverage snapshot.
+    pub fn composite_snapshot(&self, composite_snapshot_id: &str) -> AppResult<Value> {
+        self.with_read_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence FROM composite_snapshots WHERE id = ?",
+                    params![composite_snapshot_id],
+                    composite_snapshot_from_row,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "composite snapshot not found: {composite_snapshot_id}"
+                    ))
+                })
+        })
+    }
+
+    /// Lists immutable composite snapshots for the selected repository.
+    ///
+    /// The dashboard uses this bounded history to select the latest composite
+    /// measurement and its rolling predecessor. Agent-facing comparisons still
+    /// require callers to provide explicit IDs.
+    pub fn list_composite_snapshots(&self, limit: usize) -> AppResult<Vec<Value>> {
+        let project = self.project()?;
+        let ids = self.with_read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id FROM composite_snapshots WHERE repo_key = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            )?;
+            #[cfg(test)]
+            let force_query_map_failure =
+                FORCE_COMPOSITE_QUERY_MAP_FAILURE.swap(0, Ordering::SeqCst) == 1;
+            #[cfg(not(test))]
+            let force_query_map_failure = false;
+            let rows = if force_query_map_failure {
+                Err(AppError::Runtime(
+                    "injected composite snapshot query-map failure".to_owned(),
+                ))
+            } else {
+                statement
+                    .query_map(
+                        params![project.repo_key, collection_limit(limit) as i64],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(AppError::from)
+            }?;
+            rows.map(|row| row.map_err(AppError::from)).collect::<Result<Vec<_>, _>>()
+        })?;
+        ids.into_iter()
+            .map(|id| self.composite_snapshot(&id))
+            .collect()
+    }
+
+    /// Finds the newest immutable composite snapshot for the selected
+    /// repository.
+    pub fn latest_composite_snapshot(&self) -> AppResult<Option<Value>> {
+        Ok(self.list_composite_snapshots(1)?.into_iter().next())
+    }
+
+    /// Finds the composite snapshot immediately preceding the selected one.
+    pub fn previous_composite_snapshot(
+        &self,
+        composite_snapshot_id: &str,
+    ) -> AppResult<Option<Value>> {
+        #[cfg(test)]
+        if FORCE_COMPOSITE_PREVIOUS_SNAPSHOT_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Runtime(
+                "injected previous composite snapshot failure".to_owned(),
+            ));
+        }
+        let current = self.composite_snapshot(composite_snapshot_id)?;
+        let repo_key = required_string_field(&current, "repo_key", "composite snapshot")?;
+        let previous_id = self.with_read_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT id FROM composite_snapshots WHERE repo_key = ? AND created_at < (SELECT created_at FROM composite_snapshots WHERE id = ?) ORDER BY created_at DESC, id DESC LIMIT 1",
+                    params![repo_key, composite_snapshot_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(AppError::from)
+        })?;
+        previous_id
+            .map(|id| self.composite_snapshot(&id))
+            .transpose()
+    }
+
+    /// Reads bounded canonical region rows, including after ordinary snapshot compaction.
+    pub fn composite_regions(
+        &self,
+        composite_snapshot_id: &str,
+        limit: usize,
+    ) -> AppResult<Vec<Value>> {
+        self.composite_snapshot(composite_snapshot_id)?;
+        self.with_read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT region FROM composite_regions WHERE composite_snapshot_id = ? ORDER BY region_key LIMIT ?",
+            )?;
+            #[cfg(test)]
+            let force_query_map_failure =
+                FORCE_COMPOSITE_QUERY_MAP_FAILURE.swap(0, Ordering::SeqCst) == 2;
+            #[cfg(not(test))]
+            let force_query_map_failure = false;
+            let rows = if force_query_map_failure {
+                Err(AppError::Runtime(
+                    "injected composite region query-map failure".to_owned(),
+                ))
+            } else {
+                statement
+                    .query_map(
+                        params![composite_snapshot_id, collection_limit(limit) as i64],
+                        |row| Ok(json_string(row.get::<_, String>(0)?)),
+                    )
+                    .map_err(AppError::from)
+            }?;
+            rows.map(|row| row.map_err(AppError::from)).collect()
+        })
+    }
+
+    /// Reads every canonical region row for an internal exact comparison.
+    ///
+    /// Public projections remain bounded through [`Self::composite_regions`];
+    /// this path is intentionally used only to calculate exact category and
+    /// denominator deltas before applying a response budget.
+    pub(crate) fn composite_regions_all(
+        &self,
+        composite_snapshot_id: &str,
+    ) -> AppResult<Vec<Value>> {
+        self.composite_snapshot(composite_snapshot_id)?;
+        self.with_read_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT region FROM composite_regions WHERE composite_snapshot_id = ? ORDER BY region_key",
+            )?;
+            #[cfg(test)]
+            let force_query_map_failure =
+                FORCE_COMPOSITE_QUERY_MAP_FAILURE.swap(0, Ordering::SeqCst) == 3;
+            #[cfg(not(test))]
+            let force_query_map_failure = false;
+            let rows = if force_query_map_failure {
+                Err(AppError::Runtime(
+                    "injected composite region query-map failure".to_owned(),
+                ))
+            } else {
+                statement
+                    .query_map(params![composite_snapshot_id], |row| {
+                        Ok(json_string(row.get::<_, String>(0)?))
+                    })
+                    .map_err(AppError::from)
+            }?;
+            rows.map(|row| row.map_err(AppError::from)).collect()
         })
     }
 
@@ -3926,6 +5524,31 @@ impl CoverageStore {
     }
 }
 
+fn composite_snapshot_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
+    Ok(json!({
+        "id": row.get::<_, String>(0)?,
+        "created_at": timestamp_string(row.get_ref(1).expect("composite snapshot has created_at")),
+        "run_id": row.get::<_, String>(2)?,
+        "command_id": row.get::<_, String>(3)?,
+        "repo_path": row.get::<_, String>(4)?,
+        "repo_key": row.get::<_, String>(5)?,
+        "status": row.get::<_, String>(6)?,
+        "mapping_version": row.get::<_, String>(7)?,
+        "inventory_hash": row.get::<_, Option<String>>(8)?,
+        "checkout_revision": row.get::<_, Option<String>>(9)?,
+        "checkout_dirty": row.get::<_, bool>(10)?,
+        "covered_regions": row.get::<_, i64>(11)?,
+        "total_regions": row.get::<_, i64>(12)?,
+        "region_rate": row.get::<_, Option<f64>>(13)?,
+        "reasons": json_string(row.get::<_, String>(14)?),
+        "remediation": json_string(row.get::<_, String>(15)?),
+        "inventory": json_string(row.get::<_, String>(16)?),
+        "provenance": json_string(row.get::<_, String>(17)?),
+        "components": json_string(row.get::<_, String>(18)?),
+        "component_evidence": json_string(row.get::<_, String>(19)?),
+    }))
+}
+
 fn unavailable_duplicate_coverage_projection(
     offset: usize,
     reason: &str,
@@ -4135,6 +5758,167 @@ fn duplicate_coverage_from_payload(
     ))
 }
 
+fn changed_line_regions(lines: &[Value], limit: usize) -> Vec<Value> {
+    let mut grouped: BTreeMap<(String, String), Vec<i64>> = BTreeMap::new();
+    for line in lines {
+        let Some(path) = line.get("file_path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(status) = line.get("status").and_then(Value::as_str) else {
+            continue;
+        };
+        let category = line
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or(status);
+        let Some(number) = line.get("line_number").and_then(Value::as_i64) else {
+            continue;
+        };
+        grouped
+            .entry((path.to_owned(), category.to_owned()))
+            .or_default()
+            .push(number);
+    }
+    let mut regions = Vec::new();
+    for ((path, status), mut numbers) in grouped {
+        numbers.sort_unstable();
+        numbers.dedup();
+        for region in line_regions(&numbers) {
+            regions.push(json!({
+                "file_path": path,
+                "status": status,
+                "category": status,
+                "start": region["start"],
+                "end": region["end"],
+                "line_count": region["line_count"],
+            }));
+        }
+    }
+    regions.sort_by(|left, right| {
+        status_order(left).cmp(&status_order(right)).then_with(|| {
+            left.get("file_path")
+                .and_then(Value::as_str)
+                .cmp(&right.get("file_path").and_then(Value::as_str))
+                .then_with(|| {
+                    left.get("start")
+                        .and_then(Value::as_i64)
+                        .cmp(&right.get("start").and_then(Value::as_i64))
+                })
+        })
+    });
+    regions.truncate(collection_limit(limit));
+    regions
+}
+
+fn incremental_line_category(line: &Value) -> &'static str {
+    let baseline_covered = line.get("baseline_covered").and_then(Value::as_bool);
+    let current_covered = line.get("current_covered").and_then(Value::as_bool);
+    if baseline_covered.is_none() {
+        return "added";
+    }
+    if current_covered.is_none() {
+        return "removed";
+    }
+    if baseline_covered == Some(false) && current_covered == Some(true) {
+        return "newly_covered";
+    }
+    if baseline_covered == Some(true) && current_covered == Some(false) {
+        return "regressed";
+    }
+    if branch_state_changed(line) {
+        match (branch_gap(line, "baseline"), branch_gap(line, "current")) {
+            (Some(baseline), Some(current)) if current < baseline => return "newly_covered",
+            (Some(baseline), Some(current)) if current > baseline => return "regressed",
+            _ => return "branch_state_changed",
+        }
+    }
+    if line.get("baseline_hits") != line.get("current_hits") {
+        return "hit_count_only";
+    }
+    "branch_state_changed"
+}
+
+fn branch_state_changed(line: &Value) -> bool {
+    (
+        line.get("baseline_total_branches").and_then(Value::as_i64),
+        line.get("baseline_covered_branches")
+            .and_then(Value::as_i64),
+    ) != (
+        line.get("current_total_branches").and_then(Value::as_i64),
+        line.get("current_covered_branches").and_then(Value::as_i64),
+    )
+}
+
+fn branch_gap(line: &Value, prefix: &str) -> Option<i64> {
+    let total = line
+        .get(format!("{prefix}_total_branches"))
+        .and_then(Value::as_i64);
+    let covered = line
+        .get(format!("{prefix}_covered_branches"))
+        .and_then(Value::as_i64);
+    total.and_then(|total| covered.and_then(|covered| total.checked_sub(covered)))
+}
+
+fn test_observation_value(observation: (String, String, i64, String)) -> Value {
+    let (kind, file_path, line_number, region_key) = observation;
+    json!({
+        "kind": kind,
+        "file_path": file_path,
+        "line_number": line_number,
+        "region_key": region_key,
+    })
+}
+
+fn test_observation_sets_from_payload(payload: &Value) -> AppResult<Option<TestObservationSets>> {
+    let mut sets = TestObservationSets::new();
+    if let Some(raw_names) = payload.get("test_names") {
+        let names = raw_names.as_array().ok_or_else(|| {
+            AppError::Runtime("compacted coverage test_names must be an array".to_owned())
+        })?;
+        for name in names {
+            let name = name.as_str().ok_or_else(|| {
+                AppError::Runtime("compacted coverage test_names must contain strings".to_owned())
+            })?;
+            if !name.trim().is_empty() {
+                sets.entry(name.to_owned()).or_default();
+            }
+        }
+    }
+    if let Some(raw_observations) = payload.get("test_coverage") {
+        let observations = raw_observations.as_array().ok_or_else(|| {
+            AppError::Runtime("compacted coverage test_coverage must be an array".to_owned())
+        })?;
+        for raw in observations {
+            let test_name = required_string_field(raw, "test_name", "compacted test coverage")?;
+            let kind = raw
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("line")
+                .to_owned();
+            let file_path = required_string_field(raw, "file_path", "compacted test coverage")?;
+            let line_number = required_i64_field(raw, "line_number", "compacted test coverage")?;
+            if line_number <= 0 {
+                return Err(AppError::Runtime(
+                    "compacted test coverage line_number must be positive".to_owned(),
+                ));
+            }
+            let region_key = raw
+                .get("region_key")
+                .and_then(Value::as_str)
+                .unwrap_or("line")
+                .to_owned();
+            sets.entry(test_name)
+                .or_default()
+                .insert((kind, file_path, line_number, region_key));
+        }
+    }
+    if sets.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sets))
+    }
+}
+
 fn source_lines_from_text(text: &str, start: i64, end: i64) -> Vec<Value> {
     text.lines()
         .enumerate()
@@ -4163,7 +5947,7 @@ fn run_compaction_maintenance(store: &CoverageStore, settings: &ProjectSettings)
 /// Inclusive line range used by coverage projections.
 pub type LineRange = (i64, i64);
 
-const SNAPSHOT_COLUMNS: &str = "id, created_at, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate";
+const SNAPSHOT_COLUMNS: &str = "id, created_at, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, detail_retention";
 
 fn bool_column(row: &Row<'_>) -> duckdb::Result<bool> {
     row.get::<_, bool>(0)
@@ -4232,6 +6016,10 @@ fn snapshot_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     ] {
         value.insert(key.to_owned(), json!(row.get::<_, Option<f64>>(index)?));
     }
+    value.insert(
+        "detail_retention".to_owned(),
+        json!(row.get::<_, String>(24)?),
+    );
     Ok(Value::Object(value))
 }
 
@@ -4569,6 +6357,303 @@ fn checked_mul_u64(left: u64, right: u64, field: &str) -> AppResult<u64> {
 
 fn persisted_value_out_of_range(field: &str, value: i64) -> String {
     format!("persisted {field} value is out of range: {value}")
+}
+
+fn validate_detail_retention(value: &str) -> AppResult<()> {
+    if matches!(value, "compactable" | "incremental_base") {
+        Ok(())
+    } else {
+        Err(AppError::Validation(
+            "detail_retention must be compactable or incremental_base".to_owned(),
+        ))
+    }
+}
+
+fn normalize_execution(value: Option<&Value>) -> AppResult<Option<ExecutionContext>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| AppError::Validation("execution must be an object".to_owned()))?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "mode" | "identity" | "label"))
+    {
+        return Err(AppError::Validation(format!(
+            "execution does not accept argument {key}"
+        )));
+    }
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "full" | "incremental" | "custom"))
+        .ok_or_else(|| {
+            AppError::Validation("execution.mode must be full, incremental, or custom".to_owned())
+        })?;
+    let identity = object
+        .get("identity")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Validation(
+                "execution.identity must be a non-blank stable fingerprint".to_owned(),
+            )
+        })?;
+    if identity.len() > 256 {
+        return Err(AppError::Validation(
+            "execution.identity must not exceed 256 characters".to_owned(),
+        ));
+    }
+    let label = normalize_execution_label(value)?;
+    Ok(Some(ExecutionContext {
+        mode: mode.to_owned(),
+        identity: identity.to_owned(),
+        label,
+        arguments: Vec::new(),
+        baseline_snapshot_id: None,
+    }))
+}
+
+fn normalize_run_execution(
+    value: Option<&Value>,
+    arguments: &[String],
+    baseline_snapshot_id: Option<&str>,
+) -> AppResult<Option<ExecutionContext>> {
+    let Some(value) = value else {
+        if baseline_snapshot_id.is_some() {
+            return Err(AppError::Validation(
+                "execution.mode=incremental is required when baseline is provided".to_owned(),
+            ));
+        }
+        if arguments.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(generated_run_execution(
+            "full",
+            None,
+            None,
+            arguments,
+            baseline_snapshot_id,
+        )));
+    };
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| AppError::Validation("execution must be an object".to_owned()))?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "mode" | "identity" | "label"))
+    {
+        return Err(AppError::Validation(format!(
+            "execution does not accept argument {key}"
+        )));
+    }
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "full" | "incremental" | "custom"))
+        .ok_or_else(|| {
+            AppError::Validation("execution.mode must be full, incremental, or custom".to_owned())
+        })?;
+    if mode == "incremental" && baseline_snapshot_id.is_none() {
+        return Err(AppError::Validation(
+            "execution.mode=incremental requires an explicit baseline.snapshot_id".to_owned(),
+        ));
+    }
+    if mode != "incremental" && baseline_snapshot_id.is_some() {
+        return Err(AppError::Validation(
+            "baseline is only valid when execution.mode is incremental".to_owned(),
+        ));
+    }
+    let identity = object
+        .get("identity")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "execution.identity must be a non-blank stable fingerprint".to_owned(),
+                    )
+                })
+        })
+        .transpose()?;
+    if identity.as_ref().is_some_and(|value| value.len() > 256) {
+        return Err(AppError::Validation(
+            "execution.identity must not exceed 256 characters".to_owned(),
+        ));
+    }
+    let label = normalize_execution_label(value)?;
+    Ok(Some(generated_run_execution(
+        mode,
+        identity.as_deref(),
+        label,
+        arguments,
+        baseline_snapshot_id,
+    )))
+}
+
+fn generated_run_execution(
+    mode: &str,
+    requested_identity: Option<&str>,
+    label: Option<String>,
+    arguments: &[String],
+    baseline_snapshot_id: Option<&str>,
+) -> ExecutionContext {
+    let identity = match (
+        requested_identity,
+        arguments.is_empty(),
+        baseline_snapshot_id,
+    ) {
+        (Some(identity), true, None) => identity.to_owned(),
+        _ => {
+            let fingerprint_input = serde_json::json!({
+                "mode": mode,
+                "identity": requested_identity,
+                "arguments": arguments,
+                "baseline_snapshot_id": baseline_snapshot_id,
+            });
+            format!(
+                "{}:{}",
+                mode,
+                hex_prefix(
+                    &Sha256::digest(fingerprint_input.to_string().as_bytes()),
+                    24
+                )
+            )
+        }
+    };
+
+    ExecutionContext {
+        mode: mode.to_owned(),
+        identity,
+        label,
+        arguments: arguments.to_vec(),
+        baseline_snapshot_id: baseline_snapshot_id.map(str::to_owned),
+    }
+}
+
+fn normalize_execution_label(value: &Value) -> AppResult<Option<String>> {
+    let label = value
+        .get("label")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    AppError::Validation(
+                        "execution.label must be a string when provided".to_owned(),
+                    )
+                })
+        })
+        .transpose()?;
+    if label.as_ref().is_some_and(|value| value.len() > 200) {
+        return Err(AppError::Validation(
+            "execution.label must not exceed 200 characters".to_owned(),
+        ));
+    }
+    Ok(label)
+}
+
+fn execution_metadata_for_snapshot(value: &Value) -> Value {
+    let mut metadata = Map::new();
+    for key in ["mode", "identity", "label"] {
+        if let Some(field) = value.get(key) {
+            metadata.insert(key.to_owned(), field.clone());
+        }
+    }
+    Value::Object(metadata)
+}
+
+fn normalize_arguments(value: Option<&Value>) -> AppResult<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| AppError::Validation("arguments must be an array of strings".to_owned()))?;
+    if values.len() > 64 {
+        return Err(AppError::Validation(
+            "arguments must contain at most 64 values".to_owned(),
+        ));
+    }
+
+    let mut arguments = Vec::with_capacity(values.len());
+    let mut total_bytes = 0usize;
+    for (index, value) in values.iter().enumerate() {
+        let argument = value
+            .as_str()
+            .ok_or_else(|| AppError::Validation(format!("arguments[{index}] must be a string")))?;
+        if argument.contains('\0') {
+            return Err(AppError::Validation(format!(
+                "arguments[{index}] must not contain NUL"
+            )));
+        }
+        if argument.len() > 512 {
+            return Err(AppError::Validation(format!(
+                "arguments[{index}] must be at most 512 bytes"
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(argument.len());
+        if total_bytes > 8192 {
+            return Err(AppError::Validation(
+                "arguments must total at most 8192 bytes".to_owned(),
+            ));
+        }
+        arguments.push(argument.to_owned());
+    }
+    Ok(arguments)
+}
+
+fn normalize_baseline_snapshot_id(value: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::Validation(
+            "baseline.snapshot_id must not be empty".to_owned(),
+        ));
+    }
+    if value.len() > 200 {
+        return Err(AppError::Validation(
+            "baseline.snapshot_id must be at most 200 characters".to_owned(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn render_command(command: &str, arguments: &[String]) -> AppResult<String> {
+    let marker = "{{args}}";
+    let marker_count = command.matches(marker).count();
+    if marker_count > 1 {
+        return Err(AppError::Validation(
+            "registered command may contain at most one {{args}} placeholder".to_owned(),
+        ));
+    }
+    let rendered_arguments = arguments
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if marker_count == 1 {
+        return Ok(command.replacen(marker, &rendered_arguments, 1));
+    }
+    if rendered_arguments.is_empty() {
+        Ok(command.to_owned())
+    } else {
+        Ok(format!("{command} {rendered_arguments}"))
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 type LogCaptureHandle = JoinHandle<std::io::Result<LogCaptureResult>>;
@@ -5094,8 +7179,12 @@ fn job_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
 fn run_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     let parsed_summary = json_string(row.get::<_, String>(17)?);
     let artifact_paths = json_string(row.get::<_, String>(18)?);
+    let composite_snapshot_id = parsed_summary
+        .get("composite_snapshot_id")
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok(
-        json!({"id":row.get::<_, String>(0)?,"command_id":row.get::<_, String>(1)?,"command_name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"idempotency_key":row.get::<_, Option<String>>(4)?,"cwd":row.get::<_, String>(5)?,"repo_path":row.get::<_, String>(6)?,"repo_key":row.get::<_, String>(7)?,"branch":row.get::<_, Option<String>>(8)?,"commit_sha":row.get::<_, Option<String>>(9)?,"started_at":timestamp_string(row.get_ref(10).expect("run projection has started_at")),"ended_at":timestamp_string(row.get_ref(11).expect("run projection has ended_at")),"duration_ms":row.get::<_, i64>(12)?,"exit_code":row.get::<_, Option<i64>>(13)?,"status":row.get::<_, String>(14)?,"stdout_path":row.get::<_, String>(15)?,"stderr_path":row.get::<_, String>(16)?,"parsed_summary":parsed_summary,"artifact_paths":artifact_paths,"queued_at":optional_timestamp(row.get_ref(19).expect("run projection has queued_at")),"queue_duration_ms":row.get::<_, Option<i64>>(20)?,"cancellation_requested_at":optional_timestamp(row.get_ref(21).expect("run projection has cancellation_requested_at")),"terminal":true,"poll_after_ms":Value::Null,"queue_position":Value::Null,"execution_mode":"background","cancellation_requested":!matches!(row.get_ref(21).expect("run projection has cancellation_requested_at"), ValueRef::Null),"coverage_ingest":coverage_ingest(&artifact_paths)}),
+        json!({"id":row.get::<_, String>(0)?,"command_id":row.get::<_, String>(1)?,"command_name":row.get::<_, String>(2)?,"command":row.get::<_, String>(3)?,"idempotency_key":row.get::<_, Option<String>>(4)?,"cwd":row.get::<_, String>(5)?,"repo_path":row.get::<_, String>(6)?,"repo_key":row.get::<_, String>(7)?,"branch":row.get::<_, Option<String>>(8)?,"commit_sha":row.get::<_, Option<String>>(9)?,"started_at":timestamp_string(row.get_ref(10).expect("run projection has started_at")),"ended_at":timestamp_string(row.get_ref(11).expect("run projection has ended_at")),"duration_ms":row.get::<_, i64>(12)?,"exit_code":row.get::<_, Option<i64>>(13)?,"status":row.get::<_, String>(14)?,"stdout_path":row.get::<_, String>(15)?,"stderr_path":row.get::<_, String>(16)?,"parsed_summary":parsed_summary,"artifact_paths":artifact_paths,"queued_at":optional_timestamp(row.get_ref(19).expect("run projection has queued_at")),"queue_duration_ms":row.get::<_, Option<i64>>(20)?,"cancellation_requested_at":optional_timestamp(row.get_ref(21).expect("run projection has cancellation_requested_at")),"terminal":true,"poll_after_ms":Value::Null,"queue_position":Value::Null,"execution_mode":"background","cancellation_requested":!matches!(row.get_ref(21).expect("run projection has cancellation_requested_at"), ValueRef::Null),"coverage_ingest":coverage_ingest(&artifact_paths),"composite_snapshot_id":composite_snapshot_id}),
     )
 }
 
@@ -5160,15 +7249,24 @@ fn normalize_artifact_specs(value: Value) -> AppResult<Vec<Value>> {
         }
     };
     let mut specs = Vec::new();
+    let mut composite_variants = BTreeSet::new();
+    let mut composite_inventory_artifact: Option<String> = None;
+    let mut composite_inventory_path: Option<String> = None;
+    let mut composite_inventory_count = 0usize;
     for (kind, raw) in object {
         let mut spec = match raw {
-            Value::String(path) => json!({"kind":kind,"path":path,"required":false}),
+            Value::String(path) => {
+                json!({"kind":kind,"path":path,"required":false,"detail_retention":"compactable"})
+            }
             Value::Object(map) => {
                 let mut value = Value::Object(map.clone());
                 #[allow(clippy::option_map_unit_fn)]
                 value.as_object_mut().map(|object| {
                     object.insert("kind".to_owned(), json!(kind));
                     object.entry("required".to_owned()).or_insert(json!(false));
+                    object
+                        .entry("detail_retention".to_owned())
+                        .or_insert(json!("compactable"));
                 });
                 value
             }
@@ -5187,9 +7285,103 @@ fn normalize_artifact_specs(value: Value) -> AppResult<Vec<Value>> {
                 "artifact path is required: {kind}"
             )));
         }
+        let detail_retention = spec
+            .get("detail_retention")
+            .and_then(Value::as_str)
+            .unwrap_or("compactable");
+        validate_detail_retention(detail_retention)?;
+        if let Some(descriptor) = composite::composite_descriptor(&spec)? {
+            let format = spec
+                .get("coverage_format")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AppError::Validation(format!(
+                        "composite artifact {kind} must declare coverage_format"
+                    ))
+                })?;
+            if composite::normalize_composite_format(format) != descriptor.format {
+                return Err(AppError::Validation(format!(
+                    "composite artifact {kind} format must match coverage_format"
+                )));
+            }
+            let inventory_artifact = normalize_artifact_reference(&descriptor.inventory_artifact);
+            if let Some(previous) = &composite_inventory_artifact {
+                if previous != &inventory_artifact {
+                    return Err(AppError::Validation(
+                        "all composite artifacts must use the same inventory_artifact".to_owned(),
+                    ));
+                }
+            } else {
+                composite_inventory_artifact = Some(inventory_artifact);
+            }
+            if descriptor.role == "inventory" {
+                composite_inventory_count = composite_inventory_count.saturating_add(1);
+                if !required_bool_field(&spec, "required", "artifact specification")? {
+                    return Err(AppError::Validation(
+                        "the composite inventory artifact must be required".to_owned(),
+                    ));
+                }
+                if descriptor.format != composite::INVENTORY_FORMAT {
+                    return Err(AppError::Validation(
+                        "the composite inventory artifact must use coverage-mcp-inventory-v1"
+                            .to_owned(),
+                    ));
+                }
+                composite_inventory_path =
+                    spec.get("path").and_then(Value::as_str).map(str::to_owned);
+            } else if descriptor.format == composite::INVENTORY_FORMAT {
+                return Err(AppError::Validation(
+                    "coverage artifacts cannot use the inventory format".to_owned(),
+                ));
+            } else if !required_bool_field(&spec, "required", "artifact specification")? {
+                return Err(AppError::Validation(
+                    "composite coverage artifacts must be required".to_owned(),
+                ));
+            } else if !composite_variants.insert((
+                descriptor.component_id.clone(),
+                descriptor.package_variant.clone(),
+            )) {
+                return Err(AppError::Validation(format!(
+                    "duplicate composite component/package variant: {}:{}",
+                    descriptor.component_id, descriptor.package_variant
+                )));
+            }
+        }
         specs.push(spec.take());
     }
+    if !composite_variants.is_empty() && composite_inventory_count != 1 {
+        return Err(AppError::Validation(
+            "composite artifact specifications require exactly one inventory artifact".to_owned(),
+        ));
+    }
+    if !composite_variants.is_empty() {
+        let inventory_path = composite_inventory_path
+            .as_deref()
+            .expect("exactly one composite inventory path is recorded");
+        for spec in &specs {
+            let Some(descriptor) = composite::composite_descriptor(spec)
+                .expect("composite descriptors were validated above")
+            else {
+                continue;
+            };
+            if descriptor.role == "coverage"
+                && normalize_artifact_reference(&descriptor.inventory_artifact)
+                    != normalize_artifact_reference(inventory_path)
+            {
+                return Err(AppError::Validation(format!(
+                    "composite coverage artifact {} must reference the registered inventory path {}",
+                    descriptor.component_id, inventory_path
+                )));
+            }
+        }
+    }
     Ok(specs)
+}
+
+fn normalize_artifact_reference(path: &str) -> String {
+    path.trim_start_matches("./").to_owned()
 }
 
 fn resolve_artifact_path(cwd: &str, raw_path: &str) -> PathBuf {
@@ -5587,9 +7779,15 @@ fn coverage_target_priority(
 }
 
 fn status_order(value: &Value) -> u8 {
-    match value.get("status").and_then(Value::as_str) {
+    match value
+        .get("category")
+        .or_else(|| value.get("status"))
+        .and_then(Value::as_str)
+    {
         Some("regressed") => 0,
-        Some("improved") => 1,
+        Some("newly_covered") | Some("improved") => 1,
+        Some("added") | Some("new") => 2,
+        Some("removed") => 3,
         _ => 2,
     }
 }
@@ -6642,7 +8840,8 @@ mod tests {
                     commit_sha, base_ref, suite, format, report_path, warnings, metadata,
                     total_lines, covered_lines, total_branches, covered_branches,
                     total_functions, covered_functions, total_regions, covered_regions,
-                    line_rate, branch_rate, function_rate, region_rate
+                    line_rate, branch_rate, function_rate, region_rate,
+                    CAST('compactable' AS VARCHAR) AS detail_retention
              FROM snapshots_base
              WHERE id = '{current_snapshot_id}';",
         );
@@ -6672,7 +8871,8 @@ mod tests {
                     commit_sha, base_ref, suite, format, report_path, warnings, metadata,
                     total_lines, covered_lines, total_branches, covered_branches,
                     total_functions, covered_functions, total_regions, covered_regions,
-                    line_rate, branch_rate, function_rate, region_rate
+                    line_rate, branch_rate, function_rate, region_rate,
+                    CAST('compactable' AS VARCHAR) AS detail_retention
              FROM snapshots_base
              WHERE id = '{current_snapshot_id}';"
         );
@@ -7881,6 +10081,20 @@ mod tests {
                 .collect::<Vec<_>>();
             values[index] = bad.to_owned();
             row_error(&connection, &values, test_coverage_observation_from_row);
+            row_error(
+                &connection,
+                &values,
+                test_coverage_observation_tuple_from_row,
+            );
+        }
+        let execution_context = ["'full'", "'identity'", "'label'"];
+        for (index, bad) in [(0, "TRUE"), (1, "TRUE"), (2, "TRUE")] {
+            let mut values = execution_context
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, execution_context_values_from_row);
         }
         let snapshot = vec![
             "'id'",
@@ -7907,6 +10121,7 @@ mod tests {
             "NULL",
             "NULL",
             "NULL",
+            "'compactable'",
         ];
         for (index, bad) in [
             (0, "TRUE"),
@@ -7940,6 +10155,71 @@ mod tests {
             values[index] = bad.to_owned();
             row_error(&connection, &values, snapshot_from_row);
         }
+        let sql = format!("SELECT {}", snapshot.join(", "));
+        let mut statement = connection.prepare(&sql).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        snapshot_from_row(rows.next().unwrap().unwrap()).unwrap();
+        let mut values = snapshot
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        values[24] = "TRUE".to_owned();
+        row_error(&connection, &values, snapshot_from_row);
+
+        let composite_snapshot = vec![
+            "'id'",
+            "TIMESTAMP '2020-01-01 00:00:00'",
+            "'run'",
+            "'command'",
+            "'/repo'",
+            "'repo'",
+            "'complete'",
+            "'mapping'",
+            "'inventory'",
+            "'commit'",
+            "false",
+            "1",
+            "1",
+            "1.0",
+            "'[]'",
+            "'{}'",
+            "'{}'",
+            "'{}'",
+            "'[]'",
+            "'[]'",
+        ];
+        for (index, bad) in [
+            (0, "TRUE"),
+            (2, "TRUE"),
+            (3, "TRUE"),
+            (4, "TRUE"),
+            (5, "TRUE"),
+            (6, "TRUE"),
+            (7, "TRUE"),
+            (8, "TRUE"),
+            (9, "TRUE"),
+            (10, "'bad'"),
+            (11, "'bad'"),
+            (12, "'bad'"),
+            (13, "'bad'"),
+            (14, "TRUE"),
+            (15, "TRUE"),
+            (16, "TRUE"),
+            (17, "TRUE"),
+            (18, "TRUE"),
+            (19, "TRUE"),
+        ] {
+            let mut values = composite_snapshot
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            values[index] = bad.to_owned();
+            row_error(&connection, &values, composite_snapshot_from_row);
+        }
+        let sql = format!("SELECT {}", composite_snapshot.join(", "));
+        let mut statement = connection.prepare(&sql).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        assert!(composite_snapshot_from_row(rows.next().unwrap().unwrap()).is_ok());
 
         let file = vec![
             "'a.py'", "1", "1", "0", "0", "0", "0", "0", "0", "1.0", "NULL", "NULL", "NULL", "'{}'",
@@ -8345,6 +10625,11 @@ mod tests {
         assert!(store.execute_run_with_slot(&claim_error_id).is_err());
         store.clear_query_fault();
 
+        let claim_failure_id = Uuid::new_v4().to_string();
+        insert_job(&claim_failure_id, "claim-failure-command", "queued").unwrap();
+        FORCE_CLAIM_RUN_FAILURE.store(true, Ordering::SeqCst);
+        assert!(store.execute_run_with_slot(&claim_failure_id).is_err());
+
         let claim_false_id = Uuid::new_v4().to_string();
         insert_job(&claim_false_id, "claim-false-command", "queued").unwrap();
         FORCE_CLAIM_FALSE.store(true, Ordering::SeqCst);
@@ -8553,6 +10838,1705 @@ mod tests {
         );
         registry_error_store.inner.active_processes.clear_poison();
         registry_error_store.close().unwrap();
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn composite_snapshots_are_immutable_and_compaction_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        std::fs::write(
+            directory.path().join(".gitignore"),
+            "target/\n*.duckdb*\nruns/\n",
+        )
+        .unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["add", ".gitignore"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["commit", "-m", "ignore coverage artifacts"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let commit = inspect_git(directory.path()).unwrap().commit_sha.unwrap();
+        let source_path = directory.path().join("src/a.py");
+        let source_hash = hash_file(&source_path).unwrap();
+        let artifact_directory = directory.path().join("target");
+        std::fs::create_dir_all(&artifact_directory).unwrap();
+        let inventory_path = artifact_directory.join("inventory.json");
+        let regions_path = artifact_directory.join("regions.json");
+        std::fs::write(
+            &inventory_path,
+            json!({
+                "schema": composite::INVENTORY_SCHEMA,
+                "mapping_version": composite::MAPPING_VERSION,
+                "source_revision": commit,
+                "entries":[{
+                    "logical_source_id":"python:src/a.py",
+                    "path":"src/a.py",
+                    "package":"runtime",
+                    "component_id":"python",
+                    "language":"python",
+                    "role":"production",
+                    "source_hash":source_hash,
+                    "variants":["cpython"],
+                    "expected_formats":[composite::REGIONS_SCHEMA],
+                    "regions":[{"start_line":1,"end_line":1,"discriminator":"line-1"}]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &regions_path,
+            json!({
+                "schema": composite::REGIONS_SCHEMA,
+                "mapping_version": composite::MAPPING_VERSION,
+                "source_revision": commit,
+                "regions":[{
+                    "path":"src/a.py",
+                    "start_line":1,
+                    "end_line":1,
+                    "discriminator":"line-1",
+                    "hits":1,
+                    "covered":true,
+                    "source_hash":source_hash
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store =
+            CoverageStore::open(directory.path().join("composite.duckdb"), test_config()).unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&store);
+        let project = store.project().unwrap();
+        let inventory_descriptor = json!({
+            "component_id":"python",
+            "package_variant":"inventory",
+            "language":"python",
+            "format":composite::INVENTORY_FORMAT,
+            "inventory_artifact":"target/inventory.json",
+            "role":"inventory",
+            "toolchain_versions":{"coverage.py":"7"}
+        });
+        let coverage_descriptor = json!({
+            "component_id":"python",
+            "package_variant":"cpython",
+            "language":"python",
+            "format":composite::REGIONS_SCHEMA,
+            "inventory_artifact":"target/inventory.json",
+            "logical_source_aliases":[{"path":"src/a.py","logical_source_id":"python:src/a.py"}],
+            "role":"coverage",
+            "toolchain_versions":{"coverage.py":"7"}
+        });
+        let artifact = |path: &Path, descriptor: Value| {
+            let format = descriptor["format"].clone();
+            json!({
+                "path":path.to_string_lossy(),
+                "composite":descriptor,
+                "coverage_format":format,
+                "ingest_status":"ingested",
+                "snapshot_id":Value::Null,
+                "fingerprint":{"sha256":hash_file(path).unwrap()}
+            })
+        };
+        let command = json!({
+            "id":"composite-command",
+            "name":"coverage-production",
+            "repo_path":project.repo_path,
+            "repo_key":project.repo_key
+        });
+        let first = store
+            .compose_composite_snapshot(
+                "run-one",
+                &command,
+                directory.path().to_str().unwrap(),
+                &[
+                    artifact(&inventory_path, inventory_descriptor.clone()),
+                    artifact(&regions_path, coverage_descriptor.clone()),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["status"], "complete");
+        assert_eq!(first["covered_regions"], 1);
+        assert_eq!(first["total_regions"], 1);
+        assert_eq!(first["components"][1]["component"], "python");
+        assert_eq!(first["components"][1]["covered_regions"], 1);
+        store.compact_now().unwrap();
+        assert_eq!(
+            store
+                .composite_regions(first["id"].as_str().unwrap(), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::fs::write(
+            &regions_path,
+            json!({
+                "schema": composite::REGIONS_SCHEMA,
+                "mapping_version": composite::MAPPING_VERSION,
+                "source_revision": inspect_git(directory.path()).unwrap().commit_sha,
+                "regions":[{
+                    "path":"src/a.py",
+                    "start_line":1,
+                    "end_line":1,
+                    "discriminator":"line-1",
+                    "hits":0,
+                    "covered":false,
+                    "source_hash":hash_file(&source_path).unwrap()
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let second = store
+            .compose_composite_snapshot(
+                "run-two",
+                &command,
+                directory.path().to_str().unwrap(),
+                &[
+                    artifact(&inventory_path, inventory_descriptor.clone()),
+                    artifact(&regions_path, coverage_descriptor.clone()),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second["status"], "incomplete");
+        assert_eq!(second["covered_regions"], 0);
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(
+            store
+                .composite_snapshot(first["id"].as_str().unwrap())
+                .unwrap()["status"],
+            "complete"
+        );
+        assert_eq!(store.list_composite_snapshots(10).unwrap().len(), 2);
+        assert_eq!(
+            store.latest_composite_snapshot().unwrap().unwrap()["id"],
+            second["id"]
+        );
+        assert_eq!(
+            store
+                .previous_composite_snapshot(second["id"].as_str().unwrap())
+                .unwrap()
+                .unwrap()["id"],
+            first["id"]
+        );
+        assert!(
+            store
+                .previous_composite_snapshot(first["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.composite_snapshot("missing").is_err());
+        assert!(store.composite_regions("missing", 10).is_err());
+        assert_eq!(
+            store
+                .composite_regions_all(second["id"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.project_summary().unwrap()["composite_snapshot_count"],
+            2
+        );
+        let child_base_report = artifact_directory.join("child-base.lcov");
+        let child_current_report = artifact_directory.join("child-current.lcov");
+        std::fs::write(
+            &child_base_report,
+            "TN:base-test\nSF:src/a.py\nDA:1,1\nend_of_record\nTN:shared-test\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child_current_report,
+            "TN:current-test\nSF:src/a.py\nDA:1,1\nend_of_record\nTN:shared-test\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let child_base = store
+            .ingest_report(
+                &child_base_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("child-base"),
+                None,
+                "unit",
+            )
+            .unwrap();
+        let child_current = store
+            .ingest_report(
+                &child_current_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("child-current"),
+                None,
+                "unit",
+            )
+            .unwrap();
+        assert_eq!(store.project_summary().unwrap()["snapshot_count"], 2);
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET component_evidence = '[{{\"component_id\":\"python\",\"package_variant\":\"cpython\",\"status\":\"measured\",\"snapshot_id\":\"{}\"}}]' WHERE id = '{}'; UPDATE composite_snapshots SET component_evidence = '[{{\"component_id\":\"python\",\"package_variant\":\"cpython\",\"status\":\"measured\",\"snapshot_id\":\"{}\"}}]' WHERE id = '{}';",
+                child_base["id"].as_str().unwrap(),
+                first["id"].as_str().unwrap(),
+                child_current["id"].as_str().unwrap(),
+                second["id"].as_str().unwrap(),
+            ))
+            .unwrap();
+        let attribution = store
+            .composite_test_attribution(
+                first["id"].as_str().unwrap(),
+                second["id"].as_str().unwrap(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(attribution["status"], "measured");
+        assert_eq!(attribution["affected_test_count"], 2);
+        assert_eq!(attribution["tests_truncated"], true);
+        assert_eq!(attribution["affected_tests"][0]["test_id"], "base-test");
+        assert_eq!(
+            attribution["affected_tests"][0]["removed"][0]["file_path"],
+            "src/a.py"
+        );
+        assert_eq!(
+            attribution["affected_tests"][0]["removed"][0]["line_number"],
+            1
+        );
+        assert_eq!(
+            attribution["affected_tests"][0]["removed"][0]["kind"],
+            "line"
+        );
+        let no_names_report = artifact_directory.join("child-no-names.lcov");
+        std::fs::write(
+            &no_names_report,
+            "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let no_names = store
+            .ingest_report(
+                &no_names_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("child-no-names"),
+                None,
+                "unit",
+            )
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET component_evidence = '[{{\"component_id\":\"python\",\"package_variant\":\"cpython\",\"status\":\"measured\",\"snapshot_id\":\"{}\"}}]' WHERE id = '{}';",
+                no_names["id"].as_str().unwrap(),
+                second["id"].as_str().unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .composite_test_attribution(
+                    first["id"].as_str().unwrap(),
+                    second["id"].as_str().unwrap(),
+                    10,
+                )
+                .unwrap()["status"],
+            "unavailable"
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET component_evidence = '[{{\"component_id\":\"python\",\"package_variant\":\"cpython\",\"status\":\"measured\",\"snapshot_id\":\"{}\"}}]' WHERE id = '{}';",
+                child_current["id"].as_str().unwrap(),
+                second["id"].as_str().unwrap(),
+            ))
+            .unwrap();
+        let malformed_standard_report = artifact_directory.join("malformed.lcov");
+        std::fs::write(
+            &malformed_standard_report,
+            "TN:bad\nSF:src/a.py\nDA:not-a-number,1\nend_of_record\n",
+        )
+        .unwrap();
+        let mut standard_descriptor = coverage_descriptor.clone();
+        standard_descriptor["format"] = json!("lcov");
+        let malformed = store
+            .compose_composite_snapshot(
+                "run-malformed-standard",
+                &command,
+                directory.path().to_str().unwrap(),
+                &[
+                    artifact(&inventory_path, inventory_descriptor.clone()),
+                    artifact(&malformed_standard_report, standard_descriptor),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(malformed["status"], "incomplete");
+        let mut no_fingerprint = artifact(&regions_path, coverage_descriptor.clone());
+        no_fingerprint
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        let no_fingerprint_result = store
+            .compose_composite_snapshot(
+                "run-no-fingerprint",
+                &command,
+                directory.path().to_str().unwrap(),
+                &[
+                    artifact(&inventory_path, inventory_descriptor.clone()),
+                    no_fingerprint,
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_fingerprint_result["status"], "incomplete");
+        std::fs::write(&inventory_path, "{}").unwrap();
+        let invalid_inventory = store
+            .compose_composite_snapshot(
+                "run-invalid-inventory",
+                &command,
+                directory.path().to_str().unwrap(),
+                &[
+                    artifact(&inventory_path, inventory_descriptor),
+                    artifact(&regions_path, coverage_descriptor),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalid_inventory["status"], "incomplete");
+        assert_eq!(
+            store
+                .compose_composite_snapshot(
+                    "run-missing-inventory",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &[json!({
+                        "path":"target/orphan.json",
+                        "composite":{}
+                    })],
+                )
+                .unwrap()
+                .unwrap()["status"],
+            "incomplete"
+        );
+        assert!(
+            store
+                .composite_descriptor_from_artifact(&json!({}))
+                .is_err()
+        );
+        let service = crate::service::CoverageService::new(
+            store.clone(),
+            crate::service::RequestContext {
+                repo_key: project.repo_key.clone(),
+                checkout_path: project.repo_path.clone(),
+                suite: None,
+            },
+        );
+        let review = service
+            .composite_review(
+                "incremental",
+                second["id"].as_str().unwrap(),
+                Some(first["id"].as_str().unwrap()),
+                None,
+                10,
+                600,
+                12_000,
+                "compact",
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            review["data"]["incremental"]["coverage_gain"]["regressed"],
+            1
+        );
+        assert_eq!(
+            review["data"]["incremental"]["test_attribution"]["status"],
+            "measured"
+        );
+        let composite_dashboard = service
+            .dashboard_with_composite(
+                None,
+                None,
+                Some(second["id"].as_str().unwrap()),
+                Some(first["id"].as_str().unwrap()),
+                18,
+            )
+            .unwrap();
+        assert_eq!(
+            composite_dashboard["data"]["selection"]["composite_snapshot_id"],
+            second["id"]
+        );
+        assert_eq!(
+            composite_dashboard["data"]["selection"]["composite_baseline_kind"],
+            "explicit"
+        );
+        assert_eq!(
+            composite_dashboard["data"]["composite"]["current"]["total_regions"],
+            1
+        );
+        assert_eq!(
+            composite_dashboard["data"]["composite"]["incremental"]["coverage_gain"]["regressed"],
+            1
+        );
+        for focus in ["change", "history", "insight", "source", "audit", "all"] {
+            let representation = if focus == "audit" { "audit" } else { "compact" };
+            let response = service
+                .composite_review(
+                    focus,
+                    second["id"].as_str().unwrap(),
+                    None,
+                    Some("src/a.py"),
+                    10,
+                    600,
+                    12_000,
+                    representation,
+                    10,
+                )
+                .unwrap();
+            assert_eq!(response["data"]["task"], focus);
+        }
+        assert!(
+            service
+                .composite_review(
+                    "invalid",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    600,
+                    12_000,
+                    "bad",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    0,
+                    600,
+                    12_000,
+                    "audit",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    600,
+                    12_000,
+                    "audit",
+                    0,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    49,
+                    12_000,
+                    "audit",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    600,
+                    999,
+                    "audit",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "incremental",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    vec![("src/a.py".to_owned(), 1, 1)],
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_ok()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    Vec::new(),
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    vec![("src/a.py".to_owned(), 2, 1)],
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    vec![("src/a.py".to_owned(), 1, 1)],
+                    9,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        let foreign_service = crate::service::CoverageService::new(
+            store.clone(),
+            crate::service::RequestContext {
+                repo_key: "foreign-repository".to_owned(),
+                checkout_path: directory.path().to_string_lossy().into_owned(),
+                suite: None,
+            },
+        );
+        assert!(
+            foreign_service
+                .composite_review(
+                    "audit",
+                    second["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    10,
+                    600,
+                    12_000,
+                    "audit",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .dashboard_with_composite(None, None, None, None, 2)
+                .is_ok()
+        );
+        assert!(
+            service
+                .dashboard_with_composite(None, None, Some(second["id"].as_str().unwrap()), None, 2)
+                .is_ok()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    (0..=10)
+                        .map(|line| ("src/a.py".to_owned(), line + 1, line + 1))
+                        .collect(),
+                    120,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    vec![("src/a.py".to_owned(), 1, 11)],
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET mapping_version = '{}', repo_key = '{}' WHERE id = '{}'; UPDATE composite_snapshots SET component_evidence = '[]', repo_key = '{}' WHERE id = '{}';",
+                composite::MAPPING_VERSION,
+                project.repo_key,
+                first["id"].as_str().unwrap(),
+                project.repo_key,
+                second["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        for skip in 0..=64 {
+            store.inject_query_fault_after(skip);
+            let _ = service.dashboard_with_composite(
+                None,
+                None,
+                Some(second["id"].as_str().unwrap()),
+                Some(first["id"].as_str().unwrap()),
+                2,
+            );
+        }
+        store.clear_query_fault();
+        FORCE_COMPOSITE_PREVIOUS_SNAPSHOT_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            service
+                .dashboard_with_composite(
+                    None,
+                    None,
+                    Some(second["id"].as_str().unwrap()),
+                    None,
+                    2,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET repo_key = 'foreign-current' WHERE id = '{}';",
+                second["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            service
+                .dashboard_with_composite(
+                    None,
+                    None,
+                    Some(second["id"].as_str().unwrap()),
+                    None,
+                    2,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET repo_key = '{}' WHERE id = '{}';",
+                project.repo_key,
+                second["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET repo_key = 'foreign-baseline' WHERE id = '{}';",
+                first["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            service
+                .dashboard_with_composite(
+                    None,
+                    None,
+                    Some(second["id"].as_str().unwrap()),
+                    Some(first["id"].as_str().unwrap()),
+                    2,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET repo_key = '{}' WHERE id = '{}';",
+                project.repo_key,
+                first["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET mapping_version = 'incompatible' WHERE id = '{}';",
+                first["id"].as_str().unwrap(),
+            ))
+            .unwrap();
+        let invalid_dashboard = service
+            .dashboard_with_composite(
+                None,
+                None,
+                Some(second["id"].as_str().unwrap()),
+                Some(first["id"].as_str().unwrap()),
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            invalid_dashboard["data"]["composite"]["incremental"]["status"],
+            "unmeasured"
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET mapping_version = '{}', component_evidence = 'bad' WHERE id = '{}';",
+                composite::MAPPING_VERSION,
+                first["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET component_evidence = 'bad' WHERE id = '{}';",
+                second["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            service
+                .dashboard_with_composite(
+                    None,
+                    None,
+                    Some(second["id"].as_str().unwrap()),
+                    Some(first["id"].as_str().unwrap()),
+                    2,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET component_evidence = '[]' WHERE id = '{}';",
+                second["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        for skip in 0..=24 {
+            store.inject_query_fault_after(skip);
+            let _ = service.dashboard_with_composite(
+                None,
+                None,
+                Some(second["id"].as_str().unwrap()),
+                Some(first["id"].as_str().unwrap()),
+                2,
+            );
+        }
+        store.clear_query_fault();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET repo_key = 'foreign-composite' WHERE id = '{}'",
+                first["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            service
+                .dashboard_with_composite(
+                    None,
+                    None,
+                    Some(second["id"].as_str().unwrap()),
+                    Some(first["id"].as_str().unwrap()),
+                    2,
+                )
+                .is_err()
+        );
+        assert!(
+            foreign_service
+                .composite_source_review(
+                    second["id"].as_str().unwrap(),
+                    vec![("src/a.py".to_owned(), 1, 1)],
+                    10,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        for skip in 0..=12 {
+            store.inject_query_fault_after(skip);
+            let _ = store.composite_test_attribution(
+                first["id"].as_str().unwrap(),
+                second["id"].as_str().unwrap(),
+                10,
+            );
+        }
+        store.clear_query_fault();
+        FORCE_TEST_NAMES_QUERY_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .composite_test_attribution(
+                    first["id"].as_str().unwrap(),
+                    second["id"].as_str().unwrap(),
+                    10,
+                )
+                .is_err()
+        );
+        FORCE_TEST_OBSERVATIONS_QUERY_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .composite_test_attribution(
+                    first["id"].as_str().unwrap(),
+                    second["id"].as_str().unwrap(),
+                    10,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "DROP TABLE composite_regions; CREATE VIEW composite_regions AS SELECT '{}' AS composite_snapshot_id, 'region' AS region_key, CAST(NULL AS VARCHAR) AS region;",
+                second["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            store
+                .composite_regions(second["id"].as_str().unwrap(), 10)
+                .is_err()
+        );
+        assert!(
+            store
+                .composite_regions_all(second["id"].as_str().unwrap())
+                .is_err()
+        );
+        FORCE_COMPOSITE_QUERY_MAP_FAILURE.store(2, Ordering::SeqCst);
+        assert!(
+            store
+                .composite_regions(second["id"].as_str().unwrap(), 10)
+                .is_err()
+        );
+        FORCE_COMPOSITE_QUERY_MAP_FAILURE.store(3, Ordering::SeqCst);
+        assert!(
+            store
+                .composite_regions_all(second["id"].as_str().unwrap())
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(
+                "DROP VIEW composite_regions; CREATE VIEW composite_regions AS SELECT 1 AS broken;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .composite_regions(second["id"].as_str().unwrap(), 10)
+                .is_err()
+        );
+        assert!(
+            store
+                .composite_regions_all(second["id"].as_str().unwrap())
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "DELETE FROM composite_snapshots WHERE id = '{}'",
+                first["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        for skip in 0..=24 {
+            store.inject_query_fault_after(skip);
+            let _ = service.dashboard_with_composite(
+                None,
+                None,
+                Some(second["id"].as_str().unwrap()),
+                None,
+                2,
+            );
+        }
+        store.clear_query_fault();
+        make_broken_view(&store, "composite_snapshots");
+        assert!(store.project_summary().is_err());
+        assert!(store.list_composite_snapshots(10).is_err());
+        assert!(store.latest_composite_snapshot().is_err());
+        assert!(store.previous_composite_snapshot("missing").is_err());
+        assert!(store.composite_regions("missing", 10).is_err());
+        assert!(store.composite_regions_all("missing").is_err());
+        let projection_store = CoverageStore::open(
+            directory.path().join("composite-projection-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        projection_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&projection_store);
+        FORCE_COMPOSITE_QUERY_MAP_FAILURE.store(1, Ordering::SeqCst);
+        assert!(projection_store.list_composite_snapshots(10).is_err());
+        projection_store
+            .execute_sql_for_test(
+                "DROP TABLE composite_snapshots; CREATE VIEW composite_snapshots AS SELECT CAST(error('composite projection query failure') AS VARCHAR) AS id, repo_key FROM project_settings;",
+            )
+            .unwrap();
+        assert!(projection_store.project_summary().is_err());
+        assert!(projection_store.list_composite_snapshots(10).is_err());
+        projection_store.close().unwrap();
+
+        let unselected_projection_store = CoverageStore::open(
+            directory.path().join("composite-unselected.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        assert!(
+            unselected_projection_store
+                .list_composite_snapshots(10)
+                .is_err()
+        );
+        unselected_projection_store.close().unwrap();
+
+        let boundary_store = CoverageStore::open(
+            directory.path().join("composite-boundary-errors.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        boundary_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&boundary_store);
+        let boundary_project = boundary_store.project().unwrap();
+        boundary_store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        INSERT_COMPOSITE_SNAPSHOT_SQL,
+                        params![
+                            "boundary-current",
+                            Utc::now(),
+                            "boundary-run",
+                            "boundary-command",
+                            boundary_project.repo_path,
+                            boundary_project.repo_key,
+                            "complete",
+                            composite::MAPPING_VERSION,
+                            "boundary-inventory",
+                            Option::<String>::None,
+                            false,
+                            0_i64,
+                            1_i64,
+                            0.0_f64,
+                            "[]",
+                            "{}",
+                            "{}",
+                            "{}",
+                            "[]",
+                            "[]",
+                        ],
+                    )
+                    .expect("boundary composite snapshot insert should succeed");
+                Ok(())
+            })
+            .unwrap();
+        boundary_store
+            .execute_sql_for_test(
+                "DROP INDEX IF EXISTS idx_composite_snapshots_repo_time; DROP INDEX IF EXISTS idx_composite_snapshots_run; ALTER TABLE composite_snapshots RENAME TO composite_snapshots_base; CREATE VIEW composite_snapshots AS SELECT id, created_at, run_id, command_id, repo_path, CAST('' AS VARCHAR) AS repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence FROM composite_snapshots_base;",
+            )
+            .unwrap();
+        assert!(
+            boundary_store
+                .previous_composite_snapshot("boundary-current")
+                .is_err()
+        );
+        boundary_store
+            .execute_sql_for_test(
+                "DROP VIEW composite_snapshots; CREATE VIEW composite_snapshots AS SELECT id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence FROM composite_snapshots_base UNION ALL SELECT CAST(NULL AS VARCHAR) AS id, created_at - INTERVAL '1 second' AS created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence FROM composite_snapshots_base;",
+            )
+            .unwrap();
+        assert!(
+            boundary_store
+                .previous_composite_snapshot("boundary-current")
+                .is_err()
+        );
+        boundary_store.close().unwrap();
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn managed_run_assembles_multiple_composite_components() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        std::fs::write(directory.path().join("src/rust.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            directory.path().join("src/app.js"),
+            "export const app = true;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".gitignore"),
+            "target/\n*.duckdb*\nruns/\n",
+        )
+        .unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["commit", "-m", "add composite sources"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let checkout = inspect_git(directory.path()).unwrap();
+        let source_files = [
+            ("rust", "rust", "src/rust.rs", "rust-region"),
+            ("python", "python", "src/a.py", "python-region"),
+            (
+                "javascript",
+                "javascript",
+                "src/app.js",
+                "javascript-region",
+            ),
+        ];
+        let entries = source_files
+            .iter()
+            .map(|(component, language, path, discriminator)| {
+                json!({
+                    "logical_source_id": format!("{component}:{path}"),
+                    "path": path,
+                    "package": "runtime",
+                    "component_id": component,
+                    "language": language,
+                    "role": "production",
+                    "source_hash": hash_file(&directory.path().join(path)).unwrap(),
+                    "variants": ["default"],
+                    "expected_formats": [REGIONS_SCHEMA],
+                    "regions": [{"start_line":1,"end_line":1,"discriminator":discriminator}]
+                })
+            })
+            .collect::<Vec<_>>();
+        let inventory = json!({
+            "schema": composite::INVENTORY_SCHEMA,
+            "mapping_version": composite::MAPPING_VERSION,
+            "source_revision": checkout.commit_sha,
+            "entries": entries,
+        });
+        let final_directory = directory.path().join("target/final");
+        std::fs::create_dir_all(&final_directory).unwrap();
+        let inventory_final = final_directory.join("inventory.json");
+        std::fs::write(&inventory_final, inventory.to_string()).unwrap();
+        for (component, _language, path, discriminator) in source_files {
+            std::fs::write(
+                final_directory.join(format!("{component}.json")),
+                json!({
+                    "schema": REGIONS_SCHEMA,
+                    "mapping_version": composite::MAPPING_VERSION,
+                    "source_revision": inspect_git(directory.path()).unwrap().commit_sha,
+                    "regions":[{
+                        "path": path,
+                        "start_line":1,
+                        "end_line":1,
+                        "discriminator": discriminator,
+                        "hits":1,
+                        "covered":true,
+                        "source_hash": hash_file(&directory.path().join(path)).unwrap()
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let target_directory = directory.path().join("target");
+        std::fs::write(target_directory.join("inventory.json"), "{}").unwrap();
+        for component in ["rust", "python", "javascript"] {
+            std::fs::write(target_directory.join(format!("{component}.json")), "{}").unwrap();
+        }
+        let alias = |path: &str, logical_source_id: String| json!([{"path":path,"logical_source_id":logical_source_id}]);
+        let descriptor = |component: &str, language: &str, path: &str| {
+            json!({
+                "path": format!("target/{component}.json"),
+                "required": true,
+                "coverage_format": REGIONS_SCHEMA,
+                "composite": {
+                    "component_id": component,
+                    "package_variant": "default",
+                    "language": language,
+                    "format": REGIONS_SCHEMA,
+                    "inventory_artifact": "target/inventory.json",
+                    "role": "coverage",
+                    "logical_source_aliases": alias(path, format!("{component}:{path}")),
+                    "toolchain_versions": {language: "test"}
+                }
+            })
+        };
+        let artifact_specs = json!({
+            "inventory": {
+                "path":"target/inventory.json",
+                "required":true,
+                "coverage_format":composite::INVENTORY_FORMAT,
+                "composite": {
+                    "component_id":"production",
+                    "package_variant":"inventory",
+                    "language":"mixed",
+                    "format":composite::INVENTORY_FORMAT,
+                    "inventory_artifact":"target/inventory.json",
+                    "role":"inventory",
+                    "toolchain_versions":{"coverage-mcp":"test"}
+                }
+            },
+            "rust": descriptor("rust", "rust", "src/rust.rs"),
+            "python": descriptor("python", "python", "src/a.py"),
+            "javascript": descriptor("javascript", "javascript", "src/app.js")
+        });
+        let managed_inventory_descriptor = artifact_specs["inventory"]["composite"].clone();
+        let managed_coverage_descriptor = artifact_specs["python"]["composite"].clone();
+        let store = CoverageStore::open(
+            directory.path().join("composite-managed.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&store);
+        let command = store
+            .register_command(
+                "multi-composite-run",
+                "cp target/final/inventory.json target/inventory.json && cp target/final/rust.json target/rust.json && cp target/final/python.json target/python.json && cp target/final/javascript.json target/javascript.json && : {{args}}",
+                Some(directory.path()),
+                "/bin/sh",
+                Some(artifact_specs),
+                true,
+                "tester",
+                "multi-component composite coverage",
+                true,
+            )
+            .unwrap();
+        let result = store
+            .run_command_with_options(command["id"].as_str().unwrap(), Some(30), None, 20, false)
+            .unwrap();
+        assert_eq!(result["status"], "passed");
+        let composite_id = result["composite_snapshot_id"].as_str().unwrap();
+        let composite = store.composite_snapshot(composite_id).unwrap();
+        assert_eq!(composite["status"], "complete");
+        assert_eq!(composite["covered_regions"], 3);
+        assert_eq!(composite["total_regions"], 3);
+        assert_eq!(
+            composite["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|component| component["component"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["rust", "python", "javascript"]
+        );
+        std::fs::write(
+            final_directory.join("rust.json"),
+            json!({
+                "schema": REGIONS_SCHEMA,
+                "mapping_version": composite::MAPPING_VERSION,
+                "source_revision": inspect_git(directory.path()).unwrap().commit_sha,
+                "regions":[{
+                    "path":"src/rust.rs",
+                    "start_line":1,
+                    "end_line":1,
+                    "discriminator":"rust-region",
+                    "hits":0,
+                    "covered":false,
+                    "source_hash":hash_file(&directory.path().join("src/rust.rs")).unwrap()
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let execution = json!({"mode":"incremental","label":"rust focused case"});
+        let arguments = json!(["--filter", "rust"]);
+        let incremental_result = store
+            .run_command_with_execution(
+                command["id"].as_str().unwrap(),
+                Some(30),
+                Some("rust-focused-case-v1"),
+                20,
+                false,
+                Some(&execution),
+                Some(&arguments),
+                Some(composite_id),
+            )
+            .unwrap();
+        assert_eq!(incremental_result["status"], "passed");
+        assert_eq!(
+            incremental_result["execution"]["baseline"]["composite_snapshot_id"],
+            composite_id
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE runs SET execution_mode = 'full', execution_identity = 'synthetic-full', execution_label = 'synthetic' WHERE id = '{}';",
+                result["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            store
+                .composite_baseline_for_run(
+                    result["id"].as_str().unwrap(),
+                    composite["repo_key"].as_str().unwrap(),
+                    composite["inventory_hash"].as_str(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .composite_baseline_for_run(
+                    incremental_result["id"].as_str().unwrap(),
+                    composite["repo_key"].as_str().unwrap(),
+                    Some("different-inventory-hash"),
+                )
+                .unwrap()
+                .is_none()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE runs SET execution_mode = 'incremental', execution_identity = 'synthetic-no-baseline', execution_label = 'synthetic' WHERE id = '{}';",
+                result["id"].as_str().unwrap()
+            ))
+            .unwrap();
+        assert!(
+            store
+                .composite_baseline_for_run(
+                    result["id"].as_str().unwrap(),
+                    composite["repo_key"].as_str().unwrap(),
+                    composite["inventory_hash"].as_str(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let ordinary_report = directory.path().join("ordinary-baseline.lcov");
+        std::fs::write(
+            &ordinary_report,
+            "TN:ordinary\nSF:src/rust.rs\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let ordinary_snapshot = store
+            .ingest_report(
+                &ordinary_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("ordinary-baseline"),
+                None,
+                "unit",
+            )
+            .unwrap();
+        let ordinary_baseline_execution = json!({"mode":"incremental","label":"ordinary baseline"});
+        let ordinary_baseline_result = store
+            .run_command_with_execution(
+                command["id"].as_str().unwrap(),
+                Some(30),
+                Some("composite-ordinary-baseline-v1"),
+                20,
+                false,
+                Some(&ordinary_baseline_execution),
+                Some(&json!(["--filter", "all"])),
+                Some(ordinary_snapshot["id"].as_str().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(ordinary_baseline_result["status"], "passed");
+        let reuse_descriptor = composite::composite_descriptor(&json!({
+            "composite": descriptor("python", "python", "src/a.py")["composite"]
+        }))
+        .unwrap()
+        .unwrap();
+        let stale_input = || CompositeComponentInput {
+            descriptor: reuse_descriptor.clone(),
+            artifact_path: directory.path().join("stale-python.json"),
+            artifact_hash: None,
+            snapshot_id: None,
+            source_revision: None,
+            artifact_status: "skipped_stale".to_owned(),
+            reused_from_snapshot_id: None,
+            regions: Vec::new(),
+        };
+        let mut invalid_evidence_inputs = vec![stale_input()];
+        CoverageStore::reuse_stale_composite_inputs(
+            &mut invalid_evidence_inputs,
+            "baseline",
+            &json!({"component_evidence":[{}, {"component_id":"python"}]}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(invalid_evidence_inputs[0].artifact_status, "skipped_stale");
+        let mut no_evidence_inputs = vec![stale_input()];
+        CoverageStore::reuse_stale_composite_inputs(
+            &mut no_evidence_inputs,
+            "baseline",
+            &json!({}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(no_evidence_inputs[0].artifact_status, "skipped_stale");
+        let mut no_previous_regions = vec![stale_input()];
+        CoverageStore::reuse_stale_composite_inputs(
+            &mut no_previous_regions,
+            "baseline",
+            &json!({"component_evidence":[{"component_id":"python","package_variant":"default","status":"measured"}]}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(no_previous_regions[0].artifact_status, "skipped_stale");
+        let baseline_region = json!({
+            "component_id":"python",
+            "logical_source_id":"python:src/a.py",
+            "path":"src/a.py",
+            "start_line":1,
+            "end_line":1,
+            "discriminator":"python-region",
+            "source_hash":null,
+            "variants":[{"package_variant":"default","state":"covered","hits":1}]
+        });
+        let mut malformed_regions = vec![stale_input()];
+        assert!(CoverageStore::reuse_stale_composite_inputs(
+            &mut malformed_regions,
+            "baseline",
+            &json!({"component_evidence":[{"component_id":"python","package_variant":"default","status":"measured"}]}),
+            &[json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"end_line":1,"discriminator":"python-region"})],
+        )
+        .is_err());
+        for malformed_region in [
+            json!({"logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"end_line":1,"discriminator":"python-region","variants":[]}),
+            json!({"component_id":"python","path":"src/a.py","start_line":1,"end_line":1,"discriminator":"python-region","variants":[]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","start_line":1,"end_line":1,"discriminator":"python-region","variants":[]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","end_line":1,"discriminator":"python-region","variants":[]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"discriminator":"python-region","variants":[]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"end_line":1,"variants":[]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"end_line":1,"discriminator":"python-region","variants":[{}]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"end_line":1,"discriminator":"python-region","variants":[{"package_variant":"default"}]}),
+            json!({"component_id":"python","logical_source_id":"python:src/a.py","path":"src/a.py","start_line":1,"end_line":1,"discriminator":"python-region","variants":[{"package_variant":"default","state":"covered"}]}),
+        ] {
+            let mut malformed = vec![stale_input()];
+            assert!(CoverageStore::reuse_stale_composite_inputs(
+                &mut malformed,
+                "baseline",
+                &json!({"component_evidence":[{"component_id":"python","package_variant":"default","status":"measured"}]}),
+                &[malformed_region],
+            )
+            .is_err());
+        }
+        let mut ignored_state = vec![stale_input()];
+        let ignored_region = {
+            let mut region = baseline_region.clone();
+            region["variants"][0]["state"] = json!("missing_artifact");
+            region
+        };
+        CoverageStore::reuse_stale_composite_inputs(
+            &mut ignored_state,
+            "baseline",
+            &json!({"component_evidence":[{"component_id":"python","package_variant":"default","status":"measured"}]}),
+            &[ignored_region],
+        )
+        .unwrap();
+        assert_eq!(ignored_state[0].artifact_status, "skipped_stale");
+        let managed_inventory_path = inventory_final.clone();
+        let managed_regions_path = final_directory.join("python.json");
+        let managed_artifact = |path: &Path, descriptor: Value| {
+            let format = descriptor["format"].clone();
+            json!({
+                "path":path.to_string_lossy(),
+                "composite":descriptor,
+                "coverage_format":format,
+                "ingest_status":"ingested",
+                "snapshot_id":Value::Null,
+                "fingerprint":{"sha256":hash_file(path).unwrap()}
+            })
+        };
+        store.inject_query_fault_after(1);
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command["id"].as_str().unwrap(),
+                    Some(30),
+                    Some("query-fault-baseline-v1"),
+                    20,
+                    false,
+                    Some(&execution),
+                    Some(&arguments),
+                    Some(composite_id),
+                )
+                .is_err()
+        );
+        store.clear_query_fault();
+        for skip in 0..=10 {
+            store.inject_query_fault_after(skip);
+            let _ = store.composite_baseline_for_run(
+                incremental_result["id"].as_str().unwrap(),
+                composite["repo_key"].as_str().unwrap(),
+                composite["inventory_hash"].as_str(),
+            );
+        }
+        store.clear_query_fault();
+        for skip in 0..=10 {
+            store.inject_query_fault_after(skip);
+            let _ = store.run_result(incremental_result["id"].as_str().unwrap(), 20);
+        }
+        store.clear_query_fault();
+        let valid_composite_artifacts = vec![
+            managed_artifact(
+                &managed_inventory_path,
+                managed_inventory_descriptor.clone(),
+            ),
+            managed_artifact(&managed_regions_path, managed_coverage_descriptor.clone()),
+        ];
+        let mut transaction_config = test_config();
+        transaction_config.db_pool_size = 1;
+        let transaction_store = CoverageStore::open(
+            directory.path().join("composite-transaction.duckdb"),
+            transaction_config,
+        )
+        .unwrap();
+        transaction_store.ensure_project(directory.path()).unwrap();
+        stop_compaction_worker(&transaction_store);
+        transaction_store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("BEGIN TRANSACTION")
+                    .expect("boundary transaction should begin");
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            transaction_store
+                .compose_composite_snapshot(
+                    "composite-begin-transaction-error",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        transaction_store
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("ROLLBACK")
+                    .expect("boundary transaction should roll back");
+                Ok(())
+            })
+            .unwrap();
+        transaction_store.close().unwrap();
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "missing-command-id",
+                    &json!({"repo_path":directory.path(),"repo_key":composite["repo_key"]}),
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "missing-command-repo-path",
+                    &json!({"id":"command","repo_key":composite["repo_key"]}),
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "missing-command-repo-key",
+                    &json!({"id":"command","repo_path":directory.path()}),
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "invalid-command-repo",
+                    &json!({"id":"command","repo_path":"\u{0}","repo_key":"missing"}),
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "coverage-only-fallback",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &[managed_artifact(
+                        &managed_regions_path,
+                        managed_coverage_descriptor.clone()
+                    )],
+                )
+                .is_ok()
+        );
+        let invalid_descriptor_artifact = json!({
+            "path":managed_regions_path,
+            "composite":{"component_id":7},
+            "coverage_format":composite::REGIONS_SCHEMA,
+            "ingest_status":"ingested"
+        });
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "invalid-composite-descriptor",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &[
+                        managed_artifact(
+                            &managed_inventory_path,
+                            managed_inventory_descriptor.clone()
+                        ),
+                        invalid_descriptor_artifact
+                    ],
+                )
+                .is_err()
+        );
+        let mut missing_artifact_path =
+            managed_artifact(&managed_regions_path, managed_coverage_descriptor.clone());
+        missing_artifact_path
+            .as_object_mut()
+            .unwrap()
+            .remove("path");
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "missing-artifact-path",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &[
+                        managed_artifact(
+                            &managed_inventory_path,
+                            managed_inventory_descriptor.clone()
+                        ),
+                        missing_artifact_path
+                    ],
+                )
+                .is_err()
+        );
+        store.inject_query_fault();
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "composite-baseline-query-fault",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        store.clear_query_fault();
+        assert!(
+            store
+                .composite_descriptor_from_artifact(&json!({"composite":{"component_id":7}}))
+                .is_err()
+        );
+        FORCE_COMPOSITE_COMPOSE_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "composite-forced-error",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        FORCE_COMPOSITE_COMPOSE_FAILURE.store(false, Ordering::SeqCst);
+        let incremental_service = crate::service::CoverageService::new(
+            store.clone(),
+            crate::service::RequestContext {
+                repo_key: composite["repo_key"].as_str().unwrap().to_owned(),
+                checkout_path: directory.path().to_string_lossy().into_owned(),
+                suite: None,
+            },
+        );
+        let incremental_review = incremental_service
+            .run_review(
+                incremental_result["id"].as_str().unwrap(),
+                "status",
+                None,
+                "both",
+                3,
+                5,
+                false,
+                600,
+                12_000,
+            )
+            .unwrap();
+        assert_eq!(
+            incremental_review["data"]["incremental_review"]["status"],
+            "measured"
+        );
+        assert_eq!(
+            incremental_review["data"]["incremental_review"]["incremental"]["coverage_gain"]["regressed"],
+            1
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_regions SET region = '{{}}' WHERE composite_snapshot_id = '{}' AND region_key = (SELECT region_key FROM composite_regions WHERE composite_snapshot_id = '{}' LIMIT 1)",
+                composite_id, composite_id
+            ))
+            .unwrap();
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    incremental_result["id"].as_str().unwrap(),
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        make_broken_view(&store, "composite_regions");
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "composite-region-transaction-fault",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        make_broken_view(&store, "composite_snapshots");
+        assert!(
+            store
+                .compose_composite_snapshot(
+                    "composite-snapshot-transaction-fault",
+                    &command,
+                    directory.path().to_str().unwrap(),
+                    &valid_composite_artifacts,
+                )
+                .is_err()
+        );
+        let compose_error_job = json!({
+            "command": "true",
+            "cwd": directory.path(),
+            "command_id": command["id"],
+            "stdout_path": directory.path().join("compose-error.stdout"),
+            "stderr_path": directory.path().join("compose-error.stderr"),
+            "timeout_seconds": null,
+            "max_summary_lines": 20
+        });
+        FORCE_COMPOSITE_EXECUTION_FAILURE.store(true, Ordering::SeqCst);
+        let compose_error_result = store.execute_run_with_claimed_job(
+            "composite-compose-error",
+            &compose_error_job,
+            Utc::now(),
+        );
+        assert!(compose_error_result.is_err());
         store.close().unwrap();
     }
 
@@ -9268,6 +13252,15 @@ mod tests {
                 })
                 .unwrap();
         }
+        prune_store
+            .execute_sql_for_test(
+                "INSERT INTO run_execution_context (run_id, arguments, baseline_snapshot_id) VALUES ('prune-old', '[]', NULL);
+                 DROP INDEX IF EXISTS idx_run_execution_context_baseline;
+                 ALTER TABLE run_execution_context RENAME TO run_execution_context_base;
+                 CREATE VIEW run_execution_context AS SELECT * FROM run_execution_context_base;",
+            )
+            .unwrap();
+        assert!(prune_store.prune_runs("prune-command").is_err());
         make_readonly_view(&prune_store, "run_artifacts");
         assert!(prune_store.prune_runs("prune-command").is_err());
         make_broken_view(&prune_store, "runs");
@@ -10157,6 +14150,7 @@ mod tests {
         store.close().unwrap();
 
         let (store, snapshot_id) = broken_store("summary-projection-errors.duckdb", "snapshots");
+        assert!(store.compaction_summary().is_err());
         assert!(store.project_summary().is_err());
         assert!(store.list_snapshots(None, None, None, 10).is_err());
         assert!(store.latest_snapshot(None, None, None).is_err());
@@ -10164,6 +14158,13 @@ mod tests {
         assert!(store.previous_snapshot(&snapshot_id).is_err());
         assert!(store.trend(None, None, None, None, None, 10).is_err());
         assert!(store.targets(&snapshot_id, "priority", 10).is_err());
+        store.close().unwrap();
+
+        let (store, _) = broken_store(
+            "compaction-payload-projection-errors.duckdb",
+            "coverage_compacted_payloads",
+        );
+        assert!(store.compaction_summary().is_err());
         store.close().unwrap();
 
         let snapshot_query_map_store = CoverageStore::open(
@@ -10848,6 +14849,7 @@ mod tests {
         let (runs_store, runs_command) = open_store("managed-persist-runs");
         let runs_job = insert_job(&runs_store, &runs_command, "managed-persist-runs");
         make_readonly_view(&runs_store, "runs");
+        FORCE_COMPOSITE_PERSIST_FAILURE.store(true, Ordering::SeqCst);
         assert!(
             runs_store
                 .execute_run_with_claimed_job("managed-persist-runs", &runs_job, Utc::now())
@@ -10892,6 +14894,15 @@ mod tests {
         std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
         let store =
             CoverageStore::open(directory.path().join("faults.duckdb"), test_config()).unwrap();
+        let unselected = CoverageStore::open(
+            directory
+                .path()
+                .join("unselected-compaction-summary.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        assert!(unselected.compaction_summary().is_err());
+        unselected.close().unwrap();
         store.ensure_project(directory.path()).unwrap();
         stop_compaction_worker(&store);
         let snapshot = store
@@ -11034,6 +15045,7 @@ mod tests {
         sweep_query_boundaries!(store.project_settings());
         sweep_query_boundaries!(store.update_project_settings(ProjectSettingsPatch::default()));
         sweep_query_boundaries!(store.project_summary());
+        sweep_query_boundaries!(store.compaction_summary());
         sweep_query_boundaries!(store.compact_now());
         sweep_query_boundaries!(store.list_worktrees(10));
         sweep_query_boundaries!(store.worktree("missing"));
@@ -12053,6 +16065,552 @@ mod tests {
     }
 
     #[test]
+    fn incremental_comparison_is_explicit_named_and_compaction_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let baseline_report = directory.path().join("baseline.lcov");
+        std::fs::write(
+            &baseline_report,
+            "TN:base-test\nSF:src/a.py\nDA:1,0\nDA:2,1\nDA:3,0\nDA:5,1\nDA:6,1\nend_of_record\n",
+        )
+        .unwrap();
+        let current_report = directory.path().join("current.lcov");
+        std::fs::write(
+            &current_report,
+            "TN:base-test\nSF:src/a.py\nDA:1,1\nDA:2,0\nDA:3,2\nDA:6,3\nend_of_record\nTN:new-test\nSF:src/a.py\nDA:4,1\nend_of_record\n",
+        )
+        .unwrap();
+        let store = CoverageStore::open(directory.path().join("incremental.duckdb"), test_config())
+            .unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        let baseline = store
+            .ingest_report_with_options(
+                &baseline_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "full-suite",
+                "incremental_base",
+            )
+            .unwrap();
+        let current = store
+            .ingest_report(
+                &current_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "case-suite",
+            )
+            .unwrap();
+        let baseline_id = baseline["id"].as_str().unwrap();
+        let current_id = current["id"].as_str().unwrap();
+        assert_eq!(baseline["detail_retention"], "incremental_base");
+        assert!(
+            store
+                .set_snapshot_detail_retention(current_id, "invalid")
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .set_snapshot_detail_retention(current_id, "incremental_base")
+                .unwrap()["detail_retention"],
+            "incremental_base"
+        );
+        assert!(
+            store
+                .set_snapshot_detail_retention("missing-snapshot", "compactable")
+                .is_err()
+        );
+        store.inject_query_fault_after(1);
+        assert!(
+            store
+                .set_snapshot_detail_retention(current_id, "compactable")
+                .is_err()
+        );
+        store.clear_query_fault();
+        let comparison = store
+            .incremental_compare(current_id, baseline_id, None, 10, 100, 10)
+            .unwrap();
+        assert_eq!(comparison["detail_source"]["baseline"], "relational");
+        assert_eq!(comparison["coverage_gain"]["newly_covered"], 2);
+        assert_eq!(comparison["coverage_gain"]["regressed"], 1);
+        assert_eq!(comparison["coverage_gain"]["hit_count_only"], 1);
+        assert_eq!(comparison["coverage_gain"]["added"], 1);
+        assert_eq!(comparison["coverage_gain"]["removed"], 1);
+        assert_eq!(comparison["metric_deltas"]["covered_lines_delta"], 1);
+        assert_eq!(comparison["coverage_gain"]["branch_state_changed"], 0);
+        assert_eq!(comparison["regions_truncated"], false);
+        assert!(comparison["changed_lines"][0]["category"].is_string());
+        assert_eq!(comparison["test_attribution"]["status"], "measured");
+        assert_eq!(comparison["test_attribution"]["affected_test_count"], 2);
+        assert_eq!(comparison["baseline"]["suite"], "full-suite");
+        assert_eq!(comparison["current"]["suite"], "case-suite");
+        let unchanged_attribution = store
+            .incremental_test_attribution(baseline_id, baseline_id, 10)
+            .unwrap();
+        assert_eq!(unchanged_attribution["affected_test_count"], 0);
+
+        for skip in 0..=20 {
+            store.inject_query_fault_after(skip);
+            let _ = store.incremental_compare(current_id, baseline_id, None, 10, 100, 10);
+        }
+        store.clear_query_fault();
+
+        stop_compaction_worker(&store);
+        store
+            .compact_snapshot_detail(store.project().unwrap().repo_key.as_str(), baseline_id)
+            .unwrap();
+        let compacted = store
+            .incremental_compare(current_id, baseline_id, None, 10, 100, 10)
+            .unwrap();
+        assert_eq!(compacted["detail_source"]["baseline"], "compacted_payload");
+        assert_eq!(compacted["coverage_gain"], comparison["coverage_gain"]);
+        assert_eq!(
+            compacted["test_attribution"],
+            comparison["test_attribution"]
+        );
+        let inventory = store.compaction_summary().unwrap();
+        assert_eq!(inventory["snapshot_count"], 2);
+        assert_eq!(inventory["compacted_snapshot_count"], 1);
+        assert_eq!(inventory["relational_snapshot_count"], 1);
+        assert_eq!(inventory["retained_incremental_base_count"], 2);
+        assert!(inventory["original_bytes"].as_u64().unwrap() > 0);
+        assert!(inventory["compressed_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(inventory["orphan_payload_count"], 0);
+        assert_eq!(inventory["payload_inventory_consistent"], true);
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE coverage_compacted_payloads SET repo_key = ? WHERE snapshot_id = ?",
+                        params!["other-repository", baseline_id],
+                    )
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+            .unwrap();
+        let broken_inventory = store.compaction_summary().unwrap();
+        assert_eq!(broken_inventory["orphan_payload_count"], 1);
+        assert_eq!(broken_inventory["payload_inventory_consistent"], false);
+        let repo_key = store.project().unwrap().repo_key;
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE coverage_compacted_payloads SET repo_key = ? WHERE snapshot_id = ?",
+                        params![repo_key, baseline_id],
+                    )
+                    .map(|_| ())
+                    .map_err(AppError::from)
+            })
+            .unwrap();
+
+        let mut large_baseline_report = "TN:large-test\nSF:src/a.py\n".to_owned();
+        for line in 1..=60 {
+            large_baseline_report.push_str(&format!("DA:{line},1\n"));
+        }
+        large_baseline_report.push_str("end_of_record\n");
+        let large_baseline_path = directory.path().join("large-baseline.lcov");
+        std::fs::write(&large_baseline_path, large_baseline_report).unwrap();
+        let large_baseline = store
+            .ingest_report(
+                &large_baseline_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "large-base",
+            )
+            .unwrap();
+        let large_current_path = directory.path().join("large-current.lcov");
+        std::fs::write(
+            &large_current_path,
+            "TN:large-test\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let large_current = store
+            .ingest_report(
+                &large_current_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "large-current",
+            )
+            .unwrap();
+        let large_comparison = store
+            .incremental_compare(
+                large_current["id"].as_str().unwrap(),
+                large_baseline["id"].as_str().unwrap(),
+                None,
+                10,
+                100,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            large_comparison["test_attribution"]["affected_tests"][0]["observations_truncated"],
+            true
+        );
+
+        let unnamed_current_path = directory.path().join("unnamed-current.lcov");
+        std::fs::write(
+            &unnamed_current_path,
+            "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let unnamed_current = store
+            .ingest_report(
+                &unnamed_current_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unnamed-current",
+            )
+            .unwrap();
+        let unavailable_attribution = store
+            .incremental_compare(
+                unnamed_current["id"].as_str().unwrap(),
+                baseline_id,
+                None,
+                10,
+                100,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            unavailable_attribution["test_attribution"]["status"],
+            "unavailable"
+        );
+
+        let cobertura_path = directory.path().join("format-mismatch.xml");
+        std::fs::write(
+            &cobertura_path,
+            r#"<coverage><packages><package><classes><class filename="src/a.py"><lines><line number="1" hits="1"/></lines></class></classes></package></packages></coverage>"#,
+        )
+        .unwrap();
+        let different_format = store
+            .ingest_report(
+                &cobertura_path,
+                "cobertura",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "format-mismatch",
+            )
+            .unwrap();
+        assert!(
+            store
+                .incremental_compare(
+                    different_format["id"].as_str().unwrap(),
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(
+                "DROP INDEX IF EXISTS idx_snapshots_repo_time;
+                 DROP INDEX IF EXISTS idx_snapshots_commit;
+                 ALTER TABLE snapshots RENAME TO snapshots_saved;
+                 CREATE VIEW snapshots AS SELECT * FROM snapshots_saved",
+            )
+            .unwrap();
+        assert!(
+            store
+                .set_snapshot_detail_retention(current_id, "compactable")
+                .is_err()
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn execution_identity_prevents_incorrect_reuse_and_idempotency_collision() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let database_directory = tempfile::tempdir().unwrap();
+        let store = CoverageStore::open(
+            database_directory.path().join("execution.duckdb"),
+            test_config(),
+        )
+        .unwrap();
+        let command = store
+            .register_command(
+                "case-command",
+                "sleep 0.1",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "case-specific execution identity",
+                true,
+            )
+            .unwrap();
+        let command_id = command["id"].as_str().unwrap();
+        let baseline_report = database_directory.path().join("baseline.lcov");
+        std::fs::write(
+            &baseline_report,
+            "TN:baseline\nSF:src/lib.rs\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let baseline_snapshot = store
+            .ingest_report(
+                &baseline_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "baseline",
+            )
+            .unwrap();
+        let baseline_snapshot_id = baseline_snapshot["id"].as_str().unwrap();
+        let full = json!({"mode":"full","identity":"full:v1","label":"full base"});
+        let incremental =
+            json!({"mode":"incremental","identity":"incremental:v1","label":"case 1"});
+        let invalid_execution = json!("not-an-object");
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command_id,
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&invalid_execution),
+                    None,
+                    None,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command_id,
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&incremental),
+                    None,
+                    Some("missing-baseline"),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command_id,
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&incremental),
+                    None,
+                    Some(" "),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command_id,
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&incremental),
+                    None,
+                    Some(&"x".repeat(201)),
+                )
+                .is_err()
+        );
+        let first = store
+            .run_command_with_execution(command_id, None, None, 20, true, Some(&full), None, None)
+            .unwrap();
+        let second = store
+            .run_command_with_execution(
+                command_id,
+                None,
+                None,
+                20,
+                true,
+                Some(&incremental),
+                None,
+                Some(baseline_snapshot_id),
+            )
+            .unwrap();
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(second["execution"]["mode"], "incremental");
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE snapshots SET repo_key = 'foreign-repository' WHERE id = '{baseline_snapshot_id}'"
+            ))
+            .unwrap();
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command_id,
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&incremental),
+                    None,
+                    Some(baseline_snapshot_id),
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE snapshots SET repo_key = (SELECT repo_key FROM registered_commands WHERE id = '{command_id}') WHERE id = '{baseline_snapshot_id}'"
+            ))
+            .unwrap();
+        let bad_render_command = store
+            .register_command(
+                "bad-render-command",
+                "echo {{args}} {{args}}",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "multiple argument markers are rejected",
+                true,
+            )
+            .unwrap();
+        assert!(
+            store
+                .submit_command_with_execution(
+                    bad_render_command["id"].as_str().unwrap(),
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&full),
+                    Some(&json!(["case"])),
+                    None,
+                )
+                .is_err()
+        );
+        let registered = store.registered_command(command_id).unwrap();
+        FORCE_EXECUTION_CONTEXT_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .reusable_run_id_with_execution(
+                    &registered,
+                    command_id,
+                    Some(&ExecutionContext {
+                        mode: "incremental".to_owned(),
+                        identity: "incremental:v1".to_owned(),
+                        label: Some("case 1".to_owned()),
+                        arguments: Vec::new(),
+                        baseline_snapshot_id: Some(baseline_snapshot_id.to_owned()),
+                    }),
+                )
+                .is_err()
+        );
+        let keyed = store
+            .submit_command_with_execution(
+                command_id,
+                None,
+                Some("same-request"),
+                20,
+                false,
+                Some(&full),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command_id,
+                    None,
+                    Some("same-request"),
+                    20,
+                    false,
+                    Some(&incremental),
+                    None,
+                    Some(baseline_snapshot_id),
+                )
+                .is_err()
+        );
+        assert_eq!(keyed["execution"]["identity"], "full:v1");
+        let keyed_reuse = store
+            .submit_command_with_execution(
+                command_id,
+                None,
+                Some("same-request"),
+                20,
+                false,
+                Some(&full),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(keyed_reuse["submission_reused"], true);
+        for skip in 0..=6 {
+            store.inject_query_fault_after(skip);
+            let _ = store.submit_command_with_execution(
+                command_id,
+                None,
+                Some("same-request"),
+                20,
+                false,
+                Some(&full),
+                None,
+                None,
+            );
+        }
+        store.clear_query_fault();
+        for skip in 0..=12 {
+            store.inject_query_fault_after(skip);
+            let _ = store.submit_command_with_execution(
+                command_id,
+                None,
+                Some(&format!("context-fault-{skip}")),
+                20,
+                false,
+                Some(&json!({"mode":"custom"})),
+                Some(&json!(["case"])),
+                None,
+            );
+        }
+        store.clear_query_fault();
+        FORCE_RUN_COMMAND_POLL_FAILURE.store(true, Ordering::SeqCst);
+        let poll_execution = json!({"mode":"custom","identity":"poll:v1"});
+        assert!(
+            store
+                .run_command_with_execution(
+                    command_id,
+                    None,
+                    None,
+                    20,
+                    false,
+                    Some(&poll_execution),
+                    None,
+                    None,
+                )
+                .is_err()
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
     fn detail_payload_named_test_rows_and_query_errors_are_explicit() {
         let directory = tempfile::tempdir().unwrap();
         init_test_git(directory.path());
@@ -12213,6 +16771,770 @@ mod tests {
                 .is_err()
         );
         observations_insert_store.close().unwrap();
+    }
+
+    #[test]
+    fn incremental_helper_validation_and_categories_are_complete() {
+        assert!(normalize_run_execution(None, &[], Some("base")).is_err());
+        let generated = normalize_run_execution(None, &["--case".to_owned()], None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generated.mode, "full");
+        assert!(normalize_run_execution(Some(&json!("bad")), &[], None).is_err());
+        assert!(normalize_run_execution(Some(&json!({"unexpected":true})), &[], None).is_err());
+        assert!(normalize_run_execution(Some(&json!({"mode":"bad"})), &[], None).is_err());
+        assert!(normalize_run_execution(Some(&json!({"mode":"incremental"})), &[], None).is_err());
+        assert!(normalize_run_execution(Some(&json!({"mode":"full"})), &[], Some("base")).is_err());
+        assert!(
+            normalize_run_execution(Some(&json!({"mode":"full","identity":7})), &[], None).is_err()
+        );
+        assert!(
+            normalize_run_execution(
+                Some(&json!({"mode":"full","identity":"x".repeat(257)})),
+                &[],
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_run_execution(Some(&json!({"mode":"full","label":7})), &[], None).is_err()
+        );
+        assert!(
+            normalize_arguments(Some(&json!((0..65).map(|_| "x").collect::<Vec<_>>()))).is_err()
+        );
+        assert!(normalize_arguments(Some(&json!(["bad\u{0}"]))).is_err());
+        assert!(normalize_arguments(Some(&json!(["x".repeat(513)]))).is_err());
+        assert!(normalize_arguments(Some(&json!(["ok", 7]))).is_err());
+        assert!(
+            normalize_arguments(Some(&json!(
+                (0..17).map(|_| "x".repeat(512)).collect::<Vec<_>>()
+            )))
+            .is_err()
+        );
+        assert!(normalize_baseline_snapshot_id(Some(" ")).is_err());
+        assert!(normalize_baseline_snapshot_id(Some(&"x".repeat(201))).is_err());
+        assert!(render_command("echo {{args}} {{args}}", &[]).is_err());
+        assert!(validate_detail_retention("not-a-policy").is_err());
+        assert!(normalize_execution(Some(&json!("not-an-object"))).is_err());
+        assert!(normalize_execution(Some(&json!({"mode":"full"}))).is_err());
+        assert!(
+            normalize_execution(Some(&json!({
+                "mode":"full",
+                "identity":"id",
+                "unexpected":true
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_execution(Some(&json!({
+                "mode":"not-a-mode",
+                "identity":"id"
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_execution(Some(&json!({
+                "mode":"full",
+                "identity":" "
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_execution(Some(&json!({
+                "mode":"full",
+                "identity":"x".repeat(257)
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_execution(Some(&json!({
+                "mode":"full",
+                "identity":"id",
+                "label":7
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_execution(Some(&json!({
+                "mode":"full",
+                "identity":"id",
+                "label":"x".repeat(201)
+            })))
+            .is_err()
+        );
+        let execution = normalize_execution(Some(&json!({
+            "mode":"custom",
+            "identity":"id",
+            "label":"case"
+        })))
+        .unwrap()
+        .unwrap();
+        assert_eq!(execution.value()["label"], "case");
+
+        assert_eq!(
+            incremental_line_category(&json!({"baseline_covered":false,"current_covered":true})),
+            "newly_covered"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({"baseline_covered":true,"current_covered":false})),
+            "regressed"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({"baseline_covered":true})),
+            "removed"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({"current_covered":true})),
+            "added"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({
+                "baseline_covered":true,
+                "current_covered":true,
+                "baseline_total_branches":1,
+                "current_total_branches":2
+            })),
+            "branch_state_changed"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({
+                "baseline_covered":true,
+                "current_covered":true,
+                "baseline_total_branches":2,
+                "baseline_covered_branches":0,
+                "current_total_branches":2,
+                "current_covered_branches":1
+            })),
+            "newly_covered"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({
+                "baseline_covered":true,
+                "current_covered":true,
+                "baseline_total_branches":2,
+                "baseline_covered_branches":2,
+                "current_total_branches":2,
+                "current_covered_branches":1
+            })),
+            "regressed"
+        );
+        assert_eq!(
+            branch_gap(
+                &json!({"baseline_total_branches":2,"baseline_covered_branches":1}),
+                "baseline"
+            ),
+            Some(1)
+        );
+        assert!(branch_gap(&json!({"baseline_total_branches":2}), "baseline").is_none());
+        assert!(branch_gap(&json!({"baseline_covered_branches":1}), "baseline").is_none());
+        assert_eq!(
+            branch_gap(
+                &json!({"baseline_total_branches":1,"baseline_covered_branches":2}),
+                "baseline"
+            ),
+            Some(-1)
+        );
+        assert_eq!(
+            incremental_line_category(&json!({
+                "baseline_covered":true,
+                "current_covered":true,
+                "baseline_total_branches":1,
+                "current_total_branches":1,
+                "baseline_covered_branches":1,
+                "current_covered_branches":1,
+                "baseline_hits":1,
+                "current_hits":2
+            })),
+            "hit_count_only"
+        );
+        assert_eq!(
+            incremental_line_category(&json!({
+                "baseline_covered":true,
+                "current_covered":true,
+                "baseline_total_branches":1,
+                "current_total_branches":1,
+                "baseline_covered_branches":1,
+                "current_covered_branches":1,
+                "baseline_hits":1,
+                "current_hits":1
+            })),
+            "branch_state_changed"
+        );
+
+        assert!(
+            changed_line_regions(
+                &[
+                    json!({}),
+                    json!({"file_path":"a.py"}),
+                    json!({"status":"new"}),
+                    json!({"file_path":"a.py","status":"new","line_number":"bad"})
+                ],
+                10
+            )
+            .is_empty()
+        );
+
+        assert!(test_observation_sets_from_payload(&json!({"test_names":"bad"})).is_err());
+        assert!(test_observation_sets_from_payload(&json!({"test_names":[7]})).is_err());
+        assert!(
+            test_observation_sets_from_payload(&json!({"test_names":[""]}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(test_observation_sets_from_payload(&json!({"test_coverage":"bad"})).is_err());
+        assert!(
+            test_observation_sets_from_payload(&json!({
+                "test_coverage":[{}]
+            }))
+            .is_err()
+        );
+        assert!(
+            test_observation_sets_from_payload(&json!({
+                "test_coverage":[{"test_name":"test"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            test_observation_sets_from_payload(&json!({
+                "test_coverage":[{"test_name":"test","file_path":"a.py"}]
+            }))
+            .is_err()
+        );
+        assert!(
+            test_observation_sets_from_payload(&json!({
+                "test_coverage":[{"test_name":"test","file_path":"a.py","line_number":0}]
+            }))
+            .is_err()
+        );
+        let observations = test_observation_sets_from_payload(&json!({
+            "test_names":["test"],
+            "test_coverage":[{"test_name":"test","file_path":"a.py","line_number":1}]
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(observations["test"].len(), 1);
+
+        assert!(
+            normalize_artifact_specs(json!({
+                "coverage":{"path":"coverage.lcov","detail_retention":"invalid"}
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            normalize_artifact_specs(json!({"coverage":"coverage.lcov"})).unwrap()[0]["detail_retention"],
+            "compactable"
+        );
+    }
+
+    #[test]
+    fn composite_artifact_spec_validation_covers_clean_break_contract() {
+        let inventory = || {
+            json!({
+                "path":"target/inventory.json",
+                "required":true,
+                "coverage_format":composite::INVENTORY_FORMAT,
+                "composite":{
+                    "component_id":"inventory",
+                    "package_variant":"inventory",
+                    "language":"mixed",
+                    "format":composite::INVENTORY_FORMAT,
+                    "inventory_artifact":"target/inventory.json",
+                    "role":"inventory",
+                    "toolchain_versions":{}
+                }
+            })
+        };
+        let coverage = |inventory_artifact: &str| {
+            json!({
+                "path":"target/python.json",
+                "required":true,
+                "coverage_format":composite::REGIONS_SCHEMA,
+                "composite":{
+                    "component_id":"python",
+                    "package_variant":"cpython",
+                    "language":"python",
+                    "format":composite::REGIONS_SCHEMA,
+                    "inventory_artifact":inventory_artifact,
+                    "role":"coverage",
+                    "logical_source_aliases":[{"path":"src/a.py","logical_source_id":"python:src/a.py"}],
+                    "toolchain_versions":{}
+                }
+            })
+        };
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": coverage("target/inventory.json"),
+                "log":"run.log"
+            }))
+            .is_ok()
+        );
+        let mut malformed_descriptor = coverage("target/inventory.json");
+        malformed_descriptor["composite"]["component_id"] = json!(7);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": malformed_descriptor
+            }))
+            .is_err()
+        );
+        let mut malformed_inventory_required = inventory();
+        malformed_inventory_required["required"] = json!(7);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": malformed_inventory_required,
+                "python": coverage("target/inventory.json")
+            }))
+            .is_err()
+        );
+        let mut malformed_coverage_required = coverage("target/inventory.json");
+        malformed_coverage_required["required"] = json!(7);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": malformed_coverage_required
+            }))
+            .is_err()
+        );
+
+        let mut missing_format = coverage("target/inventory.json");
+        missing_format
+            .as_object_mut()
+            .unwrap()
+            .remove("coverage_format");
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": missing_format
+            }))
+            .is_err()
+        );
+
+        let mut mismatched_format = coverage("target/inventory.json");
+        mismatched_format["coverage_format"] = json!("lcov");
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": mismatched_format
+            }))
+            .is_err()
+        );
+
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": coverage("other/inventory.json")
+            }))
+            .is_err()
+        );
+
+        let mut optional_inventory = inventory();
+        optional_inventory["required"] = json!(false);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": optional_inventory,
+                "python": coverage("target/inventory.json")
+            }))
+            .is_err()
+        );
+
+        let mut wrong_inventory_format = inventory();
+        wrong_inventory_format["coverage_format"] = json!(composite::REGIONS_SCHEMA);
+        wrong_inventory_format["composite"]["format"] = json!(composite::REGIONS_SCHEMA);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": wrong_inventory_format
+            }))
+            .is_err()
+        );
+
+        let mut inventory_format_coverage = coverage("target/inventory.json");
+        inventory_format_coverage["coverage_format"] = json!(composite::INVENTORY_FORMAT);
+        inventory_format_coverage["composite"]["format"] = json!(composite::INVENTORY_FORMAT);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": inventory_format_coverage
+            }))
+            .is_err()
+        );
+
+        let mut optional_coverage = coverage("target/inventory.json");
+        optional_coverage["required"] = json!(false);
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": optional_coverage
+            }))
+            .is_err()
+        );
+
+        let duplicate = coverage("target/inventory.json");
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": inventory(),
+                "python": coverage("target/inventory.json"),
+                "python-again": duplicate
+            }))
+            .is_err()
+        );
+
+        assert!(
+            normalize_artifact_specs(json!({
+                "python": coverage("target/inventory.json")
+            }))
+            .is_err()
+        );
+
+        let mut mismatched_registered_path = inventory();
+        mismatched_registered_path["composite"]["inventory_artifact"] =
+            json!("metadata/inventory.json");
+        let mut matching_descriptor = coverage("metadata/inventory.json");
+        matching_descriptor["path"] = json!("target/python.json");
+        assert!(
+            normalize_artifact_specs(json!({
+                "inventory": mismatched_registered_path,
+                "python": matching_descriptor
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_migration_failures_are_returned_without_partial_open() {
+        let directory = tempfile::tempdir().unwrap();
+        FORCE_SCHEMA_SNAPSHOT_MIGRATION_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            CoverageStore::open(
+                directory.path().join("snapshot-migration.duckdb"),
+                test_config(),
+            )
+            .is_err()
+        );
+        FORCE_SCHEMA_RUN_MIGRATION_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            CoverageStore::open(directory.path().join("run-migration.duckdb"), test_config())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn incremental_cross_repository_and_stored_execution_edges_are_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let report = directory.path().join("coverage.lcov");
+        std::fs::write(&report, "TN:test\nSF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        let store =
+            CoverageStore::open(directory.path().join("coverage.duckdb"), test_config()).unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        let snapshot = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        let snapshot_id = snapshot["id"].as_str().unwrap();
+        assert!(
+            store
+                .ingest_report_with_execution(
+                    &report,
+                    "lcov",
+                    Some(directory.path()),
+                    Some("main"),
+                    None,
+                    None,
+                    "invalid-retention",
+                    None,
+                    "invalid",
+                )
+                .is_err()
+        );
+        let invalid_execution = json!("not-an-object");
+        assert!(
+            store
+                .ingest_report_with_execution(
+                    &report,
+                    "lcov",
+                    Some(directory.path()),
+                    Some("main"),
+                    None,
+                    None,
+                    "invalid-execution",
+                    Some(&invalid_execution),
+                    "compactable",
+                )
+                .is_err()
+        );
+        let invalid_artifact_command = json!({
+            "artifact_specs":[{
+                "kind":"coverage",
+                "path":"coverage.lcov",
+                "required":true,
+                "detail_retention":"invalid"
+            }],
+            "repo_path":directory.path().display().to_string(),
+            "name":"invalid-artifact"
+        });
+        assert!(
+            store
+                .collect_artifacts_with_execution(
+                    "invalid-artifact-run",
+                    &invalid_artifact_command,
+                    directory.path().to_str().unwrap(),
+                    true,
+                    None,
+                )
+                .is_err()
+        );
+        let git = inspect_git(directory.path()).unwrap();
+        let mut metadata_report =
+            parse_coverage_report(&report, "lcov", Some(&git.repo_path)).unwrap();
+        metadata_report.metadata = json!("parser-metadata");
+        let metadata_execution = ExecutionContext {
+            mode: "custom".to_owned(),
+            identity: "metadata:v1".to_owned(),
+            label: None,
+            arguments: Vec::new(),
+            baseline_snapshot_id: None,
+        };
+        let metadata_snapshot = store
+            .store_report_with_execution(
+                &metadata_report,
+                &git,
+                Some("main"),
+                git.commit_sha.as_deref(),
+                None,
+                "metadata-suite",
+                Some(&metadata_execution),
+                "compactable",
+            )
+            .unwrap();
+        assert_eq!(
+            store.snapshot(&metadata_snapshot).unwrap()["metadata"]["execution"]["identity"],
+            "metadata:v1"
+        );
+        assert!(
+            store
+                .execution_context_for_run("missing")
+                .unwrap()
+                .is_none()
+        );
+        let command = store
+            .register_command(
+                "queued-execution",
+                "sleep 0.05",
+                Some(directory.path()),
+                "/bin/sh",
+                None,
+                true,
+                "tester",
+                "queued execution edge",
+                true,
+            )
+            .unwrap();
+        let queued = store
+            .submit_command_with_execution(
+                command["id"].as_str().unwrap(),
+                None,
+                None,
+                20,
+                false,
+                Some(&json!({"mode":"full","identity":"queued:v1"})),
+                None,
+                None,
+            )
+            .unwrap();
+        let queued_id = queued["id"].as_str().unwrap().to_owned();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE run_jobs SET execution_mode = 'full', execution_identity = NULL WHERE id = '{queued_id}'"
+            ))
+            .unwrap();
+        assert!(store.execution_context_for_run(&queued_id).is_err());
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE run_jobs SET execution_mode = 'full', execution_identity = 'queued:v1' WHERE id = '{queued_id}'; UPDATE run_execution_context SET arguments = 'not-json' WHERE run_id = '{queued_id}'"
+            ))
+            .unwrap();
+        assert!(store.execution_context_for_run(&queued_id).is_err());
+        make_malformed_projection_view(
+            &store,
+            "run_execution_context",
+            "idx_run_execution_context_baseline",
+            &["run_id", "arguments", "baseline_snapshot_id"],
+            "arguments",
+            "7",
+        );
+        assert!(store.execution_context_for_run(&queued_id).is_err());
+        store
+            .execute_sql_for_test(
+                "DROP VIEW run_execution_context;
+                 CREATE VIEW run_execution_context AS
+                 SELECT run_id, '[]' AS arguments, 8 AS baseline_snapshot_id
+                 FROM run_execution_context_base;",
+            )
+            .unwrap();
+        assert!(store.execution_context_for_run(&queued_id).is_err());
+        assert!(
+            store
+                .submit_command_with_execution(
+                    command["id"].as_str().unwrap(),
+                    None,
+                    Some("context-view-insert-failure"),
+                    20,
+                    false,
+                    Some(&json!({"mode":"full","identity":"view-failure:v1"})),
+                    None,
+                    None,
+                )
+                .is_err()
+        );
+        let _ = store.cancel_run(&queued_id, 20);
+
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE snapshots SET repo_key = 'different-repository' WHERE id = '{snapshot_id}'"
+            ))
+            .unwrap();
+        let other_snapshot = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "other-unit",
+            )
+            .unwrap();
+        assert!(
+            store
+                .incremental_compare(
+                    other_snapshot["id"].as_str().unwrap(),
+                    snapshot_id,
+                    None,
+                    10,
+                    10,
+                    10
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(
+                "DROP INDEX IF EXISTS idx_test_coverage_tests_unique;
+                 DROP INDEX IF EXISTS idx_test_coverage_observations_unique;
+                 DROP INDEX IF EXISTS idx_test_coverage_observations_snapshot_test;
+                 ALTER TABLE test_coverage_tests RENAME TO test_coverage_tests_saved;
+                 CREATE TABLE test_coverage_tests (snapshot_id VARCHAR, test_name VARCHAR);
+                 ALTER TABLE test_coverage_observations RENAME TO test_coverage_observations_saved;
+                 CREATE TABLE test_coverage_observations (snapshot_id VARCHAR, test_name VARCHAR, kind VARCHAR, file_path VARCHAR, line_number INTEGER, region_key VARCHAR);",
+            )
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO test_coverage_tests VALUES ('{snapshot_id}', NULL)"
+            ))
+            .unwrap();
+        assert!(store.test_observation_sets(snapshot_id).is_err());
+        store
+            .execute_sql_for_test("DELETE FROM test_coverage_tests")
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO test_coverage_tests VALUES ('{snapshot_id}', 'test')"
+            ))
+            .unwrap();
+        for value in [
+            format!("'{snapshot_id}', NULL, 'line', 'src/a.py', 1, 'line'"),
+            format!("'{snapshot_id}', 'test', NULL, 'src/a.py', 1, 'line'"),
+            format!("'{snapshot_id}', 'test', 'line', NULL, 1, 'line'"),
+            format!("'{snapshot_id}', 'test', 'line', 'src/a.py', NULL, 'line'"),
+            format!("'{snapshot_id}', 'test', 'line', 'src/a.py', 1, NULL"),
+        ] {
+            store
+                .execute_sql_for_test("DELETE FROM test_coverage_observations")
+                .unwrap();
+            store
+                .execute_sql_for_test(&format!(
+                    "INSERT INTO test_coverage_observations VALUES ({value})"
+                ))
+                .unwrap();
+            assert!(store.test_observation_sets(snapshot_id).is_err());
+        }
+        FORCE_TEST_NAMES_QUERY_FAILURE.store(true, Ordering::SeqCst);
+        assert!(store.test_observation_sets(snapshot_id).is_err());
+        FORCE_TEST_OBSERVATIONS_QUERY_FAILURE.store(true, Ordering::SeqCst);
+        assert!(store.test_observation_sets(snapshot_id).is_err());
+        let no_names_report = directory.path().join("no-names.lcov");
+        std::fs::write(
+            &no_names_report,
+            "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .unwrap();
+        let no_names_snapshot = store
+            .ingest_report(
+                &no_names_report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "no-names",
+            )
+            .unwrap();
+        assert!(
+            store
+                .test_observation_sets(no_names_snapshot["id"].as_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        store.inject_query_fault_after(1);
+        assert!(
+            store
+                .test_observation_sets(no_names_snapshot["id"].as_str().unwrap())
+                .is_err()
+        );
+        store.clear_query_fault();
+        store
+            .execute_sql_for_test("DROP TABLE coverage_compacted_payloads")
+            .unwrap();
+        assert!(store.detail_source(snapshot_id).is_err());
+        store
+            .execute_sql_for_test("DROP TABLE test_coverage_tests")
+            .unwrap();
+        assert!(store.test_observation_sets(snapshot_id).is_err());
+        store
+            .execute_sql_for_test(
+                "CREATE TABLE test_coverage_tests (snapshot_id INTEGER, test_name VARCHAR)",
+            )
+            .unwrap();
+        assert!(store.test_observation_sets(snapshot_id).is_err());
+        store
+            .execute_sql_for_test("DROP TABLE test_coverage_tests")
+            .unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "CREATE TABLE test_coverage_tests (snapshot_id VARCHAR, test_name VARCHAR);
+                 INSERT INTO test_coverage_tests VALUES ('{snapshot_id}', 'test')"
+            ))
+            .unwrap();
+        store
+            .execute_sql_for_test(
+                "DROP TABLE test_coverage_observations;
+                 CREATE TABLE test_coverage_observations (snapshot_id INTEGER, test_name VARCHAR, kind VARCHAR, file_path VARCHAR, line_number INTEGER, region_key VARCHAR)",
+            )
+            .unwrap();
+        assert!(store.test_observation_sets(snapshot_id).is_ok());
+        store
+            .execute_sql_for_test("DROP TABLE test_coverage_observations")
+            .unwrap();
+        assert!(store.test_observation_sets(snapshot_id).is_err());
+        store.close().unwrap();
     }
 
     fn test_settings() -> ProjectSettings {

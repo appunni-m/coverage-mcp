@@ -4,6 +4,7 @@
 //! transports, dashboard, and background maintenance lifecycle.
 
 #![warn(missing_docs)]
+#![recursion_limit = "256"]
 // Unit tests intentionally use concise assertions. Production targets are
 // still checked with unwrap/expect denied by the package lint policy.
 #![cfg_attr(
@@ -14,6 +15,8 @@
 use sha2::{Digest, Sha256};
 
 pub mod compaction;
+/// Composite cross-language coverage contracts and aggregation.
+pub mod composite;
 /// Runtime configuration and defaults.
 pub mod config;
 /// Application error types.
@@ -72,7 +75,7 @@ extern crate self as coverage_mcp;
 mod rust_migration;
 
 /// Public Coverage MCP wire-contract schema revision.
-pub const SCHEMA_REVISION: u32 = 10;
+pub const SCHEMA_REVISION: u32 = 14;
 
 /// Rust daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

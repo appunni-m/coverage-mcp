@@ -12,7 +12,7 @@
 
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
-dashboard and REST API, and provides the consolidated schema-10 projections over
+dashboard and REST API, and provides the consolidated schema-14 projections over
 loopback HTTP and native MCP stdio.
 
 The project is designed for one user-level daemon shared by agents and Git
@@ -22,7 +22,7 @@ frontend build or a separate language runtime.
 ## Status
 
 The Rust implementation is the only runtime and the checked-in Rust test suite
-is the source of truth. The public contract is schema revision 10 with eight
+is the source of truth. The public contract is schema revision 14 with eight
 agent-facing tools. The local gate is configured to require 100% region, line,
 and function coverage for the measured Rust library/runtime targets. `src/main.rs`
 is exercised by child-process smoke tests and excluded from aggregate LLVM
@@ -73,7 +73,10 @@ open http://127.0.0.1:59471/       # macOS; use a browser on other systems
 
 The dashboard is embedded in the binary. It can inspect projects, snapshots,
 file gaps, line history, source context, comparisons, test runs, retained
-artifacts, and the project compaction policy.
+artifacts, and the project compaction policy. Its main view is one bounded
+dashboard projection, and the foreground page subscribes to a server-sent event
+stream. It checks for new snapshots, runs, or compaction work at most once every
+10 seconds; hidden tabs close the stream and pause automatic refreshes.
 
 ## MCP transports
 
@@ -143,7 +146,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.11.0' --locked
+cargo install coverage-mcp --version '=0.13.0' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -302,11 +305,140 @@ to select the smallest projection, then carry the returned run, snapshot,
 baseline, file, and source identifiers into the next request. The server never
 requires a raw report dump to answer a supported review question.
 
-### Coverage review tasks
+## Coverage review
+
+### Parameterized runs and automatic incremental review
+
+Register one human-approved command once, then reuse its ID or name for
+case-specific runs. `run_test.arguments` supplies optional runtime strings;
+the server shell-quotes them and replaces one approved `{{args}}` placeholder,
+or appends them to the approved command. A different filter or test subset
+does not require registering another command.
+
+For example, after approving a command such as `cargo test -- {{args}}`, run a
+smaller case against an explicit fixed base:
+
+```json
+{
+  "command_ref": "coverage-tests",
+  "arguments": ["--filter", "parser::handles_empty_input"],
+  "execution": {"mode": "incremental", "label": "parser empty input"},
+  "baseline": {"kind": "explicit", "snapshot_id": "<fixed-base-snapshot-id>"},
+  "reuse_if_unchanged": true,
+  "idempotency_key": "parser-empty-input-v1"
+}
+```
+
+`execution.identity` is optional. The server persists a fingerprint of the
+mode, arguments, and baseline, so unchanged-run reuse and idempotency cannot
+cross case boundaries. Use a different idempotency key for each materially
+different argument list. Obtain the fixed base ID from a completed full run's
+`data.coverage_ingest.snapshot_ids[0]` or a compatible imported snapshot; the
+server never infers it from the latest or previous snapshot.
+
+An incremental `run_test` automatically attaches `incremental_review` after
+terminal ingestion of exactly one current snapshot. `status="pending"` means
+the run is still active; `status="not_measured"` and `reasons` mean no valid
+diff claim is available. `run_review(view="status")` returns the same durable
+review. This automatic review is the normal path for fewer-test-case runs.
+
+Use standalone `coverage_review(task="incremental")` when both ordinary
+snapshots or both composite snapshots already exist and only a stored
+comparison is needed. It never reruns tests, invokes a parent runner, or
+reparses a report, and it requires an explicit current measurement plus
+`baseline.kind="explicit"` and the matching `snapshot_id` or
+`composite_snapshot_id` selector.
+
+### Composite production coverage
+
+Use a composite snapshot when one managed run produces the production coverage
+for Rust/WGSL, Python, and JavaScript. Register the command once with one
+required inventory artifact and one required descriptor for every package or
+backend variant. Later full or incremental cases reuse that registration and
+only change `run_test.arguments`, `execution`, and the explicit baseline.
+
+Each coverage descriptor has the following contract:
+
+```json
+{
+  "path": "target/python.json",
+  "required": true,
+  "coverage_format": "coveragepy",
+  "composite": {
+    "component_id": "python",
+    "package_variant": "cpython",
+    "language": "python",
+    "format": "coveragepy",
+    "inventory_artifact": "target/inventory.json",
+    "role": "coverage",
+    "logical_source_aliases": [
+      {"path": "pkg/runtime.py", "logical_source_id": "python:pkg/runtime.py"}
+    ],
+    "toolchain_versions": {"coverage.py": "7.x"}
+  }
+}
+```
+
+The inventory is authoritative for the denominator. Its
+`coverage-mcp-inventory-v1` JSON contains `mapping_version`, the producing
+`source_revision`, and `entries` with `logical_source_id`, repository-relative
+`path`, `package`, `language`, `role` (`production` or `catalogue`), a SHA-256
+`source_hash`, required `variants`, `expected_formats`, and canonical
+`regions`. Only `production` entries contribute regions. Rust/native/WASM
+LLVM, coverage.py executable lines, and Istanbul statement spans are mapped by
+their declared format. WGSL or other span-rich producers should emit
+`coverage-mcp-regions-v1`, whose artifact also declares `source_revision` and
+per-region `source_hash` plus a stable discriminator.
+
+Logical-source aliases are the only deduplication mechanism. Matching paths,
+bytes, packages, or filenames never merge regions. Shared source regions may
+therefore be counted once while every declared variant still has to be present,
+fresh, well-formed, and source-compatible. Missing, stale, malformed, source-
+mismatched, or unsupported evidence leaves the composite `incomplete` and
+never reduces its denominator. The composite records covered, uncovered,
+unmeasured, missing-artifact, stale-evidence, and source-mismatch states with
+remediation buckets such as test gap, instrumentation gap, generated-variant
+gap, and source mismatch.
+
+After the run finishes, save `data.composite_snapshot_id`; ordinary child
+reports remain in `data.coverage_ingest.snapshot_ids`. The composite projection
+returns exact `covered_regions`, `total_regions`, `coverage_percent`, and only
+three summaries: `rust` (including WGSL), `python`, and `javascript`.
+
+```json
+{
+  "task": "incremental",
+  "measurement": {"composite_snapshot_id": "<case-composite-id>"},
+  "baseline": {
+    "kind": "explicit",
+    "composite_snapshot_id": "<fixed-composite-id>"
+  },
+  "representation": "compact",
+  "limits": {"max_regions": 20, "max_test_ids": 10, "max_words": 600, "max_bytes": 12000}
+}
+```
+
+Composite incremental review compares only stored canonical-region rows and
+child named-test observations; it never reruns the fixed base, invokes a parent
+runner, or reparses either report. It requires the same repository, mapping
+version, and non-null inventory hash. `newly_covered` is the incremental gain;
+`regressed`, `hit_count_only`, `added`, and `removed` are separate categories.
+Source and audit requests accept the same composite measurement selector, and
+the bounded response exposes provenance, exact component deltas, truncation,
+and named-test attribution status. If a producer has no named observations,
+attribution is explicitly `unavailable`; aggregate coverage remains valid.
+
+Compaction does not rewrite composite rows. Ordinary child snapshots may be
+compressed, but their file, line, and named-test projections are restored from
+the zstd payload when composite attribution is requested. A fixed composite
+base therefore remains immutable and comparable after compaction; retaining its
+child reports as `detail_retention="incremental_base"` is still recommended for
+operational cost and retention control.
 
 | Question | Request |
 | --- | --- |
 | Did new code get covered? | `task="change"`; choose `baseline.kind="worktree_base"`, `"parent_commit"`, `"ref"`, `"previous_snapshot"`, `"explicit"`, or `"none"`. |
+| What did this case add without rerunning the full base? | `task="incremental"` with an explicit ordinary or composite measurement (or a run producing exactly one measurement) and `baseline.kind="explicit"` plus the matching baseline selector. The server compares stored detail immediately. |
 | What happened over time? | `task="history"`; default is the last two compatible points and an aggregate over those two points. |
 | What should be tested next? | `task="insight"`; returns ranked uncovered regions without a raw line dump. |
 | What source surrounds selected gaps? | `task="source"` with up to ten grouped `{file_path,start,end}` ranges. |
@@ -325,10 +457,45 @@ Example change request:
 }
 ```
 
+Example incremental request:
+
+```json
+{
+  "task": "incremental",
+  "measurement": {"snapshot_id": "<case-snapshot-id>"},
+  "baseline": {"kind": "explicit", "snapshot_id": "<fixed-base-snapshot-id>"},
+  "limits": {"max_files": 3, "max_regions": 5, "max_test_ids": 10, "max_words": 600, "max_bytes": 12000},
+  "representation": "compact"
+}
+```
+
+Incremental review never selects an implicit previous snapshot and never runs
+tests, invokes a parent runner, or reparses either report. It compares stored
+rows from the two immutable snapshots, allows the suites and case-specific
+execution arguments to differ, and requires the same repository and normalized
+coverage format. The result includes `metric_deltas`, grouped affected lines,
+`coverage_gain` categories (`newly_covered`, `regressed`, `hit_count_only`,
+`added`, and `removed`), bounded `regions_truncated` metadata,
+`detail_source` for each side (`relational` or `compacted_payload`), and
+opaque `test_id` added/removed observations when both reports contain named
+observations. Suite, branch, commit, command, cwd, and execution case remain
+provenance only; they are never test identity. A missing named-test projection
+sets attribution to `status="unavailable"` and limits only attribution;
+aggregate coverage remains measured.
+
+For a long-lived fixed base, import or ingest it with
+`detail_retention="incremental_base"`. This prevents automatic compaction of
+that snapshot. Retention is a safety/performance preference rather than a
+correctness requirement: incremental comparison also restores files, lines,
+and named-test observations from the compressed payload if compaction has
+already occurred. Do not manually delete either snapshot or its compacted
+payload while the base is in use.
+
 `measurement.snapshot_id` is explicit when already known. `measurement.run_id`
-resolves the first ingested snapshot attached to that run. A missing or stale
-measurement is reported as `not_measured` or `limited`; the server never turns
-it into an `unchanged` claim.
+is valid for incremental review only when it resolves to exactly one ingested
+snapshot attached to that run. A missing, ambiguous, or stale measurement is
+rejected or reported as `not_measured`/`limited` as appropriate; the server
+never turns it into an `unchanged` claim.
 
 `claim_status` is one of `supported`, `limited`, `not_measured`, `stale`, or
 `invalid`. A status other than `supported` must be reported with the server's
@@ -380,11 +547,11 @@ arrays for line/branch/function/region baseline, current, and delta values;
 | --- | --- |
 | `project_context` | Read compact project identity, freshness, up to eight approved command summaries, capped active runs, and latest run. The `max_words` budget covers the complete data projection; paginate commands with `cursor` only when needed. Use `detailed=true` only for an audit. |
 | `register_test_command` | Store one exact human-approved command and its artifacts. `human_approved` must be true; the default response is an id/name summary, and `detailed=true` returns command fields. |
-| `run_test` | Submit an approved command. Prefer `wait=false`; use `idempotency_key` and the default `reuse_if_unchanged=true`. The response is run state only; call `coverage_review` explicitly after terminal evidence. |
-| `run_review` | Read one explicit `run_id`; `view="status"` returns compact durable state and terminal ingestion evidence, while `view="logs"` returns bounded literal matches. It never embeds a coverage review. |
+| `run_test` | Submit one approved command. Prefer `wait=false`; pass optional case-specific `arguments` without registering another command, use `idempotency_key`, and keep the default `reuse_if_unchanged=true`. For incremental runs, pass `execution.mode="incremental"` plus `baseline.kind="explicit"` and exactly one ordinary `snapshot_id` or `composite_snapshot_id`; identity is optional because the server fingerprints mode, arguments, and baseline. After ingestion, the response includes automatic `incremental_review`, and composite runs also return `composite_snapshot_id`. |
+| `run_review` | Read one explicit `run_id`; `view="status"` returns compact durable state, terminal ingestion evidence, and the automatic incremental review for incremental runs, while `view="logs"` returns bounded literal matches. Use standalone `coverage_review(task="incremental")` only for two already stored ordinary or composite measurements. |
 | `cancel_run` | Request cancellation for a run the user no longer wants. |
-| `coverage_import` | Import a repository-relative external report with format, suite, branch, commit, and base provenance. Follow with `coverage_review`. |
-| `coverage_review` | Bounded change/history/insight/source/audit/all analysis. Compact defaults to three files and five targets; history returns two points, and insight returns three ranges per target plus truncation metadata. Use audit for exact records. |
+| `coverage_import` | Import a repository-relative external report with format, suite, branch, commit, and base provenance. It accepts the same optional execution identity and `detail_retention="incremental_base"` for a fixed base. Follow with `coverage_review`. |
+| `coverage_review` | Bounded change/incremental/history/insight/source/audit/all analysis. It accepts ordinary snapshot IDs or immutable composite IDs; compact defaults to three files, five regions, and ten affected test IDs; history returns two points, and insight returns three ranges per target plus truncation metadata. Use incremental for an explicit current-vs-base comparison and audit for exact records. |
 | `find_duplicate_coverage_tests` | Read-only, bounded candidate reduction for named tests with exactly equal covered line/branch/function observation sets. Defaults to the latest snapshot, ten groups, and ten names per group; follow `page.next_cursor` for more groups. |
 
 ### Exact duplicate coverage candidates
@@ -445,14 +612,15 @@ these compact-only fields.
 The compact defaults are intentional: raw command, path, artifact, and run
 provenance fields require an explicit `detailed=true`; readable or exact
 coverage detail requires a `representation` choice, and logs require
-`run_review(view="logs")`. Terminal run state also does not include a coverage
-review; call `coverage_review` explicitly when analysis is needed.
+`run_review(view="logs")`. Terminal incremental run state includes the
+automatic `incremental_review`; use standalone `coverage_review(task="incremental")`
+only when comparing two already stored snapshots independently of execution.
 
 Every successful tool uses this envelope:
 
 ```json
 {
-  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 10},
+  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 14},
   "data": {},
   "page": null
 }
@@ -478,6 +646,8 @@ Resources:
 
 - `coverage://context` — current project context, policy, commands, and runs;
 - `coverage://snapshot/{snapshot_id}/summary` — one compact immutable snapshot.
+- `coverage://composite/{composite_snapshot_id}/summary` — one bounded
+  immutable composite summary and its exact inventory/provenance audit fields.
 
 
 ## Coverage storage and compaction
@@ -533,8 +703,35 @@ MCP. Important routes are:
   handoff capability itself is never returned;
 - `GET /api/projects`, `POST /api/projects`, `GET/PATCH /api/projects/{id}` —
   project discovery and compaction policy;
-- `POST /api/ingest` — report ingestion;
+- `POST /api/ingest` — report ingestion; accepts `execution={mode,identity,label}` and `detail_retention="incremental_base"` for case-specific reports and fixed bases;
+- `GET /api/dashboard` — one bounded dashboard projection. It accepts
+  ordinary `snapshot_id`/`baseline_snapshot_id` and independent composite
+  `composite_snapshot_id`/`baseline_composite_snapshot_id` selectors plus
+  `history_limit` (2–50). It returns ordinary current/baseline provenance,
+  all four metric families, history, incremental categories, bounded
+  file/region/test detail, run activity, compaction inventory, and a separate
+  exact production-region projection with Rust, Python, and JavaScript
+  component summaries;
+- `GET /api/dashboard/events` — an SSE stream for the selected repository.
+  It emits `ready` with a 10-second refresh interval, then `refresh` only when
+  the dashboard revision changes, with heartbeat comments between changes and
+  `dashboard-error` events for recoverable refresh failures. The embedded
+  dashboard keeps this stream open only while its tab is foregrounded; the
+  stream does not run tests or recalculate coverage;
 - `GET /api/snapshots`, `/api/snapshots/{id}`, and snapshot file/insight routes;
+- `GET /api/composite-snapshots/{id}` — bounded composite audit summary with
+  exact inventory/provenance and component evidence;
+- `GET /api/composite-snapshots/{id}/regions` and `/insights` — bounded
+  canonical-region detail for composite dashboards and operators;
+- `GET /api/incremental?snapshot_id=...&baseline_snapshot_id=...` — bounded
+  explicit current-versus-fixed-base comparison with compaction detail-source
+  metadata, metric/category deltas, and bounded named-test attribution
+  (`max_files`, `max_regions`, and `max_test_ids`);
+- The incremental and compare routes also accept
+  `composite_snapshot_id` plus `baseline_composite_snapshot_id`; source-lines
+  accepts `composite_snapshot_id` and reads bounded checkout ranges with
+  canonical-region annotations. Ordinary and composite selectors cannot be
+  mixed.
 - `/api/compare`, `/api/changed-lines`, `/api/line-history`, and
   `/api/source-lines` — comparisons and bounded source views;
 - `GET /api/duplicate-coverage-tests` — exact, bounded named-test coverage
@@ -548,6 +745,29 @@ In common-daemon mode, select a repository with a project ID from
 `GET /api/projects`, the `x-coverage-mcp-repo` header, or the documented
 `repo_path` query/body field. The daemon rejects non-loopback bind hosts and
 untrusted Host headers.
+
+The embedded dashboard has dedicated Incremental and Production region
+coverage panels. Select the current report and an explicit fixed baseline, or
+select the composite current/base IDs for the combined inventory view. It
+shows gain/regression counters, file deltas, changed regions,
+affected named test IDs, each snapshot's suite/format/retention/execution
+identity, and whether detail came from relational rows or a compacted payload.
+The production panel shows one exact canonical-region percentage, covered and
+total regions, Rust (including WGSL), Python, and JavaScript component rates,
+blocking reasons, remediation buckets, and the composite IDs used for the
+comparison.
+The progression chart and timeline keep lines, branches, functions, and
+regions visible together; the file drawer adds bounded line detail only when
+requested. The page receives SSE refresh events at a 10-second foreground-only
+cadence and coalesces concurrent refreshes. It does not infer that a full run
+and an incremental run used the same arguments; the run projection displays
+persisted case arguments and the server-generated opaque execution fingerprint.
+
+The Compaction health panel distinguishes relational snapshots, compressed
+payloads, protected `incremental_base` snapshots, currently eligible work,
+original/compressed bytes, saved bytes, and inventory consistency. A compacted
+snapshot remains a valid incremental base because comparison restores its
+stored files, lines, and named-test observations from the zstd payload.
 
 ### Ownership, pooling, and deadlines
 
@@ -612,6 +832,13 @@ scripts, generated evidence, and internal release plans. See the
 for the reproducible format, test, lint, coverage, migration, documentation,
 and release commands, and the [release guide](https://github.com/appunni-m/coverage-mcp/blob/main/docs/releasing.md)
 for artifact verification.
+
+The repository Makefile requires GNU Make 3.81 or newer and a POSIX shell. Use
+`make ci` for the complete local gate, `make package` for the clean-tree Cargo
+package check used by the release workflow, and `make release` for the bundled
+release binary. These targets delegate build and test semantics to Cargo;
+`make fmt-fix` is the source-mutating formatter and `make clean` removes only
+Cargo build outputs.
 
 The published crate contains the runtime and its production-facing
 documentation; it does not contain the repository's test corpus or opt-in

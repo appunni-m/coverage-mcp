@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckdb::Connection;
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use futures_util::stream;
+use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
+use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderMap,
     HeaderValue,
@@ -46,8 +47,9 @@ use crate::{SCHEMA_REVISION, VERSION, stable_project_id};
 pub const REPOSITORY_HEADER: &str = "x-coverage-mcp-repo";
 /// Private loopback route used by a newer connector for graceful daemon handoff.
 pub const DAEMON_HANDOFF_PATH: &str = "/_coverage-mcp/handoff";
+const DASHBOARD_REFRESH_INTERVAL_SECONDS: u64 = 10;
 
-type HttpResponse = Response<Full<Bytes>>;
+type HttpResponse = Response<UnsyncBoxBody<Bytes, Infallible>>;
 
 #[cfg(test)]
 static FORCE_BOUNDED_ACCEPT_FAILURE: AtomicBool = AtomicBool::new(false);
@@ -412,14 +414,18 @@ impl CoverageServer {
                 .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
                 .or_else(|| self.config.default_repository_path_string())
         };
-        let service = self.service_for_repository_path(&repository.ok_or_else(|| {
+        let repository = repository.ok_or_else(|| {
             AppError::Validation(format!(
                 "{REPOSITORY_HEADER} header is required in common database mode"
             ))
-        })?)?;
+        })?;
+        let service = self.service_for_repository_path(&repository)?;
         let store = service.store().clone();
         let max_words = query_usize(&query, "max_words", DEFAULT_MAX_WORDS)?;
         let detailed = query_bool(&query, "detailed")?;
+        if method == Method::GET && path.as_slice() == ["api", "dashboard", "events"] {
+            return self.dashboard_stream(repository);
+        }
         if method == Method::GET
             && path.len() >= 5
             && path[0] == "api"
@@ -442,7 +448,7 @@ impl CoverageServer {
         let response = match (method, path.as_slice()) {
             (Method::POST, ["api", "ingest"]) => {
                 if let Some(repo_path) = optional_body_string(&body, "repo_path")? { service.validate_repository_path(Some(repo_path))?; }
-                service.ingest(required_body(&body, "report_path")?, optional_body_string(&body, "format")?.unwrap_or("auto"), optional_body_string(&body, "suite")?.unwrap_or("default"), optional_body_string(&body, "branch")?, optional_body_string(&body, "commit_sha")?, optional_body_string(&body, "base_ref")?, detailed)?
+                service.ingest_with_options(required_body(&body, "report_path")?, optional_body_string(&body, "format")?.unwrap_or("auto"), optional_body_string(&body, "suite")?.unwrap_or("default"), optional_body_string(&body, "branch")?, optional_body_string(&body, "commit_sha")?, optional_body_string(&body, "base_ref")?, detailed, body.get("execution"), optional_body_string(&body, "detail_retention")?.unwrap_or("compactable"))?
             }
             (Method::GET, ["api", "projects"]) => self.project_list(service.clone(), query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?,
             (Method::POST, ["api", "projects"]) => {
@@ -451,6 +457,13 @@ impl CoverageServer {
             (Method::PATCH, ["api", "projects", _]) => service.update_project_settings(project_patch(&body)?)?,
             (Method::POST, ["api", "projects", _, "compact"]) => service.compact_now()?,
             (Method::GET, ["api", "projects", _]) => service.envelope(store.project_summary()?, None, None),
+            (Method::GET, ["api", "dashboard"]) => service.dashboard_with_composite(
+                query_value(&query, "snapshot_id"),
+                query_value(&query, "baseline_snapshot_id"),
+                query_value(&query, "composite_snapshot_id"),
+                query_value(&query, "baseline_composite_snapshot_id"),
+                bounded_query_usize(&query, "history_limit", 18, 2, 50)?,
+            )?,
             (Method::GET, ["api", "snapshots"]) => {
                 let values = store.list_snapshots(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), COLLECTION_FETCH_LIMIT)?;
                 let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, "rest-snapshots", None)?;
@@ -460,6 +473,40 @@ impl CoverageServer {
                 let value = store.latest_snapshot(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"))?.ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?;
                 service.envelope(value, None, None)
             }
+            (Method::GET, ["api", "composite-snapshots", composite_snapshot_id]) => service
+                .composite_review(
+                    "audit",
+                    composite_snapshot_id,
+                    None,
+                    None,
+                    bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
+                    max_words,
+                    query_usize(&query, "max_bytes", 12_000)?,
+                    "audit",
+                    query_usize(&query, "max_test_ids", 10)?,
+                )?,
+            (Method::GET, ["api", "composite-snapshots", composite_snapshot_id, "regions"]) => {
+                service.envelope(
+                    Value::Array(store.composite_regions(
+                        composite_snapshot_id,
+                        bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
+                    )?),
+                    None,
+                    None,
+                )
+            }
+            (Method::GET, ["api", "composite-snapshots", composite_snapshot_id, "insights"]) => service
+                .composite_review(
+                    "insight",
+                    composite_snapshot_id,
+                    None,
+                    query_value(&query, "file_path"),
+                    bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
+                    max_words,
+                    query_usize(&query, "max_bytes", 12_000)?,
+                    "compact",
+                    query_usize(&query, "max_test_ids", 10)?,
+                )?,
             (Method::GET, ["api", "duplicate-coverage-tests"]) => service
                 .find_duplicate_coverage_tests(
                     query_value(&query, "snapshot_id"),
@@ -482,11 +529,107 @@ impl CoverageServer {
             }
             (Method::GET, ["api", "snapshots", snapshot_id, "insights"]) => service.envelope(store.insights(snapshot_id, query_value(&query, "baseline_snapshot_id"), COLLECTION_FETCH_LIMIT)?, None, None),
             (Method::GET, ["api", "trend"]) => service.envelope(Value::Array(store.trend(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), query_value(&query, "file_path"), query_value(&query, "worktree_id"), query_usize(&query, "limit", 100)? )?), None, None),
-            (Method::GET, ["api", "compare"]) => service.envelope(store.compare(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None),
-            (Method::POST, ["api", "compare"]) => service.envelope(store.compare(required_body(&body, "snapshot_id")?, required_body(&body, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None),
+            (Method::GET, ["api", "incremental"]) => {
+                let max_files = bounded_query_usize(&query, "max_files", 8, 1, 100)?;
+                let max_regions = bounded_query_usize(&query, "max_regions", 24, 1, 500)?;
+                let max_test_ids = bounded_query_usize(&query, "max_test_ids", 10, 1, 100)?;
+                if let Some(composite_snapshot_id) = query_value(&query, "composite_snapshot_id") {
+                    if query_value(&query, "snapshot_id").is_some()
+                        || query_value(&query, "baseline_snapshot_id").is_some()
+                    {
+                        return Err(AppError::Validation(
+                            "ordinary and composite selectors cannot be mixed".to_owned(),
+                        ));
+                    }
+                    service.composite_review(
+                        "incremental",
+                        composite_snapshot_id,
+                        Some(required_query(&query, "baseline_composite_snapshot_id")?),
+                        query_value(&query, "file_path"),
+                        max_regions.min(100),
+                        max_words,
+                        query_usize(&query, "max_bytes", 12_000)?,
+                        "compact",
+                        max_test_ids,
+                    )?
+                } else {
+                    service.envelope(store.incremental_compare(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), max_files, max_regions, max_test_ids)?, None, None)
+                }
+            }
+            (Method::GET, ["api", "compare"]) => {
+                if let Some(composite_snapshot_id) = query_value(&query, "composite_snapshot_id") {
+                    if query_value(&query, "snapshot_id").is_some()
+                        || query_value(&query, "baseline_snapshot_id").is_some()
+                    {
+                        return Err(AppError::Validation(
+                            "ordinary and composite selectors cannot be mixed".to_owned(),
+                        ));
+                    }
+                    service.composite_review(
+                        "incremental",
+                        composite_snapshot_id,
+                        Some(required_query(&query, "baseline_composite_snapshot_id")?),
+                        query_value(&query, "file_path"),
+                        bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
+                        max_words,
+                        query_usize(&query, "max_bytes", 12_000)?,
+                        "review",
+                        query_usize(&query, "max_test_ids", 10)?,
+                    )?
+                } else {
+                    service.envelope(store.compare(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None)
+                }
+            }
+            (Method::POST, ["api", "compare"]) => {
+                if let Some(composite_snapshot_id) = optional_body_string(&body, "composite_snapshot_id")? {
+                    if body.get("snapshot_id").is_some() || body.get("baseline_snapshot_id").is_some() {
+                        return Err(AppError::Validation(
+                            "ordinary and composite selectors cannot be mixed".to_owned(),
+                        ));
+                    }
+                    service.composite_review(
+                        "incremental",
+                        composite_snapshot_id,
+                        Some(required_body(&body, "baseline_composite_snapshot_id")?),
+                        optional_body_string(&body, "file_path")?,
+                        24,
+                        max_words,
+                        optional_body_u64(&body, "max_bytes")?
+                            .map(|value| value.min(2_000_000) as usize)
+                            .unwrap_or(12_000),
+                        "review",
+                        10,
+                    )?
+                } else {
+                    service.envelope(store.compare(required_body(&body, "snapshot_id")?, required_body(&body, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None)
+                }
+            }
             (Method::GET, ["api", "changed-lines"]) => service.envelope(json!({"lines":store.changed_lines(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), query_bool(&query, "only_regressions")?, COLLECTION_FETCH_LIMIT)?}), None, None),
             (Method::GET, ["api", "line-history"]) => service.envelope(Value::Array(store.line_history(required_query(&query, "file_path")?, required_query(&query, "line_number")?.parse().map_err(|_| AppError::Validation("line_number must be an integer".to_owned()))?, query_value(&query, "branch"), query_value(&query, "suite"), COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::GET, ["api", "source-lines"]) => service.source(required_query(&query, "snapshot_id")?, required_query(&query, "file_path")?, required_query(&query, "start")?.parse().map_err(|_| AppError::Validation("start must be an integer".to_owned()))?, required_query(&query, "end")?.parse().map_err(|_| AppError::Validation("end must be an integer".to_owned()))?, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?,
+            (Method::GET, ["api", "source-lines"]) => {
+                if let Some(composite_snapshot_id) = query_value(&query, "composite_snapshot_id") {
+                    if query_value(&query, "snapshot_id").is_some() {
+                        return Err(AppError::Validation(
+                            "ordinary and composite selectors cannot be mixed".to_owned(),
+                        ));
+                    }
+                    service.composite_source_review(
+                        composite_snapshot_id,
+                        vec![
+                            (
+                                required_query(&query, "file_path")?.to_owned(),
+                                required_query(&query, "start")?.parse().map_err(|_| AppError::Validation("start must be an integer".to_owned()))?,
+                                required_query(&query, "end")?.parse().map_err(|_| AppError::Validation("end must be an integer".to_owned()))?,
+                            ),
+                        ],
+                        bounded_query_usize(&query, "max_source_lines", 120, 10, 500)?,
+                        max_words,
+                        query_usize(&query, "max_bytes", 12_000)?,
+                    )?
+                } else {
+                    service.source(required_query(&query, "snapshot_id")?, required_query(&query, "file_path")?, required_query(&query, "start")?.parse().map_err(|_| AppError::Validation("start must be an integer".to_owned()))?, required_query(&query, "end")?.parse().map_err(|_| AppError::Validation("end must be an integer".to_owned()))?, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?
+                }
+            }
             (Method::GET, ["api", "worktrees"]) => service.envelope(Value::Array(store.list_worktrees(COLLECTION_FETCH_LIMIT)?), None, None),
             (Method::POST, ["api", "worktrees", "register"]) => service.ensure_lineage_baseline(required_body(&body, "path")?, required_body(&body, "base_ref")?, optional_body_string(&body, "name")?)?,
             (Method::GET, ["api", "worktrees", worktree_id, "progress"]) => service.envelope(store.worktree_progress(worktree_id, query_value(&query, "suite").ok_or_else(|| AppError::Validation("suite is required".to_owned()))?, query_value(&query, "file_path"), COLLECTION_FETCH_LIMIT)?, None, None),
@@ -511,6 +654,99 @@ impl CoverageServer {
         self.config
             .default_repository_path_string()
             .unwrap_or_else(|| ".".to_owned())
+    }
+
+    fn dashboard_stream(&self, repository: String) -> AppResult<HttpResponse> {
+        self.dashboard_stream_with_interval(
+            repository,
+            TokioDuration::from_secs(DASHBOARD_REFRESH_INTERVAL_SECONDS),
+        )
+    }
+
+    fn dashboard_stream_with_interval(
+        &self,
+        repository: String,
+        refresh_interval: TokioDuration,
+    ) -> AppResult<HttpResponse> {
+        let server = self.clone();
+        let stream = stream::unfold(
+            (server, repository, None::<String>, true),
+            move |(server, repository, previous_revision, first)| async move {
+                if first {
+                    let payload = json!({
+                        "schema_revision": SCHEMA_REVISION,
+                        "refresh_interval_ms": DASHBOARD_REFRESH_INTERVAL_SECONDS * 1_000,
+                    });
+                    let frame =
+                        Frame::data(Bytes::from(format!("event: ready\ndata: {}\n\n", payload)));
+                    return Some((Ok(frame), (server, repository, previous_revision, false)));
+                }
+                tokio::time::sleep(refresh_interval).await;
+                let revision = server.dashboard_revision(&repository);
+                let (body, next_revision) = match revision {
+                    Ok(revision) if previous_revision.as_deref() != Some(revision.as_str()) => (
+                        format!("event: refresh\ndata: {{\"revision\":{revision}}}\n\n"),
+                        Some(revision),
+                    ),
+                    Ok(revision) => (": heartbeat\n\n".to_owned(), Some(revision)),
+                    Err(error) => (
+                        format!(
+                            "event: dashboard-error\ndata: {}\n\n",
+                            json!({"detail": error.to_string()})
+                        ),
+                        previous_revision,
+                    ),
+                };
+                Some((
+                    Ok(Frame::data(Bytes::from(body))),
+                    (server, repository, next_revision, false),
+                ))
+            },
+        );
+        let mut response = Response::new(StreamBody::new(stream).boxed_unsync());
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        response
+            .headers_mut()
+            .insert("x-accel-buffering", HeaderValue::from_static("no"));
+        Ok(harden(response))
+    }
+
+    fn dashboard_revision(&self, repository: &str) -> AppResult<String> {
+        let service = self.service_for_repository_path(repository)?;
+        let project = service.store().project_summary()?;
+        let compaction = service.store().compaction_summary()?;
+        let latest_run = service.store().latest_run(None)?;
+        let active_runs = service.store().list_run_queue(11)?;
+        let policy = project.get("compaction").cloned().unwrap_or(Value::Null);
+        Ok(serde_json::to_string(&json!({
+            "latest_snapshot_id": project.get("latest_snapshot_id"),
+            "snapshot_count": project.get("snapshot_count"),
+            "latest_composite_snapshot_id": project.get("latest_composite_snapshot_id"),
+            "composite_snapshot_count": project.get("composite_snapshot_count"),
+            "compaction_policy": {
+                "enabled": policy.get("compaction_enabled"),
+                "after_days": policy.get("compaction_after_days"),
+                "interval_seconds": policy.get("compaction_interval_seconds"),
+                "batch_size": policy.get("compaction_batch_size"),
+                "last_run_at": policy.get("compaction_last_run_at"),
+                "last_status": policy.get("compaction_last_status"),
+                "last_snapshot_count": policy.get("compaction_last_snapshot_count"),
+                "last_bytes_before": policy.get("compaction_last_bytes_before"),
+                "last_bytes_after": policy.get("compaction_last_bytes_after"),
+            },
+            "compaction": compaction,
+            "latest_run": latest_run.as_ref().and_then(|value| value.get("id")),
+            "latest_run_status": latest_run.as_ref().and_then(|value| value.get("status")),
+            "active_run_ids": active_runs.iter().filter_map(|value| value.get("id")).collect::<Vec<_>>(),
+        }))
+        .expect("dashboard revision serialization is infallible"))
     }
 
     fn repository_for_project_id(&self, project_id: &str) -> AppResult<String> {
@@ -946,6 +1182,21 @@ fn query_usize(
         .transpose()
         .map(|value| value.unwrap_or(default))
 }
+fn bounded_query_usize(
+    query: &HashMap<String, Vec<String>>,
+    key: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> AppResult<usize> {
+    let value = query_usize(query, key, default)?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(AppError::Validation(format!(
+            "{key} must be between {minimum} and {maximum}"
+        )));
+    }
+    Ok(value)
+}
 fn required_query<'a>(query: &'a HashMap<String, Vec<String>>, key: &str) -> AppResult<&'a str> {
     query_value(query, key).ok_or_else(|| AppError::Validation(format!("{key} is required")))
 }
@@ -1046,7 +1297,7 @@ fn topology(store: &CoverageStore, kind: &str, reference: &str) -> AppResult<Val
 }
 
 fn json_response(status: StatusCode, value: Value) -> HttpResponse {
-    let mut response = Response::new(Full::new(Bytes::from(value.to_string())));
+    let mut response = Response::new(Full::new(Bytes::from(value.to_string())).boxed_unsync());
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -1060,7 +1311,7 @@ fn error_response(error: AppError) -> HttpResponse {
     )
 }
 fn empty_response(status: StatusCode) -> HttpResponse {
-    let mut response = Response::new(Full::new(Bytes::new()));
+    let mut response = Response::new(Full::new(Bytes::new()).boxed_unsync());
     *response.status_mut() = status;
     harden(response)
 }
@@ -1079,13 +1330,16 @@ fn harden(mut response: HttpResponse) -> HttpResponse {
     response
 }
 fn dashboard_response() -> HttpResponse {
-    let html = include_str!("dashboard.html");
-    let mut response = Response::new(Full::new(Bytes::from(html)));
+    let mut response = Response::new(Full::new(Bytes::from(dashboard_html())).boxed_unsync());
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
     harden(response)
+}
+
+fn dashboard_html() -> &'static str {
+    include_str!("dashboard.html")
 }
 
 #[cfg(test)]
@@ -1241,6 +1495,16 @@ mod tests {
         assert_eq!(query_usize(&query, "limit", 17).unwrap(), 4);
         query.insert("invalid_limit".to_owned(), vec!["many".to_owned()]);
         assert!(query_usize(&query, "invalid_limit", 17).is_err());
+        assert_eq!(
+            bounded_query_usize(&query, "missing_bounded", 4, 1, 8).unwrap(),
+            4
+        );
+        query.insert("bounded".to_owned(), vec!["6".to_owned()]);
+        assert_eq!(bounded_query_usize(&query, "bounded", 4, 1, 8).unwrap(), 6);
+        query.insert("bounded_low".to_owned(), vec!["0".to_owned()]);
+        query.insert("bounded_high".to_owned(), vec!["9".to_owned()]);
+        assert!(bounded_query_usize(&query, "bounded_low", 4, 1, 8).is_err());
+        assert!(bounded_query_usize(&query, "bounded_high", 4, 1, 8).is_err());
         assert_eq!(required_query(&query, "query").unwrap(), "one");
         assert!(required_query(&query, "missing").is_err());
         assert_eq!(
@@ -1343,18 +1607,323 @@ mod tests {
         );
         let dashboard = dashboard_response();
         assert_eq!(dashboard.status(), StatusCode::OK);
-        let dashboard_body = String::from_utf8(
-            dashboard
-                .into_body()
-                .into_inner()
-                .expect("dashboard body")
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(dashboard_body.contains("getAllJSON('/api/projects?max_words=5000')"));
-        assert!(dashboard_body.contains("coverageViewer"));
-        assert!(dashboard_body.contains("compactionAfterDays"));
+        assert!(dashboard_html().contains("EventSource"));
+        assert!(dashboard_html().contains("metricsGrid"));
+        assert!(dashboard_html().contains("compositeCurrentSelect"));
+        assert!(dashboard_html().contains("Production region coverage"));
+        assert!(dashboard_html().contains("compactionInventory"));
+        assert!(dashboard_html().contains("/api/dashboard"));
+        assert!(dashboard_html().contains("/api/dashboard/events"));
+        assert!(dashboard_html().contains("visibilitychange"));
+        assert!(dashboard_html().contains("refreshTimer"));
+        assert!(dashboard_html().contains("setLive('live', 'on')"));
         assert!(format!("{:?}", CoverageServer::new(config()).unwrap()).contains("CoverageServer"));
+
+        let dashboard_directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dashboard_directory.path().join("src")).unwrap();
+        std::fs::write(dashboard_directory.path().join("src/a.py"), "one\ntwo\n").unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "dashboard@example.com"],
+            vec!["config", "user.name", "Dashboard Tests"],
+            vec!["add", "."],
+            vec!["commit", "-m", "dashboard base"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dashboard_directory.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut dashboard_config = config();
+        dashboard_config.default_repository_path = Some(dashboard_directory.path().to_path_buf());
+        dashboard_config.common_db_path = dashboard_directory.path().join("common.duckdb");
+        let dashboard_server = CoverageServer::new(dashboard_config).unwrap();
+        let dashboard_service = dashboard_server
+            .service_for_repository_path(&dashboard_directory.path().to_string_lossy())
+            .unwrap();
+        dashboard_service
+            .update_project_settings(ProjectSettingsPatch {
+                compaction_enabled: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        let dashboard_store = dashboard_service.store().clone();
+        let dashboard_project = dashboard_store.project().unwrap();
+        let dashboard_repo_path = dashboard_project.repo_path.replace('\'', "''");
+        let dashboard_repo_key = dashboard_project.repo_key.replace('\'', "''");
+        dashboard_store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-terminal', 'dashboard-command', 'dashboard-command', 'true', '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{}}', '[]', current_timestamp, 0, NULL, 'full', 'full:v1', 'full'); INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-active', 'dashboard-command', 'dashboard-command', 'true', NULL, '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, NULL, NULL, 30, 20, 'queued', 'stdout.log', 'stderr.log', '', NULL, 'incremental', 'case:v1', 'case')"
+            ))
+            .unwrap();
+        dashboard_store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('dashboard-composite-base', current_timestamp - INTERVAL '2 seconds', 'dashboard-composite-run-base', 'dashboard-command', '{dashboard_repo_path}', '{dashboard_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'dashboard-inventory', NULL, false, 0, 1, 0.0, '[]', '{{}}', '{{}}', '{{}}', '[]', '[]'); INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('dashboard-composite-current', current_timestamp, 'dashboard-composite-run-current', 'dashboard-command', '{dashboard_repo_path}', '{dashboard_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'dashboard-inventory', NULL, false, 1, 1, 1.0, '[]', '{{}}', '{{}}', '{{}}', '[]', '[]'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('dashboard-composite-base', 'python:src/a.py:1:1:line-1', '{{\"region_key\":\"python:src/a.py:1:1:line-1\",\"component_id\":\"python\",\"logical_source_id\":\"python:src/a.py\",\"path\":\"src/a.py\",\"start_line\":1,\"end_line\":1,\"discriminator\":\"line-1\",\"state\":\"uncovered\",\"variants\":[{{\"package_variant\":\"cpython\",\"state\":\"uncovered\",\"hits\":0}}]}}'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('dashboard-composite-current', 'python:src/a.py:1:1:line-1', '{{\"region_key\":\"python:src/a.py:1:1:line-1\",\"component_id\":\"python\",\"logical_source_id\":\"python:src/a.py\",\"path\":\"src/a.py\",\"start_line\":1,\"end_line\":1,\"discriminator\":\"line-1\",\"state\":\"covered\",\"variants\":[{{\"package_variant\":\"cpython\",\"state\":\"covered\",\"hits\":1}}]}}')"
+            ))
+            .unwrap();
+        assert!(
+            dashboard_server
+                .dashboard_revision(&dashboard_directory.path().to_string_lossy())
+                .is_ok()
+        );
+        for skip in 0..=24 {
+            dashboard_store.inject_query_fault_after(skip);
+            let _ =
+                dashboard_server.dashboard_revision(&dashboard_directory.path().to_string_lossy());
+        }
+        dashboard_store.clear_query_fault();
+        let response = dashboard_server
+            .dashboard_stream(dashboard_directory.path().to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/event-stream; charset=utf-8"
+        );
+        let mut body = response.into_body();
+        let frame_text =
+            |frame: Frame<Bytes>| String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        let ready = frame_text(body.frame().await.unwrap().unwrap());
+        assert!(ready.contains("event: ready"));
+        assert!(ready.contains("\"refresh_interval_ms\":10000"));
+        let refresh = frame_text(
+            timeout(TokioDuration::from_secs(12), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(refresh.contains("event: refresh"));
+        let heartbeat = frame_text(
+            timeout(TokioDuration::from_secs(12), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(heartbeat.contains(": heartbeat"));
+        drop(body);
+        let error_response = dashboard_server
+            .dashboard_stream("\0invalid-dashboard-repository".to_owned())
+            .unwrap();
+        let mut error_body = error_response.into_body();
+        let _ = error_body.frame().await.unwrap().unwrap();
+        let error_frame = frame_text(
+            timeout(TokioDuration::from_secs(12), error_body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(error_frame.contains("event: dashboard-error"));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(dashboard_server.clone().serve_listener(listener));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(
+                b"GET /api/dashboard?history_limit=2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut response_bytes = Vec::new();
+        client.read_to_end(&mut response_bytes).await.unwrap();
+        let response_text = String::from_utf8(response_bytes).unwrap();
+        assert!(response_text.contains("200 OK"));
+        assert!(response_text.contains("\"incremental\""));
+        assert!(response_text.contains("\"composite\""));
+        async fn rest_request(
+            address: std::net::SocketAddr,
+            method: &str,
+            path: &str,
+            payload: &str,
+        ) -> String {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        }
+        for (method, path, payload) in [
+            (
+                "GET",
+                "/api/composite-snapshots/dashboard-composite-current?max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200",
+                "",
+            ),
+            (
+                "GET",
+                "/api/composite-snapshots/dashboard-composite-current/regions?max_regions=10&max_words=1200",
+                "",
+            ),
+            (
+                "GET",
+                "/api/composite-snapshots/dashboard-composite-current/insights?max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200",
+                "",
+            ),
+            (
+                "GET",
+                "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200&file_path=src%2Fa.py",
+                "",
+            ),
+            (
+                "GET",
+                "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200&file_path=src%2Fa.py",
+                "",
+            ),
+            (
+                "POST",
+                "/api/compare?max_words=1200",
+                "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\"}",
+            ),
+            (
+                "GET",
+                "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=1&max_source_lines=10&max_words=1200&max_bytes=12000",
+                "",
+            ),
+            (
+                "GET",
+                "/api/dashboard?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&history_limit=2",
+                "",
+            ),
+        ] {
+            let response = rest_request(address, method, path, payload).await;
+            response
+                .contains("200 OK")
+                .then_some(())
+                .expect("composite REST route should return 200 OK");
+        }
+        for path in [
+            "/api/composite-snapshots/dashboard-composite-current?max_words=bad",
+            "/api/composite-snapshots/dashboard-composite-current?max_regions=bad",
+            "/api/composite-snapshots/dashboard-composite-current?max_bytes=bad",
+            "/api/composite-snapshots/dashboard-composite-current?max_test_ids=bad",
+            "/api/composite-snapshots/dashboard-composite-current/regions?max_regions=bad",
+            "/api/composite-snapshots/dashboard-composite-current/insights?max_regions=bad",
+            "/api/composite-snapshots/dashboard-composite-current/insights?max_bytes=bad",
+            "/api/composite-snapshots/dashboard-composite-current/insights?max_test_ids=bad",
+            "/api/incremental?max_files=bad",
+            "/api/incremental?composite_snapshot_id=dashboard-composite-current",
+            "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=bad",
+            "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_test_ids=bad",
+            "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_bytes=bad",
+            "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=bad",
+            "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_bytes=bad",
+            "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_test_ids=bad",
+            "/api/compare?composite_snapshot_id=dashboard-composite-current",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&start=1&end=1",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=bad&end=1",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=bad",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&end=1",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=1&max_source_lines=bad",
+            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=1&max_bytes=bad",
+        ] {
+            let response = rest_request(address, "GET", path, "").await;
+            response
+                .contains("400 Bad Request")
+                .then_some(())
+                .expect("invalid composite REST query should return 400 Bad Request");
+        }
+        let response = rest_request(
+            address,
+            "POST",
+            "/api/compare",
+            "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\",\"max_bytes\":\"bad\"}",
+        )
+        .await;
+        response
+            .contains("400 Bad Request")
+            .then_some(())
+            .expect("invalid composite POST query should return 400 Bad Request");
+        for payload in [
+            "{\"composite_snapshot_id\":7}",
+            "{\"composite_snapshot_id\":\"dashboard-composite-current\"}",
+            "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\",\"file_path\":7}",
+        ] {
+            let response = rest_request(address, "POST", "/api/compare", payload).await;
+            response
+                .contains("400 Bad Request")
+                .then_some(())
+                .expect("invalid composite POST body should return 400 Bad Request");
+        }
+        let response = rest_request(
+            address,
+            "POST",
+            "/api/compare",
+            "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\",\"max_bytes\":2000001}",
+        )
+        .await;
+        response
+            .contains("200 OK")
+            .then_some(())
+            .expect("large composite POST byte limit should be capped safely");
+        let mut composite_client = TcpStream::connect(address).await.unwrap();
+        composite_client
+            .write_all(
+                b"GET /api/composite-snapshots/missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut composite_response = Vec::new();
+        composite_client
+            .read_to_end(&mut composite_response)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(composite_response)
+                .unwrap()
+                .contains("404 Not Found")
+        );
+        let mut error_client = TcpStream::connect(address).await.unwrap();
+        error_client
+            .write_all(
+                b"GET /api/dashboard?snapshot_id=missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut error_response_bytes = Vec::new();
+        error_client
+            .read_to_end(&mut error_response_bytes)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(error_response_bytes)
+                .unwrap()
+                .contains("404 Not Found")
+        );
+        let mut invalid_limit_client = TcpStream::connect(address).await.unwrap();
+        invalid_limit_client
+            .write_all(
+                b"GET /api/dashboard?history_limit=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut invalid_limit_response = Vec::new();
+        invalid_limit_client
+            .read_to_end(&mut invalid_limit_response)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(invalid_limit_response)
+                .unwrap()
+                .contains("400 Bad Request")
+        );
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -2647,9 +3216,44 @@ mod tests {
                     "",
                 ),
                 (
+                    "GET",
+                    "/api/incremental?snapshot_id=missing&baseline_snapshot_id=missing",
+                    "",
+                ),
+                (
+                    "GET",
+                    "/api/incremental?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing",
+                    "",
+                ),
+                (
+                    "GET",
+                    "/api/incremental?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing&snapshot_id=ordinary",
+                    "",
+                ),
+                (
+                    "GET",
+                    "/api/compare?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing",
+                    "",
+                ),
+                (
+                    "GET",
+                    "/api/compare?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing&snapshot_id=ordinary",
+                    "",
+                ),
+                (
                     "POST",
                     "/api/compare",
                     r#"{"snapshot_id":"missing","baseline_snapshot_id":"missing"}"#,
+                ),
+                (
+                    "POST",
+                    "/api/compare",
+                    r#"{"composite_snapshot_id":"missing","baseline_composite_snapshot_id":"missing"}"#,
+                ),
+                (
+                    "POST",
+                    "/api/compare",
+                    r#"{"composite_snapshot_id":"missing","baseline_composite_snapshot_id":"missing","snapshot_id":"ordinary"}"#,
                 ),
                 (
                     "GET",
@@ -2661,6 +3265,20 @@ mod tests {
                     "/api/source-lines?snapshot_id=missing&file_path=a.py&start=1&end=2",
                     "",
                 ),
+                (
+                    "GET",
+                    "/api/source-lines?composite_snapshot_id=missing&file_path=a.py&start=1&end=2",
+                    "",
+                ),
+                (
+                    "GET",
+                    "/api/source-lines?composite_snapshot_id=missing&snapshot_id=ordinary&file_path=a.py&start=1&end=2",
+                    "",
+                ),
+                ("GET", "/api/composite-snapshots/missing", ""),
+                ("GET", "/api/composite-snapshots/missing/regions", ""),
+                ("GET", "/api/composite-snapshots/missing/insights", ""),
+                ("GET", "/api/dashboard", ""),
                 ("GET", "/api/snapshots/missing/files", ""),
                 ("POST", "/api/projects/project/compact", "{}"),
             ],

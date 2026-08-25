@@ -1,7 +1,7 @@
 # Architecture
 
 Coverage MCP is a local-first Rust service for coverage history, approved test
-execution, and agent-facing MCP access. The binary contains the HTTP daemon,
+execution, composite production coverage, and agent-facing MCP access. The binary contains the HTTP daemon,
 native stdio transport, dashboard, storage engine, parsers, and background
 maintenance worker.
 
@@ -44,9 +44,10 @@ requests without replaying an operation whose commit status is ambiguous.
 | --- | --- |
 | `src/main.rs` | CLI, shared-daemon `serve`, `connect`/`stdio`, and daemon-routed `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
-| `src/mcp.rs` | Explicit schema-10 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
+| `src/mcp.rs` | Explicit schema-14 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
-| `src/storage.rs` | DuckDB schema, immutable snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
+| `src/storage.rs` | DuckDB schema, immutable snapshots/composite snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
+| `src/composite.rs` | Versioned production inventory, canonical-region mapping, explicit alias deduplication, variant completeness, and exact component aggregation. |
 | `src/lock.rs` | Process-lifetime daemon and per-database OS-backed exclusive leases. |
 | `src/pool.rs` | Bounded DuckDB connection pooling, checkout deadlines, query interruption, and shutdown tracking. |
 | `src/compaction.rs` | Policy and result types for background and manual detail compression. |
@@ -62,19 +63,32 @@ requests without replaying an operation whose commit status is ambiguous.
 - Queue state is mutable only while a managed run is queued or active.
 - Project settings are scoped to the canonical repository key, so linked
   worktrees use the same compaction policy and coverage history.
-- Every public schema-10 response carries `repo_key`, `checkout_path`,
+- Every public schema-14 response carries `repo_key`, `checkout_path`,
   `suite`, and `schema_revision` context.
 - Collections use bounded fetches, word budgets, and opaque query-scoped
   cursors. A defensive record cap fails explicitly instead of silently losing
   data.
 - Comparisons require compatible repository, suite, and lineage identity.
-  Unknown parents are errors.
+  Unknown parents are errors. Incremental comparisons are the explicit
+  exception for suite identity: they require the same repository and format,
+  but may compare different suites and case-specific execution arguments.
 - Managed execution requires an immutable human-approved registration. Each
   stream is drained through a pipe and retained only up to the configured byte
   cap; summaries expose byte counts and `truncated`. Commands run in a
   dedicated process group so timeout, cancellation, and shutdown reach shell
   descendants. Any setup, polling, capture, or persistence failure
   terminalizes the durable job as `failed`.
+- A composite snapshot is immutable and run-scoped. Its authoritative inventory
+  owns the denominator; `logical_source_id` aliases are the only deduplication
+  mechanism. LLVM/native/WASM, coverage.py, Istanbul, and
+  `coverage-mcp-regions-v1` evidence map into one canonical region model. Every
+  declared package/backend variant is required even when variants share a
+  logical source. Missing, stale, malformed, unsupported, or source-mismatched
+  evidence makes the composite incomplete and never lowers its denominator.
+  Composite snapshots persist mapping version, inventory hash, checkout
+  revision/cleanliness, command registration, toolchain versions, and artifact
+  hashes, plus exact combined counts and Rust/WGSL, Python, and JavaScript
+  component summaries.
 - When a project store opens after an ungraceful daemon exit, persisted
   `running` jobs become terminal `interrupted` records and persisted `queued`
   jobs re-enter the normal worker/concurrency path. Running commands are not
@@ -94,9 +108,10 @@ requests without replaying an operation whose commit status is ambiguous.
   either normal page cap. Compact history keeps two points by default and
   compact insight keeps three `[start,end,line_count]` ranges per target while
   exposing `region_count` and `regions_truncated`; audit is the explicit exact
-  projection. Terminal run state does not calculate or embed a coverage review.
-  `structuredContent` is the canonical JSON-RPC success payload; text content
-  is only a compatibility hint.
+  projection. An incremental terminal run automatically attaches a bounded
+  `incremental_review`; the standalone review tool remains independent of
+  execution. `structuredContent` is the canonical JSON-RPC success payload;
+  text content is only a compatibility hint.
 - Named per-test coverage is normalized during LCOV parsing into `test_names`
   and `test_coverage_observations`. Duplicate candidates compare a full,
   ordered JSON representation of each test's `{kind,file_path,line_number,
@@ -106,6 +121,40 @@ requests without replaying an operation whose commit status is ambiguous.
 - Compaction includes both named-test tables in the zstd detail payload and
   deletes their relational rows in the same transaction as file and line
   detail. Restored compacted payloads use the same exact signature semantics.
+- The embedded dashboard uses one bounded `GET /api/dashboard` projection for
+  its metrics, timeline, run activity, incremental categories, file table, and
+  compaction inventory. It accepts independent ordinary and composite current
+  and baseline IDs, and presents one exact production-region percentage plus
+  Rust/WGSL, Python, and JavaScript component summaries, blocking reasons, and
+  remediation buckets. Ordinary measurements also present retention,
+  relational-versus-compacted detail source, suite/format, persisted case
+  arguments, and server-generated execution fingerprints so a full run and a
+  case-specific incremental run are not visually conflated. It subscribes to
+  `GET /api/dashboard/events`, which checks the server-side revision every ten
+  seconds and emits a refresh event only when it changes. The browser keeps the
+  stream and automatic refresh active only while the tab is foregrounded; it
+  never polls individual REST projections or reruns tests.
+- MCP `coverage_review(task="incremental")` is a standalone stored-detail
+  projection. It requires an explicit current measurement and
+  `baseline.kind="explicit"` with matching ordinary snapshot IDs or composite
+  snapshot IDs. Ordinary comparisons require the same repository and normalized
+  format; composite comparisons additionally require the same mapping version
+  and inventory hash. Both return grouped line categories, aggregate metric
+  deltas, bounded opaque `test_id` set differences, and attribution status.
+  Suite, branch, commit, command, cwd, and execution case are provenance, not
+  test identity. Relational detail and the zstd compacted payload are equivalent
+  sources for the projection; neither path invokes a test runner or reparses a
+  report.
+- `run_test` accepts optional case-specific string arguments without command
+  re-registration. The durable `run_execution_context` stores those arguments
+  and an explicit incremental baseline; reuse and idempotency compare the full
+  context. A terminal incremental run invokes the same stored-detail projection
+  used by `coverage_review` and attaches its bounded result.
+- Composite region comparisons load all stored canonical rows for exact category
+  counts before applying response limits. Public region/source projections stay
+  bounded. Composite rows are independent of ordinary zstd detail compaction;
+  child named-test observations use the existing relational-or-payload restore
+  path, so a compacted fixed base remains comparable.
 
 ## Ownership, concurrency, and shutdown
 
@@ -156,13 +205,20 @@ reads the persisted policy, finds snapshots older than the project threshold,
 serializes file/line detail, compresses it with zstd, and commits the compacted
 payload in one DuckDB transaction. The original detail rows are removed only
 after the compressed payload is durable. Query paths transparently restore the
-payload when a detailed view is requested.
+payload when a detailed view is requested. Composite snapshots and canonical
+composite regions are not part of the ordinary snapshot compaction transaction;
+their immutable rows remain directly queryable. If an ordinary child snapshot
+is compacted, named-test attribution restores its observations from the same
+payload used by incremental review.
 
 Settings are inserted with validated server defaults when a project is first
 seen. REST `POST /api/projects` can provide project-creation overrides;
 `PATCH /api/projects/{id}`, the dashboard, and the one-shot CLI pass handle
-later changes. Manual passes update durable status and byte counters so the
-dashboard and MCP context can show maintenance evidence. Project summaries
+later changes. Manual passes update durable status and byte counters. The
+dashboard's compaction inventory also counts relational snapshots, compressed
+payloads, protected incremental bases, currently eligible snapshots, and
+original versus compressed bytes, and marks payload inventory
+inconsistencies explicitly. Project summaries
 expose a stable short SHA-256 ID derived from the canonical repository key,
 so common-daemon project routes can resolve the project without a repository
 selection header.
@@ -178,10 +234,12 @@ repository-local database does not. All connector and compaction requests go
 through the shared daemon; only that daemon resolves and opens project stores.
 All parent directories are created by the Rust storage layer.
 
-The database contains project settings, repository registry rows, snapshots,
-files, lines, compacted payloads, worktrees, registered commands, runs, jobs,
-artifacts, and run output metadata. Fresh schema creation is performed at open and
-is intentionally owned by storage rather than by transport code.
+The database contains project settings, repository registry rows, ordinary and
+composite snapshots, canonical composite regions, files, lines, compacted
+payloads, worktrees, registered commands, runs, jobs, run execution contexts,
+artifacts, and run output metadata. Fresh schema
+creation is performed at open and is intentionally owned by storage rather than
+by transport code.
 
 ## Trust boundary
 

@@ -9,8 +9,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_in_result)]
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -30,6 +33,9 @@ pub const DEFAULT_MAX_WORDS: usize = 600;
 const MAX_CONTEXT_ACTIVE_RUNS: usize = 10;
 const MAX_CONTEXT_COMMANDS: usize = 8;
 const MAX_COMPACT_INSIGHT_REGIONS: usize = 3;
+
+#[cfg(test)]
+static FORCE_BUDGET_FAILURE: AtomicBool = AtomicBool::new(false);
 
 /// Repository identity attached to every response envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +101,12 @@ impl CoverageService {
     /// [`Self::project_context`] exposes that accounting in its page metadata.
     pub fn apply_budget(&self, response: Value, max_words: usize) -> AppResult<Value> {
         validate_max_words(max_words)?;
+        #[cfg(test)]
+        if FORCE_BUDGET_FAILURE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::Validation(
+                "injected response budget failure".to_owned(),
+            ));
+        }
         let data = response.get("data").cloned().unwrap_or(Value::Null);
         let count = serialized_word_count(&data);
         if count > max_words {
@@ -424,23 +436,58 @@ impl CoverageService {
         reuse_if_unchanged: bool,
         detailed: bool,
     ) -> AppResult<Value> {
+        self.run_submission_with_execution(
+            command_ref,
+            timeout_seconds,
+            idempotency_key,
+            wait,
+            reuse_if_unchanged,
+            detailed,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Submits or waits for one registered command with a case-specific
+    /// execution identity used to guard reuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_submission_with_execution(
+        &self,
+        command_ref: &str,
+        timeout_seconds: Option<u64>,
+        idempotency_key: Option<&str>,
+        wait: bool,
+        reuse_if_unchanged: bool,
+        detailed: bool,
+        execution: Option<&Value>,
+        arguments: Option<&Value>,
+        baseline_snapshot_id: Option<&str>,
+    ) -> AppResult<Value> {
         let value = if wait {
-            self.store.run_command_with_options(
+            self.store.run_command_with_execution(
                 command_ref,
                 timeout_seconds,
                 idempotency_key,
                 20,
                 reuse_if_unchanged,
+                execution,
+                arguments,
+                baseline_snapshot_id,
             )?
         } else {
-            self.store.submit_command_with_options(
+            self.store.submit_command_with_execution(
                 command_ref,
                 timeout_seconds,
                 idempotency_key,
                 20,
                 reuse_if_unchanged,
+                execution,
+                arguments,
+                baseline_snapshot_id,
             )?
         };
+        let value = self.attach_automatic_incremental_review(value);
         Ok(self.envelope(compact_run_result(&value, detailed), None, None))
     }
 
@@ -455,7 +502,189 @@ impl CoverageService {
                 ));
             }
         };
+        let value = if action == "status" {
+            self.attach_automatic_incremental_review(value)
+        } else {
+            value
+        };
         Ok(self.envelope(compact_run_result(&value, detailed), None, None))
+    }
+
+    fn attach_automatic_incremental_review(&self, mut run: Value) -> Value {
+        let Some(execution) = run.get("execution") else {
+            return run;
+        };
+        if execution.get("mode").and_then(Value::as_str) != Some("incremental") {
+            return run;
+        }
+        let baseline = execution.get("baseline").and_then(Value::as_object);
+        let baseline_is_composite =
+            baseline.is_some_and(|value| value.contains_key("composite_snapshot_id"));
+        let baseline_snapshot_id = baseline.and_then(|value| {
+            value
+                .get("snapshot_id")
+                .or_else(|| value.get("composite_snapshot_id"))
+                .and_then(Value::as_str)
+        });
+        if let Some(composite_snapshot_id) =
+            run.get("composite_snapshot_id").and_then(Value::as_str)
+        {
+            let Some(baseline_snapshot_id) = baseline_snapshot_id else {
+                run["incremental_review"] = automatic_incremental_review_placeholder(
+                    "not_measured",
+                    None,
+                    baseline_is_composite,
+                    "incremental composite execution has no explicit composite baseline",
+                );
+                return run;
+            };
+            let terminal = run
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !terminal {
+                run["incremental_review"] = automatic_incremental_review_placeholder(
+                    "pending",
+                    Some(baseline_snapshot_id),
+                    true,
+                    "incremental composite review waits for terminal coverage ingestion",
+                );
+                return run;
+            }
+            let review = self.composite_review(
+                "incremental",
+                composite_snapshot_id,
+                Some(baseline_snapshot_id),
+                None,
+                5,
+                DEFAULT_MAX_WORDS,
+                12_000,
+                "compact",
+                10,
+            );
+            match review {
+                Ok(review) => {
+                    let mut data = review
+                        .get("data")
+                        .cloned()
+                        .expect("composite review always returns a data projection");
+                    let object = data
+                        .as_object_mut()
+                        .expect("composite review data is always an object");
+                    object.insert("automatic".to_owned(), json!(true));
+                    object.insert("status".to_owned(), json!("measured"));
+                    object.insert(
+                        "current_composite_snapshot_id".to_owned(),
+                        json!(composite_snapshot_id),
+                    );
+                    run["incremental_review"] = data;
+                }
+                Err(error) => {
+                    run["incremental_review"] = automatic_incremental_review_placeholder(
+                        "not_measured",
+                        Some(baseline_snapshot_id),
+                        true,
+                        &format!("incremental composite review was not measured: {error}"),
+                    );
+                }
+            }
+            return run;
+        }
+        let Some(baseline_snapshot_id) = baseline_snapshot_id else {
+            run["incremental_review"] = automatic_incremental_review_placeholder(
+                "not_measured",
+                None,
+                baseline_is_composite,
+                "incremental execution has no explicit baseline snapshot",
+            );
+            return run;
+        };
+        let baseline = json!({
+            "kind": "explicit",
+            "snapshot_id": baseline_snapshot_id,
+        });
+        let terminal = run
+            .get("terminal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !terminal {
+            run["incremental_review"] = automatic_incremental_review_placeholder(
+                "pending",
+                Some(baseline_snapshot_id),
+                false,
+                "incremental review waits for terminal coverage ingestion",
+            );
+            return run;
+        }
+        let snapshot_ids = run
+            .get("coverage_ingest")
+            .and_then(|value| value.get("snapshot_ids"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if snapshot_ids.len() != 1 {
+            run["incremental_review"] = automatic_incremental_review_placeholder(
+                "not_measured",
+                Some(baseline_snapshot_id),
+                false,
+                "incremental review requires exactly one ingested current coverage snapshot",
+            );
+            return run;
+        }
+        let Some(current_snapshot_id) = snapshot_ids[0].as_str() else {
+            run["incremental_review"] = automatic_incremental_review_placeholder(
+                "not_measured",
+                Some(baseline_snapshot_id),
+                false,
+                "incremental review received an invalid current snapshot identifier",
+            );
+            return run;
+        };
+        let review = self.coverage_review_with_max_test_ids(
+            "incremental",
+            Some(current_snapshot_id),
+            Some(baseline_snapshot_id),
+            None,
+            None,
+            None,
+            None,
+            2,
+            2,
+            3,
+            5,
+            false,
+            3,
+            120,
+            DEFAULT_MAX_WORDS,
+            12_000,
+            "compact",
+            10,
+        );
+        match review {
+            Ok(review) => {
+                let mut data = review
+                    .get("data")
+                    .cloned()
+                    .expect("coverage review always returns a data projection");
+                let object = data
+                    .as_object_mut()
+                    .expect("coverage review data is always an object");
+                object.insert("automatic".to_owned(), json!(true));
+                object.insert("status".to_owned(), json!("measured"));
+                object.insert("baseline".to_owned(), baseline.clone());
+                object.insert("current_snapshot_id".to_owned(), json!(current_snapshot_id));
+                run["incremental_review"] = data;
+            }
+            Err(error) => {
+                run["incremental_review"] = automatic_incremental_review_placeholder(
+                    "not_measured",
+                    Some(baseline_snapshot_id),
+                    false,
+                    &format!("incremental review was not measured: {error}"),
+                );
+            }
+        }
+        run
     }
 
     /// Reads one durable run projection or targeted log projection.
@@ -549,6 +778,33 @@ impl CoverageService {
         base_ref: Option<&str>,
         detailed: bool,
     ) -> AppResult<Value> {
+        self.ingest_with_options(
+            report_path,
+            format,
+            suite,
+            branch,
+            commit_sha,
+            base_ref,
+            detailed,
+            None,
+            "compactable",
+        )
+    }
+
+    /// Parses and ingests a report with execution and retention metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_with_options(
+        &self,
+        report_path: &str,
+        format: &str,
+        suite: &str,
+        branch: Option<&str>,
+        commit_sha: Option<&str>,
+        base_ref: Option<&str>,
+        detailed: bool,
+        execution: Option<&Value>,
+        detail_retention: &str,
+    ) -> AppResult<Value> {
         let suite = suite.trim();
         if suite.is_empty() {
             return Err(AppError::Validation("suite must not be blank".to_owned()));
@@ -560,7 +816,7 @@ impl CoverageService {
         } else {
             PathBuf::from(&context.checkout_path).join(path)
         };
-        let snapshot = self.store.ingest_report(
+        let snapshot = self.store.ingest_report_with_execution(
             &path,
             format,
             Some(Path::new(&context.checkout_path)),
@@ -568,6 +824,8 @@ impl CoverageService {
             commit_sha,
             base_ref,
             suite,
+            execution,
+            detail_retention,
         )?;
         Ok(self.envelope(compact_snapshot(&snapshot, detailed), Some(suite), None))
     }
@@ -585,10 +843,40 @@ impl CoverageService {
         max_words: usize,
         max_bytes: usize,
     ) -> AppResult<Value> {
+        self.coverage_import_with_options(
+            report_path,
+            format,
+            suite,
+            branch,
+            commit_sha,
+            base_ref,
+            max_words,
+            max_bytes,
+            None,
+            "compactable",
+        )
+    }
+
+    /// Imports an external report with case-specific execution context and
+    /// an optional retained incremental-base policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coverage_import_with_options(
+        &self,
+        report_path: &str,
+        format: &str,
+        suite: &str,
+        branch: Option<&str>,
+        commit_sha: Option<&str>,
+        base_ref: Option<&str>,
+        max_words: usize,
+        max_bytes: usize,
+        execution: Option<&Value>,
+        detail_retention: &str,
+    ) -> AppResult<Value> {
         validate_max_words(max_words)?;
         validate_review_byte_budget(max_bytes)?;
         validate_relative_report_path(report_path, &self.context(None).checkout_path)?;
-        let response = self.ingest(
+        let response = self.ingest_with_options(
             report_path,
             format,
             suite,
@@ -596,6 +884,8 @@ impl CoverageService {
             commit_sha,
             base_ref,
             false,
+            execution,
+            detail_retention,
         )?;
         let response = self.apply_budget(response, max_words)?;
         self.apply_byte_budget(response, max_bytes)
@@ -840,9 +1130,199 @@ impl CoverageService {
         max_bytes: usize,
         representation: &str,
     ) -> AppResult<Value> {
-        if !matches!(focus, "change" | "history" | "insight" | "all") {
+        self.coverage_review_with_max_test_ids(
+            focus,
+            snapshot_id,
+            baseline_snapshot_id,
+            worktree_id,
+            suite,
+            branch,
+            file_path,
+            detail_snapshots,
+            summary_window,
+            max_files,
+            max_regions,
+            include_source,
+            context_lines,
+            max_source_lines,
+            max_words,
+            max_bytes,
+            representation,
+            10,
+        )
+    }
+
+    /// Reviews an immutable composite region snapshot without reparsing any
+    /// child artifact. Incremental comparisons require an explicit composite
+    /// baseline and validate repository, mapping, and inventory identity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_review(
+        &self,
+        focus: &str,
+        composite_snapshot_id: &str,
+        baseline_composite_snapshot_id: Option<&str>,
+        file_path: Option<&str>,
+        max_regions: usize,
+        max_words: usize,
+        max_bytes: usize,
+        representation: &str,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        if !matches!(
+            focus,
+            "change" | "history" | "insight" | "source" | "audit" | "all" | "incremental"
+        ) {
             return Err(AppError::Validation(
-                "focus must be change, history, insight, or all".to_owned(),
+                "composite task must be change, history, insight, source, audit, all, or incremental"
+                    .to_owned(),
+            ));
+        }
+        if !matches!(representation, "review" | "compact" | "audit") {
+            return Err(AppError::Validation(
+                "representation must be review, compact, or audit".to_owned(),
+            ));
+        }
+        if !(1..=100).contains(&max_regions) {
+            return Err(AppError::Validation(
+                "max_regions must be between 1 and 100".to_owned(),
+            ));
+        }
+        if !(1..=100).contains(&max_test_ids) {
+            return Err(AppError::Validation(
+                "max_test_ids must be between 1 and 100".to_owned(),
+            ));
+        }
+        validate_max_words(max_words)?;
+        validate_review_byte_budget(max_bytes)?;
+        let current = self.store.composite_snapshot(composite_snapshot_id)?;
+        self.validate_composite_context(&current)?;
+        let current_summary = compact_composite_snapshot(&current, representation == "audit");
+        let mut result = json!({
+            "focus": focus,
+            "task": focus,
+            "representation": representation,
+            "claim_status": if current["status"] == "complete" { "supported" } else { "limited" },
+            "reasons": current["reasons"].clone(),
+            "measurement": current_summary.clone(),
+            "baseline": Value::Null,
+            "composite": current_summary,
+        });
+
+        if focus == "incremental" {
+            let baseline_id = baseline_composite_snapshot_id.ok_or_else(|| {
+                AppError::Validation(
+                    "incremental composite review requires an explicit composite baseline"
+                        .to_owned(),
+                )
+            })?;
+            let baseline = self.store.composite_snapshot(baseline_id)?;
+            self.validate_composite_context(&baseline)?;
+            ensure_compatible_composites(&current, &baseline)?;
+            let current_regions = self.store.composite_regions_all(composite_snapshot_id)?;
+            let baseline_regions = self.store.composite_regions_all(baseline_id)?;
+            let incremental = composite_incremental_projection(
+                &current,
+                &baseline,
+                current_regions,
+                baseline_regions,
+                file_path,
+                max_regions,
+                representation,
+                self.store.composite_test_attribution(
+                    baseline_id,
+                    composite_snapshot_id,
+                    max_test_ids,
+                )?,
+            );
+            result["baseline"] = compact_composite_snapshot(&baseline, representation == "audit");
+            result["incremental"] = incremental;
+            result["claim_status"] = json!(if current["status"] == "complete"
+                && baseline["status"] == "complete"
+            {
+                "supported"
+            } else {
+                "limited"
+            });
+        } else if matches!(focus, "insight" | "source" | "audit" | "all" | "change") {
+            let all_regions = self
+                .store
+                .composite_regions(composite_snapshot_id, MAX_COLLECTION_RECORDS)?;
+            let selected = all_regions
+                .into_iter()
+                .filter(|region| {
+                    file_path
+                        .is_none_or(|path| region.get("path").and_then(Value::as_str) == Some(path))
+                })
+                .filter(|region| {
+                    focus != "insight"
+                        || matches!(
+                            region.get("state").and_then(Value::as_str),
+                            Some(
+                                "uncovered" | "unmeasured" | "missing_artifact" | "source_mismatch"
+                            )
+                        )
+                })
+                .collect::<Vec<_>>();
+            let truncated = selected.len() > max_regions;
+            let selected = selected.into_iter().take(max_regions).collect::<Vec<_>>();
+            let regions = if representation == "compact" {
+                grouped_composite_regions(&selected)
+            } else {
+                selected
+            };
+            result["regions"] = Value::Array(regions);
+            result["regions_truncated"] = json!(truncated);
+            result["detail_source"] = json!("composite_relational");
+        }
+        let response = self.apply_budget(self.envelope(result, None, None), max_words)?;
+        self.apply_byte_budget(response, max_bytes)
+    }
+
+    fn validate_composite_context(&self, snapshot: &Value) -> AppResult<()> {
+        let repo_key = snapshot
+            .get("repo_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AppError::Runtime("composite snapshot is missing repo_key".to_owned())
+            })?;
+        if repo_key != self.context.repo_key {
+            return Err(AppError::Validation(
+                "composite snapshot does not belong to the selected repository".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns a bounded review with an explicit maximum number of affected
+    /// named test IDs in incremental attribution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn coverage_review_with_max_test_ids(
+        &self,
+        focus: &str,
+        snapshot_id: Option<&str>,
+        baseline_snapshot_id: Option<&str>,
+        worktree_id: Option<&str>,
+        suite: Option<&str>,
+        branch: Option<&str>,
+        file_path: Option<&str>,
+        detail_snapshots: usize,
+        summary_window: usize,
+        max_files: usize,
+        max_regions: usize,
+        include_source: bool,
+        context_lines: usize,
+        max_source_lines: usize,
+        max_words: usize,
+        max_bytes: usize,
+        representation: &str,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        if !matches!(
+            focus,
+            "change" | "history" | "insight" | "all" | "incremental"
+        ) {
+            return Err(AppError::Validation(
+                "focus must be change, history, insight, all, or incremental".to_owned(),
             ));
         }
         if !matches!(representation, "review" | "compact" | "audit") {
@@ -868,6 +1348,11 @@ impl CoverageService {
         if !(1..=100).contains(&max_regions) {
             return Err(AppError::Validation(
                 "max_regions must be between 1 and 100".to_owned(),
+            ));
+        }
+        if !(1..=100).contains(&max_test_ids) {
+            return Err(AppError::Validation(
+                "max_test_ids must be between 1 and 100".to_owned(),
             ));
         }
         if context_lines > 20 {
@@ -917,6 +1402,93 @@ impl CoverageService {
             "measurement": current.as_ref().map(|value| compact_snapshot(value, false)).unwrap_or(Value::Null),
             "baseline": Value::Null,
         });
+
+        if focus == "incremental" {
+            let baseline_id = baseline_snapshot_id.ok_or_else(|| {
+                AppError::Validation(
+                    "incremental review requires an explicit baseline snapshot".to_owned(),
+                )
+            })?;
+            let Some(current_id) = current_id.as_deref() else {
+                result["incremental"] = json!({
+                    "status": "not_measured",
+                    "baseline": Value::Null,
+                    "current": Value::Null,
+                    "overall": {},
+                    "metric_deltas": {},
+                    "files": [],
+                    "changed_lines": [],
+                    "changed_lines_truncated": false,
+                    "regions": [],
+                    "regions_truncated": false,
+                    "coverage_gain": {
+                        "newly_covered": 0,
+                        "regressed": 0,
+                        "hit_count_only": 0,
+                        "added": 0,
+                        "removed": 0,
+                        "branch_state_changed": 0
+                    },
+                    "test_attribution": {"status":"unavailable","affected_test_count":0,"affected_tests":[],"tests_truncated":false,"max_test_ids":max_test_ids},
+                    "detail_source": Value::Null,
+                    "next_action": {"kind":"obtain_measurement","reason":"no compatible coverage snapshot is available"},
+                });
+                let response = self.apply_budget(
+                    self.envelope(result, selected_suite.as_deref(), None),
+                    max_words,
+                )?;
+                return self.apply_byte_budget(response, max_bytes);
+            };
+            let mut incremental = self.store.incremental_compare(
+                current_id,
+                baseline_id,
+                file_path,
+                max_files,
+                max_regions,
+                max_test_ids,
+            )?;
+            let baseline = incremental["baseline"].clone();
+            let current = incremental["current"].clone();
+            incremental["status"] = json!("measured");
+            result["baseline"] = compact_snapshot(&baseline, representation == "audit");
+            result["claim_status"] = json!("supported");
+            if incremental["test_attribution"]["status"] == "unavailable" {
+                result["reasons"] = json!([
+                    "test attribution is unavailable for one or both snapshots; aggregate coverage remains measured"
+                ]);
+            }
+            incremental["baseline"] = compact_snapshot(&baseline, representation == "audit");
+            incremental["current"] = compact_snapshot(&current, representation == "audit");
+            if representation == "compact" {
+                incremental["files"] = Value::Array(
+                    incremental["files"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(compact_file_change)
+                        .collect(),
+                );
+                let regions = incremental["regions"].clone();
+                incremental["regions"] =
+                    compact_changed_regions(regions.as_array().map_or(&[][..], Vec::as_slice));
+                incremental["line_legend"] = json!({
+                    "newly_covered": "+",
+                    "regressed": "!",
+                    "added": "added",
+                    "removed": "removed",
+                    "hit_count_only": "hits",
+                    "branch_state_changed": "branch",
+                });
+                remove_incremental_changed_lines(&mut incremental);
+            }
+            incremental["next_action"] = incremental_next_action(&incremental["coverage_gain"]);
+            result["incremental"] = incremental;
+            let response = self.apply_budget(
+                self.envelope(result, selected_suite.as_deref(), None),
+                max_words,
+            )?;
+            return self.apply_byte_budget(response, max_bytes);
+        }
 
         if matches!(focus, "change" | "all") {
             let mut change = self.review_change(
@@ -1000,6 +1572,280 @@ impl CoverageService {
             self.envelope(compact_snapshot(&snapshot, detailed), Some(&suite), None),
             max_words,
         )
+    }
+
+    /// Returns the bounded, single-request projection used by the live
+    /// dashboard.
+    ///
+    /// The dashboard intentionally uses a rolling previous snapshot when no
+    /// baseline is supplied. That convenience belongs to this presentation
+    /// projection only; the public incremental MCP task still requires an
+    /// explicit baseline and never infers one.
+    pub fn dashboard(
+        &self,
+        snapshot_id: Option<&str>,
+        baseline_snapshot_id: Option<&str>,
+        history_limit: usize,
+    ) -> AppResult<Value> {
+        self.dashboard_with_composite(snapshot_id, baseline_snapshot_id, None, None, history_limit)
+    }
+
+    /// Returns the bounded dashboard projection for ordinary and composite
+    /// coverage layers.
+    ///
+    /// Ordinary snapshot selection remains compatible with the original
+    /// dashboard API. Composite selection is independent because a managed
+    /// run can produce both child snapshots and one immutable combined region
+    /// snapshot. When composite IDs are omitted, the newest composite and its
+    /// rolling predecessor are used for presentation only; agent-facing
+    /// incremental tasks still require an explicit baseline.
+    pub fn dashboard_with_composite(
+        &self,
+        snapshot_id: Option<&str>,
+        baseline_snapshot_id: Option<&str>,
+        composite_snapshot_id: Option<&str>,
+        baseline_composite_snapshot_id: Option<&str>,
+        history_limit: usize,
+    ) -> AppResult<Value> {
+        if !(2..=50).contains(&history_limit) {
+            return Err(AppError::Validation(
+                "history_limit must be between 2 and 50".to_owned(),
+            ));
+        }
+        let project = self.store.project_summary()?;
+        let compaction_policy = project.get("compaction").cloned().unwrap_or(Value::Null);
+        let raw_snapshots =
+            self.store
+                .list_snapshots(None, None, None, history_limit.saturating_add(1))?;
+        let snapshots_truncated = raw_snapshots.len() > history_limit;
+        let snapshots = raw_snapshots
+            .iter()
+            .take(history_limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let current = if let Some(snapshot_id) = snapshot_id {
+            let snapshot = self.store.snapshot(snapshot_id)?;
+            if snapshot.get("repo_key").and_then(Value::as_str)
+                != Some(self.context.repo_key.as_str())
+            {
+                return Err(AppError::Validation(
+                    "snapshot does not belong to the selected repository".to_owned(),
+                ));
+            }
+            Some(snapshot)
+        } else {
+            snapshots.first().cloned()
+        };
+        let initial_current_id = current.as_ref().and_then(|value| value["id"].as_str());
+        let (baseline, baseline_kind) = if let Some(snapshot_id) = baseline_snapshot_id {
+            let snapshot = self.store.snapshot(snapshot_id)?;
+            if snapshot.get("repo_key").and_then(Value::as_str)
+                != Some(self.context.repo_key.as_str())
+            {
+                return Err(AppError::Validation(
+                    "baseline snapshot does not belong to the selected repository".to_owned(),
+                ));
+            }
+            (Some(snapshot), "explicit")
+        } else if let Some(current_id) = initial_current_id {
+            let rolling = snapshots
+                .iter()
+                .find(|value| value.get("id").and_then(Value::as_str) != Some(current_id))
+                .cloned()
+                .or(self.store.previous_snapshot(current_id)?)
+                .filter(|value| value.get("id").and_then(Value::as_str) != Some(current_id));
+            (rolling, "rolling_previous")
+        } else {
+            (None, "none")
+        };
+        let current_id = current.as_ref().and_then(|value| value["id"].as_str());
+        let baseline_id = baseline.as_ref().and_then(|value| value["id"].as_str());
+        let raw_incremental = match (current_id, baseline_id) {
+            (Some(current_id), Some(baseline_id)) => {
+                match self
+                    .store
+                    .incremental_compare(current_id, baseline_id, None, 24, 120, 8)
+                {
+                    Ok(value) => Some(value),
+                    Err(AppError::Validation(message)) => Some(json!({
+                        "status": "unmeasured",
+                        "reason": message,
+                        "baseline": baseline.as_ref().map(|value| compact_snapshot(value, false)),
+                        "current": current.as_ref().map(|value| compact_snapshot(value, false)),
+                    })),
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => None,
+        };
+        let files = if let Some(current_id) = current_id {
+            if let Some(incremental) = raw_incremental
+                .as_ref()
+                .filter(|value| value.get("status").and_then(Value::as_str) != Some("unmeasured"))
+            {
+                dashboard_incremental_files(incremental)
+            } else {
+                dashboard_current_files(&self.store.files(current_id, MAX_COLLECTION_RECORDS)?)
+            }
+        } else {
+            json!({"items": [], "total": 0, "truncated": false})
+        };
+        let latest_run = self
+            .store
+            .latest_run(None)?
+            .map(|value| compact_run_result(&value, false));
+        let active_runs = self
+            .store
+            .list_run_queue(11)?
+            .into_iter()
+            .map(|value| compact_run_result(&value, false))
+            .collect::<Vec<_>>();
+        let active_runs_truncated = active_runs.len() > 10;
+        let active_runs = active_runs.into_iter().take(10).collect::<Vec<_>>();
+        let history = snapshots
+            .iter()
+            .rev()
+            .map(dashboard_history_point)
+            .collect::<Vec<_>>();
+        let incremental = raw_incremental
+            .as_ref()
+            .map(dashboard_incremental)
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "unmeasured",
+                    "reason": "select a current snapshot and a baseline to calculate progression"
+                })
+            });
+        let raw_composite_history = self
+            .store
+            .list_composite_snapshots(history_limit.saturating_add(1))?;
+        let composite_history_truncated = raw_composite_history.len() > history_limit;
+        let composite_history = raw_composite_history
+            .iter()
+            .take(history_limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        let composite_current = if let Some(composite_snapshot_id) = composite_snapshot_id {
+            let snapshot = self.store.composite_snapshot(composite_snapshot_id)?;
+            self.validate_composite_context(&snapshot)?;
+            Some(snapshot)
+        } else {
+            composite_history.first().cloned()
+        };
+        let initial_composite_current_id = composite_current
+            .as_ref()
+            .and_then(|value| value.get("id").and_then(Value::as_str));
+        let (composite_baseline, composite_baseline_kind) =
+            if let Some(baseline_composite_snapshot_id) = baseline_composite_snapshot_id {
+                let snapshot = self
+                    .store
+                    .composite_snapshot(baseline_composite_snapshot_id)?;
+                self.validate_composite_context(&snapshot)?;
+                (Some(snapshot), "explicit")
+            } else if let Some(current_id) = initial_composite_current_id {
+                let rolling = composite_history
+                    .iter()
+                    .find(|value| value.get("id").and_then(Value::as_str) != Some(current_id))
+                    .cloned()
+                    .or(self.store.previous_composite_snapshot(current_id)?)
+                    .filter(|value| value.get("id").and_then(Value::as_str) != Some(current_id));
+                (rolling, "rolling_previous")
+            } else {
+                (None, "none")
+            };
+        let composite_current_id = composite_current
+            .as_ref()
+            .and_then(|value| value.get("id").and_then(Value::as_str));
+        let composite_baseline_id = composite_baseline
+            .as_ref()
+            .and_then(|value| value.get("id").and_then(Value::as_str));
+        let raw_composite_incremental = match (composite_current_id, composite_baseline_id) {
+            (Some(current_id), Some(baseline_id)) => {
+                let review = self.composite_review(
+                    "incremental",
+                    current_id,
+                    Some(baseline_id),
+                    None,
+                    24,
+                    DEFAULT_MAX_WORDS,
+                    12_000,
+                    "compact",
+                    10,
+                );
+                match review {
+                    Ok(value) => value
+                        .get("data")
+                        .and_then(|data| data.get("incremental"))
+                        .cloned(),
+                    Err(AppError::Validation(message)) => Some(json!({
+                        "status": "unmeasured",
+                        "reason": message,
+                        "baseline": composite_baseline.as_ref().map(|value| compact_composite_snapshot(value, false)),
+                        "current": composite_current.as_ref().map(|value| compact_composite_snapshot(value, false)),
+                    })),
+                    Err(error) => return Err(error),
+                }
+            }
+            _ => None,
+        };
+        let composite_incremental = raw_composite_incremental
+            .as_ref()
+            .map(dashboard_composite_incremental)
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "unmeasured",
+                    "reason": "select a current composite snapshot and baseline to calculate production region progression"
+                })
+            });
+        let composite_history_points = composite_history
+            .iter()
+            .rev()
+            .map(dashboard_composite_history_point)
+            .collect::<Vec<_>>();
+        let data = json!({
+            "project": project,
+            "selection": {
+                "snapshot_id": current_id,
+                "baseline_snapshot_id": baseline_id,
+                "baseline_kind": baseline_kind,
+                "composite_snapshot_id": composite_current_id,
+                "baseline_composite_snapshot_id": composite_baseline_id,
+                "composite_baseline_kind": composite_baseline_kind,
+            },
+            "current": current.as_ref().map(|value| compact_snapshot(value, false)),
+            "baseline": baseline.as_ref().map(|value| compact_snapshot(value, false)),
+            "history": {
+                "points": history,
+                "returned": snapshots.len(),
+                "truncated": snapshots_truncated,
+                "limit": history_limit,
+            },
+            "incremental": incremental,
+            "composite": {
+                "current": composite_current.as_ref().map(|value| compact_composite_snapshot(value, false)),
+                "baseline": composite_baseline.as_ref().map(|value| compact_composite_snapshot(value, false)),
+                "incremental": composite_incremental,
+                "history": {
+                    "points": composite_history_points,
+                    "returned": composite_history.len(),
+                    "truncated": composite_history_truncated,
+                    "limit": history_limit,
+                },
+            },
+            "files": files,
+            "latest_run": latest_run,
+            "active_runs": active_runs,
+            "active_runs_truncated": active_runs_truncated,
+            "compaction": {
+                "policy": compaction_policy,
+                "inventory": self.store.compaction_summary()?,
+            },
+        });
+        Ok(self.envelope(
+            data,
+            current.as_ref().and_then(|value| value["suite"].as_str()),
+            None,
+        ))
     }
 
     /// Returns bounded groups of named tests with exactly equal coverage
@@ -1725,6 +2571,123 @@ impl CoverageService {
         self.apply_byte_budget(response, max_bytes)
     }
 
+    /// Reads bounded source ranges for an immutable composite snapshot.
+    ///
+    /// Composite regions are stored independently from ordinary file/line
+    /// rows, so source context is resolved from the snapshot's recorded
+    /// checkout path and annotated with the canonical region states.
+    pub fn composite_source_review(
+        &self,
+        composite_snapshot_id: &str,
+        ranges: Vec<(String, i64, i64)>,
+        max_source_lines: usize,
+        max_words: usize,
+        max_bytes: usize,
+    ) -> AppResult<Value> {
+        validate_max_words(max_words)?;
+        validate_review_byte_budget(max_bytes)?;
+        if !(10..=500).contains(&max_source_lines) {
+            return Err(AppError::Validation(
+                "source ranges max_source_lines must be between 10 and 500".to_owned(),
+            ));
+        }
+        if ranges.is_empty() {
+            return Err(AppError::Validation(
+                "source ranges must contain at least one file range".to_owned(),
+            ));
+        }
+        if ranges.len() > 10 {
+            return Err(AppError::Validation(
+                "source ranges accept at most 10 ranges".to_owned(),
+            ));
+        }
+        let snapshot = self.store.composite_snapshot(composite_snapshot_id)?;
+        self.validate_composite_context(&snapshot)?;
+        let repo_path = snapshot["repo_path"]
+            .as_str()
+            .expect("stored composite snapshots always contain repo_path")
+            .to_owned();
+        let mut grouped = BTreeMap::<String, Vec<(i64, i64)>>::new();
+        let mut requested_lines = 0usize;
+        for (file_path, start, end) in ranges {
+            validate_source_file_path(&file_path)?;
+            if start < 1 || end < start {
+                return Err(AppError::Validation(
+                    "source range must have positive bounds with end >= start".to_owned(),
+                ));
+            }
+            let line_count =
+                usize::try_from(end.saturating_sub(start).saturating_add(1)).unwrap_or(usize::MAX);
+            requested_lines = requested_lines.saturating_add(line_count);
+            if requested_lines > max_source_lines {
+                return Err(AppError::Validation(format!(
+                    "source ranges require {requested_lines} lines; reduce ranges or increase max_source_lines"
+                )));
+            }
+            grouped.entry(file_path).or_default().push((start, end));
+        }
+        let regions = self.store.composite_regions_all(composite_snapshot_id)?;
+        let mut sources = Vec::new();
+        for (file_path, file_ranges) in grouped {
+            let path = Path::new(&repo_path).join(&file_path);
+            let content = fs::read_to_string(&path)?;
+            let lines = content.lines().collect::<Vec<_>>();
+            let selected_ranges = file_ranges
+                .iter()
+                .map(|(start, end)| {
+                    let start_index = (*start as usize).saturating_sub(1).min(lines.len());
+                    let end_index = (*end as usize).min(lines.len());
+                    json!({
+                        "start": start,
+                        "end": end,
+                        "lines": (start_index..end_index)
+                            .map(|index| json!({"line_number": index + 1, "text": lines[index]}))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let annotated_regions = regions
+                .iter()
+                .filter(|region| {
+                    region.get("path").and_then(Value::as_str) == Some(file_path.as_str())
+                        && file_ranges.iter().any(|(start, end)| {
+                            region
+                                .get("end_line")
+                                .and_then(Value::as_i64)
+                                .is_some_and(|region_end| region_end >= *start)
+                                && region
+                                    .get("start_line")
+                                    .and_then(Value::as_i64)
+                                    .is_some_and(|region_start| region_start <= *end)
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            sources.push(json!({
+                "file_path": file_path,
+                "source_resolution": {"status":"checkout","path":path},
+                "ranges": selected_ranges,
+                "regions": annotated_regions,
+            }));
+        }
+        let response = self.envelope(
+            json!({
+                "focus": "source",
+                "task": "source",
+                "representation": "review",
+                "claim_status": "supported",
+                "reasons": [],
+                "measurement": compact_composite_snapshot(&snapshot, false),
+                "baseline": Value::Null,
+                "source": sources,
+            }),
+            None,
+            None,
+        );
+        let response = self.apply_budget(response, max_words)?;
+        self.apply_byte_budget(response, max_bytes)
+    }
+
     /// Returns detailed file lines for dashboard callers.
     pub fn file_detail(
         &self,
@@ -2022,9 +2985,11 @@ fn compact_context_project(value: &Value) -> Value {
     let keys = [
         "id",
         "snapshot_count",
+        "composite_snapshot_count",
         "command_count",
         "run_count",
         "latest_snapshot_id",
+        "latest_composite_snapshot_id",
         "latest_snapshot_age_seconds",
         "latest_run_age_seconds",
         "latest_branch",
@@ -2058,6 +3023,7 @@ fn compact_snapshot(value: &Value, detailed: bool) -> Value {
         "base_ref",
         "suite",
         "format",
+        "detail_retention",
         "total_lines",
         "covered_lines",
         "line_rate",
@@ -2090,6 +3056,12 @@ fn compact_snapshot(value: &Value, detailed: bool) -> Value {
             .filter(|value| !value.is_null())
             .unwrap_or_else(|| json!([])),
     );
+    if let Some(execution) = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("execution"))
+    {
+        result.insert("execution".to_owned(), execution.clone());
+    }
     if detailed {
         result.insert(
             "repo_path".to_owned(),
@@ -2153,7 +3125,11 @@ fn compact_changed_regions(values: &[Value]) -> Value {
         let Some(path) = value.get("file_path").and_then(Value::as_str) else {
             continue;
         };
-        let Some(status) = value.get("status").and_then(Value::as_str) else {
+        let Some(status) = value
+            .get("category")
+            .or_else(|| value.get("status"))
+            .and_then(Value::as_str)
+        else {
             continue;
         };
         let Some(start) = value.get("start").and_then(Value::as_i64) else {
@@ -2188,6 +3164,12 @@ fn compact_changed_regions(values: &[Value]) -> Value {
             })
             .collect(),
     )
+}
+
+fn remove_incremental_changed_lines(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("changed_lines");
+    }
 }
 
 fn compact_review_change(change: &mut Value) {
@@ -2322,6 +3304,33 @@ fn review_next_action(changed_code: &Value, regions: &[Value]) -> Value {
     }
 }
 
+fn incremental_next_action(gain: &Value) -> Value {
+    if gain
+        .get("regressed")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0)
+    {
+        return json!({
+            "kind": "inspect_regression",
+            "reason": "the selected incremental run regressed previously covered lines",
+        });
+    }
+    if gain
+        .get("newly_covered")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0)
+    {
+        return json!({
+            "kind": "review_incremental_gain",
+            "reason": "the selected incremental run added newly covered lines",
+        });
+    }
+    json!({
+        "kind": "compare_selected_runs",
+        "reason": "no newly covered or regressed line was observed in the selected snapshots",
+    })
+}
+
 fn compact_insight_regions(value: &Value) -> (Vec<Value>, usize, bool) {
     let regions = value.as_array().map_or(&[][..], Vec::as_slice);
     let compact = regions
@@ -2406,6 +3415,8 @@ fn compact_file_change(value: &Value) -> Value {
         "current_total_lines",
         "baseline_covered_lines",
         "current_covered_lines",
+        "baseline_line_rate",
+        "current_line_rate",
         "line_rate_delta",
         "baseline_branch_rate",
         "current_branch_rate",
@@ -2424,6 +3435,151 @@ fn compact_file_change(value: &Value) -> Value {
         }
     }
     Value::Object(result)
+}
+
+fn dashboard_history_point(value: &Value) -> Value {
+    let keys = [
+        "id",
+        "created_at",
+        "branch",
+        "commit_sha",
+        "suite",
+        "format",
+        "detail_retention",
+        "total_lines",
+        "covered_lines",
+        "line_rate",
+        "total_branches",
+        "covered_branches",
+        "branch_rate",
+        "total_functions",
+        "covered_functions",
+        "function_rate",
+        "total_regions",
+        "covered_regions",
+        "region_rate",
+    ];
+    let mut result = Map::new();
+    for key in keys {
+        result.insert(
+            key.to_owned(),
+            value.get(key).cloned().unwrap_or(Value::Null),
+        );
+    }
+    if let Some(execution) = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("execution"))
+    {
+        result.insert("execution".to_owned(), execution.clone());
+    }
+    Value::Object(result)
+}
+
+fn dashboard_current_files(values: &[Value]) -> Value {
+    let mut items = values
+        .iter()
+        .map(|value| compact_file(value, false))
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        left.get("line_rate")
+            .and_then(Value::as_f64)
+            .partial_cmp(&right.get("line_rate").and_then(Value::as_f64))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.get("file_path")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("file_path").and_then(Value::as_str))
+            })
+    });
+    let total = items.len();
+    let truncated = total > 16;
+    items.truncate(16);
+    json!({"source":"current_snapshot","items":items,"total":total,"truncated":truncated})
+}
+
+fn dashboard_incremental_files(value: &Value) -> Value {
+    let mut items = value
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(compact_file_change)
+        .collect::<Vec<_>>();
+    let total = items.len();
+    items.truncate(16);
+    json!({
+        "source":"current_vs_baseline",
+        "items":items,
+        "total":total,
+        "truncated": total > 16 || total == 24,
+    })
+}
+
+fn dashboard_incremental(value: &Value) -> Value {
+    if value.get("status").and_then(Value::as_str) == Some("unmeasured") {
+        return json!({
+            "status":"unmeasured",
+            "reason":value.get("reason").cloned().unwrap_or(Value::Null),
+            "baseline":value.get("baseline").cloned().unwrap_or(Value::Null),
+            "current":value.get("current").cloned().unwrap_or(Value::Null),
+        });
+    }
+    let regions = value
+        .get("regions")
+        .and_then(Value::as_array)
+        .map(|regions| compact_changed_regions(regions))
+        .unwrap_or_else(|| json!([]));
+    json!({
+        "status":"measured",
+        "baseline":value.get("baseline").map(|snapshot| compact_snapshot(snapshot, false)),
+        "current":value.get("current").map(|snapshot| compact_snapshot(snapshot, false)),
+        "metric_deltas":value.get("metric_deltas").cloned().unwrap_or(Value::Null),
+        "coverage_gain":value.get("coverage_gain").cloned().unwrap_or(Value::Null),
+        "regions":regions,
+        "regions_truncated":value.get("regions_truncated").cloned().unwrap_or(Value::Null),
+        "test_attribution":value.get("test_attribution").cloned().unwrap_or(Value::Null),
+        "detail_source":value.get("detail_source").cloned().unwrap_or(Value::Null),
+        "next_action":incremental_next_action(value.get("coverage_gain").unwrap_or(&Value::Null)),
+    })
+}
+
+fn dashboard_composite_history_point(value: &Value) -> Value {
+    json!({
+        "id": value.get("id"),
+        "created_at": value.get("created_at"),
+        "status": value.get("status"),
+        "covered_regions": value.get("covered_regions"),
+        "total_regions": value.get("total_regions"),
+        "region_rate": value.get("region_rate"),
+        "checkout_revision": value.get("checkout_revision"),
+        "checkout_dirty": value.get("checkout_dirty"),
+    })
+}
+
+fn dashboard_composite_incremental(value: &Value) -> Value {
+    if value.get("status").and_then(Value::as_str) == Some("unmeasured") {
+        return json!({
+            "status": "unmeasured",
+            "reason": value.get("reason").cloned().unwrap_or(Value::Null),
+            "baseline": value.get("baseline").cloned().unwrap_or(Value::Null),
+            "current": value.get("current").cloned().unwrap_or(Value::Null),
+        });
+    }
+    json!({
+        "status": value.get("status").cloned().unwrap_or_else(|| json!("measured")),
+        "baseline": value.get("baseline").cloned().unwrap_or(Value::Null),
+        "current": value.get("current").cloned().unwrap_or(Value::Null),
+        "overall": value.get("overall").cloned().unwrap_or(Value::Null),
+        "metric_deltas": value.get("metric_deltas").cloned().unwrap_or(Value::Null),
+        "components": value.get("components").cloned().unwrap_or_else(|| json!([])),
+        "coverage_gain": value.get("coverage_gain").cloned().unwrap_or_else(|| json!({})),
+        "affected_lines": value.get("affected_lines").cloned().unwrap_or_else(|| json!([])),
+        "regions": value.get("regions").cloned().unwrap_or_else(|| json!([])),
+        "regions_truncated": value.get("regions_truncated").cloned().unwrap_or(Value::Null),
+        "test_attribution": value.get("test_attribution").cloned().unwrap_or(Value::Null),
+        "detail_source": value.get("detail_source").cloned().unwrap_or(Value::Null),
+        "next_action": value.get("next_action").cloned().unwrap_or(Value::Null),
+    })
 }
 
 fn compact_history_snapshot(value: &Value, detailed: bool) -> Value {
@@ -2598,11 +3754,14 @@ fn compact_run_result(value: &Value, detailed: bool) -> Value {
         "poll_after_ms",
         "queue_position",
         "execution_mode",
+        "execution",
         "cancellation_requested",
         "cancellation_requested_at",
         "submission_reused",
         "reuse_reason",
         "coverage_ingest",
+        "composite_snapshot_id",
+        "incremental_review",
         "error",
     ];
     let mut result = Map::new();
@@ -2612,6 +3771,462 @@ fn compact_run_result(value: &Value, detailed: bool) -> Value {
         }
     }
     Value::Object(result)
+}
+
+fn compact_composite_snapshot(snapshot: &Value, detailed: bool) -> Value {
+    let status = snapshot
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("incomplete");
+    let reasons = snapshot
+        .get("reasons")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let complete = status == "complete" && reasons.as_array().is_none_or(Vec::is_empty);
+    let covered = snapshot
+        .get("covered_regions")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let total = snapshot
+        .get("total_regions")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut result = json!({
+        "id": snapshot.get("id"),
+        "created_at": snapshot.get("created_at"),
+        "run_id": snapshot.get("run_id"),
+        "command_id": snapshot.get("command_id"),
+        "status": status,
+        "complete": complete,
+        "covered_regions": covered,
+        "total_regions": total,
+        "region_rate": snapshot.get("region_rate"),
+        "coverage_percent": snapshot.get("region_rate").and_then(Value::as_f64).map(|rate| rate * 100.0),
+        "mapping_version": snapshot.get("mapping_version"),
+        "inventory_hash": snapshot.get("inventory_hash"),
+        "checkout_revision": snapshot.get("checkout_revision"),
+        "checkout_dirty": snapshot.get("checkout_dirty"),
+        "blocking_reasons": reasons,
+        "remediation": snapshot.get("remediation").cloned().unwrap_or_else(|| json!({})),
+        "components": snapshot.get("components").cloned().unwrap_or_else(|| json!([])),
+    });
+    if detailed {
+        let object = result
+            .as_object_mut()
+            .expect("composite compact projection is always an object");
+        for key in ["inventory", "provenance", "component_evidence"] {
+            object.insert(
+                key.to_owned(),
+                snapshot.get(key).cloned().unwrap_or(Value::Null),
+            );
+        }
+    }
+    result
+}
+
+fn ensure_compatible_composites(current: &Value, baseline: &Value) -> AppResult<()> {
+    if current.get("repo_key") != baseline.get("repo_key") {
+        return Err(AppError::Validation(
+            "incremental composite comparisons require snapshots from the same repository"
+                .to_owned(),
+        ));
+    }
+    if current.get("mapping_version") != baseline.get("mapping_version") {
+        return Err(AppError::Validation(
+            "incremental composite comparisons require the same mapping version".to_owned(),
+        ));
+    }
+    let current_inventory = current.get("inventory_hash").and_then(Value::as_str);
+    let baseline_inventory = baseline.get("inventory_hash").and_then(Value::as_str);
+    if current_inventory.is_none()
+        || baseline_inventory.is_none()
+        || current_inventory != baseline_inventory
+    {
+        return Err(AppError::Validation(
+            "incremental composite comparisons require the same non-null inventory hash".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_incremental_projection(
+    current: &Value,
+    baseline: &Value,
+    current_regions: Vec<Value>,
+    baseline_regions: Vec<Value>,
+    file_path: Option<&str>,
+    max_regions: usize,
+    representation: &str,
+    test_attribution: Value,
+) -> Value {
+    let filter = |region: &Value| {
+        file_path.is_none_or(|path| region.get("path").and_then(Value::as_str) == Some(path))
+    };
+    let current_map = current_regions
+        .into_iter()
+        .filter(filter)
+        .filter_map(|region| {
+            let key = region
+                .get("region_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned)?;
+            Some((key, region))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let baseline_map = baseline_regions
+        .into_iter()
+        .filter(filter)
+        .filter_map(|region| {
+            let key = region
+                .get("region_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned)?;
+            Some((key, region))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut changed = Vec::new();
+    let mut counts = BTreeMap::from([
+        ("newly_covered".to_owned(), 0_i64),
+        ("regressed".to_owned(), 0_i64),
+        ("hit_count_only".to_owned(), 0_i64),
+        ("added".to_owned(), 0_i64),
+        ("removed".to_owned(), 0_i64),
+    ]);
+    let mut emit = |before: Option<&Value>, after: Option<&Value>, category: &str| {
+        *counts.entry(category.to_owned()).or_default() += 1;
+        let source = after
+            .or(before)
+            .expect("changed composite region has a source row");
+        let mut row = source.clone();
+        let object = row
+            .as_object_mut()
+            .expect("stored composite region rows are objects");
+        object.insert("category".to_owned(), json!(category));
+        object.insert(
+            "baseline_state".to_owned(),
+            before
+                .and_then(|value| value.get("state"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "current_state".to_owned(),
+            after
+                .and_then(|value| value.get("state"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "baseline_hits".to_owned(),
+            before
+                .map(|value| json!(composite_region_hits(value)))
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "current_hits".to_owned(),
+            after
+                .map(|value| json!(composite_region_hits(value)))
+                .unwrap_or(Value::Null),
+        );
+        changed.push(row);
+    };
+    for (key, after) in &current_map {
+        let before = baseline_map.get(key);
+        let category = before.and_then(|before| {
+            let before_covered = composite_region_covered(before);
+            let after_covered = composite_region_covered(after);
+            if !before_covered && after_covered {
+                Some("newly_covered")
+            } else if before_covered && !after_covered {
+                Some("regressed")
+            } else if composite_region_hits(before) != composite_region_hits(after) {
+                Some("hit_count_only")
+            } else {
+                None
+            }
+        });
+        if let Some(category) = category {
+            emit(
+                Some(before.expect("category has a baseline region")),
+                Some(after),
+                category,
+            );
+        } else if before.is_none() {
+            emit(None, Some(after), "added");
+        }
+    }
+    for (key, before) in &baseline_map {
+        if !current_map.contains_key(key) {
+            emit(Some(before), None, "removed");
+        }
+    }
+    changed.sort_by(|left, right| {
+        composite_category_order(left)
+            .cmp(&composite_category_order(right))
+            .then_with(|| {
+                left.get("path")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("path").and_then(Value::as_str))
+            })
+            .then_with(|| {
+                left.get("start_line")
+                    .and_then(Value::as_i64)
+                    .cmp(&right.get("start_line").and_then(Value::as_i64))
+            })
+    });
+    let regions_truncated = changed.len() > max_regions;
+    let selected = changed.into_iter().take(max_regions).collect::<Vec<_>>();
+    let affected_lines = grouped_composite_regions(&selected);
+    let regions = if representation == "compact" {
+        affected_lines.clone()
+    } else {
+        selected
+    };
+    let covered_delta = current
+        .get("covered_regions")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        - baseline
+            .get("covered_regions")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+    let total_delta = current
+        .get("total_regions")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        - baseline
+            .get("total_regions")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+    let current_rate = current.get("region_rate").and_then(Value::as_f64);
+    let baseline_rate = baseline.get("region_rate").and_then(Value::as_f64);
+    let component_deltas = component_deltas(current, baseline);
+    let snapshot_reference = |snapshot: &Value| {
+        if representation == "audit" {
+            compact_composite_snapshot(snapshot, true)
+        } else {
+            json!({
+                "id": snapshot.get("id"),
+                "status": snapshot.get("status"),
+                "covered_regions": snapshot.get("covered_regions"),
+                "total_regions": snapshot.get("total_regions"),
+                "region_rate": snapshot.get("region_rate"),
+            })
+        }
+    };
+    json!({
+        "status": "measured",
+        "baseline": snapshot_reference(baseline),
+        "current": snapshot_reference(current),
+        "overall": {
+            "covered_regions_delta": covered_delta,
+            "total_regions_delta": total_delta,
+            "region_rate_delta": current_rate.zip(baseline_rate).map(|(now, before)| now - before),
+            "coverage_percent_delta": current_rate.zip(baseline_rate).map(|(now, before)| (now - before) * 100.0),
+        },
+        "metric_deltas": {
+            "covered_regions_delta": covered_delta,
+            "total_regions_delta": total_delta,
+            "region_rate_delta": current_rate.zip(baseline_rate).map(|(now, before)| now - before),
+            "coverage_percent_delta": current_rate.zip(baseline_rate).map(|(now, before)| (now - before) * 100.0),
+        },
+        "components": component_deltas,
+        "coverage_gain": counts,
+        "affected_lines": affected_lines,
+        "regions": regions,
+        "regions_truncated": regions_truncated,
+        "test_attribution": test_attribution,
+        "detail_source": "composite_relational",
+        "next_action": if counts.get("newly_covered").copied().unwrap_or(0) > 0 {
+            json!({"kind":"retain_baseline","reason":"new canonical regions are covered"})
+        } else {
+            json!({"kind":"inspect_uncovered","reason":"no newly covered canonical regions were observed"})
+        },
+    })
+}
+
+fn component_deltas(current: &Value, baseline: &Value) -> Vec<Value> {
+    ["rust", "python", "javascript"]
+        .into_iter()
+        .map(|component| {
+            let find = |snapshot: &Value| -> Option<Value> {
+                snapshot
+                    .get("components")
+                    .and_then(Value::as_array)
+                    .and_then(|values| {
+                        values.iter().find(|value| {
+                            value.get("component").and_then(Value::as_str) == Some(component)
+                        })
+                    })
+                    .cloned()
+            };
+            let before = find(baseline);
+            let after = find(current);
+            let covered_before = before
+                .as_ref()
+                .and_then(|value| value.get("covered_regions"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let covered_after = after
+                .as_ref()
+                .and_then(|value| value.get("covered_regions"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let total_before = before
+                .as_ref()
+                .and_then(|value| value.get("total_regions"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let total_after = after
+                .as_ref()
+                .and_then(|value| value.get("total_regions"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            json!({
+                "component": component,
+                "covered_regions_delta": covered_after - covered_before,
+                "total_regions_delta": total_after - total_before,
+                "covered_regions": covered_after,
+                "total_regions": total_after,
+                "region_rate": after.as_ref().and_then(|value| value.get("region_rate")).cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn composite_region_covered(region: &Value) -> bool {
+    region.get("state").and_then(Value::as_str) == Some("covered")
+}
+
+fn composite_region_hits(region: &Value) -> i64 {
+    region
+        .get("variants")
+        .and_then(Value::as_array)
+        .map(|variants| {
+            variants
+                .iter()
+                .filter_map(|variant| variant.get("hits").and_then(Value::as_i64))
+                .sum()
+        })
+        .unwrap_or_else(|| region.get("hits").and_then(Value::as_i64).unwrap_or(0))
+}
+
+fn composite_category_order(region: &Value) -> usize {
+    match region.get("category").and_then(Value::as_str) {
+        Some("newly_covered") => 0,
+        Some("regressed") => 1,
+        Some("added") => 2,
+        Some("removed") => 3,
+        Some("hit_count_only") => 4,
+        _ => 5,
+    }
+}
+
+fn grouped_composite_regions(regions: &[Value]) -> Vec<Value> {
+    let mut grouped = BTreeMap::<(String, String), Vec<i64>>::new();
+    for region in regions {
+        let Some(path) = region.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(start) = region.get("start_line").and_then(Value::as_i64) else {
+            continue;
+        };
+        let category = region
+            .get("category")
+            .or_else(|| region.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        grouped
+            .entry((path.to_owned(), category.to_owned()))
+            .or_default()
+            .push(start);
+    }
+    let mut result = Vec::new();
+    for ((path, category), mut lines) in grouped {
+        lines.sort_unstable();
+        lines.dedup();
+        let mut start = None;
+        let mut end: Option<i64> = None;
+        for line in lines {
+            match (start, end) {
+                (Some(_first), Some(last)) if line <= last.saturating_add(1) => end = Some(line),
+                (Some(first), Some(last)) => {
+                    result.push(json!({
+                        "file_path": path,
+                        "category": category,
+                        "status": category,
+                        "start": first,
+                        "end": last,
+                        "line_count": last - first + 1,
+                    }));
+                    start = Some(line);
+                    end = Some(line);
+                }
+                _ => {
+                    start = Some(line);
+                    end = Some(line);
+                }
+            }
+        }
+        let first = start.expect("grouped composite region has at least one line");
+        let last = end.expect("grouped composite region has a final line");
+        result.push(json!({
+            "file_path": path,
+            "category": category,
+            "status": category,
+            "start": first,
+            "end": last,
+            "line_count": last - first + 1,
+        }));
+    }
+    result.sort_by(|left, right| {
+        left.get("file_path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("file_path").and_then(Value::as_str))
+            .then_with(|| {
+                left.get("start")
+                    .and_then(Value::as_i64)
+                    .cmp(&right.get("start").and_then(Value::as_i64))
+            })
+    });
+    result
+}
+
+fn automatic_incremental_review_placeholder(
+    status: &str,
+    baseline_snapshot_id: Option<&str>,
+    baseline_is_composite: bool,
+    reason: &str,
+) -> Value {
+    let baseline = baseline_snapshot_id
+        .map(|snapshot_id| {
+            if baseline_is_composite {
+                json!({
+                    "kind": "explicit",
+                    "composite_snapshot_id": snapshot_id,
+                })
+            } else {
+                json!({
+                    "kind": "explicit",
+                    "snapshot_id": snapshot_id,
+                })
+            }
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "automatic": true,
+        "task": "incremental",
+        "status": status,
+        "claim_status": "not_measured",
+        "reasons": [reason],
+        "measurement": Value::Null,
+        "baseline": baseline,
+        "next_action": {
+            "kind": "obtain_measurement",
+            "reason": reason,
+        },
+    })
 }
 
 fn strip_log_metadata(value: &mut Value) {
@@ -2753,6 +4368,261 @@ mod tests {
     }
 
     #[test]
+    fn composite_projection_helpers_cover_categories_budgets_and_history_shapes() {
+        let baseline = json!({
+            "id":"base",
+            "status":"complete",
+            "repo_key":"repo",
+            "mapping_version":"mapping",
+            "inventory_hash":"inventory",
+            "covered_regions":2,
+            "total_regions":6,
+            "region_rate":1.0 / 3.0,
+            "components":[
+                {"component":"rust","covered_regions":1,"total_regions":2,"region_rate":0.5}
+            ],
+            "reasons":[],
+            "remediation":{}
+        });
+        let current = json!({
+            "id":"current",
+            "status":"complete",
+            "repo_key":"repo",
+            "mapping_version":"mapping",
+            "inventory_hash":"inventory",
+            "covered_regions":3,
+            "total_regions":7,
+            "region_rate":3.0 / 7.0,
+            "components":[
+                {"component":"rust","covered_regions":1,"total_regions":3,"region_rate":1.0 / 3.0},
+                {"component":"python","covered_regions":1,"total_regions":1,"region_rate":1.0}
+            ],
+            "reasons":[],
+            "remediation":{}
+        });
+        let region = |key: &str, path: &str, line: i64, state: &str, hits: i64| {
+            json!({
+                "region_key":key,
+                "path":path,
+                "start_line":line,
+                "state":state,
+                "variants":[{"hits":hits}]
+            })
+        };
+        let baseline_regions = vec![
+            region("new", "src/a.py", 1, "uncovered", 0),
+            region("regress", "src/a.py", 2, "covered", 1),
+            region("hit", "src/a.py", 3, "covered", 1),
+            region("removed", "src/a.py", 4, "covered", 1),
+            region("same", "src/a.py", 5, "uncovered", 0),
+            json!({"path":"src/a.py"}),
+        ];
+        let current_regions = vec![
+            region("new", "src/a.py", 1, "covered", 1),
+            region("regress", "src/a.py", 2, "uncovered", 0),
+            region("hit", "src/a.py", 3, "covered", 2),
+            region("added", "src/a.py", 6, "covered", 1),
+            region("added-adjacent", "src/a.py", 7, "covered", 1),
+            region("added-gap", "src/a.py", 9, "covered", 1),
+            region("other-file", "src/b.py", 1, "covered", 1),
+            region("same", "src/a.py", 5, "uncovered", 0),
+            json!({"path":"src/a.py"}),
+        ];
+        let compact = composite_incremental_projection(
+            &current,
+            &baseline,
+            current_regions.clone(),
+            baseline_regions.clone(),
+            None,
+            4,
+            "compact",
+            json!({"status":"measured"}),
+        );
+        assert_eq!(compact["coverage_gain"]["newly_covered"], 1);
+        assert_eq!(compact["coverage_gain"]["regressed"], 1);
+        assert_eq!(compact["coverage_gain"]["hit_count_only"], 1);
+        assert_eq!(compact["coverage_gain"]["added"], 4);
+        assert_eq!(compact["coverage_gain"]["removed"], 1);
+        assert_eq!(compact["next_action"]["kind"], "retain_baseline");
+        assert_eq!(compact["regions_truncated"], true);
+
+        let audit = composite_incremental_projection(
+            &current,
+            &baseline,
+            current_regions,
+            baseline_regions,
+            Some("src/a.py"),
+            20,
+            "audit",
+            json!({"status":"unavailable"}),
+        );
+        assert_eq!(audit["baseline"]["inventory_hash"], "inventory");
+        assert_eq!(audit["test_attribution"]["status"], "unavailable");
+
+        let inspect = composite_incremental_projection(
+            &json!({"id":"only","status":"complete","covered_regions":0,"total_regions":1,"region_rate":0.0}),
+            &json!({"id":"only-base","status":"complete","covered_regions":0,"total_regions":1,"region_rate":0.0}),
+            vec![region("r", "src/a.py", 1, "uncovered", 0)],
+            vec![region("r", "src/a.py", 1, "uncovered", 0)],
+            None,
+            5,
+            "review",
+            Value::Null,
+        );
+        assert_eq!(inspect["next_action"]["kind"], "inspect_uncovered");
+        assert!(inspect["regions"].is_array());
+
+        assert!(
+            ensure_compatible_composites(
+                &json!({"repo_key":"one","mapping_version":"mapping","inventory_hash":"inventory"}),
+                &json!({"repo_key":"two","mapping_version":"mapping","inventory_hash":"inventory"})
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_compatible_composites(
+                &json!({"repo_key":"one","mapping_version":"one","inventory_hash":"inventory"}),
+                &json!({"repo_key":"one","mapping_version":"two","inventory_hash":"inventory"})
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_compatible_composites(
+                &json!({"repo_key":"one","mapping_version":"one","inventory_hash":null}),
+                &json!({"repo_key":"one","mapping_version":"one","inventory_hash":"inventory"})
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_compatible_composites(
+                &json!({"repo_key":"one","mapping_version":"one","inventory_hash":"current"}),
+                &json!({"repo_key":"one","mapping_version":"one","inventory_hash":"base"})
+            )
+            .is_err()
+        );
+
+        assert_eq!(
+            dashboard_composite_incremental(&json!({"status":"unmeasured"}))["status"],
+            "unmeasured"
+        );
+        assert_eq!(
+            dashboard_composite_incremental(&json!({}))["status"],
+            "measured"
+        );
+        assert_eq!(
+            dashboard_composite_incremental(&compact)["status"],
+            "measured"
+        );
+        assert_eq!(
+            compact_history_snapshot(&json!({"id":"one","line_rate":0.5}), false)["id"],
+            "one"
+        );
+        assert_eq!(
+            compact_history_snapshot(&json!({"id":"one","total_lines":1}), true)["total_lines"],
+            1
+        );
+        assert_eq!(history_metric(&[], "line_rate"), Value::Null);
+        assert_eq!(
+            history_metric(
+                &[json!({"line_rate":0.2}), json!({"line_rate":0.1})],
+                "line_rate"
+            )["trend"],
+            "improving"
+        );
+        assert_eq!(
+            history_metric(
+                &[json!({"line_rate":0.1}), json!({"line_rate":0.2})],
+                "line_rate"
+            )["trend"],
+            "regressing"
+        );
+        assert_eq!(
+            history_metric(
+                &[json!({"line_rate":0.1}), json!({"line_rate":0.1})],
+                "line_rate"
+            )["trend"],
+            "unchanged"
+        );
+        let history = summarize_history(&[
+            json!({"line_rate":0.2}),
+            json!({"line_rate":0.3}),
+            json!({"line_rate":0.3}),
+            json!({"line_rate":0.1}),
+            json!({}),
+        ]);
+        assert_eq!(history["regression_runs"], 1);
+        assert_eq!(history["improvement_runs"], 1);
+        assert_eq!(history["unchanged_runs"], 1);
+
+        let command = json!({"id":"command","name":"name","artifact_specs":[]});
+        assert_eq!(compact_command(&command, false)["artifact_count"], 0);
+        assert_eq!(
+            compact_command(&json!({"id":"command"}), true)["artifact_specs"],
+            json!([])
+        );
+        assert_eq!(compact_run_result(&json!(true), false), true);
+        assert_eq!(compact_run_result(&json!({"id":"run"}), true)["id"], "run");
+        assert_eq!(
+            compact_composite_snapshot(&json!({"status":"complete"}), false)["total_regions"],
+            0
+        );
+        assert!(
+            compact_composite_snapshot(
+                &json!({"status":"complete","reasons":[],"inventory":{}}),
+                true
+            )
+            .get("inventory")
+            .is_some()
+        );
+        assert_eq!(
+            composite_region_hits(&json!({"variants":[{"hits":2},{"hits":3}]})),
+            5
+        );
+        assert_eq!(composite_region_hits(&json!({"hits":4})), 4);
+        assert_eq!(
+            composite_category_order(&json!({"category":"newly_covered"})),
+            0
+        );
+        assert_eq!(
+            composite_category_order(&json!({"category":"regressed"})),
+            1
+        );
+        assert_eq!(composite_category_order(&json!({"category":"added"})), 2);
+        assert_eq!(composite_category_order(&json!({"category":"removed"})), 3);
+        assert_eq!(
+            composite_category_order(&json!({"category":"hit_count_only"})),
+            4
+        );
+        assert_eq!(composite_category_order(&json!({"category":"other"})), 5);
+        assert_eq!(
+            grouped_composite_regions(&[
+                json!({"path":"src/a.py","start_line":1,"category":"added"}),
+                json!({"path":"src/a.py","start_line":2,"category":"added"}),
+                json!({"path":"src/a.py","start_line":4,"category":"added"}),
+                json!({"path":"src/a.py","start_line":4,"category":"added"}),
+                json!({"path":"src/a.py"}),
+                json!({"start_line":8})
+            ])
+            .len(),
+            2
+        );
+        assert_eq!(
+            automatic_incremental_review_placeholder("pending", Some("base"), true, "wait")["baseline"]
+                ["composite_snapshot_id"],
+            "base"
+        );
+        assert_eq!(
+            automatic_incremental_review_placeholder("pending", Some("base"), false, "wait")["baseline"]
+                ["snapshot_id"],
+            "base"
+        );
+        assert!(
+            automatic_incremental_review_placeholder("pending", None, false, "wait")["baseline"]
+                .is_null()
+        );
+    }
+
+    #[test]
     fn strict_projection_validation_and_comparison_errors_are_explicit() {
         assert!(required_value(&json!({}), "id", "projection").is_err());
         assert!(required_string_field(&json!({}), "id", "projection").is_err());
@@ -2837,8 +4707,11 @@ mod tests {
         };
         let base_commit = git_commit("HEAD");
         let report = directory.path().join("coverage.lcov");
-        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,1\nend_of_record\n")
-            .expect("coverage report");
+        std::fs::write(
+            &report,
+            "TN:service-test\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .expect("coverage report");
         let config = ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 59_471,
@@ -2887,7 +4760,7 @@ mod tests {
         let current_commit = git_commit("HEAD");
         std::fs::write(
             &report,
-            "TN:\nSF:src/a.py\nDA:1,1\nDA:2,0\nBRDA:2,0,0,-\nFN:4,func\nFNDA:0,func\nend_of_record\n",
+            "TN:service-test\nSF:src/a.py\nDA:1,1\nDA:2,0\nBRDA:2,0,0,-\nFN:4,func\nFNDA:0,func\nend_of_record\n",
         )
         .expect("current coverage report");
         let current = store
@@ -2901,7 +4774,7 @@ mod tests {
                 "unit",
             )
             .expect("current");
-        let mut many_report = "TN:\nSF:src/a.py\nDA:1,1\n".to_owned();
+        let mut many_report = "TN:service-test\nSF:src/a.py\nDA:1,1\n".to_owned();
         for line in 3..=15 {
             many_report.push_str(&format!("DA:{line},0\n"));
         }
@@ -2926,6 +4799,13 @@ mod tests {
             source
         });
         std::fs::write(directory.path().join("src/a.py"), many_source).expect("long source");
+        let dashboard_repo_path = project.repo_path.replace('\'', "''");
+        let dashboard_repo_key = project.repo_key.replace('\'', "''");
+        store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-terminal', 'dashboard-command', 'dashboard-command', 'true', '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{}}', '[]', current_timestamp, 0, NULL, 'full', 'full:v1', 'full'); INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-active', 'dashboard-command', 'dashboard-command', 'true', NULL, '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, NULL, NULL, 30, 20, 'queued', 'stdout.log', 'stderr.log', '', NULL, 'incremental', 'case:v1', 'case')"
+            ))
+            .expect("dashboard run fixtures");
         let service = CoverageService::new(
             store.clone(),
             RequestContext {
@@ -2933,6 +4813,719 @@ mod tests {
                 checkout_path: project.repo_path,
                 suite: None,
             },
+        );
+        let empty_command_context = service
+            .project_context(None, 600, false)
+            .expect("project context without registered commands");
+        assert!(
+            empty_command_context["data"]["commands"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            service
+                .project_context(Some("invalid"), 600, false)
+                .is_err()
+        );
+        assert!(
+            service
+                .attach_automatic_incremental_review(json!({
+                    "execution":{"mode":"full"}
+                }))
+                .get("incremental_review")
+                .is_none()
+        );
+        let pending = service.attach_automatic_incremental_review(json!({
+            "execution":{"mode":"incremental","baseline":{"snapshot_id":"base"}}
+        }));
+        assert_eq!(pending["incremental_review"]["status"], "pending");
+        let no_baseline = service.attach_automatic_incremental_review(json!({
+            "execution":{"mode":"incremental"}
+        }));
+        assert_eq!(no_baseline["incremental_review"]["status"], "not_measured");
+        let composite_no_baseline = service.attach_automatic_incremental_review(json!({
+            "composite_snapshot_id":"missing-composite",
+            "execution":{"mode":"incremental"},
+            "terminal":true
+        }));
+        assert_eq!(
+            composite_no_baseline["incremental_review"]["status"],
+            "not_measured"
+        );
+        let composite_pending = service.attach_automatic_incremental_review(json!({
+            "composite_snapshot_id":"missing-composite",
+            "execution":{"mode":"incremental","baseline":{"composite_snapshot_id":"base"}},
+            "terminal":false
+        }));
+        assert_eq!(composite_pending["incremental_review"]["status"], "pending");
+        let composite_error = service.attach_automatic_incremental_review(json!({
+            "composite_snapshot_id":"missing-composite",
+            "execution":{"mode":"incremental","baseline":{"composite_snapshot_id":"base"}},
+            "terminal":true
+        }));
+        assert_eq!(
+            composite_error["incremental_review"]["status"],
+            "not_measured"
+        );
+        assert!(service.validate_composite_context(&json!({})).is_err());
+        for run in [
+            json!({
+                "execution":{"mode":"incremental","baseline":{"snapshot_id":"base"}},
+                "terminal":true,
+                "coverage_ingest":{"snapshot_ids":["one","two"]}
+            }),
+            json!({
+                "execution":{"mode":"incremental","baseline":{"snapshot_id":"base"}},
+                "terminal":true,
+                "coverage_ingest":{"snapshot_ids":[7]}
+            }),
+            json!({
+                "execution":{"mode":"incremental","baseline":{"snapshot_id":"missing"}},
+                "terminal":true,
+                "coverage_ingest":{"snapshot_ids":["missing"]}
+            }),
+        ] {
+            let automatic = service.attach_automatic_incremental_review(run);
+            assert_eq!(automatic["incremental_review"]["status"], "not_measured");
+        }
+        let incremental_input = outside.path().join("incremental-current.lcov");
+        std::fs::write(
+            &incremental_input,
+            "TN:incremental\nSF:src/a.py\nDA:1,0\nDA:2,1\nend_of_record\n",
+        )
+        .expect("incremental input report");
+        let incremental_command = service
+            .command_registration(
+                "service-automatic-incremental",
+                "cp {{args}} incremental-output.lcov",
+                true,
+                "tester",
+                "automatic incremental coverage review",
+                Some(directory.path().to_str().unwrap()),
+                "/bin/sh",
+                Some(json!({
+                    "coverage": {
+                        "path": "incremental-output.lcov",
+                        "required": true,
+                        "coverage_format": "lcov",
+                        "suite": "unit",
+                        "detail_retention": "incremental_base"
+                    }
+                })),
+                false,
+            )
+            .expect("incremental command");
+        let incremental_execution = json!({"mode":"incremental","label":"case-specific"});
+        let incremental_arguments = json!([incremental_input.to_string_lossy()]);
+        let automatic_incremental = service
+            .run_submission_with_execution(
+                incremental_command["data"]["id"].as_str().unwrap(),
+                None,
+                Some("automatic-incremental-v1"),
+                true,
+                false,
+                false,
+                Some(&incremental_execution),
+                Some(&incremental_arguments),
+                Some(baseline["id"].as_str().unwrap()),
+            )
+            .expect("automatic incremental run");
+        assert_eq!(
+            automatic_incremental["data"]["execution"]["mode"],
+            "incremental"
+        );
+        assert_eq!(
+            automatic_incremental["data"]["execution"]["arguments"][0],
+            incremental_input.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            automatic_incremental["data"]["execution"]["baseline"]["snapshot_id"],
+            baseline["id"]
+        );
+        assert_eq!(
+            automatic_incremental["data"]["incremental_review"]["status"],
+            "measured"
+        );
+        assert_eq!(
+            automatic_incremental["data"]["incremental_review"]["automatic"],
+            true
+        );
+        let automatic_status = service
+            .run_review(
+                automatic_incremental["data"]["id"].as_str().unwrap(),
+                "status",
+                None,
+                "both",
+                3,
+                5,
+                false,
+                1_200,
+                20_000,
+            )
+            .expect("automatic incremental status");
+        assert_eq!(
+            automatic_status["data"]["incremental_review"]["status"],
+            "measured"
+        );
+        let current_id = many_current["id"].as_str().unwrap();
+        let dashboard = service
+            .dashboard(Some(current_id), Some(baseline["id"].as_str().unwrap()), 18)
+            .expect("dashboard projection");
+        assert_eq!(dashboard["data"]["incremental"]["status"], "measured");
+        assert_eq!(dashboard["data"]["files"]["source"], "current_vs_baseline");
+        assert!(dashboard["data"]["history"]["points"].is_array());
+        assert!(dashboard["data"]["compaction"]["inventory"].is_object());
+        let rolling_dashboard = service
+            .dashboard(Some(current_id), None, 2)
+            .expect("rolling dashboard projection");
+        assert_eq!(
+            rolling_dashboard["data"]["selection"]["baseline_kind"],
+            "rolling_previous"
+        );
+        assert_eq!(rolling_dashboard["data"]["history"]["limit"], 2);
+        let older_dashboard = service
+            .dashboard(Some(baseline["id"].as_str().unwrap()), None, 2)
+            .expect("older rolling dashboard projection");
+        assert_eq!(
+            older_dashboard["data"]["selection"]["baseline_kind"],
+            "rolling_previous"
+        );
+        assert!(service.dashboard(Some(current_id), None, 1).is_err());
+
+        let incompatible_report = directory.path().join("dashboard-cobertura.xml");
+        std::fs::write(
+            &incompatible_report,
+            r#"<coverage><packages><package><classes><class filename="src/a.py"><lines><line number="1" hits="1"/></lines></class></classes></package></packages></coverage>"#,
+        )
+        .expect("incompatible dashboard report");
+        let incompatible = store
+            .ingest_report(
+                &incompatible_report,
+                "cobertura",
+                Some(directory.path()),
+                Some("main"),
+                Some("incompatible"),
+                None,
+                "unit",
+            )
+            .expect("incompatible dashboard snapshot");
+        let unmeasured_dashboard = service
+            .dashboard(
+                Some(incompatible["id"].as_str().unwrap()),
+                Some(baseline["id"].as_str().unwrap()),
+                18,
+            )
+            .expect("unmeasured dashboard projection");
+        assert_eq!(
+            unmeasured_dashboard["data"]["incremental"]["status"],
+            "unmeasured"
+        );
+        assert_eq!(
+            unmeasured_dashboard["data"]["files"]["source"],
+            "current_snapshot"
+        );
+        for skip in 0..=24 {
+            store.inject_query_fault_after(skip);
+            let _ = service.dashboard(Some(current_id), Some(baseline["id"].as_str().unwrap()), 18);
+        }
+        for skip in 0..=24 {
+            store.inject_query_fault_after(skip);
+            let _ = service.dashboard(Some(current_id), None, 18);
+        }
+        for skip in 0..=24 {
+            store.inject_query_fault_after(skip);
+            let _ = service.dashboard(
+                Some(incompatible["id"].as_str().unwrap()),
+                Some(baseline["id"].as_str().unwrap()),
+                18,
+            );
+        }
+        store.clear_query_fault();
+
+        store
+            .execute_sql_for_test(&format!(
+                "INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('svc-composite-base', current_timestamp - INTERVAL '2 seconds', 'svc-composite-run-base', 'dashboard-command', '{dashboard_repo_path}', '{dashboard_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'svc-inventory', NULL, false, 0, 1, 0.0, '[]', '{{}}', '{{}}', '{{}}', '[]', '[]'); INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('svc-composite-current', current_timestamp, 'svc-composite-run-current', 'dashboard-command', '{dashboard_repo_path}', '{dashboard_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'svc-inventory', NULL, false, 1, 1, 1.0, '[]', '{{}}', '{{}}', '{{}}', '[]', '[]'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('svc-composite-base', 'python:src/a.py:1:1:line-1', '{{\"region_key\":\"python:src/a.py:1:1:line-1\",\"component_id\":\"python\",\"logical_source_id\":\"python:src/a.py\",\"path\":\"src/a.py\",\"start_line\":1,\"end_line\":1,\"discriminator\":\"line-1\",\"state\":\"uncovered\",\"variants\":[{{\"package_variant\":\"cpython\",\"state\":\"uncovered\",\"hits\":0}}]}}'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('svc-composite-current', 'python:src/a.py:1:1:line-1', '{{\"region_key\":\"python:src/a.py:1:1:line-1\",\"component_id\":\"python\",\"logical_source_id\":\"python:src/a.py\",\"path\":\"src/a.py\",\"start_line\":1,\"end_line\":1,\"discriminator\":\"line-1\",\"state\":\"covered\",\"variants\":[{{\"package_variant\":\"cpython\",\"state\":\"covered\",\"hits\":1}}]}}')"
+            ))
+            .expect("service composite fixtures");
+        assert!(
+            service
+                .composite_review(
+                    "incremental",
+                    "svc-composite-current",
+                    Some("svc-composite-base"),
+                    None,
+                    24,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_ok()
+        );
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    "svc-composite-current",
+                    None,
+                    None,
+                    24,
+                    600,
+                    12_000,
+                    "audit",
+                    10,
+                )
+                .is_ok()
+        );
+        for skip in 0..=12 {
+            store.inject_query_fault_after(skip);
+            let _ = service.composite_review(
+                "incremental",
+                "svc-composite-current",
+                Some("svc-composite-base"),
+                None,
+                24,
+                600,
+                12_000,
+                "compact",
+                10,
+            );
+        }
+        for skip in 0..=6 {
+            store.inject_query_fault_after(skip);
+            let _ = service.composite_review(
+                "audit",
+                "svc-composite-current",
+                None,
+                None,
+                24,
+                600,
+                12_000,
+                "audit",
+                10,
+            );
+        }
+        store.clear_query_fault();
+        store
+            .execute_sql_for_test(
+                "UPDATE composite_snapshots SET repo_key = 'foreign-composite' WHERE id = 'svc-composite-base'",
+            )
+            .expect("foreign composite fixture");
+        assert!(
+            service
+                .composite_review(
+                    "incremental",
+                    "svc-composite-current",
+                    Some("svc-composite-base"),
+                    None,
+                    24,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE composite_snapshots SET repo_key = '{dashboard_repo_key}', mapping_version = 'different-mapping' WHERE id = 'svc-composite-base'"
+            ))
+            .expect("incompatible composite fixture");
+        assert!(
+            service
+                .composite_review(
+                    "incremental",
+                    "svc-composite-current",
+                    Some("svc-composite-base"),
+                    None,
+                    24,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(
+                "UPDATE composite_snapshots SET mapping_version = 'coverage-mcp-regions-v1' WHERE id = 'svc-composite-base'",
+            )
+            .expect("restore composite mapping");
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    "missing-composite",
+                    None,
+                    None,
+                    24,
+                    600,
+                    12_000,
+                    "audit",
+                    10,
+                )
+                .is_err()
+        );
+        FORCE_BUDGET_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            service
+                .composite_review(
+                    "audit",
+                    "svc-composite-current",
+                    None,
+                    None,
+                    24,
+                    600,
+                    12_000,
+                    "audit",
+                    10,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    "svc-composite-current",
+                    vec![("src/a.py".to_owned(), 1, 2)],
+                    120,
+                    49,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    "svc-composite-current",
+                    vec![("src/a.py".to_owned(), 1, 2)],
+                    120,
+                    600,
+                    999,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    "missing-composite",
+                    vec![("src/a.py".to_owned(), 1, 2)],
+                    120,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    "svc-composite-current",
+                    vec![("../outside.py".to_owned(), 1, 2)],
+                    120,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .composite_source_review(
+                    "svc-composite-current",
+                    vec![("missing.py".to_owned(), 1, 2)],
+                    120,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+        for skip in 0..=8 {
+            store.inject_query_fault_after(skip);
+            let _ = service.composite_source_review(
+                "svc-composite-current",
+                vec![("src/a.py".to_owned(), 1, 2)],
+                120,
+                600,
+                12_000,
+            );
+        }
+        store.clear_query_fault();
+        FORCE_BUDGET_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            service
+                .composite_source_review(
+                    "svc-composite-current",
+                    vec![("src/a.py".to_owned(), 1, 2)],
+                    120,
+                    600,
+                    12_000,
+                )
+                .is_err()
+        );
+
+        let empty_store = CoverageStore::open(
+            outside.path().join("empty-dashboard.duckdb"),
+            config.clone(),
+        )
+        .expect("empty dashboard store");
+        let empty_project = empty_store
+            .ensure_project(outside.path())
+            .expect("empty dashboard project");
+        let empty_service = CoverageService::new(
+            empty_store.clone(),
+            RequestContext {
+                repo_key: empty_project.repo_key,
+                checkout_path: empty_project.repo_path,
+                suite: None,
+            },
+        );
+        let empty_dashboard = empty_service
+            .dashboard(None, None, 2)
+            .expect("empty dashboard projection");
+        assert_eq!(
+            empty_dashboard["data"]["selection"]["baseline_kind"],
+            "none"
+        );
+        assert_eq!(
+            empty_dashboard["data"]["incremental"]["status"],
+            "unmeasured"
+        );
+        assert_eq!(empty_dashboard["data"]["files"]["total"], 0);
+        empty_store.close().expect("close empty dashboard store");
+
+        std::fs::write(
+            outside.path().join("foreign.lcov"),
+            "TN:foreign\nSF:src/a.py\nDA:1,1\nend_of_record\n",
+        )
+        .expect("foreign dashboard report");
+        let foreign = store
+            .ingest_report(
+                &outside.path().join("foreign.lcov"),
+                "lcov",
+                Some(outside.path()),
+                Some("main"),
+                Some("foreign"),
+                None,
+                "foreign",
+            )
+            .expect("foreign dashboard snapshot");
+        assert!(
+            service
+                .dashboard(Some(foreign["id"].as_str().unwrap()), None, 18)
+                .is_err()
+        );
+        assert!(
+            service
+                .dashboard(Some(current_id), Some(foreign["id"].as_str().unwrap()), 18,)
+                .is_err()
+        );
+        assert!(
+            service
+                .coverage_review_with_max_test_ids(
+                    "incremental",
+                    Some(current_id),
+                    None,
+                    None,
+                    Some("unit"),
+                    Some("main"),
+                    None,
+                    2,
+                    2,
+                    3,
+                    5,
+                    false,
+                    3,
+                    120,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
+        );
+        let measured = service
+            .coverage_review_with_max_test_ids(
+                "incremental",
+                Some(current_id),
+                Some(baseline["id"].as_str().unwrap()),
+                None,
+                Some("unit"),
+                Some("main"),
+                None,
+                2,
+                2,
+                3,
+                5,
+                false,
+                3,
+                120,
+                600,
+                12_000,
+                "compact",
+                10,
+            )
+            .expect("measured incremental response");
+        assert_eq!(measured["data"]["incremental"]["status"], "measured");
+        assert_eq!(
+            measured["data"]["incremental"]["test_attribution"]["status"],
+            "measured"
+        );
+        let mut compact_projection = json!({"changed_lines":[{"line":1}]});
+        remove_incremental_changed_lines(&mut compact_projection);
+        assert!(compact_projection.get("changed_lines").is_none());
+        let mut non_object_projection = json!(true);
+        remove_incremental_changed_lines(&mut non_object_projection);
+        let review_projection = service
+            .coverage_review_with_max_test_ids(
+                "incremental",
+                Some(current_id),
+                Some(baseline["id"].as_str().unwrap()),
+                None,
+                Some("unit"),
+                Some("main"),
+                None,
+                2,
+                2,
+                3,
+                5,
+                false,
+                3,
+                120,
+                1200,
+                12_000,
+                "review",
+                10,
+            )
+            .expect("review incremental response");
+        assert_eq!(
+            review_projection["data"]["incremental"]["status"],
+            "measured"
+        );
+        store.inject_query_fault_after(1);
+        assert!(
+            service
+                .coverage_review_with_max_test_ids(
+                    "incremental",
+                    Some(current_id),
+                    Some(baseline["id"].as_str().unwrap()),
+                    None,
+                    Some("unit"),
+                    Some("main"),
+                    None,
+                    2,
+                    2,
+                    3,
+                    5,
+                    false,
+                    3,
+                    120,
+                    600,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
+        );
+        let _ = service
+            .coverage_review_with_max_test_ids(
+                "incremental",
+                Some(current_id),
+                Some(baseline["id"].as_str().unwrap()),
+                None,
+                Some("unit"),
+                Some("main"),
+                None,
+                2,
+                2,
+                3,
+                5,
+                false,
+                3,
+                120,
+                50,
+                12_000,
+                "compact",
+                10,
+            )
+            .expect_err("small word budget should reject the measured response");
+        assert!(
+            service
+                .coverage_review_with_max_test_ids(
+                    "incremental",
+                    Some(current_id),
+                    Some(current_id),
+                    None,
+                    Some("unit"),
+                    Some("main"),
+                    None,
+                    2,
+                    2,
+                    3,
+                    5,
+                    false,
+                    3,
+                    120,
+                    600,
+                    12_000,
+                    "compact",
+                    0,
+                )
+                .is_err()
+        );
+        let empty_service = CoverageService::new(
+            store.clone(),
+            RequestContext {
+                repo_key: service.context(None).repo_key.clone(),
+                checkout_path: service.context(None).checkout_path.clone(),
+                suite: None,
+            },
+        );
+        let no_measurement = empty_service
+            .coverage_review_with_max_test_ids(
+                "incremental",
+                None,
+                Some(current_id),
+                None,
+                Some("suite-without-a-snapshot"),
+                Some("main"),
+                None,
+                2,
+                2,
+                3,
+                5,
+                false,
+                3,
+                120,
+                600,
+                12_000,
+                "compact",
+                10,
+            )
+            .expect("incremental no-measurement response");
+        assert_eq!(no_measurement["data"]["claim_status"], "not_measured");
+        let wordy_suite = "word ".repeat(100);
+        FORCE_BUDGET_FAILURE.store(true, Ordering::SeqCst);
+        assert!(
+            empty_service
+                .coverage_review_with_max_test_ids(
+                    "incremental",
+                    None,
+                    Some(current_id),
+                    None,
+                    Some(&wordy_suite),
+                    Some("main"),
+                    None,
+                    2,
+                    2,
+                    3,
+                    5,
+                    false,
+                    3,
+                    120,
+                    50,
+                    12_000,
+                    "compact",
+                    10,
+                )
+                .is_err()
         );
         std::fs::write(
             &report,
@@ -5201,9 +7794,32 @@ mod tests {
         let detailed = compact_snapshot(&snapshot, true);
         assert_eq!(detailed["report_path"], "report");
         assert_eq!(detailed["metadata"], json!({}));
+        let execution_snapshot = compact_snapshot(
+            &json!({
+                "repo_path":"/repo",
+                "metadata":{"execution":{"mode":"incremental","identity":"case:v1"}}
+            }),
+            false,
+        );
+        assert_eq!(execution_snapshot["execution"]["identity"], "case:v1");
+        assert_eq!(
+            incremental_next_action(&json!({"newly_covered": 1}))["kind"],
+            "review_incremental_gain"
+        );
 
         let file = compact_file(&json!({"file_path":"a.py","raw_metrics":null}), false);
         assert!(file.get("raw_metrics").is_none());
+        let dashboard_files = dashboard_current_files(&[
+            json!({"file_path":"z.py","line_rate":null}),
+            json!({"file_path":"b.py","line_rate":0.5}),
+            json!({"file_path":"a.py","line_rate":0.5}),
+        ]);
+        assert_eq!(dashboard_files["source"], "current_snapshot");
+        assert_eq!(dashboard_files["total"], 3);
+        assert_eq!(
+            dashboard_incremental(&json!({"status":"measured"}))["regions"],
+            json!([])
+        );
         let detailed_file = compact_file(&json!({"raw_metrics":null}), true);
         assert_eq!(detailed_file["raw_metrics"], json!({}));
         let changed_regions = compact_changed_regions(&[
