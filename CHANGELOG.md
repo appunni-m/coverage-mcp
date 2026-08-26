@@ -4,6 +4,26 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.14.0 - 2026-08-26
+
+### Added
+
+- The dedicated `/graph` page separates **Function hierarchy** from **File
+  dependencies**. The hierarchy maps source files to the LLVM function
+  records projected for them; the dependency mode shows best-effort resolved
+  source-import edges rather than implying a runtime call graph.
+- LLVM-mapped function inspection now shows demangled source names, LLVM
+  symbols, source ranges, execution counts, line/region/branch completeness,
+  and explicit reasons for missing coverage. Files without LLVM records remain
+  visible without invented function nodes.
+
+### Changed
+
+- The dashboard now links to the focused graph page instead of embedding a
+  second graph panel. Graph zoom scales the SVG canvas from 50% to 200% and no
+  longer changes the graph's meaning; source line detail remains available
+  from the selected file or function.
+
 ## 0.13.0 - 2026-08-25
 
 ### Added
