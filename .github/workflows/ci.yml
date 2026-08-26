@@ -84,7 +84,13 @@ jobs:
         # The matching DuckDB release is downloaded instead of compiling the
         # C++ amalgamation; test harnesses remain serialized for deterministic
         # database and signal behavior. Diagnostics are retained on failure.
-        run: make test-ci-lib
+        shell: bash
+        run: |
+          if ! RUST_BACKTRACE=1 make test-ci-lib; then
+            details=$(tail -n 80 target/migration/test-lib.log | tr '\n' ' ' | cut -c1-12000)
+            echo "::error::library test diagnostics: $details"
+            exit 1
+          fi
       - name: Run binary tests
         run: make test-ci-bins
       - name: Run migration-status tests
