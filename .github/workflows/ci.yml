@@ -170,7 +170,13 @@ jobs:
         # always starts from a source-consistent build directory.
         run: cargo llvm-cov clean --workspace --locked
       - name: Coverage
-        run: make coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! make coverage 2>&1 | tee target/migration/coverage-command.log; then
+            tail -n 80 target/migration/coverage-command.log | sed 's/^/::error::/'
+            exit 1
+          fi
       - name: Coverage diagnostics
         if: failure()
         run: |
@@ -215,6 +221,7 @@ jobs:
           name: coverage-diagnostics
           path: |
             target/migration/coverage-raw.json
+            target/migration/coverage-command.log
             target/migration/coverage-lines.lcov
             target/migration/coverage-lines.txt
           if-no-files-found: ignore
