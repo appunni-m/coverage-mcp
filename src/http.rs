@@ -460,13 +460,27 @@ impl CoverageServer {
             (Method::PATCH, ["api", "projects", _]) => service.update_project_settings(project_patch(&body)?)?,
             (Method::POST, ["api", "projects", _, "compact"]) => service.compact_now()?,
             (Method::GET, ["api", "projects", _]) => service.envelope(store.project_summary()?, None, None),
-            (Method::GET, ["api", "dashboard"]) => service.dashboard_with_composite(
-                query_value(&query, "snapshot_id"),
-                query_value(&query, "baseline_snapshot_id"),
-                query_value(&query, "composite_snapshot_id"),
-                query_value(&query, "baseline_composite_snapshot_id"),
-                bounded_query_usize(&query, "history_limit", 18, 2, 50)?,
-            )?,
+            (Method::GET, ["api", "dashboard"]) => {
+                let snapshot_ids = if query.contains_key("snapshot_id") {
+                    let values = required_query_values(&query, "snapshot_id")?;
+                    if values.len() > 64 {
+                        return Err(AppError::Validation(
+                            "at most 64 current snapshot IDs may be selected".to_owned(),
+                        ));
+                    }
+                    Some(values)
+                } else {
+                    None
+                };
+                service.dashboard_with_snapshot_ids(
+                    snapshot_ids.as_deref(),
+                    None,
+                    query_value(&query, "baseline_snapshot_id"),
+                    query_value(&query, "composite_snapshot_id"),
+                    query_value(&query, "baseline_composite_snapshot_id"),
+                    bounded_query_usize(&query, "history_limit", 18, 2, 50)?,
+                )?
+            }
             (Method::GET, ["api", "snapshots"]) => {
                 let values = store.list_snapshots(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), COLLECTION_FETCH_LIMIT)?;
                 let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, "rest-snapshots", None)?;
@@ -566,7 +580,14 @@ impl CoverageServer {
                         max_test_ids,
                     )?
                 } else {
-                    service.envelope(store.incremental_compare(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), max_files, max_regions, max_test_ids)?, None, None)
+                    let snapshot_ids = required_query_values(&query, "snapshot_id")?;
+                    if snapshot_ids.len() > 64 {
+                        return Err(AppError::Validation(
+                            "at most 64 current snapshot IDs may be merged".to_owned(),
+                        ));
+                    }
+                    let snapshot_refs = snapshot_ids.iter().map(String::as_str).collect::<Vec<_>>();
+                    service.envelope(store.incremental_union_compare_many_with_scope(&snapshot_refs, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), max_files, max_regions, max_test_ids, "selected_subset")?, None, None)
                 }
             }
             (Method::GET, ["api", "compare"]) => {
@@ -1181,6 +1202,18 @@ fn query_value<'a>(query: &'a HashMap<String, Vec<String>>, key: &str) -> Option
 fn query_values(query: &HashMap<String, Vec<String>>, key: &str) -> Vec<String> {
     query.get(key).cloned().unwrap_or_default()
 }
+fn required_query_values(
+    query: &HashMap<String, Vec<String>>,
+    key: &str,
+) -> AppResult<Vec<String>> {
+    let values = query_values(query, key);
+    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+        return Err(AppError::Validation(format!(
+            "{key} is required and must not be blank"
+        )));
+    }
+    Ok(values)
+}
 fn query_usize(
     query: &HashMap<String, Vec<String>>,
     key: &str,
@@ -1510,6 +1543,11 @@ mod tests {
         let uri: Uri = "/api/items?query=one&query=two&flag=1".parse().unwrap();
         let mut query = query_params(&uri);
         assert_eq!(query_values(&query, "query"), vec!["one", "two"]);
+        assert_eq!(
+            required_query_values(&query, "query").unwrap(),
+            vec!["one", "two"]
+        );
+        assert!(required_query_values(&query, "missing").is_err());
         assert_eq!(query_value(&query, "flag"), Some("1"));
         assert!(query_value(&query, "missing").is_none());
         assert!(query_bool(&query, "flag").unwrap());
@@ -3498,6 +3536,24 @@ mod tests {
         )
         .await;
         assert!(function_cursor_error.contains("400 Bad Request"));
+        let too_many_snapshot_ids = (0..65)
+            .map(|_| format!("snapshot_id={snapshot_id}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let too_many_dashboard = request(
+            address,
+            &format!("/api/dashboard?{too_many_snapshot_ids}&baseline_snapshot_id={snapshot_id}"),
+        )
+        .await;
+        assert!(too_many_dashboard.contains("400 Bad Request"));
+        let too_many_incremental = request(
+            address,
+            &format!("/api/incremental?{too_many_snapshot_ids}&baseline_snapshot_id={snapshot_id}"),
+        )
+        .await;
+        assert!(too_many_incremental.contains("400 Bad Request"));
+        let blank_dashboard_snapshot = request(address, "/api/dashboard?snapshot_id=").await;
+        assert!(blank_dashboard_snapshot.contains("400 Bad Request"));
         let dependencies = request(
             address,
             &format!("/api/snapshots/{snapshot_id}/dependencies"),

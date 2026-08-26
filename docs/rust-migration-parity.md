@@ -4,7 +4,7 @@ The migration is complete at the runtime boundary: the repository contains
 one Rust implementation, Rust tests, and input-only migration fixtures. A
 separate source runtime is not required, installed, imported, or executed.
 This document preserves the behavior-family mapping so future
-changes can be reviewed against the current schema-14 contract.
+changes can be reviewed against the current schema-15 contract.
 
 This is a maintainer document for a source checkout. Published Cargo packages
 intentionally omit the test corpus, fixtures, and generated evidence described
@@ -27,7 +27,7 @@ here.
 
 ## Compatibility invariants
 
-- The public MCP inventory contains exactly eight tools and schema revision 14.
+- The public MCP inventory contains exactly eight tools and schema revision 15.
   Unsupported names use the ordinary unknown-tool error path.
 - Every successful public projection uses the `{context,data,page}` envelope.
 - Word budgets, opaque query-scoped cursors, defensive collection caps, and
@@ -50,14 +50,15 @@ here.
   text content is only a compatibility hint. Terminal incremental runs expose
   their bounded automatic review in the run result and `run_review` status;
   `coverage_review(task="incremental")` remains the standalone comparison for
-  two already stored snapshots.
+  already stored ordinary snapshot sets or composite snapshots.
 - A fresh schema is created when a store opens; incompatible database contents
   are disposable and are not repaired through compatibility migrations.
 - Compacted snapshots remain readable through file, line, source, insight, and
   comparison queries. Incremental review compares immutable stored snapshots
-  without rerunning tests or recalculating coverage; it reports aggregate
-  gain/regression, bounded regions, detail source, and named-test attribution
-  when both reports provide named observations.
+  without rerunning tests or recalculating coverage; it reports the
+  deduplicated baseline-union-current aggregate, a separate scope-aware diff,
+  bounded regions, detail source, and named-test attribution when both reports
+  provide named observations.
 - `detail_retention=incremental_base` excludes a fixed comparison base from
   automatic compaction. If a snapshot is compacted anyway, incremental review
   restores files, lines, and named observations from the compressed payload.
@@ -93,7 +94,7 @@ here.
 ## Fixture and evidence contract
 
 The machine-readable manifest in the source checkout at
-`tests/fixtures/manifest.yaml` identifies the schema-14 contract, Rust target
+`tests/fixtures/manifest.yaml` identifies the schema-15 contract, Rust target
 profile, public surfaces, input-only
 parity cases, coverage plan, and compaction benchmark workload. Inputs contain
 no expected outputs; generated reports, logs, and coverage artifacts are
@@ -153,7 +154,7 @@ profile. The release build still enables bundled DuckDB by default and proves
 the self-contained runtime shipped to users.
 
 The coverage gate requires 100% measured region, function, and line coverage
-for the Rust library/runtime target set. The schema-14 rewrite audit is measured
+for the Rust library/runtime target set. The schema-15 rewrite audit is measured
 by the same command above. The CLI launcher is excluded from aggregate LLVM counters
 because it is exercised in child processes; daemon-only CLI and concurrent
 shared-daemon stdio smoke tests still verify that launcher directly. Branch

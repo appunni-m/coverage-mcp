@@ -4,6 +4,23 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.15.0 - 2026-08-26
+
+### Added
+
+- Schema 15 separates incremental coverage into two explicit views: the
+  primary deduplicated union of baseline plus selected evidence, and a nested
+  snapshot diff for diagnosis. A selected-case run therefore cannot be
+  reported as a code regression merely because it did not exercise the full
+  baseline.
+- Incremental reviews now merge all ordinary coverage snapshots attached to a
+  run. Lines use canonical file/line identities; LLVM functions, branches, and
+  regions use preserved source-mapped identities when available, with a
+  conservative fallback and explicit merge provenance for legacy reports.
+- The dashboard's incremental panel shows final union coverage, line/branch/
+  function/region gains, not-observed evidence, and the diagnostic diff in a
+  separate block.
+
 ## 0.14.0 - 2026-08-26
 
 ### Added

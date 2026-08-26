@@ -2474,7 +2474,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     );
     assert_eq!(
         dashboard_projection["data"]["files"]["source"],
-        "current_vs_baseline"
+        "baseline_union_incremental"
     );
     let _default_ingest = http_exchange(
         address,
@@ -2688,7 +2688,9 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         incremental["data"]["detail_source"]["baseline"],
         "relational"
     );
-    assert_eq!(incremental["data"]["coverage_gain"]["added"], 1);
+    assert_eq!(incremental["data"]["comparison_mode"], "additive_union");
+    assert_eq!(incremental["data"]["coverage_gain"]["added"], 0);
+    assert_eq!(incremental["data"]["diff"]["coverage_gain"]["added"], 1);
     for invalid_limit in [
         "max_files=bad",
         "max_files=0",

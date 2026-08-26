@@ -144,7 +144,7 @@
     </section>
   </main>
   <script>
-    const SCHEMA_REVISION = 14;
+    const SCHEMA_REVISION = 15;
     const state = {projects:[], projectKey:null, repoPath:null, dashboard:null, currentId:null, snapshots:[], files:[], functions:[], dependencies:[], mode:'function', zoom:100, nodes:new Map(), selectedKey:null, loading:false};
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));

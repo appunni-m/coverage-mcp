@@ -12,7 +12,7 @@
 
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
-dashboard and REST API, and provides the consolidated schema-14 projections over
+dashboard and REST API, and provides the consolidated schema-15 projections over
 loopback HTTP and native MCP stdio.
 
 The project is designed for one user-level daemon shared by agents and Git
@@ -22,7 +22,7 @@ frontend build or a separate language runtime.
 ## Status
 
 The Rust implementation is the only runtime and the checked-in Rust test suite
-is the source of truth. The public contract is schema revision 14 with eight
+is the source of truth. The public contract is schema revision 15 with eight
 agent-facing tools. The local gate is configured to require 100% region, line,
 and function coverage for the measured Rust library/runtime targets. `src/main.rs`
 is exercised by child-process smoke tests and excluded from aggregate LLVM
@@ -146,7 +146,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.14.0' --locked
+cargo install coverage-mcp --version '=0.15.0' --locked
 ```
 
 ### Marketplace bootstrap contract
@@ -337,15 +337,26 @@ different argument list. Obtain the fixed base ID from a completed full run's
 server never infers it from the latest or previous snapshot.
 
 An incremental `run_test` automatically attaches `incremental_review` after
-terminal ingestion of exactly one current snapshot. `status="pending"` means
-the run is still active; `status="not_measured"` and `reasons` mean no valid
-diff claim is available. `run_review(view="status")` returns the same durable
-review. This automatic review is the normal path for fewer-test-case runs.
+terminal ingestion. If the run produces several ordinary artifacts, all
+`data.coverage_ingest.snapshot_ids` are one selected measurement set. The
+primary result is the deduplicated union of the fixed base and that set, so a
+selected case cannot lower the displayed aggregate simply because it did not
+hit every base region. `status="pending"` means the run is still active;
+`status="not_measured"` and `reasons` mean no valid measurement is available.
+`run_review(view="status")` returns the same durable review. This automatic
+review is the normal path for fewer-test-case runs.
 
-Use standalone `coverage_review(task="incremental")` when both ordinary
-snapshots or both composite snapshots already exist and only a stored
-comparison is needed. It never reruns tests, invokes a parent runner, or
-reparses a report, and it requires an explicit current measurement plus
+The incremental response deliberately has two blocks. `incremental.aggregate`
+and its `metric_deltas` are the final base ∪ selected-run coverage. The nested
+`incremental.diff` is a diagnostic current-versus-base replacement comparison;
+for a selected subset, baseline hits missing from that run are
+`not_observed`, not regressions. A complete snapshot can still report genuine
+regressions.
+
+Use standalone `coverage_review(task="incremental")` when the ordinary
+snapshots, ordinary snapshot set, or composite snapshots already exist and only
+a stored comparison is needed. It never reruns tests, invokes a parent runner,
+or reparses a report, and it requires an explicit current measurement plus
 `baseline.kind="explicit"` and the matching `snapshot_id` or
 `composite_snapshot_id` selector.
 
@@ -438,7 +449,7 @@ operational cost and retention control.
 | Question | Request |
 | --- | --- |
 | Did new code get covered? | `task="change"`; choose `baseline.kind="worktree_base"`, `"parent_commit"`, `"ref"`, `"previous_snapshot"`, `"explicit"`, or `"none"`. |
-| What did this case add without rerunning the full base? | `task="incremental"` with an explicit ordinary or composite measurement (or a run producing exactly one measurement) and `baseline.kind="explicit"` plus the matching baseline selector. The server compares stored detail immediately. |
+| What did this case add without rerunning the full base? | `task="incremental"` with an explicit ordinary snapshot, an ordinary snapshot set produced by a run, or a composite measurement and `baseline.kind="explicit"` plus the matching baseline selector. The server unions stored detail immediately and keeps the replacement diff separate. |
 | What happened over time? | `task="history"`; default is the last two compatible points and an aggregate over those two points. |
 | What should be tested next? | `task="insight"`; returns ranked uncovered regions without a raw line dump. |
 | What source surrounds selected gaps? | `task="source"` with up to ten grouped `{file_path,start,end}` ranges. |
@@ -471,17 +482,19 @@ Example incremental request:
 
 Incremental review never selects an implicit previous snapshot and never runs
 tests, invokes a parent runner, or reparses either report. It compares stored
-rows from the two immutable snapshots, allows the suites and case-specific
-execution arguments to differ, and requires the same repository and normalized
-coverage format. The result includes `metric_deltas`, grouped affected lines,
-`coverage_gain` categories (`newly_covered`, `regressed`, `hit_count_only`,
-`added`, and `removed`), bounded `regions_truncated` metadata,
-`detail_source` for each side (`relational` or `compacted_payload`), and
-opaque `test_id` added/removed observations when both reports contain named
-observations. Suite, branch, commit, command, cwd, and execution case remain
-provenance only; they are never test identity. A missing named-test projection
-sets attribution to `status="unavailable"` and limits only attribution;
-aggregate coverage remains measured.
+rows from the fixed baseline with the union of one or more immutable ordinary
+snapshots, allows the suites and case-specific execution arguments to differ,
+and requires the same repository and normalized coverage format. The primary
+result includes `aggregate` and `metric_deltas` for the deduplicated union;
+`coverage_gain` reports new line, branch, function, and region identities.
+The nested `diff` retains replacement-style grouped categories and
+`detail_source` for each side (`relational` or `compacted_payload`). In a
+`selected_subset` measurement, baseline identities absent from the selected
+run are `not_observed` and `regressed` is zero; `complete_snapshot` is the
+scope that supports real regression claims. Suite, branch, commit, command,
+cwd, and execution case remain provenance only; they are never test identity.
+A missing named-test projection sets attribution to `status="unavailable"` and
+limits only attribution; aggregate coverage remains measured.
 
 For a long-lived fixed base, import or ingest it with
 `detail_retention="incremental_base"`. This prevents automatic compaction of
@@ -492,10 +505,11 @@ already occurred. Do not manually delete either snapshot or its compacted
 payload while the base is in use.
 
 `measurement.snapshot_id` is explicit when already known. `measurement.run_id`
-is valid for incremental review only when it resolves to exactly one ingested
-snapshot attached to that run. A missing, ambiguous, or stale measurement is
-rejected or reported as `not_measured`/`limited` as appropriate; the server
-never turns it into an `unchanged` claim.
+may resolve to several ordinary snapshots when one run declares multiple
+coverage artifacts; all are merged and listed in `current_snapshot_ids`. A
+missing, malformed, or stale measurement is rejected or reported as
+`not_measured`/`limited` as appropriate; the server never turns it into an
+`unchanged` claim.
 
 `claim_status` is one of `supported`, `limited`, `not_measured`, `stale`, or
 `invalid`. A status other than `supported` must be reported with the server's
@@ -547,11 +561,11 @@ arrays for line/branch/function/region baseline, current, and delta values;
 | --- | --- |
 | `project_context` | Read compact project identity, freshness, up to eight approved command summaries, capped active runs, and latest run. The `max_words` budget covers the complete data projection; paginate commands with `cursor` only when needed. Use `detailed=true` only for an audit. |
 | `register_test_command` | Store one exact human-approved command and its artifacts. `human_approved` must be true; the default response is an id/name summary, and `detailed=true` returns command fields. |
-| `run_test` | Submit one approved command. Prefer `wait=false`; pass optional case-specific `arguments` without registering another command, use `idempotency_key`, and keep the default `reuse_if_unchanged=true`. For incremental runs, pass `execution.mode="incremental"` plus `baseline.kind="explicit"` and exactly one ordinary `snapshot_id` or `composite_snapshot_id`; identity is optional because the server fingerprints mode, arguments, and baseline. After ingestion, the response includes automatic `incremental_review`, and composite runs also return `composite_snapshot_id`. |
+| `run_test` | Submit one approved command. Prefer `wait=false`; pass optional case-specific `arguments` without registering another command, use `idempotency_key`, and keep the default `reuse_if_unchanged=true`. For incremental runs, pass `execution.mode="incremental"` plus `baseline.kind="explicit"` and exactly one ordinary `snapshot_id` or `composite_snapshot_id`; identity is optional because the server fingerprints mode, arguments, and baseline. After ingestion, the response includes automatic `incremental_review`; multiple ordinary artifact snapshots are unioned and listed in `current_snapshot_ids`, while composite runs also return `composite_snapshot_id`. |
 | `run_review` | Read one explicit `run_id`; `view="status"` returns compact durable state, terminal ingestion evidence, and the automatic incremental review for incremental runs, while `view="logs"` returns bounded literal matches. Use standalone `coverage_review(task="incremental")` only for two already stored ordinary or composite measurements. |
 | `cancel_run` | Request cancellation for a run the user no longer wants. |
 | `coverage_import` | Import a repository-relative external report with format, suite, branch, commit, and base provenance. It accepts the same optional execution identity and `detail_retention="incremental_base"` for a fixed base. Follow with `coverage_review`. |
-| `coverage_review` | Bounded change/incremental/history/insight/source/audit/all analysis. It accepts ordinary snapshot IDs or immutable composite IDs; compact defaults to three files, five regions, and ten affected test IDs; history returns two points, and insight returns three ranges per target plus truncation metadata. Use incremental for an explicit current-vs-base comparison and audit for exact records. |
+| `coverage_review` | Bounded change/incremental/history/insight/source/audit/all analysis. It accepts ordinary snapshot IDs or immutable composite IDs; compact defaults to three files, five regions, and ten affected test IDs; history returns two points, and insight returns three ranges per target plus truncation metadata. Use incremental for a baseline-union-current result plus its separate scope-aware snapshot diff; ordinary run selections may contain multiple artifact snapshots. Use audit for exact records. |
 | `find_duplicate_coverage_tests` | Read-only, bounded candidate reduction for named tests with exactly equal covered line/branch/function observation sets. Defaults to the latest snapshot, ten groups, and ten names per group; follow `page.next_cursor` for more groups. |
 
 ### Exact duplicate coverage candidates
@@ -614,13 +628,14 @@ provenance fields require an explicit `detailed=true`; readable or exact
 coverage detail requires a `representation` choice, and logs require
 `run_review(view="logs")`. Terminal incremental run state includes the
 automatic `incremental_review`; use standalone `coverage_review(task="incremental")`
-only when comparing two already stored snapshots independently of execution.
+when comparing stored ordinary snapshot sets or composite snapshots
+independently of execution.
 
 Every successful tool uses this envelope:
 
 ```json
 {
-  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 14},
+  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 15},
   "data": {},
   "page": null
 }
@@ -729,9 +744,11 @@ MCP. Important routes are:
 - `GET /api/composite-snapshots/{id}/regions` and `/insights` — bounded
   canonical-region detail for composite dashboards and operators;
 - `GET /api/incremental?snapshot_id=...&baseline_snapshot_id=...` — bounded
-  explicit current-versus-fixed-base comparison with compaction detail-source
-  metadata, metric/category deltas, and bounded named-test attribution
-  (`max_files`, `max_regions`, and `max_test_ids`);
+  explicit baseline-union-current coverage with a separate scope-aware
+  snapshot diff, compaction detail-source metadata, metric/category deltas, and
+  bounded named-test attribution (`max_files`, `max_regions`, and
+  `max_test_ids`); the MCP run review accepts all ordinary snapshot IDs
+  attached to a multi-artifact run;
 - The incremental and compare routes also accept
   `composite_snapshot_id` plus `baseline_composite_snapshot_id`; source-lines
   accepts `composite_snapshot_id` and reads bounded checkout ranges with
@@ -756,8 +773,11 @@ untrusted Host headers.
 
 The embedded dashboard has dedicated Incremental and Production region
 coverage panels. Select the current report and an explicit fixed baseline, or
-select the composite current/base IDs for the combined inventory view. It
-shows gain/regression counters, file deltas, changed regions,
+select the composite current/base IDs for the combined inventory view. The
+incremental panel shows final deduplicated base ∪ selected-run coverage first,
+then puts the raw snapshot diff in a separate diagnostic block. It shows
+line/branch/function/region gains, not-observed evidence, regression counters
+only for complete reports, file deltas, changed regions,
 affected named test IDs, each snapshot's suite/format/retention/execution
 identity, and whether detail came from relational rows or a compacted payload.
 The production panel shows one exact canonical-region percentage, covered and

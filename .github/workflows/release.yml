@@ -399,7 +399,9 @@ jobs:
     name: Publish release
     needs: artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The publish command verifies the clean packaged source before upload;
+    # allow the bundled DuckDB build enough time on a cold hosted runner.
+    timeout-minutes: 30
     environment: crates-io
     permissions:
       contents: read
@@ -432,10 +434,10 @@ jobs:
         id: crates-io-auth
       - name: Publish verified crate
         if: steps.registry.outputs.published != 'true'
-        # The package job already ran Cargo's clean package verification on an
-        # isolated runner. Avoid recompiling bundled DuckDB after minting the
-        # short-lived trusted-publishing token.
-        run: cargo publish --locked --no-verify
+        # Re-run Cargo's package verification in this clean publish checkout;
+        # the archive uploaded by Cargo is therefore verified from this exact
+        # immutable tag rather than relying on a separate unbound artifact.
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 

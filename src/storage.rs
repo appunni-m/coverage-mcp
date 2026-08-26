@@ -1979,6 +1979,707 @@ impl CoverageStore {
         }))
     }
 
+    /// Computes additive coverage for a selected incremental measurement.
+    ///
+    /// An incremental report is commonly produced by a subset of the test
+    /// matrix. Its zero-hit rows therefore describe what that subset did not
+    /// exercise; they do not replace the baseline's hit set. This projection
+    /// keeps the raw snapshot comparison under `diff` and reports the
+    /// deduplicated baseline-union-current result as the primary metrics.
+    pub fn incremental_union_compare(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        file_limit: usize,
+        line_limit: usize,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        self.incremental_union_compare_many_with_scope(
+            &[snapshot_id],
+            baseline_snapshot_id,
+            file_path,
+            file_limit,
+            line_limit,
+            max_test_ids,
+            "selected_subset",
+        )
+    }
+
+    /// Computes additive coverage for several ordinary artifacts selected by
+    /// one run. The first snapshot remains the compatibility `current` field;
+    /// `current_snapshot_ids` identifies the complete selected set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn incremental_union_compare_many_with_scope(
+        &self,
+        snapshot_ids: &[&str],
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        file_limit: usize,
+        line_limit: usize,
+        max_test_ids: usize,
+        scope: &str,
+    ) -> AppResult<Value> {
+        let snapshot_id = snapshot_ids.first().copied().ok_or_else(|| {
+            AppError::Validation(
+                "incremental coverage requires at least one current snapshot".to_owned(),
+            )
+        })?;
+        self.incremental_union_compare_many_with_scope_inner(
+            snapshot_ids,
+            snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            file_limit,
+            line_limit,
+            max_test_ids,
+            scope,
+        )
+    }
+
+    /// Computes additive coverage while explicitly selecting how the current
+    /// measurement should be interpreted by the replacement diff.
+    ///
+    /// `selected_subset` marks baseline-covered rows that are not hit by the
+    /// current report as `not_observed`. `complete_snapshot` retains ordinary
+    /// regression semantics in the nested diff. The union itself is always
+    /// computed from canonical identities and is never a count addition.
+    #[allow(clippy::too_many_arguments)]
+    pub fn incremental_union_compare_with_scope(
+        &self,
+        snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        file_limit: usize,
+        line_limit: usize,
+        max_test_ids: usize,
+        scope: &str,
+    ) -> AppResult<Value> {
+        self.incremental_union_compare_many_with_scope(
+            &[snapshot_id],
+            baseline_snapshot_id,
+            file_path,
+            file_limit,
+            line_limit,
+            max_test_ids,
+            scope,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn incremental_union_compare_many_with_scope_inner(
+        &self,
+        snapshot_ids: &[&str],
+        first_snapshot_id: &str,
+        baseline_snapshot_id: &str,
+        file_path: Option<&str>,
+        file_limit: usize,
+        line_limit: usize,
+        max_test_ids: usize,
+        scope: &str,
+    ) -> AppResult<Value> {
+        if !matches!(scope, "selected_subset" | "complete_snapshot") {
+            return Err(AppError::Validation(
+                "incremental coverage scope must be selected_subset or complete_snapshot"
+                    .to_owned(),
+            ));
+        }
+        let direct = self.incremental_compare(
+            first_snapshot_id,
+            baseline_snapshot_id,
+            file_path,
+            file_limit,
+            line_limit,
+            max_test_ids,
+        )?;
+        let baseline = direct["baseline"].clone();
+        let current = direct["current"].clone();
+        for snapshot_id in snapshot_ids.iter().skip(1) {
+            let snapshot = self.snapshot(snapshot_id)?;
+            if snapshot.get("repo_key") != baseline.get("repo_key") {
+                return Err(AppError::Validation(
+                    "incremental comparisons require snapshots from the same repository".to_owned(),
+                ));
+            }
+            if snapshot.get("format") != baseline.get("format") {
+                return Err(AppError::Validation(
+                    "incremental comparisons require snapshots with the same coverage format"
+                        .to_owned(),
+                ));
+            }
+        }
+        let aggregate = if snapshot_ids.len() == 1 {
+            self.union_snapshot_detail(
+                &baseline,
+                &current,
+                baseline_snapshot_id,
+                first_snapshot_id,
+                file_path,
+            )?
+        } else {
+            self.union_snapshot_detail_many(
+                &baseline,
+                &current,
+                baseline_snapshot_id,
+                snapshot_ids,
+                file_path,
+            )?
+        };
+        let aggregate_delta = overall_delta(&aggregate.summary, &baseline)
+            .expect("union summary and baseline contain complete metrics");
+        let mut diff = if snapshot_ids.len() == 1 {
+            direct
+        } else {
+            self.incremental_diff_for_union(
+                &baseline,
+                &aggregate,
+                baseline_snapshot_id,
+                snapshot_ids,
+                file_path,
+                file_limit,
+                line_limit,
+                max_test_ids,
+            )?
+        };
+        annotate_incremental_diff_scope(&mut diff, scope);
+        let aggregate_lines = aggregate
+            .newly_covered_lines
+            .iter()
+            .take(collection_limit(line_limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        let aggregate_lines_truncated =
+            aggregate.newly_covered_lines.len() > collection_limit(line_limit);
+        let aggregate_regions = aggregate
+            .newly_covered_regions
+            .iter()
+            .take(collection_limit(line_limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        let aggregate_regions_truncated =
+            aggregate.newly_covered_regions.len() > collection_limit(line_limit);
+        let mut coverage_gain = aggregate.coverage_gain;
+        if scope == "selected_subset" {
+            coverage_gain["not_observed"] = diff["coverage_gain"]
+                .get("not_observed")
+                .cloned()
+                .unwrap_or(json!(0));
+        }
+        let aggregate_file_count = aggregate.file_count;
+        let aggregate_files = aggregate
+            .files
+            .into_iter()
+            .filter(|value| {
+                file_path
+                    .is_none_or(|path| value.get("file_path").and_then(Value::as_str) == Some(path))
+            })
+            .take(collection_limit(file_limit))
+            .collect::<Vec<_>>();
+        let aggregate_files_truncated = aggregate_file_count > aggregate_files.len();
+        let diff_claim_status = if scope == "selected_subset" {
+            "limited"
+        } else {
+            "supported"
+        };
+        Ok(json!({
+            "status": "measured",
+            "comparison_mode": "additive_union",
+            "measurement_scope": {
+                "kind": scope,
+                "complete": scope == "complete_snapshot",
+                "interpretation": if scope == "selected_subset" {
+                    "unhit baseline coverage is outside this selected run and is not a regression"
+                } else {
+                    "the current report is treated as a complete replacement snapshot"
+                },
+            },
+            "baseline": baseline,
+            "current": current,
+            "current_snapshot_ids": snapshot_ids,
+            "aggregate": aggregate.summary,
+            "overall": aggregate_delta.clone(),
+            "metric_deltas": aggregate_delta,
+            "files": aggregate_files,
+            "files_truncated": aggregate_files_truncated,
+            "changed_lines": aggregate_lines,
+            "changed_lines_truncated": aggregate_lines_truncated,
+            "regions": aggregate_regions,
+            "regions_truncated": aggregate_regions_truncated,
+            "coverage_gain": coverage_gain,
+            "diff": {
+                "status": "measured",
+                "claim_status": diff_claim_status,
+                "comparison_mode": "snapshot_diff",
+                "measurement_scope": {
+                    "kind": scope,
+                    "complete": scope == "complete_snapshot",
+                },
+                "metric_deltas": diff["metric_deltas"].clone(),
+                "coverage_gain": diff["coverage_gain"].clone(),
+                "files": diff["files"].clone(),
+                "changed_lines": diff["changed_lines"].clone(),
+                "changed_lines_truncated": diff["changed_lines_truncated"].clone(),
+                "regions": diff["regions"].clone(),
+                "regions_truncated": diff["regions_truncated"].clone(),
+                "test_attribution": diff["test_attribution"].clone(),
+                "detail_source": diff["detail_source"].clone(),
+                "reasons": if scope == "selected_subset" {
+                    json!(["the replacement diff is scope-limited because the current measurement is a selected subset"])
+                } else {
+                    json!([])
+                },
+            },
+            "aggregate_regions_truncated": aggregate_regions_truncated,
+            "test_attribution": diff["test_attribution"].clone(),
+            "detail_source": diff["detail_source"].clone(),
+        }))
+    }
+
+    fn union_snapshot_detail(
+        &self,
+        baseline: &Value,
+        current: &Value,
+        baseline_snapshot_id: &str,
+        current_snapshot_id: &str,
+        file_path: Option<&str>,
+    ) -> AppResult<UnionSnapshotDetail> {
+        self.union_snapshot_detail_many(
+            baseline,
+            current,
+            baseline_snapshot_id,
+            &[current_snapshot_id],
+            file_path,
+        )
+    }
+
+    fn union_snapshot_detail_many(
+        &self,
+        baseline: &Value,
+        current: &Value,
+        baseline_snapshot_id: &str,
+        current_snapshot_ids: &[&str],
+        file_path: Option<&str>,
+    ) -> AppResult<UnionSnapshotDetail> {
+        if current_snapshot_ids.is_empty() {
+            return Err(AppError::Validation(
+                "incremental coverage requires at least one current snapshot".to_owned(),
+            ));
+        }
+        let baseline_files = self.files(baseline_snapshot_id, COLLECTION_FETCH_LIMIT)?;
+        let baseline_files = files_by_path(baseline_files);
+        let current_file_maps = current_snapshot_ids
+            .iter()
+            .map(|snapshot_id| {
+                self.files(snapshot_id, COLLECTION_FETCH_LIMIT)
+                    .map(files_by_path)
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        let baseline_lines = self.lines_all(baseline_snapshot_id)?;
+        let current_line_maps = current_snapshot_ids
+            .iter()
+            .map(|snapshot_id| self.lines_all(snapshot_id))
+            .collect::<AppResult<Vec<_>>>()?;
+        let mut paths = BTreeSet::new();
+        paths.extend(baseline_files.keys().cloned());
+        for current_files in &current_file_maps {
+            paths.extend(current_files.keys().cloned());
+        }
+        paths.extend(baseline_lines.keys().map(|(path, _)| path.clone()));
+        for current_lines in &current_line_maps {
+            paths.extend(current_lines.keys().map(|(path, _)| path.clone()));
+        }
+
+        let repo_path = baseline
+            .get("repo_path")
+            .and_then(Value::as_str)
+            .or_else(|| current.get("repo_path").and_then(Value::as_str))
+            .unwrap_or_default();
+        let mut line_total = MetricMerge::default();
+        let mut branch_total = MetricMerge::default();
+        let mut function_total = MetricMerge::default();
+        let mut region_total = MetricMerge::default();
+        let mut current_line_total = MetricMerge::default();
+        let mut current_branch_total = MetricMerge::default();
+        let mut current_function_total = MetricMerge::default();
+        let mut current_region_total = MetricMerge::default();
+        let mut files = Vec::new();
+        let mut current_files = Vec::new();
+        let mut newly_covered_lines = Vec::new();
+        let mut newly_covered_numbers = BTreeMap::<String, Vec<i64>>::new();
+        let mut newly_covered_line_keys = BTreeSet::<(String, i64)>::new();
+
+        for path in paths {
+            let left_file = baseline_files.get(&path);
+            let current_file_values = current_file_maps
+                .iter()
+                .filter_map(|files| files.get(&path))
+                .collect::<Vec<_>>();
+            let current_file_projection =
+                merged_current_file(&path, repo_path, &current_file_values, &current_line_maps)?;
+            let right_file = current_file_projection
+                .as_ref()
+                .map(|projection| &projection.value);
+            let line_merge = union_line_metric_many(
+                &path,
+                &baseline_lines,
+                &current_line_maps,
+                left_file,
+                &current_file_values,
+            );
+            let current_line_merge = union_line_metric_many(
+                &path,
+                &HashMap::new(),
+                &current_line_maps,
+                None,
+                &current_file_values,
+            );
+            if file_path.is_none_or(|selected| selected == path) {
+                for current_lines in &current_line_maps {
+                    for (key, right) in current_lines.iter().filter(|((file, _), _)| file == &path)
+                    {
+                        let left = baseline_lines.get(key);
+                        let right_covered = line_bool(right, "covered");
+                        if line_bool(right, "count_line")
+                            && right_covered
+                            && !left.is_some_and(|value| line_bool(value, "covered"))
+                            && newly_covered_line_keys.insert(key.clone())
+                        {
+                            let line_number = key.1;
+                            newly_covered_lines.push(json!({
+                                "file_path": path,
+                                "line_number": line_number,
+                                "baseline_covered": left.map(|value| value["covered"].clone()).unwrap_or(Value::Null),
+                                "current_covered": true,
+                                "baseline_hits": left.map(|value| value["hits"].clone()).unwrap_or(Value::Null),
+                                "current_hits": right["hits"].clone(),
+                                "category": "newly_covered",
+                            }));
+                            newly_covered_numbers
+                                .entry(key.0.clone())
+                                .or_default()
+                                .push(line_number);
+                        }
+                    }
+                }
+            }
+            let branch_merge = union_metric_for_file_many(
+                &path,
+                repo_path,
+                "branches",
+                left_file,
+                &current_file_values,
+            )?;
+            let function_merge = union_metric_for_file_many(
+                &path,
+                repo_path,
+                "functions",
+                left_file,
+                &current_file_values,
+            )?;
+            let region_merge = union_metric_for_file_many(
+                &path,
+                repo_path,
+                "regions",
+                left_file,
+                &current_file_values,
+            )?;
+            let current_branch_merge = current_file_projection
+                .as_ref()
+                .map_or_else(MetricMerge::default, |projection| projection.branches);
+            let current_function_merge = current_file_projection
+                .as_ref()
+                .map_or_else(MetricMerge::default, |projection| projection.functions);
+            let current_region_merge = current_file_projection
+                .as_ref()
+                .map_or_else(MetricMerge::default, |projection| projection.regions);
+            line_total.add(line_merge);
+            branch_total.add(branch_merge);
+            function_total.add(function_merge);
+            region_total.add(region_merge);
+            current_line_total.add(current_line_merge);
+            current_branch_total.add(current_branch_merge);
+            current_function_total.add(current_function_merge);
+            current_region_total.add(current_region_merge);
+            files.push(aggregate_file_projection(
+                &path,
+                left_file,
+                right_file,
+                line_merge,
+                branch_merge,
+                function_merge,
+                region_merge,
+            ));
+            if let Some(current_file) = right_file {
+                current_files.push(current_file.clone());
+            }
+        }
+
+        files.sort_by(|left, right| {
+            left.get("aggregate_line_rate")
+                .and_then(Value::as_f64)
+                .partial_cmp(&right.get("aggregate_line_rate").and_then(Value::as_f64))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.get("file_path")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("file_path").and_then(Value::as_str))
+                })
+        });
+        let file_count = files.len();
+        let current_file_count = current_files.len();
+        current_files.sort_by(|left, right| {
+            left.get("aggregate_line_rate")
+                .and_then(Value::as_f64)
+                .partial_cmp(&right.get("aggregate_line_rate").and_then(Value::as_f64))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.get("file_path")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("file_path").and_then(Value::as_str))
+                })
+        });
+        let newly_covered_regions = grouped_incremental_lines(&newly_covered_numbers);
+        let exact =
+            line_total.exact && branch_total.exact && function_total.exact && region_total.exact;
+        let current_exact = current_line_total.exact
+            && current_branch_total.exact
+            && current_function_total.exact
+            && current_region_total.exact;
+        let summary = json!({
+            "kind": "baseline_union_incremental",
+            "baseline_snapshot_id": baseline_snapshot_id,
+            "incremental_snapshot_id": current_snapshot_ids[0],
+            "incremental_snapshot_ids": current_snapshot_ids,
+            "total_lines": line_total.total,
+            "covered_lines": line_total.covered,
+            "line_rate": rate(line_total.covered, line_total.total),
+            "total_branches": branch_total.total,
+            "covered_branches": branch_total.covered,
+            "branch_rate": rate(branch_total.covered, branch_total.total),
+            "total_functions": function_total.total,
+            "covered_functions": function_total.covered,
+            "function_rate": rate(function_total.covered, function_total.total),
+            "total_regions": region_total.total,
+            "covered_regions": region_total.covered,
+            "region_rate": rate(region_total.covered, region_total.total),
+            "file_count": file_count,
+            "files_truncated": false,
+            "merge": {
+                "exact": exact,
+                "strategies": {
+                    "lines": if line_total.exact { "canonical_line_union" } else { "conservative_max_fallback" },
+                    "branches": if branch_total.exact { "canonical_identity_union" } else { "conservative_max_fallback" },
+                    "functions": if function_total.exact { "canonical_identity_union" } else { "conservative_max_fallback" },
+                    "regions": if region_total.exact { "canonical_identity_union" } else { "conservative_max_fallback" },
+                },
+            },
+        });
+        let coverage_gain = json!({
+            "newly_covered": line_total.newly_covered,
+            "regressed": 0,
+            "hit_count_only": 0,
+            "added": 0,
+            "removed": 0,
+            "branch_state_changed": 0,
+            "newly_covered_lines": line_total.newly_covered,
+            "newly_covered_branches": branch_total.newly_covered,
+            "newly_covered_functions": function_total.newly_covered,
+            "newly_covered_regions": region_total.newly_covered,
+            "exact": exact,
+        });
+        let current_summary = json!({
+            "kind": "selected_current_union",
+            "snapshot_ids": current_snapshot_ids,
+            "total_lines": current_line_total.total,
+            "covered_lines": current_line_total.covered,
+            "line_rate": rate(current_line_total.covered, current_line_total.total),
+            "total_branches": current_branch_total.total,
+            "covered_branches": current_branch_total.covered,
+            "branch_rate": rate(current_branch_total.covered, current_branch_total.total),
+            "total_functions": current_function_total.total,
+            "covered_functions": current_function_total.covered,
+            "function_rate": rate(current_function_total.covered, current_function_total.total),
+            "total_regions": current_region_total.total,
+            "covered_regions": current_region_total.covered,
+            "region_rate": rate(current_region_total.covered, current_region_total.total),
+            "file_count": current_file_count,
+            "merge": {
+                "exact": current_exact,
+                "strategies": {
+                    "lines": if current_line_total.exact { "canonical_line_union" } else { "conservative_max_fallback" },
+                    "branches": if current_branch_total.exact { "canonical_identity_union" } else { "conservative_max_fallback" },
+                    "functions": if current_function_total.exact { "canonical_identity_union" } else { "conservative_max_fallback" },
+                    "regions": if current_region_total.exact { "canonical_identity_union" } else { "conservative_max_fallback" },
+                },
+            },
+        });
+        Ok(UnionSnapshotDetail {
+            summary,
+            current_summary,
+            files,
+            current_files,
+            current_file_maps,
+            file_count,
+            newly_covered_lines,
+            newly_covered_regions,
+            coverage_gain,
+            baseline_lines,
+            current_lines: merge_line_maps(&current_line_maps),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn incremental_diff_for_union(
+        &self,
+        baseline: &Value,
+        aggregate: &UnionSnapshotDetail,
+        baseline_snapshot_id: &str,
+        current_snapshot_ids: &[&str],
+        file_path: Option<&str>,
+        file_limit: usize,
+        line_limit: usize,
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        let categorized_lines = changed_line_values_from_maps(
+            &aggregate.baseline_lines,
+            &aggregate.current_lines,
+            file_path,
+        );
+        let changed_lines = categorized_lines
+            .iter()
+            .take(collection_limit(line_limit))
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed_lines_truncated = categorized_lines.len() > collection_limit(line_limit);
+        let all_regions = changed_line_regions(&categorized_lines, MAX_COLLECTION_RECORDS);
+        let regions_truncated = all_regions.len() > collection_limit(line_limit);
+        let regions = all_regions
+            .into_iter()
+            .take(collection_limit(line_limit))
+            .collect::<Vec<_>>();
+        let mut coverage_gain = BTreeMap::<String, usize>::new();
+        for category in [
+            "newly_covered",
+            "regressed",
+            "hit_count_only",
+            "added",
+            "removed",
+            "branch_state_changed",
+        ] {
+            coverage_gain.insert(category.to_owned(), 0);
+        }
+        for line in &categorized_lines {
+            let category = line
+                .get("category")
+                .and_then(Value::as_str)
+                .unwrap_or("changed");
+            *coverage_gain.entry(category.to_owned()).or_default() += 1;
+        }
+        let baseline_files =
+            files_by_path(self.files(baseline_snapshot_id, COLLECTION_FETCH_LIMIT)?);
+        let current_files = files_by_path(aggregate.current_files.clone());
+        let mut paths = BTreeSet::new();
+        paths.extend(baseline_files.keys().cloned());
+        paths.extend(current_files.keys().cloned());
+        let empty_lines = HashMap::new();
+        let current_line_maps = std::slice::from_ref(&aggregate.current_lines);
+        let mut files = Vec::new();
+        for path in paths {
+            let baseline_file = baseline_files.get(&path);
+            let current_file = current_files.get(&path);
+            let current_file_values = aggregate
+                .current_file_maps
+                .iter()
+                .filter_map(|files| files.get(&path))
+                .collect::<Vec<_>>();
+            let line_merge = union_line_metric_many(
+                &path,
+                &empty_lines,
+                current_line_maps,
+                None,
+                &current_file_values,
+            );
+            let branch_merge = union_metric_for_file_many(
+                &path,
+                baseline
+                    .get("repo_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "branches",
+                None,
+                &current_file_values,
+            )?;
+            let function_merge = union_metric_for_file_many(
+                &path,
+                baseline
+                    .get("repo_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "functions",
+                None,
+                &current_file_values,
+            )?;
+            let region_merge = union_metric_for_file_many(
+                &path,
+                baseline
+                    .get("repo_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "regions",
+                None,
+                &current_file_values,
+            )?;
+            files.push(aggregate_file_projection(
+                &path,
+                baseline_file,
+                current_file,
+                line_merge,
+                branch_merge,
+                function_merge,
+                region_merge,
+            ));
+        }
+        files.sort_by(|left, right| {
+            left.get("line_rate_delta")
+                .and_then(Value::as_f64)
+                .partial_cmp(&right.get("line_rate_delta").and_then(Value::as_f64))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.get("file_path")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("file_path").and_then(Value::as_str))
+                })
+        });
+        let file_count = files.len();
+        let files_truncated = file_count > collection_limit(file_limit);
+        files.truncate(collection_limit(file_limit));
+        let metric_deltas = overall_delta(&aggregate.current_summary, baseline)
+            .expect("union current summary and baseline contain complete metrics");
+        let baseline_source = self.detail_source(baseline_snapshot_id)?;
+        let current_source = self.detail_source_many(current_snapshot_ids)?;
+        let test_attribution = self.incremental_test_attribution_many(
+            baseline_snapshot_id,
+            current_snapshot_ids,
+            max_test_ids,
+        )?;
+        Ok(json!({
+            "baseline": baseline,
+            "current": aggregate.current_summary,
+            "current_snapshot_ids": current_snapshot_ids,
+            "overall": metric_deltas.clone(),
+            "metric_deltas": metric_deltas,
+            "files": files,
+            "files_truncated": files_truncated,
+            "changed_lines": changed_lines,
+            "changed_lines_truncated": changed_lines_truncated,
+            "regions": regions,
+            "regions_truncated": regions_truncated,
+            "coverage_gain": coverage_gain,
+            "test_attribution": test_attribution,
+            "detail_source": {"baseline": baseline_source, "current": current_source},
+        }))
+    }
+
     /// Compares named test observations carried by the child snapshots of two
     /// composite snapshots. Composite evidence without named child observations
     /// is reported as unavailable rather than inferred from command identity.
@@ -2483,6 +3184,15 @@ impl CoverageStore {
         })
     }
 
+    fn detail_source_many(&self, snapshot_ids: &[&str]) -> AppResult<&'static str> {
+        for snapshot_id in snapshot_ids {
+            if self.detail_source(snapshot_id)? == "compacted_payload" {
+                return Ok("compacted_payload");
+            }
+        }
+        Ok("relational")
+    }
+
     fn incremental_test_attribution(
         &self,
         baseline_snapshot_id: &str,
@@ -2501,44 +3211,36 @@ impl CoverageStore {
                 "max_test_ids": max_test_ids,
             }));
         };
-        let mut test_ids = baseline
-            .keys()
-            .chain(current.keys())
-            .cloned()
-            .collect::<Vec<_>>();
-        test_ids.sort();
-        test_ids.dedup();
-        let mut affected = Vec::new();
-        for test_id in test_ids {
-            let before = baseline.get(&test_id).cloned().unwrap_or_default();
-            let after = current.get(&test_id).cloned().unwrap_or_default();
-            if before == after {
-                continue;
+        Ok(incremental_test_attribution_from_sets(
+            &baseline,
+            &current,
+            max_test_ids,
+        ))
+    }
+
+    fn incremental_test_attribution_many(
+        &self,
+        baseline_snapshot_id: &str,
+        current_snapshot_ids: &[&str],
+        max_test_ids: usize,
+    ) -> AppResult<Value> {
+        let Some(baseline) = self.test_observation_sets(baseline_snapshot_id)? else {
+            return Ok(unavailable_incremental_test_attribution(max_test_ids));
+        };
+        let mut current = TestObservationSets::new();
+        for snapshot_id in current_snapshot_ids {
+            let Some(snapshot) = self.test_observation_sets(snapshot_id)? else {
+                return Ok(unavailable_incremental_test_attribution(max_test_ids));
+            };
+            for (test_id, observations) in snapshot {
+                current.entry(test_id).or_default().extend(observations);
             }
-            let mut added = after.difference(&before).cloned().collect::<Vec<_>>();
-            let mut removed = before.difference(&after).cloned().collect::<Vec<_>>();
-            let observations_truncated = added.len() > 50 || removed.len() > 50;
-            added.truncate(50);
-            removed.truncate(50);
-            affected.push(json!({
-                "test_id": test_id,
-                "baseline_observation_count": before.len(),
-                "current_observation_count": after.len(),
-                "added": added.into_iter().map(test_observation_value).collect::<Vec<_>>(),
-                "removed": removed.into_iter().map(test_observation_value).collect::<Vec<_>>(),
-                "observations_truncated": observations_truncated,
-            }));
         }
-        let affected_test_count = affected.len();
-        let tests_truncated = affected.len() > max_test_ids;
-        affected.truncate(max_test_ids);
-        Ok(json!({
-            "status": "measured",
-            "affected_test_count": affected_test_count,
-            "affected_tests": affected,
-            "tests_truncated": tests_truncated,
-            "max_test_ids": max_test_ids,
-        }))
+        Ok(incremental_test_attribution_from_sets(
+            &baseline,
+            &current,
+            max_test_ids,
+        ))
     }
 
     fn test_observation_sets(&self, snapshot_id: &str) -> AppResult<Option<TestObservationSets>> {
@@ -5935,6 +6637,84 @@ fn changed_line_regions(lines: &[Value], limit: usize) -> Vec<Value> {
     regions
 }
 
+fn changed_line_values_from_maps(
+    before: &HashMap<(String, i64), Value>,
+    after: &HashMap<(String, i64), Value>,
+    file_path: Option<&str>,
+) -> Vec<Value> {
+    let mut keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    let mut values = Vec::new();
+    for (path, number) in keys {
+        if file_path.is_some_and(|wanted| wanted != path) {
+            continue;
+        }
+        let left = before.get(&(path.clone(), number));
+        let right = after.get(&(path.clone(), number));
+        let left_covered = left.map(|value| line_bool(value, "covered"));
+        let right_covered = right.map(|value| line_bool(value, "covered"));
+        let left_hits = left.map(|value| file_metric(Some(value), "hits"));
+        let right_hits = right.map(|value| file_metric(Some(value), "hits"));
+        let left_branches = left.map(|value| file_metric(Some(value), "covered_branches"));
+        let right_branches = right.map(|value| file_metric(Some(value), "covered_branches"));
+        let left_total_branches = left.map(|value| file_metric(Some(value), "total_branches"));
+        let right_total_branches = right.map(|value| file_metric(Some(value), "total_branches"));
+        if left_covered == right_covered
+            && left_hits == right_hits
+            && left_branches == right_branches
+            && left_total_branches == right_total_branches
+        {
+            continue;
+        }
+        let branch_gap = |covered: Option<i64>, total: Option<i64>| {
+            total.zip(covered).map(|(total, covered)| total - covered)
+        };
+        let branch_regressed = branch_gap(right_branches, right_total_branches)
+            .zip(branch_gap(left_branches, left_total_branches))
+            .is_some_and(|(current, baseline)| current > baseline);
+        let branch_improved = branch_gap(right_branches, right_total_branches)
+            .zip(branch_gap(left_branches, left_total_branches))
+            .is_some_and(|(current, baseline)| current < baseline);
+        let status = if left.is_none() {
+            "new"
+        } else if right.is_none() {
+            "removed"
+        } else if left_covered == Some(true) && right_covered == Some(false) {
+            "regressed"
+        } else if left_covered == Some(false) && right_covered == Some(true) {
+            "improved"
+        } else if branch_regressed {
+            "regressed"
+        } else if branch_improved {
+            "improved"
+        } else {
+            "changed"
+        };
+        let mut value = json!({
+            "file_path": path,
+            "line_number": number,
+            "baseline_covered": left.map(|value| json!(line_bool(value, "covered"))).unwrap_or(Value::Null),
+            "current_covered": right.map(|value| json!(line_bool(value, "covered"))).unwrap_or(Value::Null),
+            "baseline_hits": left.map(|value| json!(file_metric(Some(value), "hits"))).unwrap_or(Value::Null),
+            "current_hits": right.map(|value| json!(file_metric(Some(value), "hits"))).unwrap_or(Value::Null),
+            "baseline_total_branches": left.map(|value| json!(file_metric(Some(value), "total_branches"))).unwrap_or(Value::Null),
+            "current_total_branches": right.map(|value| json!(file_metric(Some(value), "total_branches"))).unwrap_or(Value::Null),
+            "baseline_covered_branches": left.map(|value| json!(file_metric(Some(value), "covered_branches"))).unwrap_or(Value::Null),
+            "current_covered_branches": right.map(|value| json!(file_metric(Some(value), "covered_branches"))).unwrap_or(Value::Null),
+            "status": status,
+        });
+        let category = incremental_line_category(&value);
+        value["category"] = json!(category);
+        values.push(value);
+    }
+    values
+}
+
 fn incremental_line_category(line: &Value) -> &'static str {
     let baseline_covered = line.get("baseline_covered").and_then(Value::as_bool);
     let current_covered = line.get("current_covered").and_then(Value::as_bool);
@@ -5982,6 +6762,62 @@ fn branch_gap(line: &Value, prefix: &str) -> Option<i64> {
         .get(format!("{prefix}_covered_branches"))
         .and_then(Value::as_i64);
     total.and_then(|total| covered.and_then(|covered| total.checked_sub(covered)))
+}
+
+fn unavailable_incremental_test_attribution(max_test_ids: usize) -> Value {
+    json!({
+        "status": "unavailable",
+        "reason": "both snapshots need named test observations; LCOV TN records currently provide them",
+        "affected_test_count": 0,
+        "affected_tests": [],
+        "tests_truncated": false,
+        "max_test_ids": max_test_ids,
+    })
+}
+
+fn incremental_test_attribution_from_sets(
+    baseline: &TestObservationSets,
+    current: &TestObservationSets,
+    max_test_ids: usize,
+) -> Value {
+    let mut test_ids = baseline
+        .keys()
+        .chain(current.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    test_ids.sort();
+    test_ids.dedup();
+    let mut affected = Vec::new();
+    for test_id in test_ids {
+        let before = baseline.get(&test_id).cloned().unwrap_or_default();
+        let after = current.get(&test_id).cloned().unwrap_or_default();
+        if before == after {
+            continue;
+        }
+        let mut added = after.difference(&before).cloned().collect::<Vec<_>>();
+        let mut removed = before.difference(&after).cloned().collect::<Vec<_>>();
+        let observations_truncated = added.len() > 50 || removed.len() > 50;
+        added.truncate(50);
+        removed.truncate(50);
+        affected.push(json!({
+            "test_id": test_id,
+            "baseline_observation_count": before.len(),
+            "current_observation_count": after.len(),
+            "added": added.into_iter().map(test_observation_value).collect::<Vec<_>>(),
+            "removed": removed.into_iter().map(test_observation_value).collect::<Vec<_>>(),
+            "observations_truncated": observations_truncated,
+        }));
+    }
+    let affected_test_count = affected.len();
+    let tests_truncated = affected.len() > max_test_ids;
+    affected.truncate(max_test_ids);
+    json!({
+        "status": "measured",
+        "affected_test_count": affected_test_count,
+        "affected_tests": affected,
+        "tests_truncated": tests_truncated,
+        "max_test_ids": max_test_ids,
+    })
 }
 
 fn test_observation_value(observation: (String, String, i64, String)) -> Value {
@@ -8164,6 +9000,607 @@ fn overall_delta(current: &Value, baseline: &Value) -> AppResult<Value> {
         "covered_regions_delta": count_delta("covered_regions")?,
         "total_regions_delta": count_delta("total_regions")?,
     }))
+}
+
+#[derive(Clone, Copy)]
+struct MetricMerge {
+    total: i64,
+    covered: i64,
+    newly_covered: i64,
+    exact: bool,
+}
+
+impl Default for MetricMerge {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            covered: 0,
+            newly_covered: 0,
+            exact: true,
+        }
+    }
+}
+
+impl MetricMerge {
+    fn add(&mut self, other: Self) {
+        self.total = self.total.saturating_add(other.total);
+        self.covered = self.covered.saturating_add(other.covered);
+        self.newly_covered = self.newly_covered.saturating_add(other.newly_covered);
+        self.exact &= other.exact;
+    }
+}
+
+#[derive(Default)]
+struct CoverageUnitSet {
+    total: BTreeSet<String>,
+    covered: BTreeSet<String>,
+}
+
+struct UnionSnapshotDetail {
+    summary: Value,
+    current_summary: Value,
+    files: Vec<Value>,
+    current_files: Vec<Value>,
+    current_file_maps: Vec<BTreeMap<String, Value>>,
+    file_count: usize,
+    newly_covered_lines: Vec<Value>,
+    newly_covered_regions: Vec<Value>,
+    coverage_gain: Value,
+    baseline_lines: HashMap<(String, i64), Value>,
+    current_lines: HashMap<(String, i64), Value>,
+}
+
+struct MergedCurrentFile {
+    value: Value,
+    branches: MetricMerge,
+    functions: MetricMerge,
+    regions: MetricMerge,
+}
+
+fn files_by_path(files: Vec<Value>) -> BTreeMap<String, Value> {
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let path = file.get("file_path")?.as_str()?.to_owned();
+            Some((path, file))
+        })
+        .collect()
+}
+
+fn merge_line_maps(maps: &[HashMap<(String, i64), Value>]) -> HashMap<(String, i64), Value> {
+    let mut merged = HashMap::new();
+    for map in maps {
+        for (key, line) in map {
+            let Some(existing) = merged.get_mut(key) else {
+                merged.insert(key.clone(), line.clone());
+                continue;
+            };
+            let Some(existing) = existing.as_object_mut() else {
+                continue;
+            };
+            let Some(line) = line.as_object() else {
+                continue;
+            };
+            for metric in [
+                "hits",
+                "total_branches",
+                "covered_branches",
+                "total_functions",
+                "covered_functions",
+            ] {
+                let current = existing
+                    .get(metric)
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let candidate = line.get(metric).and_then(Value::as_i64).unwrap_or_default();
+                existing.insert(metric.to_owned(), json!(current.max(candidate)));
+            }
+            for flag in ["covered", "count_line"] {
+                let current = existing.get(flag).and_then(Value::as_bool).unwrap_or(false);
+                let candidate = line.get(flag).and_then(Value::as_bool).unwrap_or(false);
+                existing.insert(flag.to_owned(), json!(current || candidate));
+            }
+        }
+    }
+    merged
+}
+
+fn file_metric(file: Option<&Value>, key: &str) -> i64 {
+    file.and_then(|value| value.get(key))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn file_rate_value(file: Option<&Value>, key: &str) -> Option<f64> {
+    file.and_then(|value| value.get(key))
+        .and_then(Value::as_f64)
+}
+
+fn line_bool(value: &Value, key: &str) -> bool {
+    value.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn union_line_metric_many(
+    path: &str,
+    baseline_lines: &HashMap<(String, i64), Value>,
+    current_lines: &[HashMap<(String, i64), Value>],
+    baseline_file: Option<&Value>,
+    current_files: &[&Value],
+) -> MetricMerge {
+    let mut keys = BTreeSet::new();
+    keys.extend(
+        baseline_lines
+            .keys()
+            .filter(|(file, _)| file == path)
+            .cloned(),
+    );
+    for lines in current_lines {
+        keys.extend(lines.keys().filter(|(file, _)| file == path).cloned());
+    }
+    let mut merge = MetricMerge::default();
+    let mut has_counted_line = false;
+    for key in keys {
+        let before = baseline_lines.get(&key);
+        let count_line = before.is_some_and(|value| line_bool(value, "count_line"))
+            || current_lines.iter().any(|lines| {
+                lines
+                    .get(&key)
+                    .is_some_and(|value| line_bool(value, "count_line"))
+            });
+        if !count_line {
+            continue;
+        }
+        has_counted_line = true;
+        merge.total += 1;
+        let before_covered = before.is_some_and(|value| line_bool(value, "covered"));
+        let after_covered = current_lines.iter().any(|lines| {
+            lines
+                .get(&key)
+                .is_some_and(|value| line_bool(value, "covered"))
+        });
+        merge.covered += i64::from(before_covered || after_covered);
+        merge.newly_covered += i64::from(after_covered && !before_covered);
+    }
+    if has_counted_line {
+        return merge;
+    }
+    let baseline_total = file_metric(baseline_file, "total_lines");
+    let current_total = current_files
+        .iter()
+        .map(|file| file_metric(Some(*file), "total_lines"))
+        .max()
+        .unwrap_or(0);
+    merge.total = baseline_total.max(current_total);
+    merge.covered = file_metric(baseline_file, "covered_lines")
+        .max(
+            current_files
+                .iter()
+                .map(|file| file_metric(Some(*file), "covered_lines"))
+                .max()
+                .unwrap_or(0),
+        )
+        .min(merge.total);
+    merge.exact = merge.total == 0;
+    merge
+}
+
+fn union_metric_for_file_many(
+    file_path: &str,
+    repo_path: &str,
+    metric: &str,
+    baseline_file: Option<&Value>,
+    current_files: &[&Value],
+) -> AppResult<MetricMerge> {
+    let total_key = format!("total_{metric}");
+    let covered_key = format!("covered_{metric}");
+    let baseline_total = file_metric(baseline_file, &total_key);
+    let current_total = current_files
+        .iter()
+        .map(|file| file_metric(Some(*file), &total_key))
+        .max()
+        .unwrap_or(0);
+    let baseline_units = coverage_units(file_path, repo_path, baseline_file, metric)?;
+    let current_units = current_files
+        .iter()
+        .map(|file| coverage_units(file_path, repo_path, Some(*file), metric))
+        .collect::<AppResult<Vec<_>>>()?;
+    let baseline_exact = units_match(baseline_units.as_ref(), baseline_total);
+    let current_exact = current_units
+        .iter()
+        .zip(current_files.iter())
+        .all(|(units, file)| units_match(units.as_ref(), file_metric(Some(*file), &total_key)));
+    if baseline_exact && current_exact {
+        let baseline_units = baseline_units.unwrap_or_default();
+        let mut current_total_units = BTreeSet::new();
+        let mut current_covered_units = BTreeSet::new();
+        for units in current_units.into_iter().flatten() {
+            current_total_units.extend(units.total);
+            current_covered_units.extend(units.covered);
+        }
+        let newly_covered = current_covered_units
+            .difference(&baseline_units.covered)
+            .count();
+        let mut total = baseline_units.total;
+        total.extend(current_total_units);
+        let mut covered = baseline_units.covered;
+        covered.extend(current_covered_units);
+        return Ok(MetricMerge {
+            total: total.len() as i64,
+            covered: covered.len() as i64,
+            newly_covered: newly_covered as i64,
+            exact: true,
+        });
+    }
+    let total = baseline_total.max(current_total);
+    Ok(MetricMerge {
+        total,
+        covered: file_metric(baseline_file, &covered_key)
+            .max(
+                current_files
+                    .iter()
+                    .map(|file| file_metric(Some(*file), &covered_key))
+                    .max()
+                    .unwrap_or(0),
+            )
+            .min(total),
+        newly_covered: current_files
+            .iter()
+            .map(|file| file_metric(Some(*file), &covered_key))
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(file_metric(baseline_file, &covered_key)),
+        exact: total == 0,
+    })
+}
+
+fn units_match(units: Option<&CoverageUnitSet>, expected_total: i64) -> bool {
+    match units {
+        Some(units) => units.total.len() as i64 == expected_total,
+        None => expected_total == 0,
+    }
+}
+
+fn coverage_units(
+    file_path: &str,
+    repo_path: &str,
+    file: Option<&Value>,
+    metric: &str,
+) -> AppResult<Option<CoverageUnitSet>> {
+    let Some(file) = file else {
+        return Ok(Some(CoverageUnitSet::default()));
+    };
+    let Some(raw) = file.get("raw_metrics").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    if metric == "branches" {
+        if let Some(branches) = raw.get("llvm_branches") {
+            return Ok(Some(llvm_file_branch_units(branches)?));
+        }
+    }
+    if let Some(functions) = raw.get("llvm_functions") {
+        return Ok(Some(llvm_function_units(
+            file_path, repo_path, functions, metric,
+        )?));
+    }
+    Ok(None)
+}
+
+fn llvm_function_units(
+    file_path: &str,
+    repo_path: &str,
+    functions: &Value,
+    metric: &str,
+) -> AppResult<CoverageUnitSet> {
+    let functions = functions
+        .as_array()
+        .ok_or_else(|| AppError::Runtime("LLVM function metrics must be an array".to_owned()))?;
+    let mut units = CoverageUnitSet::default();
+    for function in functions {
+        let object = function.as_object().ok_or_else(|| {
+            AppError::Runtime("LLVM function metrics must contain objects".to_owned())
+        })?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AppError::Runtime("LLVM function metrics are missing name".to_owned())
+            })?;
+        if metric == "functions" {
+            let key = format!("llvm:function:{name}");
+            units.total.insert(key.clone());
+            if required_llvm_i64(object.get("count"), "LLVM function execution count")? > 0 {
+                units.covered.insert(key);
+            }
+            continue;
+        }
+        let filenames = object
+            .get("filenames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::Runtime("LLVM function metrics are missing filenames".to_owned())
+            })?;
+        let file_index = filenames
+            .iter()
+            .enumerate()
+            .find_map(|(index, filename)| {
+                let filename = filename.as_str()?;
+                let normalized = normalize_report_path(filename, Some(repo_path));
+                (normalized == file_path || filename == file_path).then_some(index)
+            })
+            .unwrap_or(0);
+        let entries_key = if metric == "regions" {
+            "regions"
+        } else if metric == "branches" {
+            "branches"
+        } else {
+            continue;
+        };
+        let Some(entries) = object.get(entries_key) else {
+            continue;
+        };
+        let entries = entries.as_array().ok_or_else(|| {
+            AppError::Runtime(format!("LLVM function {entries_key} must be an array"))
+        })?;
+        for (index, entry) in entries.iter().enumerate() {
+            let kind = if metric == "regions" {
+                "region"
+            } else {
+                "branch"
+            };
+            let values = llvm_function_region_values(entry, kind)?;
+            let file_id_index = if metric == "regions" { 5 } else { 6 };
+            if required_llvm_i64(values.get(file_id_index), "LLVM coverage file id")?
+                != file_index as i64
+            {
+                continue;
+            }
+            if metric == "regions" {
+                let key = format!(
+                    "llvm:{name}:region:{index}:{}:{}:{}:{}:{}",
+                    required_llvm_i64(values.first(), "LLVM range start line")?,
+                    required_llvm_i64(values.get(1), "LLVM range start column")?,
+                    required_llvm_i64(values.get(2), "LLVM range end line")?,
+                    required_llvm_i64(values.get(3), "LLVM range end column")?,
+                    required_llvm_i64(values.get(7), "LLVM region kind")?,
+                );
+                units.total.insert(key.clone());
+                if required_llvm_i64(values.get(4), "LLVM region execution count")? > 0 {
+                    units.covered.insert(key);
+                }
+            } else {
+                let prefix = format!(
+                    "llvm:{name}:branch:{index}:{}:{}:{}:{}",
+                    required_llvm_i64(values.first(), "LLVM branch start line")?,
+                    required_llvm_i64(values.get(1), "LLVM branch start column")?,
+                    required_llvm_i64(values.get(2), "LLVM branch end line")?,
+                    required_llvm_i64(values.get(3), "LLVM branch end column")?,
+                );
+                for (arm, offset) in [("true", 4_usize), ("false", 5_usize)] {
+                    let key = format!("{prefix}:{arm}");
+                    units.total.insert(key.clone());
+                    if required_llvm_i64(values.get(offset), "LLVM branch execution count")? > 0 {
+                        units.covered.insert(key);
+                    }
+                }
+            }
+        }
+    }
+    Ok(units)
+}
+
+fn llvm_file_branch_units(value: &Value) -> AppResult<CoverageUnitSet> {
+    let branches = value
+        .as_array()
+        .ok_or_else(|| AppError::Runtime("LLVM file branches must be an array".to_owned()))?;
+    let mut units = CoverageUnitSet::default();
+    for (index, branch) in branches.iter().enumerate() {
+        let object = branch.as_object().ok_or_else(|| {
+            AppError::Runtime("LLVM file branch metrics must be objects".to_owned())
+        })?;
+        let true_hits = required_llvm_i64(object.get("true_hits"), "LLVM true branch count")?;
+        let false_hits = required_llvm_i64(object.get("false_hits"), "LLVM false branch count")?;
+        for (arm, hits) in [("true", true_hits), ("false", false_hits)] {
+            let key = format!("llvm:file-branch:{index}:{arm}");
+            units.total.insert(key.clone());
+            if hits > 0 {
+                units.covered.insert(key);
+            }
+        }
+    }
+    Ok(units)
+}
+
+fn merged_current_file(
+    path: &str,
+    repo_path: &str,
+    current_files: &[&Value],
+    current_lines: &[HashMap<(String, i64), Value>],
+) -> AppResult<Option<MergedCurrentFile>> {
+    let has_lines = current_lines.iter().any(|lines| {
+        lines
+            .keys()
+            .any(|(file_path, _)| file_path.as_str() == path)
+    });
+    if current_files.is_empty() && !has_lines {
+        return Ok(None);
+    }
+    let empty_lines = HashMap::new();
+    let lines = union_line_metric_many(path, &empty_lines, current_lines, None, current_files);
+    let branches = union_metric_for_file_many(path, repo_path, "branches", None, current_files)?;
+    let functions = union_metric_for_file_many(path, repo_path, "functions", None, current_files)?;
+    let regions = union_metric_for_file_many(path, repo_path, "regions", None, current_files)?;
+    let mut value = json!({
+        "file_path": path,
+        "total_lines": lines.total,
+        "covered_lines": lines.covered,
+        "line_rate": rate(lines.covered, lines.total),
+        "total_branches": branches.total,
+        "covered_branches": branches.covered,
+        "branch_rate": rate(branches.covered, branches.total),
+        "total_functions": functions.total,
+        "covered_functions": functions.covered,
+        "function_rate": rate(functions.covered, functions.total),
+        "total_regions": regions.total,
+        "covered_regions": regions.covered,
+        "region_rate": rate(regions.covered, regions.total),
+    });
+    if let Some(raw_metrics) = current_files
+        .iter()
+        .find_map(|file| file.get("raw_metrics"))
+    {
+        value["raw_metrics"] = raw_metrics.clone();
+    }
+    Ok(Some(MergedCurrentFile {
+        value,
+        branches,
+        functions,
+        regions,
+    }))
+}
+
+fn aggregate_file_projection(
+    path: &str,
+    baseline_file: Option<&Value>,
+    current_file: Option<&Value>,
+    lines: MetricMerge,
+    branches: MetricMerge,
+    functions: MetricMerge,
+    regions: MetricMerge,
+) -> Value {
+    let mut value = json!({
+        "file_path": path,
+        "total_lines": lines.total,
+        "covered_lines": lines.covered,
+        "line_rate": rate(lines.covered, lines.total),
+        "total_branches": branches.total,
+        "covered_branches": branches.covered,
+        "branch_rate": rate(branches.covered, branches.total),
+        "total_functions": functions.total,
+        "covered_functions": functions.covered,
+        "function_rate": rate(functions.covered, functions.total),
+        "total_regions": regions.total,
+        "covered_regions": regions.covered,
+        "region_rate": rate(regions.covered, regions.total),
+        "aggregate_total_lines": lines.total,
+        "aggregate_covered_lines": lines.covered,
+        "aggregate_line_rate": rate(lines.covered, lines.total),
+        "aggregate_total_branches": branches.total,
+        "aggregate_covered_branches": branches.covered,
+        "aggregate_branch_rate": rate(branches.covered, branches.total),
+        "aggregate_total_functions": functions.total,
+        "aggregate_covered_functions": functions.covered,
+        "aggregate_function_rate": rate(functions.covered, functions.total),
+        "aggregate_total_regions": regions.total,
+        "aggregate_covered_regions": regions.covered,
+        "aggregate_region_rate": rate(regions.covered, regions.total),
+    });
+    for (metric, rate_key) in [
+        ("lines", "line_rate"),
+        ("branches", "branch_rate"),
+        ("functions", "function_rate"),
+        ("regions", "region_rate"),
+    ] {
+        let total_key = format!("total_{metric}");
+        let covered_key = format!("covered_{metric}");
+        let baseline_rate = file_rate_value(baseline_file, rate_key);
+        let current_rate = file_rate_value(current_file, rate_key);
+        value[format!("baseline_{total_key}")] = json!(file_metric(baseline_file, &total_key));
+        value[format!("current_{total_key}")] = json!(file_metric(current_file, &total_key));
+        value[format!("baseline_{covered_key}")] = json!(file_metric(baseline_file, &covered_key));
+        value[format!("current_{covered_key}")] = json!(file_metric(current_file, &covered_key));
+        value[format!("baseline_{rate_key}")] =
+            baseline_rate.map_or(Value::Null, |value| json!(value));
+        value[format!("current_{rate_key}")] =
+            current_rate.map_or(Value::Null, |value| json!(value));
+        let aggregate_rate = value
+            .get(format!("aggregate_{rate_key}"))
+            .and_then(Value::as_f64);
+        value[format!("{rate_key}_delta")] = match (aggregate_rate, baseline_rate) {
+            (Some(current), Some(baseline)) => json!(current - baseline),
+            _ => Value::Null,
+        };
+    }
+    value
+}
+
+fn grouped_incremental_lines(numbers: &BTreeMap<String, Vec<i64>>) -> Vec<Value> {
+    let mut regions = Vec::new();
+    for (path, values) in numbers {
+        for region in line_regions(values) {
+            regions.push(json!({
+                "file_path": path,
+                "category": "newly_covered",
+                "status": "newly_covered",
+                "start": region["start"],
+                "end": region["end"],
+                "line_count": region["line_count"],
+            }));
+        }
+    }
+    regions
+}
+
+fn annotate_incremental_diff_scope(value: &mut Value, scope: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("comparison_mode".to_owned(), json!("snapshot_diff"));
+    object.insert(
+        "measurement_scope".to_owned(),
+        json!({
+            "kind": scope,
+            "complete": scope == "complete_snapshot",
+        }),
+    );
+    object.insert(
+        "regressions_valid".to_owned(),
+        json!(scope == "complete_snapshot"),
+    );
+    if scope != "selected_subset" {
+        object.insert("claim_status".to_owned(), json!("supported"));
+        return;
+    }
+    let scope_absence = object.get("coverage_gain").map_or(0, |value| {
+        value.get("regressed").and_then(Value::as_i64).unwrap_or(0)
+            + value.get("removed").and_then(Value::as_i64).unwrap_or(0)
+    });
+    if let Some(gain) = object
+        .get_mut("coverage_gain")
+        .and_then(Value::as_object_mut)
+    {
+        gain.insert("not_observed".to_owned(), json!(scope_absence));
+        gain.insert("regressed".to_owned(), json!(0));
+        gain.insert("removed".to_owned(), json!(0));
+    }
+    object.insert("claim_status".to_owned(), json!("limited"));
+    if let Some(lines) = object
+        .get_mut("changed_lines")
+        .and_then(Value::as_array_mut)
+    {
+        for line in lines {
+            relabel_scope_absence(line);
+        }
+    }
+    if let Some(regions) = object.get_mut("regions").and_then(Value::as_array_mut) {
+        for region in regions {
+            relabel_scope_absence(region);
+        }
+    }
+}
+
+fn relabel_scope_absence(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for key in ["category", "status"] {
+        if matches!(
+            object.get(key).and_then(Value::as_str),
+            Some("regressed" | "removed")
+        ) {
+            object.insert(key.to_owned(), json!("not_observed"));
+        }
+    }
 }
 
 fn line_regions(numbers: &[i64]) -> Vec<Value> {
@@ -17169,6 +18606,24 @@ mod tests {
         assert_eq!(comparison["test_attribution"]["affected_test_count"], 2);
         assert_eq!(comparison["baseline"]["suite"], "full-suite");
         assert_eq!(comparison["current"]["suite"], "case-suite");
+        let union = store
+            .incremental_union_compare(current_id, baseline_id, None, 10, 100, 10)
+            .unwrap();
+        assert_eq!(union["comparison_mode"], "additive_union");
+        assert_eq!(union["measurement_scope"]["kind"], "selected_subset");
+        assert_eq!(union["aggregate"]["total_lines"], 6);
+        assert_eq!(union["aggregate"]["covered_lines"], 6);
+        assert_eq!(union["aggregate"]["line_rate"], 1.0);
+        assert_eq!(union["metric_deltas"]["covered_lines_delta"], 3);
+        assert_eq!(union["coverage_gain"]["newly_covered"], 3);
+        assert_eq!(union["coverage_gain"]["not_observed"], 2);
+        assert_eq!(union["coverage_gain"]["regressed"], 0);
+        assert_eq!(union["coverage_gain"]["removed"], 0);
+        assert_eq!(union["diff"]["claim_status"], "limited");
+        assert_eq!(union["diff"]["coverage_gain"]["not_observed"], 2);
+        assert_eq!(union["diff"]["coverage_gain"]["regressed"], 0);
+        assert_eq!(union["diff"]["coverage_gain"]["removed"], 0);
+        assert_eq!(union["regions"].as_array().unwrap().len(), 2);
         let unchanged_attribution = store
             .incremental_test_attribution(baseline_id, baseline_id, 10)
             .unwrap();
@@ -17193,6 +18648,11 @@ mod tests {
             compacted["test_attribution"],
             comparison["test_attribution"]
         );
+        let compacted_union = store
+            .incremental_union_compare(current_id, baseline_id, None, 10, 100, 10)
+            .unwrap();
+        assert_eq!(compacted_union["aggregate"]["covered_lines"], 6);
+        assert_eq!(compacted_union["coverage_gain"]["newly_covered"], 3);
         let inventory = store.compaction_summary().unwrap();
         assert_eq!(inventory["snapshot_count"], 2);
         assert_eq!(inventory["compacted_snapshot_count"], 1);
@@ -17354,6 +18814,849 @@ mod tests {
                 .is_err()
         );
         store.close().unwrap();
+    }
+
+    #[test]
+    fn incremental_union_merges_multiple_ordinary_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let baseline_path = directory.path().join("baseline.lcov");
+        std::fs::write(
+            &baseline_path,
+            "TN:base\nSF:src/a.py\nDA:1,1\nDA:2,0\nend_of_record\nTN:base\nSF:src/old.py\nDA:1,0\nend_of_record\n",
+        )
+        .unwrap();
+        let first_path = directory.path().join("first.lcov");
+        std::fs::write(
+            &first_path,
+            "TN:first\nSF:src/a.py\nDA:1,0\nDA:2,1\nend_of_record\n",
+        )
+        .unwrap();
+        let second_path = directory.path().join("second.lcov");
+        std::fs::write(
+            &second_path,
+            "TN:second\nSF:src/a.py\nDA:1,0\nDA:3,1\nend_of_record\nTN:second\nSF:src/b.py\nDA:1,1\nend_of_record\nTN:second\nSF:src/c.py\nDA:1,0\nend_of_record\n",
+        )
+        .unwrap();
+        let store =
+            CoverageStore::open(directory.path().join("multi.duckdb"), test_config()).unwrap();
+        store.ensure_project(directory.path()).unwrap();
+        let baseline = store
+            .ingest_report(
+                &baseline_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "full-suite",
+            )
+            .unwrap();
+        let first = store
+            .ingest_report(
+                &first_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "case-one",
+            )
+            .unwrap();
+        let second = store
+            .ingest_report(
+                &second_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "case-two",
+            )
+            .unwrap();
+        let baseline_id = baseline["id"].as_str().unwrap();
+        let first_id = first["id"].as_str().unwrap();
+        let second_id = second["id"].as_str().unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE files SET total_branches = 2, covered_branches = 1, total_functions = 1, covered_functions = 0, total_regions = 1, covered_regions = 0 WHERE snapshot_id IN ('{baseline_id}', '{first_id}', '{second_id}')"
+            ))
+            .unwrap();
+        for snapshot_id in [baseline_id, first_id, second_id] {
+            store
+                .execute_sql_for_test(&format!(
+                    "INSERT INTO files (snapshot_id, file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics) VALUES ('{snapshot_id}', 'src/summary.py', 1, 0, 0, 0, 0, 0, 0, 0, 0.0, NULL, NULL, NULL, '{{}}')"
+                ))
+                .unwrap();
+        }
+        let set_file_raw = |snapshot_id: &str, file_path: &str, raw_metrics: Value| {
+            let raw_metrics = serde_json::to_string(&raw_metrics)
+                .unwrap()
+                .replace('\'', "''");
+            store.execute_sql_for_test(&format!(
+                "UPDATE files SET raw_metrics = '{raw_metrics}' WHERE snapshot_id = '{snapshot_id}' AND file_path = '{file_path}'"
+            ))
+        };
+        set_file_raw(first_id, "src/a.py", json!({"llvm_functions": {}})).unwrap();
+        assert!(
+            store
+                .incremental_union_compare_many_with_scope(
+                    &[first_id, second_id],
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                    "selected_subset",
+                )
+                .is_err()
+        );
+        set_file_raw(first_id, "src/a.py", json!({})).unwrap();
+        for raw_metrics in [
+            json!({"llvm_functions": {}}),
+            json!({"llvm_branches": [], "llvm_functions": {}}),
+            json!({
+                "llvm_branches": [],
+                "llvm_functions": [{
+                    "name": "bad",
+                    "count": 1,
+                    "filenames": ["src/old.py"],
+                    "regions": {}
+                }]
+            }),
+        ] {
+            set_file_raw(baseline_id, "src/old.py", raw_metrics).unwrap();
+            assert!(
+                store
+                    .incremental_union_compare_many_with_scope(
+                        &[first_id, second_id],
+                        baseline_id,
+                        None,
+                        10,
+                        100,
+                        10,
+                        "selected_subset",
+                    )
+                    .is_err()
+            );
+            set_file_raw(baseline_id, "src/old.py", json!({})).unwrap();
+        }
+        assert!(
+            store
+                .incremental_union_compare_many_with_scope(
+                    &[],
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                    "selected_subset",
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .incremental_union_compare_many_with_scope(
+                    &[first_id],
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                    "invalid_scope",
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .union_snapshot_detail_many(&baseline, &first, baseline_id, &[], None)
+                .is_err()
+        );
+        let scoped = store
+            .incremental_union_compare_with_scope(
+                first_id,
+                baseline_id,
+                None,
+                10,
+                100,
+                10,
+                "complete_snapshot",
+            )
+            .unwrap();
+        assert_eq!(scoped["measurement_scope"]["complete"], true);
+        let comparison = store
+            .incremental_union_compare_many_with_scope(
+                &[first_id, second_id],
+                baseline_id,
+                None,
+                10,
+                100,
+                10,
+                "selected_subset",
+            )
+            .unwrap();
+        assert_eq!(
+            comparison["current_snapshot_ids"],
+            json!([first_id, second_id])
+        );
+        assert_eq!(comparison["aggregate"]["total_lines"], 7);
+        assert_eq!(comparison["aggregate"]["covered_lines"], 4);
+        assert_eq!(comparison["coverage_gain"]["newly_covered"], 3);
+        assert_eq!(comparison["coverage_gain"]["regressed"], 0);
+        assert_eq!(comparison["diff"]["coverage_gain"]["newly_covered"], 1);
+        assert_eq!(comparison["diff"]["coverage_gain"]["added"], 3);
+        assert_eq!(comparison["diff"]["coverage_gain"]["not_observed"], 2);
+        assert_eq!(comparison["diff"]["coverage_gain"]["removed"], 0);
+        assert_eq!(comparison["files"].as_array().unwrap().len(), 5);
+        assert!(
+            store
+                .incremental_union_compare_many_with_scope(
+                    &[first_id, "missing-current-snapshot"],
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                    "selected_subset",
+                )
+                .is_err()
+        );
+        for successful_queries in 0..=60 {
+            store.inject_query_fault_after(successful_queries);
+            let _ = store.incremental_union_compare_many_with_scope(
+                &[first_id, second_id],
+                baseline_id,
+                None,
+                10,
+                100,
+                10,
+                "selected_subset",
+            );
+            store.clear_query_fault();
+        }
+        let filtered = store
+            .incremental_union_compare_many_with_scope(
+                &[first_id, second_id],
+                baseline_id,
+                Some("src/does-not-exist.py"),
+                10,
+                100,
+                10,
+                "selected_subset",
+            )
+            .unwrap();
+        assert!(filtered["changed_lines"].as_array().unwrap().is_empty());
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE snapshots SET repo_key = 'other-repository' WHERE id = '{second_id}'"
+            ))
+            .unwrap();
+        assert!(
+            store
+                .incremental_union_compare_many_with_scope(
+                    &[first_id, second_id],
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                    "selected_subset",
+                )
+                .is_err()
+        );
+        let repo_key = baseline["repo_key"].as_str().unwrap();
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE snapshots SET repo_key = '{repo_key}', format = 'llvm' WHERE id = '{second_id}'"
+            ))
+            .unwrap();
+        assert!(
+            store
+                .incremental_union_compare_many_with_scope(
+                    &[first_id, second_id],
+                    baseline_id,
+                    None,
+                    10,
+                    100,
+                    10,
+                    "selected_subset",
+                )
+                .is_err()
+        );
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE snapshots SET format = 'lcov' WHERE id = '{second_id}'"
+            ))
+            .unwrap();
+        stop_compaction_worker(&store);
+        store
+            .compact_snapshot_detail(store.project().unwrap().repo_key.as_str(), first_id)
+            .unwrap();
+        let compacted_multi = store
+            .incremental_union_compare_many_with_scope(
+                &[first_id, second_id],
+                baseline_id,
+                None,
+                10,
+                100,
+                10,
+                "selected_subset",
+            )
+            .unwrap();
+        assert_eq!(
+            compacted_multi["detail_source"]["current"],
+            "compacted_payload"
+        );
+        let mut baseline_without_repo = baseline.clone();
+        baseline_without_repo
+            .as_object_mut()
+            .unwrap()
+            .remove("repo_path");
+        assert!(
+            store
+                .union_snapshot_detail_many(
+                    &baseline_without_repo,
+                    &first,
+                    baseline_id,
+                    &[first_id],
+                    None,
+                )
+                .is_ok()
+        );
+        let valid_aggregate = store
+            .union_snapshot_detail_many(
+                &baseline,
+                &first,
+                baseline_id,
+                &[first_id, second_id],
+                None,
+            )
+            .unwrap();
+        for successful_queries in 0..=12 {
+            store.inject_query_fault_after(successful_queries);
+            let _ = store.incremental_diff_for_union(
+                &baseline,
+                &valid_aggregate,
+                baseline_id,
+                &[first_id, second_id],
+                None,
+                10,
+                100,
+                10,
+            );
+            store.clear_query_fault();
+        }
+        for raw_metrics in [
+            json!({"llvm_functions":{}}),
+            json!({"llvm_branches":[],"llvm_functions":{}}),
+            json!({
+                "llvm_branches":[],
+                "llvm_functions":[{
+                    "name":"bad",
+                    "count":1,
+                    "filenames":["src/a.py"],
+                    "regions":{}
+                }]
+            }),
+        ] {
+            let bad_file = json!({"file_path":"src/a.py","raw_metrics":raw_metrics});
+            let bad_aggregate = UnionSnapshotDetail {
+                summary: json!({}),
+                current_summary: json!({}),
+                files: Vec::new(),
+                current_files: vec![bad_file.clone()],
+                current_file_maps: vec![BTreeMap::from([("src/a.py".to_owned(), bad_file)])],
+                file_count: 0,
+                newly_covered_lines: Vec::new(),
+                newly_covered_regions: Vec::new(),
+                coverage_gain: json!({}),
+                baseline_lines: HashMap::new(),
+                current_lines: HashMap::new(),
+            };
+            assert!(
+                store
+                    .incremental_diff_for_union(
+                        &baseline,
+                        &bad_aggregate,
+                        baseline_id,
+                        &[first_id],
+                        None,
+                        10,
+                        100,
+                        10,
+                    )
+                    .is_err()
+            );
+        }
+        let no_named_path = directory.path().join("no-named.lcov");
+        std::fs::write(&no_named_path, "SF:src/a.py\nDA:1,1\nend_of_record\n").unwrap();
+        let no_named = store
+            .ingest_report(
+                &no_named_path,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "case-three",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .incremental_test_attribution_many(
+                    baseline_id,
+                    &[first_id, no_named["id"].as_str().unwrap()],
+                    10,
+                )
+                .unwrap()["status"],
+            "unavailable"
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn incremental_union_identity_helpers_cover_exact_and_fallback_paths() {
+        let key = |path: &str, line: i64| (path.to_owned(), line);
+        let line = |covered: bool, hits: i64, total_branches: i64, covered_branches: i64| {
+            json!({
+                "covered": covered,
+                "hits": hits,
+                "count_line": true,
+                "total_branches": total_branches,
+                "covered_branches": covered_branches,
+            })
+        };
+        let before = HashMap::from([
+            (key("src/a.py", 1), line(true, 1, 0, 0)),
+            (key("src/a.py", 2), line(false, 0, 0, 0)),
+            (key("src/a.py", 3), line(true, 1, 0, 0)),
+            (key("src/a.py", 4), line(false, 0, 2, 1)),
+            (key("src/a.py", 5), line(false, 0, 2, 0)),
+            (key("src/a.py", 6), line(false, 1, 0, 0)),
+            (key("src/z.py", 7), line(false, 0, 0, 0)),
+            (key("src/a.py", 9), line(false, 0, 0, 0)),
+        ]);
+        let after = HashMap::from([
+            (key("src/a.py", 1), line(false, 0, 0, 0)),
+            (key("src/a.py", 2), line(true, 1, 0, 0)),
+            (key("src/a.py", 4), line(false, 0, 2, 0)),
+            (key("src/a.py", 5), line(false, 0, 2, 1)),
+            (key("src/a.py", 6), line(false, 2, 0, 0)),
+            (key("src/a.py", 8), line(true, 1, 0, 0)),
+            (key("src/a.py", 9), line(false, 0, 0, 0)),
+        ]);
+        let changes = changed_line_values_from_maps(&before, &after, Some("src/a.py"));
+        let categories = changes
+            .iter()
+            .filter_map(|value| value.get("category").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        assert!(categories.contains("regressed"));
+        assert!(categories.contains("newly_covered"));
+        assert!(categories.contains("added"));
+        assert!(categories.contains("removed"));
+        assert!(categories.contains("hit_count_only"));
+        assert!(changed_line_values_from_maps(&before, &after, Some("missing.py")).is_empty());
+
+        let merge_key = key("src/a.py", 10);
+        let other_key = key("src/a.py", 11);
+        let mut first_map = HashMap::new();
+        first_map.insert(merge_key.clone(), Value::Null);
+        first_map.insert(
+            other_key.clone(),
+            json!({
+                "hits": 1,
+                "total_branches": 1,
+                "covered_branches": 0,
+                "total_functions": 1,
+                "covered_functions": 0,
+                "covered": false,
+                "count_line": false,
+            }),
+        );
+        let mut second_map = HashMap::new();
+        second_map.insert(
+            merge_key.clone(),
+            json!({"hits": 2, "covered": true, "count_line": true}),
+        );
+        second_map.insert(other_key.clone(), Value::Null);
+        let merged = merge_line_maps(&[first_map, second_map]);
+        assert!(merged[&merge_key].is_null());
+        assert_eq!(merged[&other_key]["hits"], 1);
+        let file_map = files_by_path(vec![
+            json!({}),
+            json!({"file_path": 7}),
+            json!({"file_path": "src/a.c"}),
+        ]);
+        assert_eq!(file_map.len(), 1);
+
+        let no_count = HashMap::from([(
+            key("src/a.py", 1),
+            json!({"covered": true, "hits": 3, "count_line": false}),
+        )]);
+        let line_baseline = json!({"total_lines": 4, "covered_lines": 2});
+        let line_current = json!({"total_lines": 3, "covered_lines": 3});
+        let fallback_line = union_line_metric_many(
+            "src/a.py",
+            &HashMap::new(),
+            std::slice::from_ref(&no_count),
+            Some(&line_baseline),
+            &[&line_current],
+        );
+        assert_eq!(fallback_line.total, 4);
+        assert_eq!(fallback_line.covered, 3);
+        assert!(!fallback_line.exact);
+        let empty_fallback_line = union_line_metric_many(
+            "src/a.py",
+            &HashMap::new(),
+            std::slice::from_ref(&no_count),
+            None,
+            &[],
+        );
+        assert_eq!(empty_fallback_line.total, 0);
+        assert!(empty_fallback_line.exact);
+
+        let function_records = json!([
+            {
+                "name": "demo",
+                "count": 1,
+                "filenames": [7, "src/a.c"],
+                "regions": [
+                    [1, 1, 1, 2, 1, 1, 0, 0],
+                    [2, 1, 2, 2, 0, 0, 0, 0]
+                ],
+                "branches": [[1, 1, 1, 2, 1, 0, 1, 0]]
+            },
+            {"name": "missing_entries", "count": 0, "filenames": ["src/a.c"]}
+        ]);
+        let function_units =
+            llvm_function_units("src/a.c", "/repo", &function_records, "functions").unwrap();
+        assert_eq!(function_units.total.len(), 2);
+        assert_eq!(function_units.covered.len(), 1);
+        let region_units =
+            llvm_function_units("src/a.c", "/repo", &function_records, "regions").unwrap();
+        assert_eq!(region_units.total.len(), 1);
+        assert_eq!(region_units.covered.len(), 1);
+        let branch_units =
+            llvm_function_units("src/a.c", "/repo", &function_records, "branches").unwrap();
+        assert_eq!(branch_units.total.len(), 2);
+        assert_eq!(branch_units.covered.len(), 1);
+        assert!(
+            llvm_function_units("src/a.c", "/repo", &function_records, "lines")
+                .unwrap()
+                .total
+                .is_empty()
+        );
+        assert!(llvm_function_units("src/a.c", "/repo", &json!({}), "functions").is_err());
+        assert!(llvm_function_units("src/a.c", "/repo", &json!([null]), "functions").is_err());
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{"name":"","count":0}]),
+                "functions"
+            )
+            .is_err()
+        );
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{"name":"bad","count":null}]),
+                "functions"
+            )
+            .is_err()
+        );
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{"name":"bad","count":0}]),
+                "regions"
+            )
+            .is_err()
+        );
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{"name":"bad","filenames":["src/a.c"],"regions":[[1]]}]),
+                "regions"
+            )
+            .is_err()
+        );
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{"name":"bad","filenames":["src/a.c"],"regions":[{}]}]),
+                "regions"
+            )
+            .is_err()
+        );
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{"name":"bad","filenames":["src/a.c"],"regions":{}}]),
+                "regions"
+            )
+            .is_err()
+        );
+        assert!(
+            llvm_function_units(
+                "src/a.c",
+                "/repo",
+                &json!([{
+                    "name":"bad",
+                    "filenames":["src/a.c"],
+                    "regions":[[1,1,1,2,1,null,0,0]]
+                }]),
+                "regions"
+            )
+            .is_err()
+        );
+        for index in [0_usize, 1, 2, 3, 4, 7] {
+            let mut values = vec![json!(1); 8];
+            values[5] = json!(0);
+            values[index] = Value::Null;
+            assert!(
+                llvm_function_units(
+                    "src/a.c",
+                    "/repo",
+                    &json!([{
+                        "name":"bad",
+                        "filenames":["src/a.c"],
+                        "regions":[values]
+                    }]),
+                    "regions"
+                )
+                .is_err()
+            );
+        }
+        for index in [0_usize, 1, 2, 3, 4, 5] {
+            let mut values = vec![json!(1); 8];
+            values[6] = json!(0);
+            values[index] = Value::Null;
+            assert!(
+                llvm_function_units(
+                    "src/a.c",
+                    "/repo",
+                    &json!([{
+                        "name":"bad",
+                        "filenames":["src/a.c"],
+                        "branches":[values]
+                    }]),
+                    "branches"
+                )
+                .is_err()
+            );
+        }
+        let backslash_function = json!([{
+            "name":"backslash",
+            "filenames":["src\\a.c"],
+            "regions":[[1,1,1,2,1,0,0,0]]
+        }]);
+        assert_eq!(
+            llvm_function_units("src\\a.c", "/repo", &backslash_function, "regions")
+                .unwrap()
+                .total
+                .len(),
+            1
+        );
+        let file_branch_units =
+            llvm_file_branch_units(&json!([{"true_hits":1,"false_hits":0}])).unwrap();
+        assert_eq!(file_branch_units.total.len(), 2);
+        assert_eq!(file_branch_units.covered.len(), 1);
+        assert!(llvm_file_branch_units(&Value::Null).is_err());
+        assert!(llvm_file_branch_units(&json!([null])).is_err());
+        assert!(llvm_file_branch_units(&json!([{"true_hits":null,"false_hits":0}])).is_err());
+        assert!(llvm_file_branch_units(&json!([{"true_hits":0}])).is_err());
+
+        let baseline_functions = json!([
+            {
+                "name": "demo",
+                "count": 0,
+                "filenames": [7, "src/a.c"],
+                "regions": [[1, 1, 1, 2, 0, 1, 0, 0]],
+                "branches": [[1, 1, 1, 2, 0, 0, 1, 0]]
+            },
+            {"name": "missing_entries", "count": 0, "filenames": ["src/a.c"]}
+        ]);
+        let baseline_file = json!({
+            "file_path":"src/a.c",
+            "total_functions":2,"covered_functions":0,
+            "total_regions":1,"covered_regions":0,
+            "total_branches":2,"covered_branches":0,
+            "raw_metrics":{"llvm_functions":baseline_functions,"llvm_branches":[{"true_hits":0,"false_hits":0}]}
+        });
+        let current_file = json!({
+            "file_path":"src/a.c",
+            "total_functions":2,"covered_functions":1,
+            "total_regions":1,"covered_regions":1,
+            "total_branches":2,"covered_branches":1,
+            "raw_metrics":{"llvm_functions":function_records,"llvm_branches":[{"true_hits":1,"false_hits":0}]}
+        });
+        let current_files = [&current_file];
+        for (metric, expected_total, expected_covered) in
+            [("functions", 2, 1), ("regions", 1, 1), ("branches", 2, 1)]
+        {
+            let merged = union_metric_for_file_many(
+                "src/a.c",
+                "/repo",
+                metric,
+                Some(&baseline_file),
+                &current_files,
+            )
+            .unwrap();
+            assert_eq!(merged.total, expected_total);
+            assert_eq!(merged.covered, expected_covered);
+            assert!(merged.exact);
+        }
+        assert!(
+            coverage_units("src/a.c", "/repo", None, "functions")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            coverage_units(
+                "src/a.c",
+                "/repo",
+                Some(&json!({"raw_metrics":null})),
+                "functions"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            coverage_units(
+                "src/a.c",
+                "/repo",
+                Some(&json!({"raw_metrics":{}})),
+                "functions"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            coverage_units(
+                "src/a.c",
+                "/repo",
+                Some(&json!({"raw_metrics":{"llvm_branches":{}}})),
+                "branches"
+            )
+            .is_err()
+        );
+        assert!(
+            coverage_units(
+                "src/a.c",
+                "/repo",
+                Some(&json!({"raw_metrics":{"llvm_functions":{}}})),
+                "functions"
+            )
+            .is_err()
+        );
+        let fallback_metric = union_metric_for_file_many(
+            "src/a.c",
+            "/repo",
+            "functions",
+            Some(&json!({"total_functions":3,"covered_functions":2})),
+            &[&json!({
+                "total_functions":4,
+                "covered_functions":3,
+                "raw_metrics":{"llvm_functions":[]}
+            })],
+        )
+        .unwrap();
+        assert_eq!(fallback_metric.total, 4);
+        assert_eq!(fallback_metric.covered, 3);
+        assert!(!fallback_metric.exact);
+        assert!(
+            union_metric_for_file_many(
+                "src/a.c",
+                "/repo",
+                "functions",
+                Some(&json!({
+                    "total_functions":1,
+                    "raw_metrics":{"llvm_functions":{}}
+                })),
+                &[]
+            )
+            .is_err()
+        );
+        let invalid_current = json!({
+            "total_functions":1,
+            "raw_metrics":{"llvm_functions":{}}
+        });
+        assert!(
+            union_metric_for_file_many("src/a.c", "/repo", "functions", None, &[&invalid_current])
+                .is_err()
+        );
+
+        assert!(
+            merged_current_file("src/a.c", "/repo", &[], &[])
+                .unwrap()
+                .is_none()
+        );
+        let current_line_map = HashMap::from([(
+            key("src/a.c", 1),
+            json!({"covered":true,"hits":1,"count_line":true}),
+        )]);
+        let line_only_file = merged_current_file(
+            "src/a.c",
+            "/repo",
+            &[],
+            std::slice::from_ref(&current_line_map),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(line_only_file.value["total_lines"], 1);
+        let raw_current_file = merged_current_file("src/a.c", "/repo", &current_files, &[])
+            .unwrap()
+            .unwrap();
+        assert!(raw_current_file.value["raw_metrics"].is_object());
+        let invalid_branch_file = json!({"raw_metrics":{"llvm_functions":{}}});
+        assert!(merged_current_file("src/a.c", "/repo", &[&invalid_branch_file], &[]).is_err());
+        let invalid_function_file = json!({"raw_metrics":{"llvm_branches":[],"llvm_functions":{}}});
+        assert!(merged_current_file("src/a.c", "/repo", &[&invalid_function_file], &[]).is_err());
+        let invalid_region_file = json!({
+            "raw_metrics":{
+                "llvm_branches":[],
+                "llvm_functions":[{
+                    "name":"bad",
+                    "count":1,
+                    "filenames":["src/a.c"],
+                    "regions":{}
+                }]
+            }
+        });
+        assert!(merged_current_file("src/a.c", "/repo", &[&invalid_region_file], &[]).is_err());
+
+        let mut non_object = Value::Null;
+        annotate_incremental_diff_scope(&mut non_object, "selected_subset");
+        let mut complete = json!({
+            "coverage_gain":{"regressed":1},
+            "changed_lines":[{"status":"regressed"}],
+            "regions":[{"category":"regressed"}]
+        });
+        annotate_incremental_diff_scope(&mut complete, "complete_snapshot");
+        assert_eq!(complete["claim_status"], "supported");
+        let mut selected = json!({
+            "coverage_gain":{"regressed":1,"removed":2},
+            "changed_lines":[{"status":"regressed"},{"category":"removed"},{"status":"ok"}],
+            "regions":[{"category":"regressed"},{"status":"removed"},true]
+        });
+        annotate_incremental_diff_scope(&mut selected, "selected_subset");
+        assert_eq!(selected["coverage_gain"]["not_observed"], 3);
+        assert_eq!(selected["coverage_gain"]["regressed"], 0);
+        assert_eq!(selected["coverage_gain"]["removed"], 0);
+        assert_eq!(selected["changed_lines"][0]["status"], "not_observed");
+        assert_eq!(selected["changed_lines"][1]["category"], "not_observed");
+        assert_eq!(selected["regions"][0]["category"], "not_observed");
+        assert_eq!(selected["regions"][1]["status"], "not_observed");
+        let mut missing_details = json!({"coverage_gain":{"regressed":1}});
+        annotate_incremental_diff_scope(&mut missing_details, "selected_subset");
+        let mut missing_gain = json!({"coverage_gain":null});
+        annotate_incremental_diff_scope(&mut missing_gain, "selected_subset");
     }
 
     #[test]

@@ -848,12 +848,19 @@ fn parse_llvm(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                     );
                 }
             }
-            if let Some(branches) = file_payload.get("branches") {
+            let normalized_branches = if let Some(branches) = file_payload.get("branches") {
                 let branches = branches
                     .as_array()
                     .ok_or_else(|| parse_error("LLVM branches must be an array".to_owned()))?;
-                for branch in branches {
+                let mut normalized = Vec::with_capacity(branches.len());
+                for (index, branch) in branches.iter().enumerate() {
                     let (line, true_count, false_count) = llvm_branch_counts(branch)?;
+                    normalized.push(json!({
+                        "index": index,
+                        "line": line,
+                        "true_hits": true_count,
+                        "false_hits": false_count,
+                    }));
                     builder.add_line(
                         file_path,
                         line,
@@ -867,7 +874,10 @@ fn parse_llvm(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                         json!({}),
                     );
                 }
-            }
+                Some(normalized)
+            } else {
+                None
+            };
             if let Some(summary) = file_payload.get("summary") {
                 let summary = summary
                     .as_object()
@@ -876,15 +886,19 @@ fn parse_llvm(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport>
                 if let Some(functions) = function_records.get(file_path) {
                     metrics.insert("llvm_functions".to_owned(), Value::Array(functions.clone()));
                 }
+                if let Some(branches) = normalized_branches {
+                    metrics.insert("llvm_branches".to_owned(), Value::Array(branches));
+                }
                 builder.add_file_metrics(file_path, metrics);
-            } else if let Some(functions) = function_records.get(file_path) {
-                builder.add_file_metrics(
-                    file_path,
-                    Map::from_iter([(
-                        "llvm_functions".to_owned(),
-                        Value::Array(functions.clone()),
-                    )]),
-                );
+            } else if function_records.contains_key(file_path) || normalized_branches.is_some() {
+                let mut metrics = Map::new();
+                if let Some(functions) = function_records.get(file_path) {
+                    metrics.insert("llvm_functions".to_owned(), Value::Array(functions.clone()));
+                }
+                if let Some(branches) = normalized_branches {
+                    metrics.insert("llvm_branches".to_owned(), Value::Array(branches));
+                }
+                builder.add_file_metrics(file_path, metrics);
             }
         }
     }
@@ -1943,7 +1957,7 @@ mod tests {
         );
         let llvm = write(
             "llvm.json",
-            r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,2,true],[2,0,0,false]],"branches":[[4,0,0,0,1,0],{"line_start":5,"trueCount":1,"falseCount":0}],"summary":{"lines":{"count":2,"covered":1},"branches":{"count":2,"covered":1},"functions":{"covered":1},"regions":{"count":2}}},{"filename":"no-summary.c","segments":[]}],"functions":[{"name":"_ZN4demo3run17h1234567890abcdefE","count":1,"filenames":["a.c"],"regions":[[1,1,2,4,1,0,0,0]],"branches":[[1,1,1,4,1,0,0,0]]},{"name":"no_summary","count":0,"filenames":["no-summary.c"],"regions":[[2,1,2,4,0,1,0,0]]}]}]}"#,
+            r#"{"data":[{"files":[{"filename":"a.c","segments":[[1,0,2,true],[2,0,0,false]],"branches":[[4,0,0,0,1,0],{"line_start":5,"trueCount":1,"falseCount":0}],"summary":{"lines":{"count":2,"covered":1},"branches":{"count":2,"covered":1},"functions":{"covered":1},"regions":{"count":2}}},{"filename":"no-summary.c","segments":[],"branches":[[3,0,0,0,1,0]]}],"functions":[{"name":"_ZN4demo3run17h1234567890abcdefE","count":1,"filenames":["a.c"],"regions":[[1,1,2,4,1,0,0,0]],"branches":[[1,1,1,4,1,0,0,0]]},{"name":"no_summary","count":0,"filenames":["no-summary.c"],"regions":[[2,1,2,4,0,1,0,0]]}]}]}"#,
         );
         let llvm_report = parse_coverage_report(&llvm, "auto", None).unwrap();
         assert_eq!(llvm_report.format, "llvm");
@@ -1958,8 +1972,35 @@ mod tests {
             "_ZN4demo3run17h1234567890abcdefE"
         );
         assert_eq!(
+            llvm_report.files[0].raw_metrics["llvm_branches"][0]["true_hits"],
+            1
+        );
+        assert_eq!(
+            llvm_report.files[0].raw_metrics["llvm_branches"][1]["false_hits"],
+            0
+        );
+        assert_eq!(
             llvm_report.files[1].raw_metrics["llvm_functions"][0]["name"],
             "no_summary"
+        );
+        let llvm_no_summary_variants = write(
+            "llvm-no-summary-variants.json",
+            r#"{"data":[{"files":[{"filename":"only-branches.c","branches":[[3,0,0,0,1,0]]},{"filename":"only-functions.c","segments":[]}],"functions":[{"name":"only_functions","count":1,"filenames":["only-functions.c"],"regions":[[1,1,1,2,1,0,0,0]]}]}]}"#,
+        );
+        let variants = parse_coverage_report(&llvm_no_summary_variants, "llvm", None).unwrap();
+        assert!(
+            variants.files[0]
+                .raw_metrics
+                .as_object()
+                .unwrap()
+                .contains_key("llvm_branches")
+        );
+        assert!(
+            variants.files[1]
+                .raw_metrics
+                .as_object()
+                .unwrap()
+                .contains_key("llvm_functions")
         );
         let llvm_edges = write(
             "llvm-edges.json",

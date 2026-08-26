@@ -44,7 +44,7 @@ requests without replaying an operation whose commit status is ambiguous.
 | --- | --- |
 | `src/main.rs` | CLI, shared-daemon `serve`, `connect`/`stdio`, and daemon-routed `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
-| `src/mcp.rs` | Explicit schema-14 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
+| `src/mcp.rs` | Explicit schema-15 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
 | `src/storage.rs` | DuckDB schema, immutable snapshots/composite snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
 | `src/composite.rs` | Versioned production inventory, canonical-region mapping, explicit alias deduplication, variant completeness, and exact component aggregation. |
@@ -63,7 +63,7 @@ requests without replaying an operation whose commit status is ambiguous.
 - Queue state is mutable only while a managed run is queued or active.
 - Project settings are scoped to the canonical repository key, so linked
   worktrees use the same compaction policy and coverage history.
-- Every public schema-14 response carries `repo_key`, `checkout_path`,
+- Every public schema-15 response carries `repo_key`, `checkout_path`,
   `suite`, and `schema_revision` context.
 - Collections use bounded fetches, word budgets, and opaque query-scoped
   cursors. A defensive record cap fails explicitly instead of silently losing
@@ -109,9 +109,10 @@ requests without replaying an operation whose commit status is ambiguous.
   compact insight keeps three `[start,end,line_count]` ranges per target while
   exposing `region_count` and `regions_truncated`; audit is the explicit exact
   projection. An incremental terminal run automatically attaches a bounded
-  `incremental_review`; the standalone review tool remains independent of
-  execution. `structuredContent` is the canonical JSON-RPC success payload;
-  text content is only a compatibility hint.
+  `incremental_review`; when a run ingests multiple ordinary artifacts, the
+  review unions their snapshot IDs. The standalone review tool remains
+  independent of execution. `structuredContent` is the canonical JSON-RPC
+  success payload; text content is only a compatibility hint.
 - Named per-test coverage is normalized during LCOV parsing into `test_names`
   and `test_coverage_observations`. Duplicate candidates compare a full,
   ordered JSON representation of each test's `{kind,file_path,line_number,
@@ -137,19 +138,24 @@ requests without replaying an operation whose commit status is ambiguous.
 - MCP `coverage_review(task="incremental")` is a standalone stored-detail
   projection. It requires an explicit current measurement and
   `baseline.kind="explicit"` with matching ordinary snapshot IDs or composite
-  snapshot IDs. Ordinary comparisons require the same repository and normalized
-  format; composite comparisons additionally require the same mapping version
-  and inventory hash. Both return grouped line categories, aggregate metric
-  deltas, bounded opaque `test_id` set differences, and attribution status.
-  Suite, branch, commit, command, cwd, and execution case are provenance, not
-  test identity. Relational detail and the zstd compacted payload are equivalent
-  sources for the projection; neither path invokes a test runner or reparses a
-  report.
+  snapshot IDs. When a run produced several ordinary artifacts, all selected
+  ordinary IDs are merged. The primary ordinary result is the deduplicated
+  baseline-union-current projection; its nested `diff` is a separate
+  replacement-style diagnostic. Selected-subset absence is `not_observed`, not
+  regression; only `complete_snapshot` supports regression claims. Ordinary
+  comparisons require the same repository and normalized format; composite
+  comparisons additionally require the same mapping version and inventory hash.
+  Both return grouped line categories, aggregate metric deltas, bounded opaque
+  `test_id` set differences, and attribution status. Suite, branch, commit,
+  command, cwd, and execution case are provenance, not test identity.
+  Relational detail and the zstd compacted payload are equivalent sources for
+  the projection; neither path invokes a test runner or reparses a report.
 - `run_test` accepts optional case-specific string arguments without command
   re-registration. The durable `run_execution_context` stores those arguments
   and an explicit incremental baseline; reuse and idempotency compare the full
   context. A terminal incremental run invokes the same stored-detail projection
-  used by `coverage_review` and attaches its bounded result.
+  used by `coverage_review`, unions all ordinary artifacts attached to the run,
+  and attaches its bounded result.
 - Composite region comparisons load all stored canonical rows for exact category
   counts before applying response limits. Public region/source projections stay
   bounded. Composite rows are independent of ordinary zstd detail compaction;
