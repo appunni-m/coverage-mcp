@@ -164,6 +164,11 @@ jobs:
           cargo +stable install cargo-llvm-cov --locked --version 0.8.7
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+      - name: Reset coverage build target
+        # Shared Rust caches can restore non-coverage artifacts from another
+        # lane. Remove cargo-llvm-cov's instrumentation target so coverage
+        # always starts from a source-consistent build directory.
+        run: cargo llvm-cov clean --workspace --locked
       - name: Coverage
         run: make coverage
       - name: Coverage diagnostics
