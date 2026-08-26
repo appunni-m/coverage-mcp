@@ -161,7 +161,11 @@ jobs:
         run: |
           set -o pipefail
           if ! make coverage 2>&1 | tee target/migration/coverage-command.log; then
-            tail -n 80 target/migration/coverage-command.log | sed 's/^/::error::/'
+            details=$(grep -Ei 'error: linking|ld:|collect2:|undefined reference|cannot find|fatal error|signal [0-9]+|killed' target/migration/coverage-command.log | tail -n 24 | tr '\n' ' ' | cut -c1-12000 || true)
+            if [ -z "$details" ]; then
+              details=$(tail -n 24 target/migration/coverage-command.log | tr '\n' ' ' | cut -c1-12000)
+            fi
+            echo "::error::coverage command diagnostics: $details"
             exit 1
           fi
       - name: Coverage diagnostics
