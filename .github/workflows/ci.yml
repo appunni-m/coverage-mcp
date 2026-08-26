@@ -172,6 +172,7 @@ jobs:
       - name: Coverage
         shell: bash
         run: |
+          mkdir -p target/migration
           set -o pipefail
           if ! make coverage 2>&1 | tee target/migration/coverage-command.log; then
             details=$(grep -Ei 'error: linking|ld:|collect2:|undefined reference|cannot find|fatal error|signal [0-9]+|killed' target/migration/coverage-command.log | tail -n 24 | tr '\n' ' ' | cut -c1-12000 || true)
