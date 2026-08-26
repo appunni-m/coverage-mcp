@@ -60,10 +60,26 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: verify
+      - name: Reset cached test target
+        # The shared cache can retain Cargo fingerprints without the native
+        # DuckDB link copy. Rebuild the generated target so the build script
+        # recreates its link search path consistently.
+        run: cargo clean
       - name: Compile test targets
         # Keep the expensive link phase observable independently from runtime
         # tests while bounding Cargo to one compilation job.
-        run: make test-ci-compile
+        shell: bash
+        run: |
+          mkdir -p target/migration
+          set -o pipefail
+          if ! make test-ci-compile 2>&1 | tee target/migration/compile-command.log; then
+            details=$(grep -Ei 'error: linking|ld:|collect2:|undefined reference|cannot find|fatal error|signal [0-9]+|killed' target/migration/compile-command.log | tail -n 24 | tr '\n' ' ' | cut -c1-12000 || true)
+            if [ -z "$details" ]; then
+              details=$(tail -n 24 target/migration/compile-command.log | tr '\n' ' ' | cut -c1-12000)
+            fi
+            echo "::error::test compilation diagnostics: $details"
+            exit 1
+          fi
       - name: Run library tests
         # The matching DuckDB release is downloaded instead of compiling the
         # C++ amalgamation; test harnesses remain serialized for deterministic
@@ -123,7 +139,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ci-test-diagnostics
-          path: target/migration/test-*.log
+          path: |
+            target/migration/compile-command.log
+            target/migration/test-*.log
           if-no-files-found: ignore
       - name: Prepare test evidence
         run: |
