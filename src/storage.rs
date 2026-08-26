@@ -33,7 +33,7 @@ use crate::config::{MAX_RUN_LOG_MAX_BYTES, MIN_RUN_LOG_MAX_BYTES, ServerConfig};
 use crate::error::{AppError, AppResult};
 use crate::git::{GitInfo, inspect_git, is_clean, merge_base, read_file_at_commit};
 use crate::lock::{FileLease, database_lock_path};
-use crate::models::CoverageReport;
+use crate::models::{CoverageReport, normalize_report_path, rate};
 use crate::parser::parse_coverage_report;
 use crate::pool::{DbConnection, DbPool, QueryTracker, checkout, open_pool, run_with_timeout};
 use crate::{hex_prefix, stable_project_id};
@@ -5226,6 +5226,131 @@ impl CoverageStore {
         Ok(files.clone())
     }
 
+    /// Returns source-mapped LLVM function coverage records for a snapshot.
+    ///
+    /// LLVM stores function exports inside the file's raw metrics rather than
+    /// the normalized line table. Keeping the records there preserves
+    /// compatibility with existing databases while this projection calculates
+    /// line, region, and branch completeness on demand.
+    pub fn functions(
+        &self,
+        snapshot_id: &str,
+        file_path: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<Value>> {
+        let snapshot = self.snapshot(snapshot_id)?;
+        if let Some(file_path) = file_path {
+            self.file_coverage(snapshot_id, file_path)?;
+        }
+        let repo_path = required_string_field(&snapshot, "repo_path", "snapshot")
+            .expect("snapshot projections always contain repo_path");
+        let files = self.files(snapshot_id, COLLECTION_FETCH_LIMIT)?;
+        let mut values = Vec::new();
+        for file in files {
+            let path = required_string_field(&file, "file_path", "file")
+                .expect("file projections always contain file_path");
+            if file_path.is_some_and(|requested| requested != path) {
+                continue;
+            }
+            let Some(raw_metrics) = file.get("raw_metrics").and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(raw_functions) = raw_metrics.get("llvm_functions") else {
+                continue;
+            };
+            let raw_functions = raw_functions.as_array().ok_or_else(|| {
+                AppError::Runtime(format!("LLVM function metrics for {path} must be an array"))
+            })?;
+            if raw_functions.is_empty() {
+                continue;
+            }
+            let lines = self.lines(snapshot_id, &path, MAX_COLLECTION_RECORDS)?;
+            values.extend(project_llvm_functions(
+                &path,
+                &repo_path,
+                raw_functions,
+                &lines,
+            )?);
+        }
+        values.sort_by(|left, right| {
+            let left_path = left
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let right_path = right
+                .get("file_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            left_path
+                .cmp(right_path)
+                .then_with(|| {
+                    left.get("start_line")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(i64::MAX)
+                        .cmp(
+                            &right
+                                .get("start_line")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(i64::MAX),
+                        )
+                })
+                .then_with(|| {
+                    left.get("function_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .cmp(
+                            right
+                                .get("function_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                })
+        });
+        values.truncate(collection_limit(limit));
+        Ok(values)
+    }
+
+    /// Returns best-effort Rust source dependencies between covered files.
+    ///
+    /// Coverage artifacts do not contain import edges. This projection reads
+    /// the measured source revision and resolves `use`/`mod` declarations only
+    /// to files already present in the snapshot, so unresolved or external
+    /// crates never become misleading graph nodes.
+    pub fn dependencies(&self, snapshot_id: &str, limit: usize) -> AppResult<Vec<Value>> {
+        let snapshot = self.snapshot(snapshot_id)?;
+        let repo_path = required_string_field(&snapshot, "repo_path", "snapshot")
+            .expect("snapshot projections always contain repo_path");
+        let files = self.files(snapshot_id, COLLECTION_FETCH_LIMIT)?;
+        let known = files
+            .iter()
+            .filter_map(|file| file.get("file_path").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let mut edges = BTreeSet::new();
+        for file in &known {
+            let Some(source) = snapshot_source_text(&snapshot, &repo_path, file)? else {
+                continue;
+            };
+            for raw_dependency in rust_dependency_tokens(&source) {
+                if let Some(target) = resolve_rust_dependency(file, &raw_dependency, &known) {
+                    edges.insert((file.clone(), target, raw_dependency));
+                }
+            }
+        }
+        let mut values = edges
+            .into_iter()
+            .map(|(from, to, import)| {
+                json!({
+                    "from": from,
+                    "to": to,
+                    "kind": "rust-source",
+                    "import": import,
+                })
+            })
+            .collect::<Vec<_>>();
+        values.truncate(collection_limit(limit));
+        Ok(values)
+    }
     /// Returns one file summary.
     pub fn file_coverage(&self, snapshot_id: &str, file_path: &str) -> AppResult<Value> {
         let file = self.with_connection(|connection| Ok(connection.query_row("SELECT file_path, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate, raw_metrics FROM files WHERE snapshot_id = ? AND file_path = ?", params![snapshot_id, file_path], file_from_row).optional()?))?;
@@ -6053,6 +6178,344 @@ fn file_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     Ok(Value::Object(value))
 }
 
+fn project_llvm_functions(
+    file_path: &str,
+    repo_path: &str,
+    raw_functions: &[Value],
+    lines: &[Value],
+) -> AppResult<Vec<Value>> {
+    let mut projected = Vec::new();
+    for function in raw_functions {
+        let object = function.as_object().ok_or_else(|| {
+            AppError::Runtime("LLVM function metrics must contain objects".to_owned())
+        })?;
+        let llvm_name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                AppError::Runtime("LLVM function metrics are missing name".to_owned())
+            })?;
+        let execution_count =
+            required_llvm_i64(object.get("count"), "LLVM function execution count")?.max(0);
+        let filenames = object
+            .get("filenames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::Runtime("LLVM function metrics are missing filenames".to_owned())
+            })?;
+        let file_index = filenames
+            .iter()
+            .enumerate()
+            .find_map(|(index, filename)| {
+                let filename = filename.as_str()?;
+                let normalized = normalize_report_path(filename, Some(repo_path));
+                (normalized == file_path || filename == file_path).then_some(index)
+            })
+            .unwrap_or(0);
+        let regions = object
+            .get("regions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                AppError::Runtime("LLVM function metrics are missing regions".to_owned())
+            })?;
+        let mut total_regions = 0_i64;
+        let mut covered_regions = 0_i64;
+        let mut start_line = None;
+        let mut end_line = None;
+        let mut region_lines = BTreeMap::<i64, bool>::new();
+        let mut region_ranges = Vec::new();
+        for region in regions {
+            let values = llvm_function_region_values(region, "region")?;
+            if required_llvm_i64(values.get(5), "LLVM region file id")? != file_index as i64 {
+                continue;
+            }
+            let start = required_llvm_i64(values.first(), "LLVM region start line")?;
+            let end = required_llvm_i64(values.get(2), "LLVM region end line")?;
+            let hits = required_llvm_i64(values.get(4), "LLVM region execution count")?.max(0);
+            if start < 1 || end < start {
+                return Err(AppError::Runtime(
+                    "LLVM region source range is invalid".to_owned(),
+                ));
+            }
+            total_regions += 1;
+            covered_regions += i64::from(hits > 0);
+            start_line = Some(start_line.map_or(start, |current: i64| current.min(start)));
+            end_line = Some(end_line.map_or(end, |current: i64| current.max(end)));
+            if end - start <= 10_000 {
+                for line in start..=end {
+                    let covered = hits > 0;
+                    region_lines
+                        .entry(line)
+                        .and_modify(|value| *value |= covered)
+                        .or_insert(covered);
+                }
+            }
+            region_ranges.push(json!({
+                "start_line": start,
+                "start_column": required_llvm_i64(values.get(1), "LLVM region start column")?,
+                "end_line": end,
+                "end_column": required_llvm_i64(values.get(3), "LLVM region end column")?,
+                "hits": hits,
+                "covered": hits > 0,
+                "kind": required_llvm_i64(values.get(7), "LLVM region kind")?,
+            }));
+        }
+        let mut total_branches = 0_i64;
+        let mut covered_branches = 0_i64;
+        let mut branch_ranges = Vec::new();
+        if let Some(branches) = object.get("branches") {
+            let branches = branches.as_array().ok_or_else(|| {
+                AppError::Runtime("LLVM function branches must be an array".to_owned())
+            })?;
+            for branch in branches {
+                let values = llvm_function_region_values(branch, "branch")?;
+                if required_llvm_i64(values.get(6), "LLVM branch file id")? != file_index as i64 {
+                    continue;
+                }
+                let start = required_llvm_i64(values.first(), "LLVM branch start line")?;
+                let end = required_llvm_i64(values.get(2), "LLVM branch end line")?;
+                let true_hits = required_llvm_i64(values.get(4), "LLVM branch true count")?.max(0);
+                let false_hits =
+                    required_llvm_i64(values.get(5), "LLVM branch false count")?.max(0);
+                if start < 1 || end < start {
+                    return Err(AppError::Runtime(
+                        "LLVM branch source range is invalid".to_owned(),
+                    ));
+                }
+                total_branches += 2;
+                covered_branches += i64::from(true_hits > 0) + i64::from(false_hits > 0);
+                branch_ranges.push(json!({
+                    "start_line": start,
+                    "start_column": required_llvm_i64(values.get(1), "LLVM branch start column")?,
+                    "end_line": end,
+                    "end_column": required_llvm_i64(values.get(3), "LLVM branch end column")?,
+                    "true_hits": true_hits,
+                    "false_hits": false_hits,
+                    "true_covered": true_hits > 0,
+                    "false_covered": false_hits > 0,
+                }));
+            }
+        }
+        let (total_lines, covered_lines) =
+            function_line_counts(lines, start_line, end_line, &region_lines);
+        let line_rate = rate(covered_lines, total_lines);
+        let branch_rate = rate(covered_branches, total_branches);
+        let region_rate = rate(covered_regions, total_regions);
+        let function_rate = Some(f64::from(execution_count > 0));
+        let completeness_rate = [line_rate, region_rate, branch_rate]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
+            .or(function_rate);
+        let source_name = source_function_name(llvm_name);
+        projected.push(json!({
+            "function_key": format!("{file_path}:{llvm_name}"),
+            "file_path": file_path,
+            "function_name": source_name,
+            "llvm_name": llvm_name,
+            "start_line": start_line,
+            "end_line": end_line,
+            "execution_count": execution_count,
+            "covered": execution_count > 0,
+            "total_lines": total_lines,
+            "covered_lines": covered_lines,
+            "line_rate": line_rate,
+            "total_regions": total_regions,
+            "covered_regions": covered_regions,
+            "region_rate": region_rate,
+            "total_branches": total_branches,
+            "covered_branches": covered_branches,
+            "branch_rate": branch_rate,
+            "function_rate": function_rate,
+            "completeness_rate": completeness_rate,
+            "missing_lines": total_lines.saturating_sub(covered_lines),
+            "missing_regions": total_regions.saturating_sub(covered_regions),
+            "missing_branches": total_branches.saturating_sub(covered_branches),
+            "region_ranges": region_ranges,
+            "branch_ranges": branch_ranges,
+        }));
+    }
+    Ok(projected)
+}
+
+fn function_line_counts(
+    lines: &[Value],
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    region_lines: &BTreeMap<i64, bool>,
+) -> (i64, i64) {
+    let mut total = 0_i64;
+    let mut covered = 0_i64;
+    if let (Some(start), Some(end)) = (start_line, end_line) {
+        for line in lines {
+            let Some(number) = line.get("line_number").and_then(Value::as_i64) else {
+                continue;
+            };
+            if number < start || number > end {
+                continue;
+            }
+            if !line
+                .get("count_line")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            total += 1;
+            covered += i64::from(
+                line.get("covered")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            );
+        }
+    }
+    if total == 0 {
+        total = region_lines.len() as i64;
+        covered = region_lines.values().filter(|value| **value).count() as i64;
+    }
+    (total, covered)
+}
+
+fn llvm_function_region_values<'a>(value: &'a Value, kind: &str) -> AppResult<&'a Vec<Value>> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| AppError::Runtime(format!("LLVM function {kind} must be an array")))?;
+    if values.len() < 8 {
+        return Err(AppError::Runtime(format!(
+            "LLVM function {kind} must contain source range and coverage fields"
+        )));
+    }
+    Ok(values)
+}
+
+fn required_llvm_i64(value: Option<&Value>, context: &str) -> AppResult<i64> {
+    value
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            value
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+        })
+        .ok_or_else(|| AppError::Runtime(format!("{context} must be an integer")))
+}
+
+fn source_function_name(name: &str) -> String {
+    rustc_demangle::try_demangle(name)
+        .map(|demangled| format!("{demangled:#}"))
+        .unwrap_or_else(|_| name.to_owned())
+}
+
+fn snapshot_source_text(
+    snapshot: &Value,
+    repo_path: &str,
+    file_path: &str,
+) -> AppResult<Option<String>> {
+    let relative = Path::new(file_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(AppError::Validation(
+            "file_path must remain inside the repository".to_owned(),
+        ));
+    }
+    if let Some(commit_sha) = snapshot.get("commit_sha").and_then(Value::as_str) {
+        if let Some(contents) = read_file_at_commit(repo_path, commit_sha, file_path)? {
+            return Ok(Some(contents));
+        }
+    }
+    let root = Path::new(repo_path).canonicalize()?;
+    let path = match root.join(relative).canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::from(error)),
+    };
+    if !path.starts_with(&root) {
+        return Err(AppError::Validation(
+            "file_path escapes repository root".to_owned(),
+        ));
+    }
+    fs::read_to_string(path).map(Some).map_err(AppError::from)
+}
+
+fn rust_dependency_tokens(source: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    for raw_line in source.lines() {
+        let line = raw_line.split("//").next().unwrap_or_default().trim();
+        let declaration = line
+            .strip_prefix("use ")
+            .or_else(|| line.strip_prefix("pub use "))
+            .or_else(|| line.strip_prefix("pub(crate) use "))
+            .or_else(|| line.strip_prefix("mod "))
+            .or_else(|| line.strip_prefix("pub mod "));
+        let Some(declaration) = declaration else {
+            continue;
+        };
+        let declaration = declaration
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .split(" as ")
+            .next()
+            .unwrap_or_default()
+            .split("::{")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !declaration.is_empty() {
+            tokens.insert(declaration.to_owned());
+        }
+    }
+    tokens
+}
+
+fn resolve_rust_dependency(
+    file_path: &str,
+    raw_dependency: &str,
+    known_files: &BTreeSet<String>,
+) -> Option<String> {
+    let mut segments = raw_dependency
+        .split("::")
+        .filter(|segment| !segment.is_empty());
+    let first = segments.next()?;
+    let remaining = segments.collect::<Vec<_>>();
+    let mut base = Path::new(file_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let module_segments = match first {
+        "crate" => {
+            base = PathBuf::from("src");
+            remaining
+        }
+        "super" => {
+            base = base.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+            remaining
+        }
+        "self" => remaining,
+        _ => {
+            let mut direct = vec![first];
+            direct.extend(remaining);
+            direct
+        }
+    };
+    if module_segments.is_empty() {
+        return None;
+    }
+    for depth in (1..=module_segments.len()).rev() {
+        let module = module_segments[..depth].join("/");
+        let candidate = base.join(module);
+        for path in [candidate.with_extension("rs"), candidate.join("mod.rs")] {
+            let path = path.to_string_lossy().replace('\\', "/");
+            if known_files.contains(&path) && path != file_path {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
 fn line_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
     let mut value = Map::new();
     value.insert("line_number".to_owned(), json!(row.get::<_, i64>(0)?));
@@ -7802,6 +8265,7 @@ fn insight_order(value: &Value) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{FileCoverage, LineCoverage};
     use crate::pool::{checkout, inject_watchdog_failure};
     use std::fmt::Write as _;
     use std::io::{self, Write};
@@ -15079,6 +15543,8 @@ mod tests {
         sweep_query_boundaries!(store.latest_snapshot(None, None, None));
         sweep_query_boundaries!(store.duplicate_coverage_test_groups(snapshot_id, 0, 10, 10));
         sweep_query_boundaries!(store.files(snapshot_id, 10));
+        sweep_query_boundaries!(store.functions(snapshot_id, None, 10));
+        sweep_query_boundaries!(store.dependencies(snapshot_id, 10));
         sweep_query_boundaries!(store.file_coverage(snapshot_id, "src/a.py"));
         sweep_query_boundaries!(store.lines(snapshot_id, "src/a.py", 10));
         sweep_query_boundaries!(store.lines_in_ranges(snapshot_id, "src/a.py", &[(1, 1)]));
@@ -15169,6 +15635,560 @@ mod tests {
         };
         assert_eq!(resumed["status"], "passed");
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn llvm_function_and_dependency_projections_are_source_mapped() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            "mod dep;\nuse crate::dep::value;\nuse external::thing;\nuse ;\npub fn run() { value(); let _ = thing; }\n",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("src/dep.rs"), "pub fn value() {}\n").unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["add", "."])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["commit", "-m", "source graph"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let commit = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let store =
+            CoverageStore::open(directory.path().join("graph.duckdb"), test_config()).unwrap();
+        let git = store.ensure_project(directory.path()).unwrap();
+        let function = json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [
+                [1, 1, 3, 2, 1, 0, 0, 0],
+                [3, 1, 3, 2, 0, 0, 0, 0],
+                [4, 1, 4, 2, 1, 1, 0, 0]
+            ],
+            "branches": [[2, 1, 2, 10, 1, 0, 0, 0]]
+        });
+        let other_function = json!({
+            "name": "run2",
+            "count": 0,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 2, 0, 0, 0, 0]]
+        });
+        let report = CoverageReport {
+            format: "llvm".to_owned(),
+            report_path: "coverage.json".to_owned(),
+            files: vec![
+                FileCoverage {
+                    file_path: "src/lib.rs".to_owned(),
+                    total_lines: 3,
+                    covered_lines: 2,
+                    total_branches: 2,
+                    covered_branches: 1,
+                    total_functions: 2,
+                    covered_functions: 1,
+                    total_regions: 3,
+                    covered_regions: 1,
+                    raw_metrics: json!({"llvm_functions": [function, other_function]}),
+                },
+                FileCoverage {
+                    file_path: "src/dep.rs".to_owned(),
+                    total_lines: 1,
+                    covered_lines: 1,
+                    total_branches: 0,
+                    covered_branches: 0,
+                    total_functions: 1,
+                    covered_functions: 1,
+                    total_regions: 1,
+                    covered_regions: 1,
+                    raw_metrics: Value::Null,
+                },
+                FileCoverage {
+                    file_path: "missing.rs".to_owned(),
+                    total_lines: 0,
+                    covered_lines: 0,
+                    total_branches: 0,
+                    covered_branches: 0,
+                    total_functions: 0,
+                    covered_functions: 0,
+                    total_regions: 0,
+                    covered_regions: 0,
+                    raw_metrics: Value::Null,
+                },
+            ],
+            lines: vec![
+                LineCoverage {
+                    file_path: "src/lib.rs".to_owned(),
+                    line_number: 1,
+                    hits: 1,
+                    covered: true,
+                    count_line: true,
+                    total_branches: 0,
+                    covered_branches: 0,
+                    total_functions: 0,
+                    covered_functions: 0,
+                    details: Value::Null,
+                },
+                LineCoverage {
+                    file_path: "src/lib.rs".to_owned(),
+                    line_number: 2,
+                    hits: 1,
+                    covered: true,
+                    count_line: true,
+                    total_branches: 2,
+                    covered_branches: 1,
+                    total_functions: 0,
+                    covered_functions: 0,
+                    details: Value::Null,
+                },
+                LineCoverage {
+                    file_path: "src/lib.rs".to_owned(),
+                    line_number: 3,
+                    hits: 0,
+                    covered: false,
+                    count_line: true,
+                    total_branches: 0,
+                    covered_branches: 0,
+                    total_functions: 0,
+                    covered_functions: 0,
+                    details: Value::Null,
+                },
+            ],
+            test_names: Vec::new(),
+            test_coverage: Vec::new(),
+            warnings: Vec::new(),
+            metadata: Value::Null,
+        };
+        let snapshot = store
+            .store_report(&report, &git, Some("main"), Some(&commit), None, "unit")
+            .unwrap();
+        let functions = store.functions(&snapshot, None, 10).unwrap();
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0]["function_name"], "run");
+        assert_eq!(functions[0]["start_line"], 1);
+        assert_eq!(functions[0]["end_line"], 3);
+        assert_eq!(functions[0]["total_lines"], 3);
+        assert_eq!(functions[0]["covered_lines"], 2);
+        assert_eq!(functions[0]["total_branches"], 2);
+        assert_eq!(functions[0]["covered_branches"], 1);
+        assert_eq!(functions[0]["total_regions"], 2);
+        assert_eq!(functions[0]["covered_regions"], 1);
+        assert_eq!(functions[1]["function_name"], "run2");
+        assert_eq!(functions[1]["covered"], false);
+        for skip in 0..=20 {
+            store.inject_query_fault_after(skip);
+            let _ = store.functions(&snapshot, None, 10);
+        }
+        store.clear_query_fault();
+        assert_eq!(
+            store
+                .functions(&snapshot, Some("src/lib.rs"), 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .functions(&snapshot, Some("missing.rs"), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.functions(&snapshot, Some("unknown.rs"), 10).is_err());
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE files SET raw_metrics = '{{\"llvm_functions\":{{}}}}' WHERE snapshot_id = '{snapshot}' AND file_path = 'src/lib.rs'"
+            ))
+            .unwrap();
+        assert!(store.functions(&snapshot, None, 10).is_err());
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE files SET raw_metrics = '{{\"llvm_functions\":[]}}' WHERE snapshot_id = '{snapshot}' AND file_path = 'src/lib.rs'"
+            ))
+            .unwrap();
+        assert!(store.functions(&snapshot, None, 10).unwrap().is_empty());
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE files SET raw_metrics = '{{\"llvm_functions\":[{{\"name\":\"run\",\"count\":\"bad\",\"filenames\":[\"src/lib.rs\"],\"regions\":[]}}]}}' WHERE snapshot_id = '{snapshot}' AND file_path = 'src/lib.rs'"
+            ))
+            .unwrap();
+        assert!(store.functions(&snapshot, None, 10).is_err());
+        let dependencies = store.dependencies(&snapshot, 10).unwrap();
+        assert!(dependencies.iter().any(|edge| {
+            edge["from"] == "src/lib.rs"
+                && edge["to"] == "src/dep.rs"
+                && edge["import"] == "crate::dep::value"
+        }));
+        assert!(dependencies.iter().any(|edge| edge["import"] == "dep"));
+        store
+            .execute_sql_for_test(&format!(
+                "UPDATE files SET file_path = '../bad.rs' WHERE snapshot_id = '{snapshot}' AND file_path = 'missing.rs'"
+            ))
+            .unwrap();
+        assert!(store.dependencies(&snapshot, 10).is_err());
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn source_graph_projection_edge_paths_are_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src/nested")).unwrap();
+        std::fs::write(
+            directory.path().join("src/current.rs"),
+            "pub fn current() {}\n",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("src/foo.rs"), "pub fn foo() {}\n").unwrap();
+        let repository = directory.path().to_string_lossy().to_string();
+        let fallback_snapshot = json!({"commit_sha": "missing-commit"});
+        assert_eq!(
+            snapshot_source_text(&fallback_snapshot, &repository, "src/current.rs")
+                .unwrap()
+                .as_deref(),
+            Some("pub fn current() {}\n")
+        );
+        assert!(
+            snapshot_source_text(&json!({}), &repository, "missing.rs")
+                .unwrap()
+                .is_none()
+        );
+        assert!(snapshot_source_text(&json!({}), &repository, "../outside.rs").is_err());
+        assert!(snapshot_source_text(&json!({}), &repository, "/tmp/outside.rs").is_err());
+        assert!(snapshot_source_text(&json!({}), "/missing/repository", "src/current.rs").is_err());
+        assert!(snapshot_source_text(&json!({}), &repository, "bad\0path").is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside_directory = tempfile::tempdir().unwrap();
+            let outside = outside_directory.path().join("outside.rs");
+            std::fs::write(&outside, "outside\n").unwrap();
+            symlink(&outside, directory.path().join("src/outside-link.rs")).unwrap();
+            assert!(snapshot_source_text(&json!({}), &repository, "src/outside-link.rs").is_err());
+        }
+
+        assert!(source_function_name("_ZN4demo3run17h1234567890abcdefE").contains("demo::run"));
+        assert_eq!(source_function_name("plain_name"), "plain_name");
+        assert!(llvm_function_region_values(&json!([1, 2]), "region").is_err());
+        assert!(llvm_function_region_values(&Value::Null, "region").is_err());
+        assert!(llvm_function_region_values(&json!([1, 1, 1, 1, 1, 0, 0, 0]), "region").is_ok());
+        assert!(required_llvm_i64(Some(&json!(u64::MAX)), "value").is_err());
+        assert!(required_llvm_i64(Some(&json!(1.5)), "value").is_err());
+        assert!(
+            snapshot_source_text(&json!({"commit_sha": "missing"}), "bad\0repo", "file.rs")
+                .is_err()
+        );
+        assert!(rust_dependency_tokens("use ;\n").is_empty());
+
+        let mut region_lines = BTreeMap::new();
+        region_lines.insert(4, true);
+        let line_counts = function_line_counts(
+            &[
+                json!({"line_number": 1, "count_line": true, "covered": true}),
+                json!({"line_number": 99, "count_line": true, "covered": true}),
+                json!({"line_number": 2, "count_line": false, "covered": true}),
+                json!({"count_line": true, "covered": true}),
+            ],
+            Some(1),
+            Some(3),
+            &region_lines,
+        );
+        assert_eq!(line_counts, (1, 1));
+        assert_eq!(
+            function_line_counts(&[], Some(4), Some(4), &region_lines),
+            (1, 1)
+        );
+        assert_eq!(
+            function_line_counts(&[], None, Some(4), &region_lines),
+            (1, 1)
+        );
+
+        let known = BTreeSet::from(["src/foo.rs".to_owned(), "src/nested/child.rs".to_owned()]);
+        assert_eq!(
+            resolve_rust_dependency("src/nested/child.rs", "super::foo", &known),
+            Some("src/foo.rs".to_owned())
+        );
+        assert_eq!(resolve_rust_dependency("src/lib.rs", "crate", &known), None);
+        assert_eq!(
+            resolve_rust_dependency("src/lib.rs", "missing", &known),
+            None
+        );
+        assert_eq!(resolve_rust_dependency("lib.rs", "missing", &known), None);
+        assert_eq!(resolve_rust_dependency("", "missing", &known), None);
+        assert_eq!(
+            resolve_rust_dependency("child.rs", "super::foo", &known),
+            None
+        );
+        assert_eq!(resolve_rust_dependency("src/lib.rs", "", &known), None);
+        assert_eq!(
+            resolve_rust_dependency("src/lib.rs", "self::foo", &known),
+            Some("src/foo.rs".to_owned())
+        );
+
+        let assert_projection_error = |function: Value| {
+            assert!(project_llvm_functions("src/lib.rs", &repository, &[function], &[]).is_err());
+        };
+        assert_projection_error(json!({
+            "name": "run",
+            "count": "bad",
+            "filenames": ["src/lib.rs"],
+            "regions": []
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [null]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, "bad", 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [["bad", 1, 1, 1, 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, "bad", 1, 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, "bad", 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, "bad", 1, 1, 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, "bad", 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, "bad"]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [null]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, 1, 1, 1, 1, "bad", 0, 0]]
+        }));
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "run",
+                    "count": 1,
+                    "filenames": [1, "other.rs"],
+                    "regions": [[1, 1, 1, 1, 1, 0, 0, 0]]
+                })],
+                &[],
+            )
+            .is_ok()
+        );
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, 1, 1, 1, 1, 0, "bad", 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [["bad", 1, 1, 1, 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, 1, "bad", 1, 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, 1, 1, 1, "bad", 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, 1, 1, 1, 1, "bad", 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, "bad", 1, 1, 1, 0, 0, 0]]
+        }));
+        assert_projection_error(json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 1, 1, 0, 0, 0]],
+            "branches": [[1, 1, 1, "bad", 1, 0, 0, 0]]
+        }));
+
+        let valid_function = json!({
+            "name": "run",
+            "count": 1,
+            "filenames": ["src/lib.rs"],
+            "regions": [[1, 1, 1, 2, 1, 0, 0, 0]]
+        });
+        for malformed in [
+            Value::Null,
+            json!({"count": 1, "filenames": [], "regions": []}),
+            json!({"name": "run", "count": 1, "regions": []}),
+            json!({"name": "run", "count": 1, "filenames": ["src/lib.rs"]}),
+        ] {
+            assert!(project_llvm_functions("src/lib.rs", &repository, &[malformed], &[]).is_err());
+        }
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "run",
+                    "count": 1,
+                    "filenames": ["src/lib.rs"],
+                    "regions": [[0, 1, 0, 2, 1, 0, 0, 0]]
+                })],
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "run",
+                    "count": 1,
+                    "filenames": ["src/lib.rs"],
+                    "regions": [[1, 1, 1, 2, 1, 0, 0, 0]],
+                    "branches": [[0, 1, 0, 2, 1, 0, 0, 0]]
+                })],
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "run",
+                    "count": 1,
+                    "filenames": ["src/lib.rs"],
+                    "regions": [[1, 1, 1, 2, 1, 0, 0, 0]],
+                    "branches": {}
+                })],
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "run",
+                    "count": 1,
+                    "filenames": ["src/lib.rs"],
+                    "regions": [[1, 1, 1, 2, 1, 0, 0, 0]],
+                    "branches": [[0, 1, 0, 2, 1, 0, 0, 0]]
+                })],
+                &[],
+            )
+            .is_err()
+        );
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "run",
+                    "count": 1,
+                    "filenames": ["src/lib.rs"],
+                    "regions": [[1, 1, 1, 2, 1, 0, 0, 0]],
+                    "branches": [[1, 1, 1, 2, 1, 0, 0, 0], [1, 1, 1, 2, 1, 0, 1, 0]]
+                })],
+                &[],
+            )
+            .is_ok()
+        );
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[valid_function],
+                &[json!({"line_number": 1, "count_line": true})],
+            )
+            .is_ok()
+        );
+        assert!(
+            project_llvm_functions(
+                "src/lib.rs",
+                &repository,
+                &[json!({
+                    "name": "large",
+                    "count": 1,
+                    "filenames": ["src/lib.rs"],
+                    "regions": [[1, 1, 20_002, 2, 1, 0, 0, 0]]
+                })],
+                &[],
+            )
+            .is_ok()
+        );
     }
 
     #[test]

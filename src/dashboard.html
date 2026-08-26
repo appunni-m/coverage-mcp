@@ -67,6 +67,11 @@
     .legend { display: flex; flex-wrap: wrap; gap: 8px 12px; padding: 0 14px 10px; color: var(--muted); font-size: 11px; }
     .legend span { display: inline-flex; align-items: center; gap: 5px; }
     .legend i { width: 9px; height: 3px; border-radius: 3px; }
+    a.primary { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 0 11px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; text-decoration: none; white-space: nowrap; }
+    .graph-teaser { overflow: visible; }
+    .graph-teaser .panel-head { align-items: center; }
+    .graph-teaser .panel-body { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+    .graph-teaser-summary { display: flex; flex-wrap: wrap; gap: 7px; color: var(--muted); font-size: 11px; }
     .progress-table, .file-table { width: 100%; border-collapse: collapse; }
     th, td { padding: 7px 8px; border-bottom: 1px solid #edf0f3; text-align: left; vertical-align: middle; white-space: nowrap; }
     th { color: var(--muted); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
@@ -159,6 +164,10 @@
   </header>
   <main class="stack">
     <section id="metricsGrid" class="metricsGrid" aria-label="Coverage metrics"></section>
+    <section class="panel graph-teaser">
+      <div class="panel-head"><div><h2>Source coverage graph</h2><p>A dedicated map for checking source hierarchy, LLVM-mapped functions, and resolved source-import edges.</p></div><a class="primary" href="/graph">Open source graph</a></div>
+      <div class="panel-body"><div id="graphTeaserStatus" class="graph-teaser-summary"><span>Choose a snapshot to see its source map.</span></div><span class="muted">Function nodes show line, region, branch, and execution completeness.</span></div>
+    </section>
     <section class="panel">
       <div class="panel-head"><div><h2>Production region coverage</h2><p id="compositeMeta">Combined immutable Rust, Python, and JavaScript production regions.</p></div><span id="compositeStatus" class="status">not measured</span></div>
       <div class="snapshot-bar composite-bar"><label>Composite current <select id="compositeCurrentSelect" aria-label="Current composite snapshot"></select></label><label>Composite baseline <select id="compositeBaselineSelect" aria-label="Baseline composite snapshot"></select></label><span id="compositeSelectionStatus" class="muted"></span></div>
@@ -204,7 +213,7 @@
     const currentProject = () => state.projects.find(project => project.repo_key === state.projectKey) || null;
     const isForeground = () => document.visibilityState === 'visible';
 
-    async function api(url, options = {}, includeRepository = true) {
+    async function apiEnvelope(url, options = {}, includeRepository = true) {
       const request = {...options}; const headers = new Headers(request.headers || {});
       if (includeRepository && state.repoPath) headers.set('X-Coverage-MCP-Repo', state.repoPath);
       if (request.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -212,7 +221,22 @@
       const response = await fetch(url, request); const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
       if (payload.context?.schema_revision !== SCHEMA_REVISION || !Object.hasOwn(payload, 'data')) throw new Error(`Dashboard needs schema revision ${SCHEMA_REVISION}; reload the current coverage-mcp daemon.`);
-      return payload.data;
+      return payload;
+    }
+    async function api(url, options = {}, includeRepository = true) {
+      return (await apiEnvelope(url, options, includeRepository)).data;
+    }
+    async function apiCollection(url, options = {}, includeRepository = true) {
+      const values = [];
+      let cursor = null;
+      for (let page = 0; page < 20; page += 1) {
+        const separator = url.includes('?') ? '&' : '?';
+        const payload = await apiEnvelope(url + (cursor ? separator + 'cursor=' + encodeURIComponent(cursor) : ''), options, includeRepository);
+        if (Array.isArray(payload.data)) values.push(...payload.data);
+        cursor = payload.page?.next_cursor || null;
+        if (!cursor) break;
+      }
+      return values;
     }
     function notify(message) { const toast = $('toast'); toast.textContent = message; toast.hidden = false; clearTimeout(state.toastTimer); state.toastTimer = setTimeout(() => { toast.hidden = true; }, 3800); }
     function setLive(label, mode = '') { const live = $('liveState'); live.textContent = label; live.className = `live ${mode}`; }
@@ -224,7 +248,8 @@
     async function loadDashboard() {
       if (!state.repoPath) { state.dashboard = null; renderEmpty('No repository is registered yet. Import or ingest a coverage report to start the timeline.'); return; }
       const params = new URLSearchParams({repo_path:state.repoPath, history_limit:'18'}); if (state.currentId) params.set('snapshot_id', state.currentId); if (state.baselineId) params.set('baseline_snapshot_id', state.baselineId); if (state.compositeCurrentId) params.set('composite_snapshot_id', state.compositeCurrentId); if (state.compositeBaselineId) params.set('baseline_composite_snapshot_id', state.compositeBaselineId);
-      state.dashboard = await api(`/api/dashboard?${params}`, {}, false); state.currentId = state.dashboard.selection?.snapshot_id || null; state.compositeCurrentId = state.dashboard.selection?.composite_snapshot_id || null; if (!state.baselineId && state.dashboard.selection?.baseline_kind === 'explicit') state.baselineId = state.dashboard.selection.baseline_snapshot_id; if (!state.compositeBaselineId && state.dashboard.selection?.composite_baseline_kind === 'explicit') state.compositeBaselineId = state.dashboard.selection.baseline_composite_snapshot_id; render(state.dashboard); connectStream();
+      state.dashboard = await api(`/api/dashboard?${params}`, {}, false); state.currentId = state.dashboard.selection?.snapshot_id || null; state.compositeCurrentId = state.dashboard.selection?.composite_snapshot_id || null; if (!state.baselineId && state.dashboard.selection?.baseline_kind === 'explicit') state.baselineId = state.dashboard.selection.baseline_snapshot_id; if (!state.compositeBaselineId && state.dashboard.selection?.composite_baseline_kind === 'explicit') state.compositeBaselineId = state.dashboard.selection.baseline_composite_snapshot_id;
+      render(state.dashboard); connectStream();
     }
     async function refresh({silent = false} = {}) {
       if (!isForeground()) return;
@@ -241,13 +266,13 @@
       state.eventSource.addEventListener('ready', () => setLive('live', 'on')); state.eventSource.addEventListener('refresh', () => { setLive('updated', 'busy'); queueRefresh(); }); state.eventSource.addEventListener('dashboard-error', event => { try { notify(JSON.parse(event.data).detail || 'Dashboard stream error'); } catch (_) { notify('Dashboard stream error'); } }); state.eventSource.onerror = () => setLive('reconnecting', 'busy');
     }
     function renderEmpty(message) {
-      $('metricsGrid').innerHTML = `<div class="panel empty" style="grid-column:1/-1">${esc(message)}</div>`; $('progressChart').innerHTML = ''; $('chartLegend').innerHTML = ''; $('runActivity').innerHTML = '<div class="empty">No run activity.</div>'; $('measurementFacts').innerHTML = '<div class="empty" style="grid-column:1/-1">No selected measurement.</div>'; $('incrementalBody').innerHTML = '<div class="empty">Ingest two compatible snapshots to see progression without rerunning the base.</div>'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot.</div>'; $('fileRows').innerHTML = '<tr><td colspan="7" class="empty">No coverage files.</td></tr>'; $('timelineRows').innerHTML = '<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; $('compactionInventory').innerHTML = '<div class="empty" style="grid-column:1/-1">No compaction inventory.</div>'; $('projectMeta').textContent = message;
+      $('metricsGrid').innerHTML = `<div class="panel empty" style="grid-column:1/-1">${esc(message)}</div>`; $('progressChart').innerHTML = ''; $('chartLegend').innerHTML = ''; $('runActivity').innerHTML = '<div class="empty">No run activity.</div>'; $('measurementFacts').innerHTML = '<div class="empty" style="grid-column:1/-1">No selected measurement.</div>'; $('incrementalBody').innerHTML = '<div class="empty">Ingest two compatible snapshots to see progression without rerunning the base.</div>'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot.</div>'; $('fileRows').innerHTML = '<tr><td colspan="7" class="empty">No coverage files.</td></tr>'; $('timelineRows').innerHTML = '<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; $('compactionInventory').innerHTML = '<div class="empty" style="grid-column:1/-1">No compaction inventory.</div>'; $('graphTeaserStatus').innerHTML = '<span>Choose a snapshot to see its source map.</span>'; $('projectMeta').textContent = message;
     }
     function metricCard(label, snapshot, definition, delta) { const rate = snapshot?.[definition.rate]; const deltaClass = Number(delta) > 0 ? 'good' : Number(delta) < 0 ? 'bad' : 'neutral'; return `<article class="metric"><div class="metric-top"><span>${label}</span><span class="delta ${deltaClass}">${signedPct(delta)}</span></div><div class="metric-value">${pct(rate)}</div><div class="metric-sub"><span>${int(snapshot?.[definition.covered])} / ${int(snapshot?.[definition.total])}</span><span>${definition.unit}</span></div></article>`; }
     function renderMetrics(data) {
       const snapshot = data.current; const delta = data.incremental?.status === 'measured' ? data.incremental.metric_deltas || {} : {};
       const definitions = [['Lines',{rate:'line_rate',covered:'covered_lines',total:'total_lines',unit:'executable lines'},'line_rate_delta'],['Branches',{rate:'branch_rate',covered:'covered_branches',total:'total_branches',unit:'branch outcomes'},'branch_rate_delta'],['Functions',{rate:'function_rate',covered:'covered_functions',total:'total_functions',unit:'functions'},'function_rate_delta'],['Regions',{rate:'region_rate',covered:'covered_regions',total:'total_regions',unit:'regions'},'region_rate_delta']];
-      $('metricsGrid').innerHTML = snapshot ? definitions.map(([label, definition, key]) => metricCard(label, snapshot, definition, delta[key])).join('') : '<div class="panel empty" style="grid-column:1/-1">Select a snapshot to see metrics.</div>'; $('progressMeta').textContent = snapshot ? `${snapshot.suite || 'unknown suite'} · ${snapshot.branch || 'no branch'} · ${commit(snapshot.commit_sha)} · ${snapshot.detail_retention || 'compactable'}` : 'No selected measurement.';
+      $('metricsGrid').innerHTML = snapshot ? definitions.map(([label, definition, key]) => metricCard(label, snapshot, definition, delta[key])).join('') : '<div class="panel empty" style="grid-column:1/-1">Select a snapshot to see metrics.</div>'; $('progressMeta').textContent = snapshot ? `${snapshot.suite || 'unknown suite'} · ${snapshot.branch || 'no branch'} · ${commit(snapshot.commit_sha)} · ${snapshot.detail_retention || 'compactable'}` : 'No selected measurement.'; $('graphTeaserStatus').innerHTML = snapshot ? `<span>${int(snapshot.total_functions)} report-level functions</span><span>·</span><span>${int(snapshot.total_regions)} LLVM/source regions</span><span>·</span><span>${int(snapshot.total_lines)} executable lines</span>` : '<span>Choose a snapshot to see its source map.</span>';
     }
     function renderControls(data) {
       const points = [...(data.history?.points || [])]; const snapshots = new Map(points.map(point => [point.id, point])); if (data.current?.id) snapshots.set(data.current.id, data.current); if (data.baseline?.id) snapshots.set(data.baseline.id, data.baseline); const options = [...snapshots.values()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at))); const option = point => `<option value="${esc(point.id)}">${esc(new Date(point.created_at).toLocaleString())} · ${esc(point.suite || 'default')} · ${pct(point.line_rate)}</option>`;
@@ -272,7 +297,312 @@
       const composite = data.composite || {}, current = composite.current, inc = composite.incremental || {}, complete = current?.complete === true; $('compositeStatus').textContent = current ? (complete ? 'complete' : 'incomplete') : 'not measured'; $('compositeStatus').className = `status ${current ? (complete ? 'completed' : 'warning') : ''}`; renderCompositeControls(data); if (!current) { $('compositeMeta').textContent = 'Combined immutable Rust, Python, and JavaScript production regions.'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot has been produced by a managed run.</div>'; return; }
       const delta = inc.metric_deltas || {}, gain = inc.coverage_gain || {}, components = current.components || [], componentDeltas = new Map((inc.components || []).map(component => [component.component, component])); const componentRows = components.map(component => { const componentDelta = componentDeltas.get(component.component) || {}; const deltaText = Number.isFinite(Number(componentDelta.covered_regions_delta)) ? `${Number(componentDelta.covered_regions_delta) >= 0 ? '+' : ''}${int(componentDelta.covered_regions_delta)}` : '—'; return `<div class="component-row"><strong>${esc(component.component || 'other')}</strong><span>${pct(component.region_rate)} <small>${int(component.covered_regions)}/${int(component.total_regions)} regions</small></span><span class="delta ${Number(componentDelta.covered_regions_delta) > 0 ? 'good' : Number(componentDelta.covered_regions_delta) < 0 ? 'bad' : 'neutral'}">${deltaText}</span></div>`; }).join('') || '<div class="empty">No component summaries.</div>'; const categories = [['newly covered','newly_covered','good'],['regressed','regressed','bad'],['hit-only','hit_count_only','neutral'],['added','added','good'],['removed','removed','bad']].map(([label,key,tone]) => `<div class="category"><span>${label}</span><strong class="${tone}">${int(gain[key] || 0)}</strong></div>`).join(''); const reasons = (current.blocking_reasons || []).map(reason => `<span class="composite-reason">${esc(reason)}</span>`).join(''); const remediation = Object.entries(current.remediation || {}).map(([key,value]) => `<span class="pill">${esc(key)}: ${int(value)}</span>`).join(''); $('compositeMeta').textContent = `${int(current.covered_regions)}/${int(current.total_regions)} canonical regions · mapping ${esc(current.mapping_version || 'unknown')} · ${current.checkout_dirty ? 'dirty checkout' : `revision ${commit(current.checkout_revision)}`}`; $('compositeBody').innerHTML = `<div class="composite-grid"><div><div class="composite-summary">${fact('Coverage',pct(current.region_rate))}${fact('Covered',`${int(current.covered_regions)}/${int(current.total_regions)}`)}${fact('Delta',signedPct(delta.region_rate_delta))}${fact('Snapshot',current.id,true)}${fact('Inventory',current.inventory_hash ? String(current.inventory_hash).slice(0,10) : '—',true)}${fact('Source',inc.detail_source || 'stored')}</div>${reasons ? `<div class="composite-reasons">${reasons}</div>` : ''}${remediation ? `<div class="detail-source">${remediation}</div>` : ''}</div><div><h3 style="margin:0 0 6px;font-size:11px">Component coverage</h3><div class="component-list">${componentRows}</div></div></div><div class="category-grid" style="margin-top:10px">${categories}</div><div class="detail-source"><span class="pill ${inc.status === 'measured' ? 'good' : 'warn'}">${inc.status === 'measured' ? 'exact stored diff' : esc(inc.reason || 'no composite baseline')}</span><span class="pill">base: ${esc(inc.baseline?.id || 'none')}</span><span class="pill">current: ${esc(inc.current?.id || current.id)}</span><span class="pill">${inc.test_attribution?.status === 'unavailable' ? 'test IDs unavailable' : `${int(inc.test_attribution?.affected_test_count)} affected tests`}</span></div>`;
     }
-    function rateCell(rate,covered,total) { return `<div class="rate-cell"><div class="rate-line"><span>${pct(rate)}</span><span class="muted">${int(covered)}/${int(total)}</span></div><div class="bar"><i style="width:${safeRate(rate)*100}%"></i></div></div>`; }
+function rateCell(rate,covered,total) { return `<div class="rate-cell"><div class="rate-line"><span>${pct(rate)}</span><span class="muted">${int(covered)}/${int(total)}</span></div><div class="bar"><i style="width:${safeRate(rate)*100}%"></i></div></div>`; }
+
+    function renderFunctionGraph() {
+      const svg = $('sourceGraph');
+      const files = state.graphFiles.length ? state.graphFiles : (state.dashboard?.files?.items || []);
+      const root = buildFunctionGraph(files, state.functions);
+      const leaves = graphFlatten(root).filter(node => !node.children.length);
+      const rowHeight = leaves.length > 180 ? 23 : leaves.length > 80 ? 27 : 34;
+      graphPlace(root, 0, {value:0}, rowHeight);
+      const nodes = graphFlatten(root);
+      const maxDepth = Math.max(...nodes.map(node => node.depth), 0);
+      const width = Math.max(1000, 290 + maxDepth * 210);
+      const height = Math.max(540, leaves.length * rowHeight + 80);
+      state.graphNodes = new Map(nodes.map(node => [node.id, node]));
+      if (!state.graphSelected || !state.graphNodes.has(state.graphSelected)) state.graphSelected = root.id;
+      $('graphStatus').textContent = files.length + ' files · ' + (state.functions.length ? state.functions.length + ' source functions' : 'no per-function LLVM records');
+      $('graphZoomLabel').textContent = 'Function map';
+      svg.style.width = width + 'px';
+      svg.style.height = height + 'px';
+      svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+      svg.innerHTML = '';
+      svg.appendChild(svgElement('rect', {x:0, y:0, width, height, fill:'#f8fafc'}));
+      nodes.forEach(parent => parent.children.forEach(child => {
+        const startX = parent.x + 8;
+        const endX = child.x - 8;
+        const midpoint = startX + (endX - startX) / 2;
+        svg.appendChild(svgElement('path', {class:'graph-edge', d:'M ' + startX + ' ' + parent.y + ' C ' + midpoint + ' ' + parent.y + ', ' + midpoint + ' ' + child.y + ', ' + endX + ' ' + child.y}));
+      }));
+      nodes.forEach(node => appendGraphNode(svg, node));
+      renderGraphInspector(state.graphNodes.get(state.graphSelected));
+    }
+    function renderDependencyGraph() {
+      const svg = $('sourceGraph');
+      const files = state.graphFiles.length ? state.graphFiles : (state.dashboard?.files?.items || []);
+      const nodes = files.map((file, index) => {
+        const node = graphNode('file', String(file.file_path).split('/').pop() || file.file_path, file.file_path, file);
+        node.filePath = file.file_path;
+        node.files = [file];
+        node.metrics = graphFileMetrics(file);
+        const angle = files.length <= 1 ? 0 : (Math.PI * 2 * index / files.length) - Math.PI / 2;
+        const radius = files.length <= 1 ? 0 : Math.min(245, 75 + Math.sqrt(files.length) * 35);
+        node.x = 500 + Math.cos(angle) * radius;
+        node.y = 285 + Math.sin(angle) * radius;
+        return node;
+      });
+      state.graphNodes = new Map(nodes.map(node => [node.id, node]));
+      if (!state.graphSelected || !state.graphNodes.has(state.graphSelected)) state.graphSelected = nodes[0]?.id || null;
+      const nodeByPath = new Map(nodes.map(node => [node.filePath, node]));
+      const dependencies = state.dependencies.filter(edge => nodeByPath.has(edge.from) && nodeByPath.has(edge.to) && edge.from !== edge.to);
+      $('graphStatus').textContent = files.length + ' file circles · ' + dependencies.length + ' dependency edges';
+      $('graphZoomLabel').textContent = 'File dependencies';
+      const width = 1000;
+      const height = 570;
+      svg.style.width = '100%';
+      svg.style.height = height + 'px';
+      svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+      svg.innerHTML = '';
+      svg.appendChild(svgElement('rect', {x:0, y:0, width, height, fill:'#f8fafc'}));
+      const defs = svgElement('defs');
+      const marker = svgElement('marker', {id:'graph-arrow', markerWidth:7, markerHeight:7, refX:6, refY:3.5, orient:'auto'});
+      marker.appendChild(svgElement('path', {d:'M 0 0 L 7 3.5 L 0 7 z', fill:'#94a3b8'}));
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+      dependencies.forEach(edge => {
+        const from = nodeByPath.get(edge.from);
+        const to = nodeByPath.get(edge.to);
+        svg.appendChild(svgElement('path', {class:'graph-edge dependency', d:'M ' + from.x + ' ' + from.y + ' L ' + to.x + ' ' + to.y}));
+      });
+      nodes.forEach(node => appendGraphNode(svg, node));
+      renderGraphInspector(state.graphNodes.get(state.graphSelected));
+    }
+    function updateGraphZoomControls() {
+      $('graphZoom').value = state.graphZoom;
+      $('graphZoomLabel').textContent = state.graphZoom < 50 ? 'File dependencies' : 'Function map';
+    }
+    function setGraphZoom(value) {
+      state.graphZoom = Math.max(0, Math.min(100, Number(value) || 0));
+      updateGraphZoomControls();
+      renderSourceGraph();
+    }
+    function renderSourceGraph() {
+      updateGraphZoomControls();
+      const svg = $('sourceGraph');
+      const files = state.graphFiles.length ? state.graphFiles : (state.dashboard?.files?.items || []);
+      if (!state.currentId || !files.length) {
+        $('graphStatus').textContent = '';
+        svg.innerHTML = '<text x="500" y="270" text-anchor="middle" fill="#687385" font-size="12">Select a snapshot to build the source graph.</text>';
+        state.graphNodes = new Map();
+        renderGraphInspector(null);
+        return;
+      }
+      if (state.graphZoom < 50) renderDependencyGraph();
+      else renderFunctionGraph();
+    }
+    function selectGraphNode(nodeId) {
+      const node = state.graphNodes.get(nodeId);
+      if (!node) return;
+      state.graphSelected = nodeId;
+      renderSourceGraph();
+      if (node.kind === 'file' || node.kind === 'function') openFile(node.filePath);
+    }
+
+
+    function graphReasons(node) {
+      const metrics = node.metrics || {};
+      const reasons = [];
+      if (node.kind === 'function' && !metrics.executed) reasons.push({tone:'danger', text:'LLVM recorded zero executions for this function.'});
+      if (metrics.missingLines) reasons.push({tone:'danger', text:metrics.missingLines + ' executable line' + (metrics.missingLines === 1 ? '' : 's') + ' have no recorded hits.'});
+      if (metrics.missingRegions) reasons.push({tone:'warn', text:metrics.missingRegions + ' LLVM region' + (metrics.missingRegions === 1 ? '' : 's') + ' are not covered.'});
+      if (metrics.missingBranches) reasons.push({tone:'warn', text:metrics.missingBranches + ' branch outcome' + (metrics.missingBranches === 1 ? '' : 's') + ' are not covered.'});
+      if (!reasons.length) reasons.push({tone:'good', text:'No line, region, or branch gaps are reported for this selection.'});
+      return reasons.slice(0, 5);
+    }
+    function renderGraphInspector(node) {
+      const inspector = $('graphInspector');
+      if (!node) { inspector.innerHTML = '<span class="muted">Select a source node.</span>'; return; }
+      const metrics = node.metrics || {};
+      const path = node.kind === 'function' ? node.filePath : (node.path || 'all selected source files');
+      const title = node.kind === 'root' ? 'Project source' : node.name;
+      const kind = node.kind === 'function' ? 'Source function' : node.kind === 'file' ? 'File' : node.kind === 'root' ? 'Project' : 'Directory';
+      const html = ['<h3>Graph selection</h3>','<div class="graph-selection-title"><strong>',esc(title),'</strong><code title="',esc(path),'">',esc(path),'</code><span class="muted">',kind,' · ',node.files.length,' file',node.files.length === 1 ? '' : 's','</span></div>','<div class="graph-stat-grid">','<div class="graph-stat"><span>Completeness</span><strong>',esc(pct(graphCoverageRate(metrics))),'</strong></div>','<div class="graph-stat"><span>Missed lines</span><strong>',int(metrics.missingLines),'</strong></div>','<div class="graph-stat"><span>Region gaps</span><strong>',int(metrics.missingRegions),'</strong></div>','<div class="graph-stat"><span>Branch gaps</span><strong>',int(metrics.missingBranches),'</strong></div>','<div class="graph-stat"><span>',node.kind === 'function' ? 'Executed' : 'Functions','</span><strong>',node.kind === 'function' ? (metrics.executed ? 'yes' : 'no') : int(metrics.coveredFunctions) + '/' + int(metrics.totalFunctions),'</strong></div>','</div><ul class="graph-reasons">',graphReasons(node).map(reason => '<li class="graph-reason ' + reason.tone + '">' + esc(reason.text) + '</li>').join(''),'</ul>'];
+      inspector.innerHTML = html.join('');
+      if (node.kind === 'function' || node.kind === 'file') {
+        const button = document.createElement('button');
+        button.className = 'primary';
+        button.type = 'button';
+        button.textContent = 'Open source detail';
+        button.addEventListener('click', () => openFile(node.filePath));
+        inspector.appendChild(button);
+      }
+    }
+    function graphNodeClass(node) {
+      return 'graph-node ' + node.kind + ' ' + graphTone(graphCoverageRate(node.metrics)) + (state.graphSelected === node.id ? ' selected' : '');
+    }
+    function appendGraphNode(svg, node) {
+      const group = svgElement('g', {class:graphNodeClass(node), tabindex:0, role:'button', 'aria-label':node.kind + ' ' + (node.filePath || node.path || 'project') + ', ' + pct(graphCoverageRate(node.metrics)) + ' completeness'});
+      const title = svgElement('title');
+      title.textContent = node.kind === 'function' ? node.name + ' · ' + pct(graphCoverageRate(node.metrics)) + ' completeness · ' + node.filePath + ':' + (node.function?.start_line || '') : (node.path || 'project') + ' · ' + pct(graphCoverageRate(node.metrics)) + ' completeness · ' + graphNumber(node.metrics.missingLines) + ' missed lines';
+      group.appendChild(title);
+      const missing = graphNumber(node.metrics.missingLines) + graphNumber(node.metrics.missingRegions) + graphNumber(node.metrics.missingBranches);
+      const size = node.kind === 'function' ? Math.min(10, 4 + Math.sqrt(missing) * .55) : node.kind === 'file' ? Math.min(16, 5 + Math.sqrt(graphNumber(node.metrics.missingLines)) * .75) : Math.min(12, node.kind === 'root' ? 9 : 5 + Math.sqrt(graphNumber(node.metrics.missingLines)) * .35);
+      const shape = node.kind === 'directory' || node.kind === 'root' ? svgElement('rect', {class:'graph-node-shape', x:node.x-size, y:node.y-size, width:size*2, height:size*2, rx:3}) : svgElement('circle', {class:'graph-node-shape', cx:node.x, cy:node.y, r:size});
+      group.appendChild(shape);
+      const labelX = node.x + size + 8;
+      const label = svgElement('text', {class:'graph-label ' + node.kind, x:labelX, y:node.y+4});
+      label.textContent = graphNodeLabel(node);
+      group.appendChild(label);
+      const rate = svgElement('text', {class:'graph-label-rate', x:labelX, y:node.y+18});
+      rate.textContent = node.kind === 'function' ? 'L ' + graphNumber(node.metrics.coveredLines) + '/' + graphNumber(node.metrics.totalLines) + ' · R ' + graphNumber(node.metrics.coveredRegions) + '/' + graphNumber(node.metrics.totalRegions) + ' · B ' + graphNumber(node.metrics.coveredBranches) + '/' + graphNumber(node.metrics.totalBranches) : pct(graphCoverageRate(node.metrics)) + ' · ' + graphNumber(node.metrics.missingLines) + ' missed · ' + graphNumber(node.metrics.totalFunctions) + ' fn';
+      group.appendChild(rate);
+      group.addEventListener('click', () => selectGraphNode(node.id));
+      group.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectGraphNode(node.id); } });
+      svg.appendChild(group);
+    }
+
+
+    function graphMaybeRate(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : null;
+    }
+    function graphRate(total, covered) {
+      return total > 0 ? Math.max(0, Math.min(1, covered / total)) : null;
+    }
+    function graphMetricValue(file, key) {
+      const current = file['current_' + key];
+      return current === undefined || current === null ? file[key] : current;
+    }
+    function graphFileMetrics(file) {
+      const totalLines = graphNumber(graphMetricValue(file, 'total_lines'));
+      const coveredLines = Math.min(totalLines, graphNumber(graphMetricValue(file, 'covered_lines')));
+      const totalRegions = graphNumber(graphMetricValue(file, 'total_regions'));
+      const coveredRegions = Math.min(totalRegions, graphNumber(graphMetricValue(file, 'covered_regions')));
+      const totalBranches = graphNumber(graphMetricValue(file, 'total_branches'));
+      const coveredBranches = Math.min(totalBranches, graphNumber(graphMetricValue(file, 'covered_branches')));
+      const totalFunctions = graphNumber(graphMetricValue(file, 'total_functions'));
+      const coveredFunctions = Math.min(totalFunctions, graphNumber(graphMetricValue(file, 'covered_functions')));
+      const lineRate = graphMaybeRate(graphMetricValue(file, 'line_rate')) ?? graphRate(totalLines, coveredLines);
+      const regionRate = graphMaybeRate(graphMetricValue(file, 'region_rate')) ?? graphRate(totalRegions, coveredRegions);
+      const branchRate = graphMaybeRate(graphMetricValue(file, 'branch_rate')) ?? graphRate(totalBranches, coveredBranches);
+      const functionRate = graphMaybeRate(graphMetricValue(file, 'function_rate')) ?? graphRate(totalFunctions, coveredFunctions);
+      const rates = [lineRate, regionRate, branchRate, functionRate].filter(rate => rate !== null);
+      return {totalLines, coveredLines, totalRegions, coveredRegions, totalBranches, coveredBranches, totalFunctions, coveredFunctions, lineRate, regionRate, branchRate, functionRate, completenessRate: rates.length ? Math.min(...rates) : null, missingLines: Math.max(0, totalLines - coveredLines), missingRegions: Math.max(0, totalRegions - coveredRegions), missingBranches: Math.max(0, totalBranches - coveredBranches)};
+    }
+    function graphFunctionMetrics(coverage) {
+      const totalLines = graphNumber(coverage.total_lines);
+      const coveredLines = Math.min(totalLines, graphNumber(coverage.covered_lines));
+      const totalRegions = graphNumber(coverage.total_regions);
+      const coveredRegions = Math.min(totalRegions, graphNumber(coverage.covered_regions));
+      const totalBranches = graphNumber(coverage.total_branches);
+      const coveredBranches = Math.min(totalBranches, graphNumber(coverage.covered_branches));
+      const executed = Boolean(coverage.covered || graphNumber(coverage.execution_count) > 0);
+      const lineRate = graphMaybeRate(coverage.line_rate) ?? graphRate(totalLines, coveredLines);
+      const regionRate = graphMaybeRate(coverage.region_rate) ?? graphRate(totalRegions, coveredRegions);
+      const branchRate = graphMaybeRate(coverage.branch_rate) ?? graphRate(totalBranches, coveredBranches);
+      const functionRate = graphMaybeRate(coverage.function_rate) ?? (executed ? 1 : 0);
+      const rates = [lineRate, regionRate, branchRate].filter(rate => rate !== null);
+      return {totalLines, coveredLines, totalRegions, coveredRegions, totalBranches, coveredBranches, totalFunctions:1, coveredFunctions:executed ? 1 : 0, lineRate, regionRate, branchRate, functionRate, completenessRate: graphMaybeRate(coverage.completeness_rate) ?? (rates.length ? Math.min(...rates) : functionRate), missingLines: Math.max(0, totalLines - coveredLines), missingRegions: Math.max(0, totalRegions - coveredRegions), missingBranches: Math.max(0, totalBranches - coveredBranches), executed};
+    }
+    function graphCoverageRate(metrics) {
+      return metrics.completenessRate ?? [metrics.lineRate, metrics.regionRate, metrics.branchRate, metrics.functionRate].filter(rate => rate !== null && rate !== undefined).reduce((lowest, rate) => Math.min(lowest, rate), 1);
+    }
+    function graphTone(rate) {
+      if (rate === null || rate === undefined) return 'neutral';
+      return rate < 0.6 ? 'critical' : rate < 0.85 ? 'attention' : 'good';
+    }
+    function graphNode(kind, name, path, file = null) {
+      return {id: kind + ':' + (path || '/'), kind, name, path, file, filePath:path, function:null, children:[], childMap:new Map(), files:[], metrics:null, x:0, y:0, depth:0};
+    }
+    function buildFunctionGraph(files, functions) {
+      const root = graphNode('root', 'project', '');
+      const fileNodes = new Map();
+      for (const file of files) {
+        const parts = String(file.file_path || '').split('/').filter(Boolean);
+        if (!parts.length) continue;
+        let parent = root;
+        parts.forEach((part, index) => {
+          const path = parts.slice(0, index + 1).join('/');
+          let node = parent.childMap.get(path);
+          if (!node) {
+            const kind = index === parts.length - 1 ? 'file' : 'directory';
+            node = graphNode(kind, part, path, kind === 'file' ? file : null);
+            parent.childMap.set(path, node);
+            parent.children.push(node);
+          }
+          parent = node;
+          if (index === parts.length - 1) {
+            node.file = file;
+            node.filePath = file.file_path;
+            node.files = [file];
+            node.metrics = graphFileMetrics(file);
+            fileNodes.set(file.file_path, node);
+          }
+        });
+      }
+      for (const coverage of functions) {
+        const fileNode = fileNodes.get(coverage.file_path);
+        if (!fileNode) continue;
+        const name = coverage.function_name || coverage.llvm_name || 'anonymous function';
+        const key = coverage.function_key || coverage.llvm_name || String(coverage.start_line || name);
+        const node = graphNode('function', name, coverage.file_path + '#' + key, fileNode.file);
+        node.filePath = coverage.file_path;
+        node.function = coverage;
+        node.files = [fileNode.file];
+        node.metrics = graphFunctionMetrics(coverage);
+        fileNode.children.push(node);
+      }
+      function aggregate(node) {
+        if (node.kind === 'function') return node.metrics;
+        if (node.kind === 'file') {
+          if (node.children.length && node.metrics.totalFunctions === 0) {
+            node.metrics.totalFunctions = node.children.length;
+            node.metrics.coveredFunctions = node.children.filter(child => child.metrics.coveredFunctions > 0).length;
+            node.metrics.functionRate = graphRate(node.metrics.totalFunctions, node.metrics.coveredFunctions);
+            node.metrics.completenessRate = [node.metrics.lineRate, node.metrics.regionRate, node.metrics.branchRate, node.metrics.functionRate].filter(rate => rate !== null).reduce((lowest, rate) => Math.min(lowest, rate), 1);
+          }
+          return node.metrics;
+        }
+        const children = node.children.map(aggregate);
+        const total = key => children.reduce((sum, metrics) => sum + graphNumber(metrics[key]), 0);
+        const metrics = {totalLines:total('totalLines'), coveredLines:total('coveredLines'), totalRegions:total('totalRegions'), coveredRegions:total('coveredRegions'), totalBranches:total('totalBranches'), coveredBranches:total('coveredBranches'), totalFunctions:total('totalFunctions'), coveredFunctions:total('coveredFunctions')};
+        metrics.lineRate = graphRate(metrics.totalLines, metrics.coveredLines);
+        metrics.regionRate = graphRate(metrics.totalRegions, metrics.coveredRegions);
+        metrics.branchRate = graphRate(metrics.totalBranches, metrics.coveredBranches);
+        metrics.functionRate = graphRate(metrics.totalFunctions, metrics.coveredFunctions);
+        metrics.completenessRate = [metrics.lineRate, metrics.regionRate, metrics.branchRate, metrics.functionRate].filter(rate => rate !== null).reduce((lowest, rate) => Math.min(lowest, rate), 1);
+        metrics.missingLines = metrics.totalLines - metrics.coveredLines;
+        metrics.missingRegions = metrics.totalRegions - metrics.coveredRegions;
+        metrics.missingBranches = metrics.totalBranches - metrics.coveredBranches;
+        node.metrics = metrics;
+        node.files = children.flatMap(child => child.files);
+        return metrics;
+      }
+      aggregate(root);
+      return root;
+    }
+    function graphFlatten(node) {
+      return [node, ...node.children.flatMap(graphFlatten)];
+    }
+    function graphPlace(node, depth, cursor, rowHeight) {
+      node.depth = depth;
+      node.x = 100 + depth * 210;
+      if (!node.children.length) {
+        node.y = 44 + cursor.value * rowHeight;
+        cursor.value += 1;
+        return;
+      }
+      node.children.forEach(child => graphPlace(child, depth + 1, cursor, rowHeight));
+      node.y = node.children.reduce((sum, child) => sum + child.y, 0) / node.children.length;
+    }
+    function graphNodeLabel(node) {
+      if (node.kind === 'function') return String(node.name || 'anonymous').split('::').slice(-2).join('::');
+      if (node.kind === 'root') return 'project';
+      return node.name;
+    }
+    function svgElement(tag, attributes = {}) {
+      const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, String(value)));
+      return element;
+    }
+
+
+    function graphNumber(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : 0;
+    }
+
     function renderFiles(data) { const items=data.files?.items||[]; $('filesMeta').textContent=data.files?`${int(data.files.total)} files · ${data.files.source==='current_vs_baseline'?'sorted by delta':'lowest current coverage first'}${data.files.truncated?' · showing a bounded slice':''}`:''; if(!items.length){$('fileRows').innerHTML='<tr><td colspan="7" class="empty">No coverage files in the selected snapshot.</td></tr>';return;} const measured=data.incremental?.status==='measured'; $('fileRows').innerHTML=items.map(file=>{const lineRate=measured?file.current_line_rate:file.line_rate,branchRate=measured?file.current_branch_rate:file.branch_rate,functionRate=measured?file.current_function_rate:file.function_rate,regionRate=measured?file.current_region_rate:file.region_rate,delta=measured?file.line_rate_delta:null; return `<tr data-file="${esc(file.file_path)}"><td class="path"><code title="${esc(file.file_path)}">${esc(file.file_path)}</code></td><td>${rateCell(lineRate,measured?file.current_covered_lines:file.covered_lines,measured?file.current_total_lines:file.total_lines)}</td><td class="num">${pct(branchRate)}</td><td class="num">${pct(functionRate)}</td><td class="num">${pct(regionRate)}</td><td class="${Number(delta)<0?'bad':Number(delta)>0?'good':'neutral'}">${signedPct(delta)}</td><td>${esc(data.current?.detail_retention||'compactable')}</td></tr>`;}).join(''); }
     function renderCompaction(data) { const policy=data.compaction?.policy||{},inventory=data.compaction?.inventory||{},ratio=Number.isFinite(Number(inventory.compression_ratio))?`${(Number(inventory.compression_ratio)*100).toFixed(0)}%`:'—'; $('compactionInventory').innerHTML=[fact('Snapshots',int(inventory.snapshot_count)),fact('Payloads',int(inventory.compacted_snapshot_count)),fact('Relational',int(inventory.relational_snapshot_count)),fact('Protected bases',int(inventory.retained_incremental_base_count)),fact('Eligible now',int(inventory.eligible_snapshot_count)),fact('Original bytes',`${int(inventory.original_bytes)} B`),fact('Compressed bytes',`${int(inventory.compressed_bytes)} B`),fact('Saved',`${int(inventory.bytes_saved)} B`),fact('Compression',ratio),fact('Orphans',int(inventory.orphan_payload_count)),fact('Last payload',inventory.last_compacted_at?new Date(inventory.last_compacted_at).toLocaleString():'never')].join(''); $('compactionEnabled').checked=Boolean(policy.compaction_enabled); $('compactionAfterDays').value=policy.compaction_after_days??''; $('compactionIntervalSeconds').value=policy.compaction_interval_seconds??''; $('compactionBatchSize').value=policy.compaction_batch_size??''; const consistent=inventory.payload_inventory_consistent!==false; $('compactionHealth').textContent=!consistent?'inventory error':inventory.compacted_snapshot_count?'payloads verified':'no payloads yet'; $('compactionHealth').className=`status ${consistent&&inventory.compacted_snapshot_count?'completed':consistent?'':'failed'}`; }
     function renderTimeline(data) { const points=[...(data.history?.points||[])]; $('historyStatus').textContent=data.history?.truncated?`showing ${data.history.returned} of more snapshots`:`${data.history?.returned||0} snapshots`; $('timelineMeta').textContent=points.length?`${points.length} measurements · newest selected in the controls above`:'No measurements yet.'; $('timelineRows').innerHTML=points.slice().reverse().map(point=>`<tr class="${point.id===data.current?.id?'selected':''}"><td><strong>${esc(new Date(point.created_at).toLocaleString())}</strong><br><span class="suite">${esc(point.suite)} · ${esc(point.format)}</span></td><td class="num">${pct(point.line_rate)}<br><span class="muted">${int(point.covered_lines)}/${int(point.total_lines)}</span></td><td class="num">${pct(point.branch_rate)}<br><span class="muted">${int(point.covered_branches)}/${int(point.total_branches)}</span></td><td class="num">${pct(point.function_rate)}<br><span class="muted">${int(point.covered_functions)}/${int(point.total_functions)}</span></td><td class="num">${pct(point.region_rate)}<br><span class="muted">${int(point.covered_regions)}/${int(point.total_regions)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; }

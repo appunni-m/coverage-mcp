@@ -316,6 +316,9 @@ impl CoverageServer {
         if path == "/" && request.method() == Method::GET {
             return Ok(dashboard_response());
         }
+        if path == "/graph" && request.method() == Method::GET {
+            return Ok(graph_response());
+        }
         if path == "/mcp" || path == "/mcp/" {
             return self.dispatch_mcp(request).await;
         }
@@ -526,6 +529,16 @@ impl CoverageServer {
                     let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, &format!("rest-files:{snapshot_id}"), None)?;
                     service.envelope(Value::Array(values), None, Some(page))
                 }
+            }
+            (Method::GET, ["api", "snapshots", snapshot_id, "functions"]) => {
+                let values = store.functions(snapshot_id, query_value(&query, "file_path"), COLLECTION_FETCH_LIMIT)?;
+                let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, &format!("rest-functions:{snapshot_id}"), None)?;
+                service.envelope(Value::Array(values), None, Some(page))
+            }
+            (Method::GET, ["api", "snapshots", snapshot_id, "dependencies"]) => {
+                let values = store.dependencies(snapshot_id, COLLECTION_FETCH_LIMIT)?;
+                let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, &format!("rest-dependencies:{snapshot_id}"), None)?;
+                service.envelope(Value::Array(values), None, Some(page))
             }
             (Method::GET, ["api", "snapshots", snapshot_id, "insights"]) => service.envelope(store.insights(snapshot_id, query_value(&query, "baseline_snapshot_id"), COLLECTION_FETCH_LIMIT)?, None, None),
             (Method::GET, ["api", "trend"]) => service.envelope(Value::Array(store.trend(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), query_value(&query, "file_path"), query_value(&query, "worktree_id"), query_usize(&query, "limit", 100)? )?), None, None),
@@ -1342,6 +1355,19 @@ fn dashboard_html() -> &'static str {
     include_str!("dashboard.html")
 }
 
+fn graph_response() -> HttpResponse {
+    let mut response = Response::new(Full::new(Bytes::from(graph_html())).boxed_unsync());
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    harden(response)
+}
+
+fn graph_html() -> &'static str {
+    include_str!("graph.html")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1607,6 +1633,8 @@ mod tests {
         );
         let dashboard = dashboard_response();
         assert_eq!(dashboard.status(), StatusCode::OK);
+        let graph = graph_response();
+        assert_eq!(graph.status(), StatusCode::OK);
         assert!(dashboard_html().contains("EventSource"));
         assert!(dashboard_html().contains("metricsGrid"));
         assert!(dashboard_html().contains("compositeCurrentSelect"));
@@ -1617,6 +1645,10 @@ mod tests {
         assert!(dashboard_html().contains("visibilitychange"));
         assert!(dashboard_html().contains("refreshTimer"));
         assert!(dashboard_html().contains("setLive('live', 'on')"));
+        assert!(graph_html().contains("Function hierarchy"));
+        assert!(graph_html().contains("File dependencies"));
+        assert!(graph_html().contains("/api/snapshots/"));
+        assert!(graph_html().contains("source-import edges"));
         assert!(format!("{:?}", CoverageServer::new(config()).unwrap()).contains("CoverageServer"));
 
         let dashboard_directory = tempfile::tempdir().unwrap();
@@ -1758,6 +1790,9 @@ mod tests {
             stream.read_to_end(&mut response).await.unwrap();
             String::from_utf8(response).unwrap()
         }
+        let graph_page = rest_request(address, "GET", "/graph", "").await;
+        assert!(graph_page.contains("200 OK"));
+        assert!(graph_page.contains("Function hierarchy"));
         for (method, path, payload) in [
             (
                 "GET",
@@ -3280,6 +3315,8 @@ mod tests {
                 ("GET", "/api/composite-snapshots/missing/insights", ""),
                 ("GET", "/api/dashboard", ""),
                 ("GET", "/api/snapshots/missing/files", ""),
+                ("GET", "/api/snapshots/missing/functions", ""),
+                ("GET", "/api/snapshots/missing/dependencies", ""),
                 ("POST", "/api/projects/project/compact", "{}"),
             ],
         )
@@ -3369,6 +3406,114 @@ mod tests {
         task.abort();
         let _ = task.await;
         command_server.close_stores().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_graph_rest_routes_return_projected_collections() {
+        async fn request(address: std::net::SocketAddr, path: &str) -> String {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub mod dep;\npub fn graph_entry() -> i32 { dep::value() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/dep.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "graph@example.com"],
+            vec!["config", "user.name", "Graph Tests"],
+            vec!["add", "."],
+            vec!["commit", "-m", "graph base"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(directory.path())
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut server_config = config();
+        server_config.default_repository_path = Some(directory.path().to_path_buf());
+        server_config.common_db_path = directory.path().join("graph-common.duckdb");
+        let server = CoverageServer::new(server_config).unwrap();
+        let service = server
+            .service_for_repository_path(&directory.path().to_string_lossy())
+            .unwrap();
+        let report_path = directory.path().join("coverage.json");
+        std::fs::write(
+            &report_path,
+            r#"{"data":[{"files":[{"filename":"src/lib.rs","segments":[[1,1,1,true]],"summary":{"lines":{"count":1,"covered":1},"functions":{"count":1,"covered":1},"regions":{"count":1,"covered":1}}},{"filename":"src/dep.rs","segments":[[1,1,1,true]],"summary":{"lines":{"count":1,"covered":1},"regions":{"count":1,"covered":1}}}],"functions":[{"name":"graph_entry","count":1,"filenames":["src/lib.rs"],"regions":[[1,1,1,1,1,0,0,0]],"branches":[[1,1,1,1,1,0,0,0]]}]}]}"#,
+        )
+        .unwrap();
+        let snapshot_id = service
+            .store()
+            .ingest_report(
+                &report_path,
+                "llvm",
+                Some(directory.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(server.clone().serve_listener(listener));
+        let functions = request(
+            address,
+            &format!("/api/snapshots/{snapshot_id}/functions?file_path=src%2Flib.rs"),
+        )
+        .await;
+        assert!(functions.contains("200 OK"));
+        assert!(functions.contains("graph_entry"));
+        let function_cursor_error = request(
+            address,
+            &format!("/api/snapshots/{snapshot_id}/functions?cursor=bad"),
+        )
+        .await;
+        assert!(function_cursor_error.contains("400 Bad Request"));
+        let dependencies = request(
+            address,
+            &format!("/api/snapshots/{snapshot_id}/dependencies"),
+        )
+        .await;
+        assert!(dependencies.contains("200 OK"));
+        assert!(dependencies.contains("rust-source"));
+        let dependency_cursor_error = request(
+            address,
+            &format!("/api/snapshots/{snapshot_id}/dependencies?cursor=bad"),
+        )
+        .await;
+        assert!(dependency_cursor_error.contains("400 Bad Request"));
+        task.abort();
+        let _ = task.await;
+        server.close_stores().unwrap();
     }
 
     #[test]

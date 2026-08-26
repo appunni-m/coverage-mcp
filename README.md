@@ -719,6 +719,11 @@ MCP. Important routes are:
   dashboard keeps this stream open only while its tab is foregrounded; the
   stream does not run tests or recalculate coverage;
 - `GET /api/snapshots`, `/api/snapshots/{id}`, and snapshot file/insight routes;
+- `GET /api/snapshots/{id}/functions` — source-mapped LLVM function records with
+  line, region, branch, execution, and completeness metrics;
+- `GET /api/snapshots/{id}/dependencies` — bounded best-effort Rust `use`/`mod`
+  file edges for the source graph; these are source-import edges, not a runtime
+  call graph;
 - `GET /api/composite-snapshots/{id}` — bounded composite audit summary with
   exact inventory/provenance and component evidence;
 - `GET /api/composite-snapshots/{id}/regions` and `/insights` — bounded
@@ -741,6 +746,9 @@ MCP. Important routes are:
   approved execution, retained evidence, and baselines;
 - `POST /mcp/` — stateless JSON-RPC MCP over HTTP.
 
+The embedded dashboard is available at `/`; `/graph` opens the dedicated
+source-graph page without the dashboard's timeline and maintenance panels.
+
 In common-daemon mode, select a repository with a project ID from
 `GET /api/projects`, the `x-coverage-mcp-repo` header, or the documented
 `repo_path` query/body field. The daemon rejects non-loopback bind hosts and
@@ -762,6 +770,17 @@ requested. The page receives SSE refresh events at a 10-second foreground-only
 cadence and coalesces concurrent refreshes. It does not infer that a full run
 and an incremental run used the same arguments; the run projection displays
 persisted case arguments and the server-generated opaque execution fingerprint.
+
+The Source coverage graph is a separate `/graph` page. Its explicit
+**Function hierarchy** mode renders project/directory/file nodes and the LLVM
+function records mapped to each file. Each function card shows `L
+covered/total`, `R covered/total`, `B covered/total`, execution count, source
+range, and weakest-metric completeness. Its **File dependencies** mode renders
+source files and resolved import edges; these are source-import edges, not a
+runtime call graph. Zoom now scales the selected graph canvas from 50% to
+200% and never changes the graph's meaning. Non-LLVM reports remain useful in
+the file mode, while the hierarchy explicitly reports files without mapped
+function records instead of inventing them.
 
 The Compaction health panel distinguishes relational snapshots, compressed
 payloads, protected `incremental_base` snapshots, currently eligible work,

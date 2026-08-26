@@ -2603,6 +2603,24 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
         None,
     )
     .await;
+    let functions = http_exchange(
+        address,
+        "GET",
+        &format!("/api/snapshots/{snapshot_id}/functions"),
+        None,
+        None,
+    )
+    .await;
+    assert!(functions["data"].as_array().unwrap().is_empty());
+    let dependencies = http_exchange(
+        address,
+        "GET",
+        &format!("/api/snapshots/{snapshot_id}/dependencies"),
+        None,
+        None,
+    )
+    .await;
+    assert!(dependencies["data"].as_array().unwrap().is_empty());
     let _file_filter = http_exchange(
         address,
         "GET",

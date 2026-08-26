@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coverage MCP · Source graph</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #fff;
+      --ink: #17202a;
+      --muted: #687385;
+      --line: #dfe4eb;
+      --soft: #f8fafc;
+      --accent: #176b63;
+      --good: #067647;
+      --bad: #b42318;
+      --warn: #b54708;
+      --shadow: 0 1px 2px rgba(15, 23, 42, .05);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button, input, select { font: inherit; min-height: 32px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+    button { padding: 0 10px; cursor: pointer; }
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button:disabled { cursor: default; opacity: .55; }
+    input, select { min-width: 0; padding: 0 8px; }
+    code { font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    a { color: var(--accent); }
+    header { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 22px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.96); backdrop-filter: blur(8px); }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .brand h1 { margin: 0; font-size: 16px; line-height: 1.1; }
+    .brand p { margin: 3px 0 0; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .back { color: var(--muted); font-size: 11px; text-decoration: none; white-space: nowrap; }
+    .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #98a2b3; }
+    .live.on { color: var(--good); }
+    .live.on::before { background: var(--good); box-shadow: 0 0 0 3px #dcfae6; }
+    .live.busy::before { background: var(--warn); }
+    .toolbar { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .toolbar select:first-child { width: min(300px, 25vw); }
+    .toolbar select:nth-child(2) { width: min(350px, 28vw); }
+    main { max-width: 1600px; margin: 0 auto; padding: 16px 22px 34px; }
+    .stack { display: grid; gap: 12px; }
+    .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
+    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .panel-head h2 { margin: 0; font-size: 13px; }
+    .panel-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
+    .muted { color: var(--muted); }
+    .empty { padding: 28px 14px; color: var(--muted); text-align: center; }
+    .graph-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 7px; }
+    .mode-switch { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+    .mode-switch button { border: 0; border-radius: 0; border-right: 1px solid var(--line); background: var(--panel); color: var(--muted); }
+    .mode-switch button:last-child { border-right: 0; }
+    .mode-switch button[aria-pressed="true"] { background: #e7f5f1; color: var(--accent); font-weight: 700; }
+    .zoom-tools { display: inline-flex; align-items: center; gap: 5px; }
+    .zoom-tools input { width: 120px; accent-color: var(--accent); }
+    .zoom-tools button { min-width: 31px; padding: 0; }
+    .zoom-label { min-width: 43px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+    .graph-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 13px; padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--soft); }
+    .graph-meta span { color: var(--muted); font-size: 11px; }
+    .legend-dot { display: inline-block; width: 9px; height: 9px; margin-right: 4px; border-radius: 50%; vertical-align: -1px; }
+    .legend-dot.good { background: var(--good); }
+    .legend-dot.attention { background: var(--warn); }
+    .legend-dot.critical { background: var(--bad); }
+    .graph-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: 650px; }
+    .graph-stage { min-width: 0; min-height: 650px; max-height: 760px; overflow: auto; background: var(--soft); }
+    #sourceGraph { display: block; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .graph-bg { fill: #f8fafc; }
+    .graph-edge { fill: none; stroke: #8c9aab; stroke-width: 2; }
+    .graph-edge.dependency { stroke: #8c9aab; stroke-dasharray: 6 4; marker-end: url(#graph-arrow); }
+    .graph-edge-label { fill: #667085; font-size: 10px; pointer-events: none; }
+    .graph-node { cursor: pointer; outline: none; }
+    .graph-node .node-shape { stroke-width: 1.5; transition: stroke-width 120ms ease, filter 120ms ease; }
+    .graph-node.good .node-shape { fill: #d1fae5; stroke: var(--good); }
+    .graph-node.attention .node-shape { fill: #fef3c7; stroke: var(--warn); }
+    .graph-node.critical .node-shape { fill: #fee4e2; stroke: var(--bad); }
+    .graph-node.neutral .node-shape { fill: #eef2f6; stroke: #98a2b3; }
+    .graph-node.selected .node-shape, .graph-node:hover .node-shape, .graph-node:focus .node-shape { stroke: var(--accent); stroke-width: 3; filter: drop-shadow(0 2px 2px rgba(15, 23, 42, .15)); }
+    .node-title { fill: #17202a; font-size: 12px; font-weight: 750; pointer-events: none; }
+    .node-title.function { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+    .node-subtitle { fill: #475467; font-size: 10px; pointer-events: none; }
+    .node-metrics { fill: #667085; font-size: 10px; pointer-events: none; }
+    .graph-inspector { overflow: auto; max-height: 760px; padding: 13px; border-left: 1px solid var(--line); background: #fff; }
+    .graph-inspector h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+    .selection-title { display: grid; gap: 3px; margin-bottom: 11px; }
+    .selection-title strong { font-size: 14px; }
+    .selection-title code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stat-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+    .stat { min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
+    .stat span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+    .stat strong { display: block; margin-top: 2px; font-size: 16px; font-variant-numeric: tabular-nums; }
+    .mapping-note { margin: 11px 0; padding: 9px; border-left: 3px solid var(--accent); background: #eefaf7; color: #344054; font-size: 11px; }
+    .mapping-note strong { display: block; margin-bottom: 2px; color: var(--accent); }
+    .reasons { display: grid; gap: 5px; margin: 10px 0; padding: 0; list-style: none; }
+    .reason { padding: 7px 8px; border-left: 3px solid var(--line); background: var(--soft); font-size: 11px; }
+    .reason.danger { border-color: var(--bad); background: #fff1f0; }
+    .reason.warn { border-color: var(--warn); background: #fff8eb; }
+    .reason.good { border-color: var(--good); background: #ecfdf3; }
+    .inspector-action { width: 100%; margin-top: 4px; }
+    .detail-panel[hidden] { display: none; }
+    .detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+    .detail-head h2 { margin: 0; font-size: 13px; }
+    .detail-head code { display: block; margin-top: 3px; color: var(--muted); }
+    .detail-summary { padding: 12px 14px 0; }
+    .facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+    .fact { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
+    .fact span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+    .fact strong { display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .line-table { width: 100%; border-collapse: collapse; }
+    .line-table-wrap { overflow: auto; padding: 10px 14px 14px; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid #edf0f3; text-align: left; vertical-align: middle; white-space: nowrap; }
+    th { color: var(--muted); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.line-no { width: 64px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+    tr.focused { background: #fff8eb; }
+    .covered { color: var(--good); }
+    .missed { color: var(--bad); }
+    @media (max-width: 1120px) { .graph-layout { grid-template-columns: 1fr; } .graph-inspector { max-height: none; border-top: 1px solid var(--line); border-left: 0; } }
+    @media (max-width: 760px) { header { align-items: flex-start; flex-direction: column; padding: 11px 14px; } .toolbar, .toolbar select { width: 100%; } main { padding: 12px 10px 24px; } .panel-head { flex-direction: column; } .graph-tools { justify-content: flex-start; } .graph-stage { min-height: 520px; } .graph-layout { min-height: 520px; } .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><a class="back" href="/">← Dashboard</a><div><h1>Source coverage graph</h1><p id="projectMeta">Select a repository and snapshot to inspect source mapping.</p></div><span id="liveState" class="live">connecting</span></div>
+    <div class="toolbar"><select id="projectSelect" aria-label="Project"></select><select id="snapshotSelect" aria-label="Coverage snapshot"></select><button id="refreshBtn" type="button">Refresh</button></div>
+  </header>
+  <main class="stack">
+    <section class="panel">
+      <div class="panel-head">
+        <div><h2 id="graphTitle">Function hierarchy</h2><p id="graphDescription">Source files are connected to the LLVM function records that were mapped back to them.</p><span id="graphStatus" class="muted" aria-live="polite"></span></div>
+        <div class="graph-tools">
+          <div class="mode-switch" role="group" aria-label="Graph mode"><button id="functionMode" type="button" data-mode="function" aria-pressed="true">Function hierarchy</button><button id="dependencyMode" type="button" data-mode="dependency" aria-pressed="false">File dependencies</button></div>
+          <div class="zoom-tools" role="group" aria-label="Graph zoom"><button id="zoomOut" type="button" aria-label="Zoom out">−</button><input id="zoomRange" type="range" min="50" max="200" step="10" value="100" aria-label="Graph zoom percentage"><button id="zoomIn" type="button" aria-label="Zoom in">+</button><button id="zoomReset" type="button">Reset</button><span id="zoomLabel" class="zoom-label">100%</span></div>
+        </div>
+      </div>
+      <div class="graph-meta"><span><i class="legend-dot good"></i>complete</span><span><i class="legend-dot attention"></i>partial</span><span><i class="legend-dot critical"></i>missing</span><span id="graphLegendMetrics">Function cards: <code>L</code> lines · <code>R</code> regions · <code>B</code> branch outcomes</span><span>Wheel over the canvas changes scale; mode buttons change meaning.</span></div>
+      <div class="graph-layout"><div id="graphStage" class="graph-stage"><svg id="sourceGraph" viewBox="0 0 1100 620" role="img" aria-label="Source coverage graph"></svg></div><aside id="graphInspector" class="graph-inspector"><span class="muted">Select a node to inspect its mapping and coverage gaps.</span></aside></div>
+    </section>
+    <section id="sourceDetail" class="panel detail-panel" hidden>
+      <div class="detail-head"><div><h2 id="detailTitle">Source detail</h2><code id="detailPath"></code></div><button id="closeDetail" type="button">Close</button></div>
+      <div id="detailSummary" class="detail-summary"></div><div id="detailLines" class="line-table-wrap"></div>
+    </section>
+  </main>
+  <script>
+    const SCHEMA_REVISION = 14;
+    const state = {projects:[], projectKey:null, repoPath:null, dashboard:null, currentId:null, snapshots:[], files:[], functions:[], dependencies:[], mode:'function', zoom:100, nodes:new Map(), selectedKey:null, loading:false};
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const numeric = value => value === null || value === undefined || value === '' ? NaN : Number(value);
+    const int = value => Number.isFinite(numeric(value)) ? Number(value).toLocaleString() : '—';
+    const pct = value => Number.isFinite(numeric(value)) ? `${(numeric(value) * 100).toFixed(1)}%` : '—';
+    const shortPath = value => { const parts = String(value || '').split('/').filter(Boolean); return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : (value || '—'); };
+    const shortText = (value, max = 42) => { const text = String(value || '—'); return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text; };
+    const rate = (total, covered) => Number(total) > 0 ? Math.max(0, Math.min(1, Number(covered || 0) / Number(total))) : null;
+    const tone = value => value === null || value === undefined ? 'neutral' : value < .6 ? 'critical' : value < .85 ? 'attention' : 'good';
+    const fileName = path => String(path || '').split('/').filter(Boolean).pop() || path || 'project';
+    const directoryName = path => { const parts = String(path || '').split('/').filter(Boolean); return parts.length > 1 ? parts.slice(0, -1).join('/') : '(root)'; };
+    const currentProject = () => state.projects.find(project => project.repo_key === state.projectKey) || null;
+
+    async function apiEnvelope(url, options = {}, includeRepository = true) {
+      const request = {...options}; const headers = new Headers(request.headers || {});
+      if (includeRepository && state.repoPath) headers.set('X-Coverage-MCP-Repo', state.repoPath);
+      if (request.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      request.headers = headers;
+      const response = await fetch(url, request); const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+      if (payload.context?.schema_revision !== SCHEMA_REVISION || !Object.hasOwn(payload, 'data')) throw new Error(`Graph needs schema revision ${SCHEMA_REVISION}; reload the current coverage-mcp daemon.`);
+      return payload;
+    }
+    async function api(url, options = {}, includeRepository = true) { return (await apiEnvelope(url, options, includeRepository)).data; }
+    async function apiCollection(url) {
+      const values = []; let cursor = null;
+      for (let page = 0; page < 20; page += 1) {
+        const separator = url.includes('?') ? '&' : '?'; const payload = await apiEnvelope(url + (cursor ? `${separator}cursor=${encodeURIComponent(cursor)}` : ''));
+        if (Array.isArray(payload.data)) values.push(...payload.data); cursor = payload.page?.next_cursor || null; if (!cursor) break;
+      }
+      return values;
+    }
+    function setLive(label, mode = '') { const live = $('liveState'); live.textContent = label; live.className = `live ${mode}`; }
+    function setLoading(value) { state.loading = value; $('refreshBtn').disabled = value; setLive(value ? 'loading' : 'ready', value ? 'busy' : 'on'); }
+
+    async function loadProjects() {
+      const projects = await api('/api/projects?max_words=5000', {}, false); state.projects = Array.isArray(projects) ? projects : [];
+      if (!state.projectKey || !state.projects.some(project => project.repo_key === state.projectKey)) state.projectKey = (state.projects.find(project => Number(project.snapshot_count) > 0) || state.projects[0])?.repo_key || null;
+      state.repoPath = currentProject()?.repo_path || null;
+      $('projectSelect').innerHTML = state.projects.map(project => `<option value="${esc(project.repo_key)}">${esc(shortPath(project.repo_path))}</option>`).join('') || '<option value="">No projects</option>';
+      $('projectSelect').value = state.projectKey || '';
+      $('projectMeta').textContent = state.repoPath ? `${shortPath(state.repoPath)} · select a snapshot` : 'No repository is registered yet.';
+    }
+    function snapshotLabel(snapshot) { return `${new Date(snapshot.created_at).toLocaleString()} · ${snapshot.suite || 'default'} · ${snapshot.format || 'coverage'}`; }
+    function renderSnapshotOptions() {
+      const snapshots = [...state.snapshots].sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)));
+      $('snapshotSelect').innerHTML = snapshots.map(snapshot => `<option value="${esc(snapshot.id)}">${esc(snapshotLabel(snapshot))}</option>`).join('') || '<option value="">No snapshots</option>';
+      $('snapshotSelect').value = state.currentId || '';
+    }
+    function selectedSnapshot() { return state.snapshots.find(snapshot => snapshot.id === state.currentId) || state.dashboard?.current || null; }
+    async function loadSnapshot() {
+      if (!state.repoPath) { state.dashboard = null; state.currentId = null; state.snapshots = []; state.files = []; state.functions = []; state.dependencies = []; renderSnapshotOptions(); renderGraph(); return; }
+      const params = new URLSearchParams({repo_path:state.repoPath, history_limit:'18'}); if (state.currentId) params.set('snapshot_id', state.currentId);
+      state.dashboard = await api(`/api/dashboard?${params}`, {}, false);
+      state.currentId = state.dashboard.selection?.snapshot_id || state.currentId || state.dashboard.current?.id || null;
+      const points = state.dashboard.history?.points || []; state.snapshots = [...points]; if (state.dashboard.current?.id && !state.snapshots.some(snapshot => snapshot.id === state.dashboard.current.id)) state.snapshots.push(state.dashboard.current); renderSnapshotOptions();
+      if (!state.currentId) { state.files = []; state.functions = []; state.dependencies = []; renderGraph(); return; }
+      const [files, functions, dependencies] = await Promise.all([
+        apiCollection(`/api/snapshots/${encodeURIComponent(state.currentId)}/files?max_words=5000`),
+        apiCollection(`/api/snapshots/${encodeURIComponent(state.currentId)}/functions?max_words=5000`),
+        apiCollection(`/api/snapshots/${encodeURIComponent(state.currentId)}/dependencies?max_words=5000`)
+      ]);
+      state.files = Array.isArray(files) ? files : []; state.functions = Array.isArray(functions) ? functions : []; state.dependencies = Array.isArray(dependencies) ? dependencies : [];
+      $('projectMeta').textContent = `${shortPath(state.repoPath)} · ${snapshotLabel(selectedSnapshot())}`;
+      renderGraph();
+    }
+    async function refresh() {
+      if (state.loading) return; setLoading(true);
+      try { await loadProjects(); await loadSnapshot(); } catch (error) { setLive('error', 'busy'); $('graphStatus').textContent = error.message; renderEmpty(error.message); } finally { state.loading = false; $('refreshBtn').disabled = false; if ($('liveState').textContent !== 'error') setLive('ready', 'on'); }
+    }
+
+    function fileMetrics(file, records = []) {
+      const totalFunctions = Math.max(Number(file.total_functions || 0), records.length); const coveredFunctions = Math.min(totalFunctions, Math.max(Number(file.covered_functions || 0), records.filter(record => functionMetrics(record).executed).length));
+      const totalLines = Number(file.total_lines || 0), coveredLines = Math.min(totalLines, Number(file.covered_lines || 0)); const totalRegions = Number(file.total_regions || 0), coveredRegions = Math.min(totalRegions, Number(file.covered_regions || 0)); const totalBranches = Number(file.total_branches || 0), coveredBranches = Math.min(totalBranches, Number(file.covered_branches || 0));
+      const lineRate = numeric(file.line_rate); const regionRate = numeric(file.region_rate); const branchRate = numeric(file.branch_rate); const functionRate = numeric(file.function_rate); const rates = [lineRate, regionRate, branchRate, functionRate].filter(Number.isFinite); return {totalLines, coveredLines, totalRegions, coveredRegions, totalBranches, coveredBranches, totalFunctions, coveredFunctions, lineRate:Number.isFinite(lineRate) ? lineRate : rate(totalLines, coveredLines), regionRate:Number.isFinite(regionRate) ? regionRate : rate(totalRegions, coveredRegions), branchRate:Number.isFinite(branchRate) ? branchRate : rate(totalBranches, coveredBranches), functionRate:Number.isFinite(functionRate) ? functionRate : rate(totalFunctions, coveredFunctions), completeness:rates.length ? Math.min(...rates) : Math.min(...[rate(totalLines, coveredLines), rate(totalRegions, coveredRegions), rate(totalBranches, coveredBranches), rate(totalFunctions, coveredFunctions)].filter(value => value !== null)), missingLines:Math.max(0, totalLines - coveredLines), missingRegions:Math.max(0, totalRegions - coveredRegions), missingBranches:Math.max(0, totalBranches - coveredBranches)};
+    }
+    function functionMetrics(record) {
+      const totalLines = Number(record.total_lines || 0), coveredLines = Math.min(totalLines, Number(record.covered_lines || 0)); const totalRegions = Number(record.total_regions || 0), coveredRegions = Math.min(totalRegions, Number(record.covered_regions || 0)); const totalBranches = Number(record.total_branches || 0), coveredBranches = Math.min(totalBranches, Number(record.covered_branches || 0)); const executed = Boolean(record.covered || Number(record.execution_count || 0) > 0); const lineRate = numeric(record.line_rate); const regionRate = numeric(record.region_rate); const branchRate = numeric(record.branch_rate); const available = [lineRate, regionRate, branchRate].filter(Number.isFinite); return {totalLines, coveredLines, totalRegions, coveredRegions, totalBranches, coveredBranches, totalFunctions:1, coveredFunctions:executed ? 1 : 0, lineRate:Number.isFinite(lineRate) ? lineRate : rate(totalLines, coveredLines), regionRate:Number.isFinite(regionRate) ? regionRate : rate(totalRegions, coveredRegions), branchRate:Number.isFinite(branchRate) ? branchRate : rate(totalBranches, coveredBranches), functionRate:executed ? 1 : 0, completeness:Number.isFinite(numeric(record.completeness_rate)) ? Number(record.completeness_rate) : available.length ? Math.min(...available) : executed ? 1 : 0, missingLines:Math.max(0, totalLines - coveredLines), missingRegions:Math.max(0, totalRegions - coveredRegions), missingBranches:Math.max(0, totalBranches - coveredBranches), executed};
+    }
+    function aggregateMetrics(items) {
+      const keys = ['totalLines','coveredLines','totalRegions','coveredRegions','totalBranches','coveredBranches','totalFunctions','coveredFunctions']; const metrics = Object.fromEntries(keys.map(key => [key, items.reduce((sum, item) => sum + Number(item[key] || 0), 0)])); metrics.lineRate = rate(metrics.totalLines, metrics.coveredLines); metrics.regionRate = rate(metrics.totalRegions, metrics.coveredRegions); metrics.branchRate = rate(metrics.totalBranches, metrics.coveredBranches); metrics.functionRate = rate(metrics.totalFunctions, metrics.coveredFunctions); const rates = [metrics.lineRate, metrics.regionRate, metrics.branchRate, metrics.functionRate].filter(value => value !== null); metrics.completeness = rates.length ? Math.min(...rates) : null; metrics.missingLines = metrics.totalLines - metrics.coveredLines; metrics.missingRegions = metrics.totalRegions - metrics.coveredRegions; metrics.missingBranches = metrics.totalBranches - metrics.coveredBranches; return metrics;
+    }
+    function recordsFor(filePath) { return state.functions.filter(record => record.file_path === filePath); }
+    function metricLine(metrics) { return `L ${int(metrics.coveredLines)}/${int(metrics.totalLines)} · R ${int(metrics.coveredRegions)}/${int(metrics.totalRegions)} · B ${int(metrics.coveredBranches)}/${int(metrics.totalBranches)}`; }
+    function node(kind, id, name, path, x, y, width, height, metrics, filePath = null, functionRecord = null, extra = {}) { return {kind, id, name, path, x, y, w:width, h:height, metrics, filePath, functionRecord, ...extra}; }
+
+    function buildFunctionLayout() {
+      const sortedFiles = [...state.files].sort((left, right) => String(left.file_path).localeCompare(String(right.file_path))); const groups = new Map(); sortedFiles.forEach(file => { const directory = directoryName(file.file_path); if (!groups.has(directory)) groups.set(directory, []); groups.get(directory).push(file); });
+      const columns = {root:24, directory:210, file:400, function:640}; const top = 38; const rowHeight = 88; let cursor = 0; const nodes = []; const edges = []; const directoryRecords = [];
+      for (const [directory, files] of groups) {
+        const groupStart = cursor; const fileRecords = [];
+        for (const file of files) {
+          const records = recordsFor(file.file_path); const rows = Math.max(1, records.length); const fileMetricsValue = fileMetrics(file, records); const fileNode = node('file', `file:${file.file_path}`, fileName(file.file_path), file.file_path, columns.file, top + (cursor + rows / 2) * rowHeight - 36, 215, 72, fileMetricsValue, file.file_path, null, {mappedCount:records.length}); nodes.push(fileNode); fileRecords.push(fileMetricsValue); const directoryNodeId = `directory:${directory}`; edges.push({from:directoryNodeId, to:fileNode.id});
+          records.forEach((record, index) => { const metrics = functionMetrics(record); const functionNode = node('function', `function:${record.function_key || `${record.file_path}:${record.llvm_name || record.start_line || index}`}`, record.function_name || record.llvm_name || 'anonymous function', `${file.file_path}:${record.start_line || '—'}`, columns.function, top + (cursor + index + .5) * rowHeight - 30, 270, 60, metrics, file.file_path, record); nodes.push(functionNode); edges.push({from:fileNode.id, to:functionNode.id}); }); cursor += rows;
+        }
+        const directoryMetrics = aggregateMetrics(fileRecords); const directoryNodeId = `directory:${directory}`; const directoryNode = node('directory', directoryNodeId, directory, directory, columns.directory, top + (groupStart + (cursor - groupStart) / 2) * rowHeight - 36, 170, 72, directoryMetrics, null, null, {fileCount:files.length}); nodes.push(directoryNode); edges.push({from:'root', to:directoryNodeId}); directoryRecords.push(directoryMetrics);
+      }
+      const rootMetrics = aggregateMetrics(directoryRecords); const totalRows = Math.max(1, cursor); nodes.unshift(node('root', 'root', 'project', '', columns.root, top + totalRows * rowHeight / 2 - 36, 160, 72, rootMetrics, null, null, {fileCount:sortedFiles.length, functionCount:state.functions.length}));
+      const width = 930; const height = Math.max(620, top + totalRows * rowHeight + 36); return {nodes, edges, width, height, label:'Function hierarchy', description:'Source files are connected to the LLVM function records that were mapped back to them.', status:`${sortedFiles.length} files · ${state.functions.length} LLVM function records · ${sortedFiles.filter(file => recordsFor(file.file_path).length === 0).length} files without mapped records`};
+    }
+    function buildDependencyLayout() {
+      const sortedFiles = [...state.files].sort((left, right) => String(left.file_path).localeCompare(String(right.file_path))); const columns = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(Math.max(1, sortedFiles.length))))); const nodes = sortedFiles.map((file, index) => { const records = recordsFor(file.file_path); const col = index % columns; const row = Math.floor(index / columns); return node('file', `file:${file.file_path}`, fileName(file.file_path), file.file_path, 34 + col * 330, 38 + row * 104, 292, 72, fileMetrics(file, records), file.file_path, null, {mappedCount:records.length}); }); const nodeByPath = new Map(nodes.map(item => [item.filePath, item])); const grouped = new Map(); state.dependencies.forEach(edge => { const from = nodeByPath.get(edge.from); const to = nodeByPath.get(edge.to); if (!from || !to || from.id === to.id) return; const key = `${from.id}->${to.id}`; if (!grouped.has(key)) grouped.set(key, {from, to, imports:[]}); grouped.get(key).imports.push(edge.import || edge.kind || 'source import'); }); const rows = Math.max(1, Math.ceil(sortedFiles.length / columns)); return {nodes, edges:[...grouped.values()], width:Math.max(1000, 34 + columns * 330), height:Math.max(560, 38 + rows * 104 + 42), label:'File dependencies', description:'Dashed arrows are resolved source-import edges; they are not runtime call edges.', status:`${sortedFiles.length} files · ${state.dependencies.length} source-import edges · ${grouped.size} file links`};
+    }
+    function edgePath(edge) { const from = edge.from, to = edge.to; const x1 = from.x + from.w, y1 = from.y + from.h / 2, x2 = to.x, y2 = to.y + to.h / 2, middle = x1 + (x2 - x1) / 2; return `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}`; }
+    function nodeLabelLines(item) {
+      if (item.kind === 'function') { const record = item.functionRecord || {}; return [shortText(item.name, 40), `${shortText(item.filePath, 34)}:${record.start_line || '—'}`, metricLine(item.metrics)]; }
+      if (item.kind === 'root') return ['project', `${int(item.fileCount)} files · ${int(item.functionCount)} LLVM records`, `${pct(item.metrics.completeness)} weakest completeness`];
+      if (item.kind === 'directory') return [shortText(item.name, 31), `${int(item.fileCount)} files`, `${pct(item.metrics.completeness)} · ${int(item.metrics.missingLines)} missed lines`];
+      return [shortText(item.name, 34), shortText(item.path, 38), `${int(item.mappedCount)} LLVM fn · ${pct(item.metrics.completeness)} complete`];
+    }
+    function nodeMarkup(item) { const selected = state.selectedKey === item.id ? ' selected' : ''; const lines = nodeLabelLines(item); const title = item.kind === 'function' ? `${item.name} · ${metricLine(item.metrics)} · ${pct(item.metrics.completeness)} completeness` : `${item.path || 'project'} · ${pct(item.metrics.completeness)} completeness`; const aria = `${item.kind} ${item.path || item.name}, ${pct(item.metrics.completeness)} completeness`; const titleClass = item.kind === 'function' ? 'node-title function' : 'node-title'; return `<g class="graph-node ${tone(item.metrics.completeness)}${selected}" data-node="${esc(item.id)}" tabindex="0" role="button" aria-label="${esc(aria)}"><rect class="node-shape" x="${item.x}" y="${item.y}" width="${item.w}" height="${item.h}" rx="7"></rect><title>${esc(title)}</title><text class="${titleClass}" x="${item.x + 12}" y="${item.y + 19}">${esc(lines[0])}</text><text class="node-subtitle" x="${item.x + 12}" y="${item.y + 37}">${esc(lines[1])}</text><text class="node-metrics" x="${item.x + 12}" y="${item.y + 55}">${esc(lines[2])}</text></g>`; }
+    function renderEmpty(message) { state.nodes = new Map(); $('graphStatus').textContent = message; $('sourceGraph').setAttribute('viewBox', '0 0 1100 620'); $('sourceGraph').style.width = '1100px'; $('sourceGraph').style.height = '620px'; $('sourceGraph').innerHTML = `<rect class="graph-bg" x="0" y="0" width="1100" height="620"></rect><text x="550" y="310" text-anchor="middle" fill="#687385" font-size="13">${esc(message)}</text>`; $('graphInspector').innerHTML = '<span class="muted">No graph selection.</span>'; }
+    function renderGraph() {
+      const layout = state.mode === 'function' ? buildFunctionLayout() : buildDependencyLayout(); $('graphTitle').textContent = layout.label; $('graphDescription').textContent = layout.description; $('graphStatus').textContent = layout.status; $('functionMode').setAttribute('aria-pressed', String(state.mode === 'function')); $('dependencyMode').setAttribute('aria-pressed', String(state.mode === 'dependency')); $('graphLegendMetrics').innerHTML = state.mode === 'function' ? 'Function cards: <code>L</code> lines · <code>R</code> regions · <code>B</code> branch outcomes' : 'File cards: line, branch, function, and region rates'; $('zoomRange').value = state.zoom; $('zoomLabel').textContent = `${state.zoom}%`;
+      if (!state.currentId || !state.files.length) { renderEmpty(state.currentId ? 'This snapshot has no coverage files.' : 'Select a snapshot to build the source graph.'); return; }
+      state.nodes = new Map(layout.nodes.map(item => [item.id, item])); if (!state.selectedKey || !state.nodes.has(state.selectedKey)) state.selectedKey = layout.nodes.find(item => item.kind === 'function')?.id || layout.nodes.find(item => item.kind === 'file')?.id || layout.nodes[0]?.id || null;
+      const svg = $('sourceGraph'); svg.setAttribute('viewBox', `0 0 ${layout.width} ${layout.height}`); svg.style.width = `${Math.max(1, Math.round(layout.width * state.zoom / 100))}px`; svg.style.height = `${Math.max(1, Math.round(layout.height * state.zoom / 100))}px`; const marker = `<defs><marker id="graph-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M 0 0 L 7 3.5 L 0 7 z" fill="#8c9aab"></path></marker></defs>`; const edges = layout.edges.map(edge => { const from = typeof edge.from === 'string' ? state.nodes.get(edge.from) : edge.from; const to = typeof edge.to === 'string' ? state.nodes.get(edge.to) : edge.to; if (!from || !to) return ''; const resolved = {...edge, from, to}; const label = edge.imports ? `<text class="graph-edge-label" x="${(from.x + from.w + to.x) / 2}" y="${(from.y + from.h / 2 + to.y + to.h / 2) / 2 - 5}" text-anchor="middle">${esc(edge.imports.length > 1 ? `${edge.imports.length} imports` : shortText(edge.imports[0], 23))}</text>` : ''; return `<path class="graph-edge${edge.imports ? ' dependency' : ''}" d="${edgePath(resolved)}"></path>${label}`; }).join(''); svg.innerHTML = `<title>${esc(layout.label)}</title><desc>${esc(layout.description)}</desc><rect class="graph-bg" x="0" y="0" width="${layout.width}" height="${layout.height}"></rect>${marker}${edges}${layout.nodes.map(nodeMarkup).join('')}`; renderInspector(state.nodes.get(state.selectedKey));
+    }
+    function stat(label, value) { return `<div class="stat"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`; }
+    function reasonList(item) { const metrics = item.metrics || {}; const reasons = []; if (item.kind === 'function' && !metrics.executed) reasons.push(`<li class="reason danger">LLVM recorded zero executions for this function.</li>`); if (metrics.missingLines) reasons.push(`<li class="reason danger">${int(metrics.missingLines)} executable line${metrics.missingLines === 1 ? '' : 's'} are not covered.</li>`); if (metrics.missingRegions) reasons.push(`<li class="reason warn">${int(metrics.missingRegions)} LLVM region${metrics.missingRegions === 1 ? '' : 's'} remain uncovered.</li>`); if (metrics.missingBranches) reasons.push(`<li class="reason warn">${int(metrics.missingBranches)} branch outcome${metrics.missingBranches === 1 ? '' : 's'} remain uncovered.</li>`); return reasons.length ? `<ul class="reasons">${reasons.join('')}</ul>` : '<ul class="reasons"><li class="reason good">No missing line, region, or branch outcomes in this projection.</li></ul>'; }
+    function renderInspector(item) {
+      if (!item) { $('graphInspector').innerHTML = '<span class="muted">Select a node to inspect its mapping and coverage gaps.</span>'; return; }
+      const metrics = item.metrics || {}; const mapped = item.kind === 'function' ? 1 : item.kind === 'file' ? item.mappedCount : item.functionCount || item.metrics.totalFunctions; const heading = item.kind === 'function' ? item.name : item.path || item.name; const kind = item.kind === 'function' ? 'LLVM-mapped source function' : item.kind === 'file' ? 'Source file' : item.kind === 'directory' ? 'Source directory' : 'Project aggregate'; let html = `<h3>Selection</h3><div class="selection-title"><strong>${esc(heading)}</strong><code title="${esc(item.path || '')}">${esc(item.path || 'project')}</code><span class="muted">${esc(kind)} · ${int(mapped)} mapped record${mapped === 1 ? '' : 's'}</span></div><div class="stat-grid">${stat('Completeness',pct(metrics.completeness))}${stat('Missed lines',int(metrics.missingLines))}${stat('Region gaps',int(metrics.missingRegions))}${stat('Branch gaps',int(metrics.missingBranches))}${stat('Functions',`${int(metrics.coveredFunctions)}/${int(metrics.totalFunctions)}`)}${stat(item.kind === 'function' ? 'Executed' : 'Coverage lines',item.kind === 'function' ? (metrics.executed ? `yes · ${int(item.functionRecord?.execution_count)} hits` : 'no') : `${int(metrics.coveredLines)}/${int(metrics.totalLines)}`)}</div>`;
+      if (item.kind === 'function') { const record = item.functionRecord || {}; html += `<div class="mapping-note"><strong>How this is mapped</strong>This card is one LLVM function record projected onto the source file and range below. Its completeness is the weakest available line, region, or branch rate; the source function name is demangled when possible.</div><dl class="mapping-details"><dt>Source function</dt><dd><code>${esc(record.function_name || item.name)}</code></dd><dt>LLVM symbol</dt><dd><code title="${esc(record.llvm_name)}">${esc(shortText(record.llvm_name, 54))}</code></dd><dt>Source range</dt><dd>${esc(record.start_line || '—')}–${esc(record.end_line || record.start_line || '—')}</dd></dl><button class="primary inspector-action" type="button" data-open-file="${esc(item.filePath)}" data-start-line="${esc(record.start_line || '')}">Open source detail</button>`; } else if (item.kind === 'file') { html += `<div class="mapping-note"><strong>Source file coverage</strong>${item.mappedCount ? `${int(item.mappedCount)} LLVM function record${item.mappedCount === 1 ? '' : 's'} map to this file.` : 'No LLVM function records map to this file in this snapshot; file line coverage still remains available.'}</div><button class="primary inspector-action" type="button" data-open-file="${esc(item.filePath)}">Open source detail</button>`; } else { html += `<div class="mapping-note"><strong>Aggregate node</strong>Coverage is aggregated from the child source files. Select a file or function for the source range and detailed gaps.</div>`; }
+      html += reasonList(item); $('graphInspector').innerHTML = html;
+    }
+    function selectNode(id) { if (!state.nodes.has(id)) return; state.selectedKey = id; renderGraph(); }
+    function setMode(mode) { if (mode !== 'function' && mode !== 'dependency') return; state.mode = mode; state.selectedKey = null; renderGraph(); }
+    function setZoom(value) { state.zoom = Math.max(50, Math.min(200, Number(value) || 100)); renderGraph(); }
+
+    function fact(label, value) { return `<div class="fact"><span>${esc(label)}</span><strong title="${esc(value)}">${esc(value || '—')}</strong></div>`; }
+    async function openFile(filePath, startLine = null) {
+      if (!state.currentId || !filePath) return; const detail = $('sourceDetail'); detail.hidden = false; $('detailTitle').textContent = 'Loading source detail…'; $('detailPath').textContent = filePath; $('detailSummary').innerHTML = ''; $('detailLines').innerHTML = '<div class="empty">Loading lines…</div>'; detail.scrollIntoView({behavior:'smooth', block:'start'});
+      try { const data = await api(`/api/snapshots/${encodeURIComponent(state.currentId)}/files?file_path=${encodeURIComponent(filePath)}&max_words=5000`); const file = data.file || {}; $('detailTitle').textContent = `${pct(file.line_rate)} line coverage`; $('detailSummary').innerHTML = `<div class="facts">${fact('Lines',`${int(file.covered_lines)}/${int(file.total_lines)}`)}${fact('Branches',`${int(file.covered_branches)}/${int(file.total_branches)}`)}${fact('Functions',`${int(file.covered_functions)}/${int(file.total_functions)}`)}${fact('Regions',`${int(file.covered_regions)}/${int(file.total_regions)}`)}</div>`; const lines = data.lines || []; $('detailLines').innerHTML = lines.length ? `<table class="line-table"><thead><tr><th>Line</th><th class="num">Hits</th><th>State</th><th class="num">Branches</th><th class="num">Functions</th></tr></thead><tbody>${lines.slice(0, 240).map(line => `<tr class="${Number(startLine) === Number(line.line_number) ? 'focused' : ''}"><td class="line-no">${int(line.line_number)}</td><td class="num">${int(line.hits)}</td><td class="${line.covered ? 'covered' : 'missed'}">${line.covered ? 'covered' : 'missed'}</td><td class="num">${int(line.covered_branches)}/${int(line.total_branches)}</td><td class="num">${int(line.covered_functions)}/${int(line.total_functions)}</td></tr>`).join('')}</tbody></table>` : '<div class="empty">No line detail returned for this file.</div>'; } catch (error) { $('detailTitle').textContent = 'Source detail unavailable'; $('detailLines').innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
+    }
+
+    $('refreshBtn').addEventListener('click', refresh);
+    $('projectSelect').addEventListener('change', async event => { state.projectKey = event.target.value || null; state.repoPath = currentProject()?.repo_path || null; state.currentId = null; state.selectedKey = null; await refresh(); });
+    $('snapshotSelect').addEventListener('change', async event => { state.currentId = event.target.value || null; state.selectedKey = null; setLoading(true); try { await loadSnapshot(); } catch (error) { setLive('error', 'busy'); renderEmpty(error.message); } finally { state.loading = false; $('refreshBtn').disabled = false; if ($('liveState').textContent !== 'error') setLive('ready', 'on'); } });
+    document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => setMode(button.dataset.mode)));
+    $('zoomRange').addEventListener('input', event => setZoom(event.target.value)); $('zoomOut').addEventListener('click', () => setZoom(state.zoom - 10)); $('zoomIn').addEventListener('click', () => setZoom(state.zoom + 10)); $('zoomReset').addEventListener('click', () => setZoom(100));
+    $('sourceGraph').addEventListener('click', event => { const target = event.target.closest ? event.target.closest('[data-node]') : null; if (target) selectNode(target.dataset.node); });
+    $('sourceGraph').addEventListener('keydown', event => { if (event.key !== 'Enter' && event.key !== ' ') return; const target = event.target.closest ? event.target.closest('[data-node]') : null; if (target) { event.preventDefault(); selectNode(target.dataset.node); } });
+    $('sourceGraph').addEventListener('wheel', event => { event.preventDefault(); setZoom(state.zoom + (event.deltaY < 0 ? 10 : -10)); }, {passive:false});
+    $('graphInspector').addEventListener('click', event => { const button = event.target.closest ? event.target.closest('[data-open-file]') : null; if (button) openFile(button.dataset.openFile, button.dataset.startLine || null); });
+    $('closeDetail').addEventListener('click', () => { $('sourceDetail').hidden = true; });
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') $('sourceDetail').hidden = true; });
+    refresh();
+  </script>
+</body>
+</html>
