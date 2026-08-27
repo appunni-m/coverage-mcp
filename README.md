@@ -495,6 +495,9 @@ scope that supports real regression claims. Suite, branch, commit, command,
 cwd, and execution case remain provenance only; they are never test identity.
 A missing named-test projection sets attribution to `status="unavailable"` and
 limits only attribution; aggregate coverage remains measured.
+When detailed line rows are sparse relative to a file summary, the aggregate
+preserves the summary counts and marks the affected metric family with
+`merge.exact=false` and `conservative_max_fallback`.
 
 For a long-lived fixed base, import or ingest it with
 `detail_retention="incremental_base"`. This prevents automatic compaction of

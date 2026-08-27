@@ -4,6 +4,15 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.15.1 - 2026-08-27
+
+### Fixed
+
+- Preserve complete file-summary line counts when incremental reports contain
+  sparse detailed line rows, so the primary baseline union cannot decrease.
+  Such aggregates expose `merge.exact=false` with
+  `conservative_max_fallback` provenance.
+
 ## 0.15.0 - 2026-08-26
 
 ### Added

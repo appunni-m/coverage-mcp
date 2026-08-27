@@ -2040,6 +2040,74 @@ fn rust_service_projection_and_mcp_contract_match() {
     );
     assert!(direct_incremental["data"]["incremental"]["metric_deltas"].is_object());
 
+    let partial_baseline_report = write_file(
+        directory.path(),
+        "partial-baseline.json",
+        r#"{"data":[{"files":[{"filename":"src/a.py","segments":[[1,0,1,true],[2,0,0,true]],"summary":{"lines":{"count":4,"covered":3}}}]}]}"#,
+    );
+    let partial_baseline = store
+        .ingest_report(
+            &partial_baseline_report,
+            "llvm",
+            Some(directory.path()),
+            Some("main"),
+            Some("base"),
+            None,
+            "partial",
+        )
+        .unwrap();
+    let partial_current_report = write_file(
+        directory.path(),
+        "partial-current.json",
+        r#"{"data":[{"files":[{"filename":"src/a.py","segments":[[3,0,1,true]],"summary":{"lines":{"count":3,"covered":1}}}]}]}"#,
+    );
+    let partial_execution = json!({"mode":"incremental","identity":"partial-case"});
+    let partial_current = store
+        .ingest_report_with_execution(
+            &partial_current_report,
+            "llvm",
+            Some(directory.path()),
+            Some("main"),
+            Some("head"),
+            None,
+            "partial",
+            Some(&partial_execution),
+            "compactable",
+        )
+        .unwrap();
+    let partial_incremental_arguments = json!({
+        "task":"incremental",
+        "measurement":{"snapshot_id":partial_current["id"]},
+        "baseline":{"kind":"explicit","snapshot_id":partial_baseline["id"]},
+        "limits":{"max_words":1200,"max_bytes":12000}
+    });
+    let partial_incremental = mcp::dispatch_json_rpc(
+        Some(&service),
+        &json!({
+            "jsonrpc":"2.0",
+            "id":43,
+            "method":"tools/call",
+            "params":{"name":"coverage_review","arguments":partial_incremental_arguments}
+        }),
+    )
+    .unwrap();
+    let partial_data = &partial_incremental["result"]["structuredContent"]["data"];
+    assert_eq!(partial_data["incremental"]["status"], "measured");
+    assert_eq!(
+        partial_data["incremental"]["measurement_scope"]["kind"],
+        "selected_subset"
+    );
+    assert_eq!(partial_data["incremental"]["aggregate"]["total_lines"], 4);
+    assert_eq!(partial_data["incremental"]["aggregate"]["covered_lines"], 3);
+    assert_eq!(
+        partial_data["incremental"]["metric_deltas"]["covered_lines_delta"],
+        0
+    );
+    assert_eq!(
+        partial_data["incremental"]["aggregate"]["merge"]["exact"],
+        false
+    );
+
     let unavailable_duplicates = service
         .find_duplicate_coverage_tests(
             Some(current["id"].as_str().unwrap()),

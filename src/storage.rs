@@ -2592,12 +2592,13 @@ impl CoverageStore {
                 .iter()
                 .filter_map(|files| files.get(&path))
                 .collect::<Vec<_>>();
+            let current_line_file_values = current_file.into_iter().collect::<Vec<_>>();
             let line_merge = union_line_metric_many(
                 &path,
                 &empty_lines,
                 current_line_maps,
                 None,
-                &current_file_values,
+                &current_line_file_values,
             );
             let branch_merge = union_metric_for_file_many(
                 &path,
@@ -9120,6 +9121,24 @@ fn line_bool(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn line_detail_matches_file_summary(
+    path: &str,
+    lines: &HashMap<(String, i64), Value>,
+    file: Option<&Value>,
+) -> bool {
+    let Some(file) = file else {
+        return true;
+    };
+    let (total, covered) = lines
+        .iter()
+        .filter(|((file_path, _), value)| file_path == path && line_bool(value, "count_line"))
+        .fold((0_i64, 0_i64), |(total, covered), (_, value)| {
+            (total + 1, covered + i64::from(line_bool(value, "covered")))
+        });
+    total == file_metric(Some(file), "total_lines")
+        && covered == file_metric(Some(file), "covered_lines")
+}
+
 fn union_line_metric_many(
     path: &str,
     baseline_lines: &HashMap<(String, i64), Value>,
@@ -9162,6 +9181,46 @@ fn union_line_metric_many(
         merge.newly_covered += i64::from(after_covered && !before_covered);
     }
     if has_counted_line {
+        let baseline_detail_complete =
+            line_detail_matches_file_summary(path, baseline_lines, baseline_file);
+        let current_detail_complete = if current_files.is_empty() {
+            true
+        } else if current_files.len() != current_lines.len() {
+            false
+        } else {
+            current_lines
+                .iter()
+                .zip(current_files.iter())
+                .all(|(lines, file)| line_detail_matches_file_summary(path, lines, Some(*file)))
+        };
+        if baseline_detail_complete && current_detail_complete {
+            return merge;
+        }
+
+        // Some formats publish complete file summaries while their detailed
+        // line rows are intentionally sparse. Preserve those summary-only
+        // metrics and retain any canonical detail that is available; using
+        // only the detailed rows would make a baseline union smaller than its
+        // explicit baseline.
+        let baseline_total = file_metric(baseline_file, "total_lines");
+        let current_total = current_files
+            .iter()
+            .map(|file| file_metric(Some(*file), "total_lines"))
+            .max()
+            .unwrap_or(0);
+        let baseline_covered = file_metric(baseline_file, "covered_lines");
+        let current_covered = current_files
+            .iter()
+            .map(|file| file_metric(Some(*file), "covered_lines"))
+            .max()
+            .unwrap_or(0);
+        merge.total = merge.total.max(baseline_total).max(current_total);
+        merge.covered = merge
+            .covered
+            .max(baseline_covered)
+            .max(current_covered)
+            .min(merge.total);
+        merge.exact = false;
         return merge;
     }
     let baseline_total = file_metric(baseline_file, "total_lines");
@@ -19305,6 +19364,23 @@ mod tests {
         assert_eq!(fallback_line.total, 4);
         assert_eq!(fallback_line.covered, 3);
         assert!(!fallback_line.exact);
+
+        let partial_baseline_lines = HashMap::from([
+            (key("src/a.py", 1), line(true, 1, 0, 0)),
+            (key("src/a.py", 2), line(false, 0, 0, 0)),
+        ]);
+        let selected_line = HashMap::from([(key("src/a.py", 3), line(true, 1, 0, 0))]);
+        let incomplete_union = union_line_metric_many(
+            "src/a.py",
+            &partial_baseline_lines,
+            std::slice::from_ref(&selected_line),
+            Some(&json!({"total_lines": 4, "covered_lines": 3})),
+            &[&json!({"total_lines": 3, "covered_lines": 1})],
+        );
+        assert_eq!(incomplete_union.total, 4);
+        assert_eq!(incomplete_union.covered, 3);
+        assert!(!incomplete_union.exact);
+
         let empty_fallback_line = union_line_metric_many(
             "src/a.py",
             &HashMap::new(),
