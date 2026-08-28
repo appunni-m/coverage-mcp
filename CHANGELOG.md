@@ -4,6 +4,19 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.15.2 - 2026-08-28
+
+### Fixed
+
+- Schema 16 makes incremental ordinary reviews use the same full-shaped
+  `measurement` and `baseline` projections as full reviews. The canonical
+  `measurement` is the server-computed baseline ∪ selected-run union; raw run
+  provenance, signed deltas, gain/decrement categories, merge provenance, and
+  the replacement diagnostic diff remain supplemental incremental data.
+- The dashboard and source graph consume the canonical union projection for
+  their default metrics and file cards instead of reconstructing coverage from
+  separate aggregate numerator/denominator fields.
+
 ## 0.15.1 - 2026-08-27
 
 ### Fixed

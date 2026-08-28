@@ -677,12 +677,12 @@ impl CoverageService {
                     .expect("coverage review data is always an object");
                 object.insert("automatic".to_owned(), json!(true));
                 object.insert("status".to_owned(), json!("measured"));
-                object.insert("baseline".to_owned(), baseline.clone());
-                object.insert("current_snapshot_id".to_owned(), json!(current_snapshot_id));
-                object.insert(
-                    "current_snapshot_ids".to_owned(),
-                    json!(selected_current_snapshot_ids),
-                );
+                object.insert("baseline_selector".to_owned(), baseline.clone());
+                let incremental = object
+                    .get_mut("incremental")
+                    .expect("incremental review always contains incremental data");
+                incremental["current_snapshot_id"] = json!(current_snapshot_id);
+                incremental["current_snapshot_ids"] = json!(selected_current_snapshot_ids);
                 run["incremental_review"] = data;
             }
             Err(error) => {
@@ -1481,10 +1481,10 @@ impl CoverageService {
                     "status": "not_measured",
                     "comparison_mode": "additive_union",
                     "measurement_scope": Value::Null,
-                    "baseline": Value::Null,
-                    "current": Value::Null,
-                    "aggregate": Value::Null,
-                    "overall": {},
+                    "run": Value::Null,
+                    "current_snapshot_id": Value::Null,
+                    "current_snapshot_ids": [],
+                    "merge": Value::Null,
                     "metric_deltas": {},
                     "files": [],
                     "changed_lines": [],
@@ -1533,12 +1533,14 @@ impl CoverageService {
             )?;
             let baseline = incremental["baseline"].clone();
             let current = incremental["current"].clone();
+            let run = incremental["run"].clone();
             incremental["status"] = json!("measured");
+            result["measurement"] = compact_snapshot(&current, representation == "audit");
             result["baseline"] = compact_snapshot(&baseline, representation == "audit");
             result["claim_status"] = json!("supported");
             if incremental["test_attribution"]["status"] == "unavailable" {
                 result["reasons"] =
-                    json!(["test attribution unavailable; aggregate coverage remains measured"]);
+                    json!(["test attribution unavailable; union measurement remains measured"]);
             }
             if scope == "selected_subset" && result["reasons"].as_array().is_some_and(Vec::is_empty)
             {
@@ -1547,11 +1549,14 @@ impl CoverageService {
                     "diagnostic diff is scope-limited"
                 ]);
             }
-            incremental["baseline"] = compact_snapshot(&baseline, representation == "audit");
-            incremental["current"] = compact_snapshot(&current, representation == "audit");
+            incremental["run"] = compact_snapshot(&run, representation == "audit");
+            let object = incremental
+                .as_object_mut()
+                .expect("incremental comparison projection is an object");
+            object.remove("baseline");
+            object.remove("current");
+            object.remove("overall");
             if representation == "compact" {
-                let aggregate = incremental["aggregate"].clone();
-                incremental["aggregate"] = compact_incremental_aggregate(&aggregate);
                 incremental["files"] = Value::Array(
                     incremental["files"]
                         .as_array()
@@ -1856,6 +1861,11 @@ impl CoverageService {
             }
             _ => None,
         };
+        let dashboard_current = raw_incremental
+            .as_ref()
+            .filter(|value| value.get("status").and_then(Value::as_str) == Some("measured"))
+            .and_then(|value| value.get("current"))
+            .or(current.as_ref());
         let files = if let Some(current_id) = current_id {
             if let Some(incremental) = raw_incremental
                 .as_ref()
@@ -1991,7 +2001,7 @@ impl CoverageService {
                 "baseline_composite_snapshot_id": composite_baseline_id,
                 "composite_baseline_kind": composite_baseline_kind,
             },
-            "current": current.as_ref().map(|value| compact_snapshot(value, false)),
+            "current": dashboard_current.map(|value| compact_snapshot(value, false)),
             "baseline": baseline.as_ref().map(|value| compact_snapshot(value, false)),
             "history": {
                 "points": history,
@@ -3602,18 +3612,6 @@ fn compact_file_change(value: &Value) -> Value {
         "total_regions",
         "covered_regions",
         "region_rate",
-        "aggregate_total_lines",
-        "aggregate_covered_lines",
-        "aggregate_line_rate",
-        "aggregate_total_branches",
-        "aggregate_covered_branches",
-        "aggregate_branch_rate",
-        "aggregate_total_functions",
-        "aggregate_covered_functions",
-        "aggregate_function_rate",
-        "aggregate_total_regions",
-        "aggregate_covered_regions",
-        "aggregate_region_rate",
         "baseline_total_lines",
         "current_total_lines",
         "baseline_covered_lines",
@@ -3641,7 +3639,7 @@ fn compact_file_change(value: &Value) -> Value {
 }
 
 fn compact_incremental_diff(value: &mut Value) {
-    // The primary incremental projection already carries aggregate files and
+    // The primary incremental projection already carries union files and
     // attribution. Keep the nested compact diagnostic focused on its purpose:
     // replacement-style deltas and affected ranges. `review` and `audit`
     // retain the full diff, including file and attribution records.
@@ -3659,35 +3657,6 @@ fn compact_incremental_diff(value: &mut Value) {
         value["regions"] = compact;
     }
     remove_incremental_changed_lines(value);
-}
-
-fn compact_incremental_aggregate(value: &Value) -> Value {
-    let keys = [
-        "kind",
-        "total_lines",
-        "covered_lines",
-        "line_rate",
-        "total_branches",
-        "covered_branches",
-        "branch_rate",
-        "total_functions",
-        "covered_functions",
-        "function_rate",
-        "total_regions",
-        "covered_regions",
-        "region_rate",
-        "file_count",
-    ];
-    let mut result = Map::new();
-    for key in keys {
-        if let Some(value) = value.get(key) {
-            result.insert(key.to_owned(), value.clone());
-        }
-    }
-    if let Some(exact) = value.get("merge").and_then(|merge| merge.get("exact")) {
-        result.insert("merge".to_owned(), json!({"exact": exact}));
-    }
-    Value::Object(result)
 }
 
 fn compact_incremental_rate_deltas(value: &Value) -> Value {
@@ -3790,7 +3759,7 @@ fn dashboard_incremental_files(value: &Value) -> Value {
     let total = items.len();
     items.truncate(16);
     json!({
-        "source":if value.get("comparison_mode").and_then(Value::as_str) == Some("additive_union") { "baseline_union_incremental" } else { "current_vs_baseline" },
+        "source":if value.get("comparison_mode").and_then(Value::as_str) == Some("additive_union") { "current_union" } else { "current_vs_baseline" },
         "items":items,
         "total":total,
         "truncated": value.get("files_truncated").and_then(Value::as_bool).unwrap_or(total > 16 || total == 24),
@@ -3802,8 +3771,7 @@ fn dashboard_incremental(value: &Value) -> Value {
         return json!({
             "status":"unmeasured",
             "reason":value.get("reason").cloned().unwrap_or(Value::Null),
-            "baseline":value.get("baseline").cloned().unwrap_or(Value::Null),
-            "current":value.get("current").cloned().unwrap_or(Value::Null),
+            "run":value.get("current").cloned().unwrap_or(Value::Null),
         });
     }
     let regions = value
@@ -3823,10 +3791,9 @@ fn dashboard_incremental(value: &Value) -> Value {
         "status":"measured",
         "comparison_mode":value.get("comparison_mode").cloned().unwrap_or_else(|| json!("snapshot_diff")),
         "measurement_scope":value.get("measurement_scope").cloned().unwrap_or(Value::Null),
-        "baseline":value.get("baseline").map(|snapshot| compact_snapshot(snapshot, false)),
-        "current":value.get("current").map(|snapshot| compact_snapshot(snapshot, false)),
+        "run":value.get("run").map(|snapshot| compact_snapshot(snapshot, false)),
         "current_snapshot_ids":value.get("current_snapshot_ids").cloned().unwrap_or_else(|| json!([])),
-        "aggregate":value.get("aggregate").cloned().unwrap_or(Value::Null),
+        "merge":value.get("merge").cloned().unwrap_or(Value::Null),
         "metric_deltas":value.get("metric_deltas").cloned().unwrap_or(Value::Null),
         "coverage_gain":value.get("coverage_gain").cloned().unwrap_or(Value::Null),
         "regions":regions,
@@ -4516,7 +4483,8 @@ fn automatic_incremental_review_placeholder(
         "claim_status": "not_measured",
         "reasons": [reason],
         "measurement": Value::Null,
-        "baseline": baseline,
+        "baseline": Value::Null,
+        "baseline_selector": baseline,
         "next_action": {
             "kind": "obtain_measurement",
             "reason": reason,
@@ -4902,17 +4870,17 @@ mod tests {
             2
         );
         assert_eq!(
-            automatic_incremental_review_placeholder("pending", Some("base"), true, "wait")["baseline"]
+            automatic_incremental_review_placeholder("pending", Some("base"), true, "wait")["baseline_selector"]
                 ["composite_snapshot_id"],
             "base"
         );
         assert_eq!(
-            automatic_incremental_review_placeholder("pending", Some("base"), false, "wait")["baseline"]
+            automatic_incremental_review_placeholder("pending", Some("base"), false, "wait")["baseline_selector"]
                 ["snapshot_id"],
             "base"
         );
         assert!(
-            automatic_incremental_review_placeholder("pending", None, false, "wait")["baseline"]
+            automatic_incremental_review_placeholder("pending", None, false, "wait")["baseline_selector"]
                 .is_null()
         );
     }
@@ -5262,6 +5230,19 @@ mod tests {
             automatic_status["data"]["incremental_review"]["status"],
             "measured"
         );
+        assert!(automatic_status["data"]["incremental_review"]["measurement"].is_object());
+        assert!(automatic_status["data"]["incremental_review"]["baseline"].is_object());
+        assert!(automatic_status["data"]["incremental_review"]["baseline_selector"].is_object());
+        assert!(
+            automatic_status["data"]["incremental_review"]["incremental"]
+                .get("run")
+                .is_some_and(Value::is_object)
+        );
+        assert!(
+            automatic_status["data"]["incremental_review"]["incremental"]
+                .get("aggregate")
+                .is_none()
+        );
         let current_id = many_current["id"].as_str().unwrap();
         let dashboard = service
             .dashboard(Some(current_id), Some(baseline["id"].as_str().unwrap()), 18)
@@ -5275,10 +5256,10 @@ mod tests {
             dashboard["data"]["incremental"]["coverage_gain"]["regressed"],
             0
         );
-        assert_eq!(
-            dashboard["data"]["files"]["source"],
-            "baseline_union_incremental"
-        );
+        assert!(dashboard["data"]["current"]["covered_lines"].is_number());
+        assert!(dashboard["data"]["incremental"].get("aggregate").is_none());
+        assert_eq!(dashboard["data"]["incremental"]["run"]["id"], current_id);
+        assert_eq!(dashboard["data"]["files"]["source"], "current_union");
         let selected_dashboard_ids = vec![
             current_id.to_owned(),
             many_current["id"].clone().as_str().unwrap().to_owned(),
@@ -8285,7 +8266,7 @@ mod tests {
         compact_incremental_diff(&mut empty_incremental_diff);
         let mut sparse_incremental_diff = json!({"metric_deltas":{}});
         compact_incremental_diff(&mut sparse_incremental_diff);
-        assert_eq!(compact_incremental_aggregate(&json!({}),), json!({}));
+        assert_eq!(compact_incremental_rate_deltas(&json!({})), json!({}));
         assert_eq!(
             dashboard_incremental_files(&json!({"comparison_mode":"snapshot_diff"}))["source"],
             "current_vs_baseline"

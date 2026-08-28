@@ -4,7 +4,7 @@ scope:
   mode: full
   inventory:
     authority: README.md-and-src-mcp.rs
-    revision: schema-15
+    revision: schema-16
     command_id: inventory
 oracles:
   - id: frozen-contract
@@ -206,7 +206,7 @@ surfaces:
         source:
           oracle_id: frozen-contract
           path: docs/rust-migration-parity.md#compatibility-invariants
-          signature: schema-15 REST and MCP protocol surface
+          signature: schema-16 REST and MCP protocol surface
           parameters:
             - id: input
               style: positional
@@ -227,9 +227,9 @@ surfaces:
             signature: shared HTTP and native stdio JSON-RPC dispatcher
             support: {status: supported}
         requirements:
-          - id: coverage-mcp.transport.contract.schema15
+          - id: coverage-mcp.transport.contract.schema16
             dimension: protocol_variant
-            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-15 compatible, including parameterized command runs, automatic incremental review with additive union and a separate diagnostic diff, bounded exact duplicate-coverage test groups, explicit stored-snapshot incremental review, and composite production coverage.
+            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-16 compatible, including parameterized command runs, automatic incremental review with a canonical full-shaped union measurement plus supplemental run data and a separate diagnostic diff, bounded exact duplicate-coverage test groups, explicit stored-snapshot incremental review, and composite production coverage.
             lanes: [parity, coverage]
             target_profiles: [rust-default]
           - id: coverage-mcp.transport.contract.shared-daemon-stdio

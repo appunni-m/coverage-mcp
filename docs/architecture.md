@@ -44,7 +44,7 @@ requests without replaying an operation whose commit status is ambiguous.
 | --- | --- |
 | `src/main.rs` | CLI, shared-daemon `serve`, `connect`/`stdio`, and daemon-routed `compact` lifecycle. |
 | `src/http.rs` | Loopback HTTP server, repository routing, REST handlers, dashboard response, and health payload. |
-| `src/mcp.rs` | Explicit schema-15 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
+| `src/mcp.rs` | Explicit schema-16 inventory, instructions, resource descriptions, tool dispatch, and shared JSON-RPC dispatch. |
 | `src/service.rs` | Transport-neutral validation, response envelopes, word budgets, cursors, and compact projections. |
 | `src/storage.rs` | DuckDB schema, immutable snapshots/composite snapshots, runs, worktrees, artifacts, project settings, and compaction transactions. |
 | `src/composite.rs` | Versioned production inventory, canonical-region mapping, explicit alias deduplication, variant completeness, and exact component aggregation. |
@@ -63,7 +63,7 @@ requests without replaying an operation whose commit status is ambiguous.
 - Queue state is mutable only while a managed run is queued or active.
 - Project settings are scoped to the canonical repository key, so linked
   worktrees use the same compaction policy and coverage history.
-- Every public schema-15 response carries `repo_key`, `checkout_path`,
+- Every public schema-16 response carries `repo_key`, `checkout_path`,
   `suite`, and `schema_revision` context.
 - Collections use bounded fetches, word budgets, and opaque query-scoped
   cursors. A defensive record cap fails explicitly instead of silently losing

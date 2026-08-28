@@ -25,17 +25,17 @@ const STRUCTURED_CONTENT_HINT: &str = "See structuredContent for the bounded res
 pub const MCP_INSTRUCTIONS: &str = concat!(
     "Coverage MCP ",
     env!("CARGO_PKG_VERSION"),
-    r#" schema 15 exposes a compact, composable agent interface.
+    r#" schema 16 exposes a compact, composable agent interface.
 
-Start with project_context. Its default response is compact: max_words covers the complete data projection, including the fixed project/latest-run summary and current command page. The command page returns at most eight compact summaries per call; follow page.next_cursor only when a command outside that window is needed. In that response, page.reserved_words is the fixed-summary count, page.word_count is command-page words, page.response_word_count is their combined budget count, and page.next_cursor continues only commands. data.active_runs is capped at ten entries; data.active_runs_truncated=true means more active runs were omitted, and detailed=true does not lift that cap. Use detailed=true only for an explicit audit of command, run, or provenance fields. Register one exact human-approved command once. Reuse it for case-specific runs by passing optional arguments; arguments are shell-quoted and appended to the registered command, or replace its single {{args}} placeholder. For an incremental run, pass execution.mode=incremental and baseline.kind=explicit with baseline.snapshot_id or baseline.composite_snapshot_id. The server fingerprints the effective case, persists the arguments and baseline, and automatically attaches incremental_review after terminal ingestion; composite runs automatically use composite_review. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...), save run_id, wait poll_after_ms, then call run_review(view=status, run_id=...). Standalone coverage_review(task=incremental) remains available for comparing an ordinary snapshot set or an immutable composite snapshot against its explicit baseline. Use run_review(view=logs) only for targeted literal evidence and cancel_run only when the user no longer wants the run.
+Start with project_context. Its default response is compact: max_words covers the complete data projection, including the fixed project/latest-run summary and current command page. The command page returns at most eight compact summaries per call; follow page.next_cursor only when a command outside that window is needed. In that response, page.reserved_words is the fixed-summary count, page.word_count is command-page words, page.response_word_count is their combined budget count, and page.next_cursor continues only commands. data.active_runs is capped at ten entries; data.active_runs_truncated=true means more active runs were omitted, and detailed=true does not lift that cap. Use detailed=true only for an explicit audit of command, run, or provenance fields. Register one exact human-approved command once. Reuse it for case-specific runs by passing optional arguments; arguments are shell-quoted and appended to the registered command, or replace its single {{args}} placeholder. For an incremental run, use the same execution input as full mode and add baseline.kind=explicit with baseline.snapshot_id or baseline.composite_snapshot_id. The server fingerprints the effective case, persists the arguments and baseline, and automatically attaches incremental_review after terminal ingestion; composite runs automatically use composite_review. Prefer run_test(wait=false, reuse_if_unchanged=true, idempotency_key=...), save run_id, wait poll_after_ms, then call run_review(view=status, run_id=...). Standalone coverage_review(task=incremental) remains available for comparing an ordinary snapshot set or an immutable composite snapshot against its explicit baseline. Use run_review(view=logs) only for targeted literal evidence and cancel_run only when the user no longer wants the run.
 
-Use coverage_review as the analysis boundary: task=change for changed-code coverage, task=incremental for an explicit ordinary snapshot set or composite snapshot versus an explicit baseline, task=history for the last two points plus an aggregate, task=insight for ranked gaps, task=source for bounded ranges, task=audit for exact records, and task=all for a bounded combination. Incremental never guesses a previous snapshot, invokes a parent runner, reparses a baseline report, or reruns tests: provide measurement.snapshot_id or measurement.composite_snapshot_id or a run_id resolving to one or more ordinary ingested measurements, plus baseline.kind=explicit with the matching baseline selector. When multiple ordinary artifacts are attached to one run, their snapshot IDs are merged as one selected measurement set. The primary ordinary incremental result is the deduplicated baseline-union-current aggregate; its nested diff is a separate replacement-style diagnostic. A selected subset reports missing baseline hits as not_observed rather than regression; only complete_snapshot supports regression claims. Composite reviews aggregate an authoritative inventory across Rust/WGSL, Python, and JavaScript, require explicit logical-source aliases and every declared package variant, and return one exact canonical-region denominator plus three component summaries. Composite baselines must match repository, mapping version, and inventory hash. Ordinary snapshots must belong to the same repository and normalized coverage format; suite, branch, commit, command, cwd, and execution case are provenance only, never test identity. The result reports grouped affected lines, metric_deltas, newly_covered, regressed, hit_count_only, added, and removed categories, bounded opaque test_id added/removed observations, explicit attribution status when named observations are unavailable, and whether detail came from relational rows or a compacted payload. Independent reviews may use multiple calls in parallel. Compact is the default representation; request review or audit deliberately. Normal compact limits are three files and five ranked targets; increase max_files, max_regions, or max_test_ids explicitly for wider review. Compact insight targets return at most three regions per target as [start,end,line_count], with region_count and regions_truncated; audit is the opt-in exact projection. Carry snapshot/run/baseline selectors in the structured request. Successful tools return {context,data,page} in structuredContent; the text content is only a short compatibility hint. Keep detailed=false, source ranges bounded, and max_words within 50–5000 (default 600); review, run, and import also enforce max_bytes. claim_status and reasons are authoritative. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. Legends define the short fields.
+Use coverage_review as the analysis boundary: task=change for changed-code coverage, task=incremental for an explicit ordinary snapshot set or composite snapshot versus an explicit baseline, task=history for the last two points plus an aggregate, task=insight for ranked gaps, task=source for bounded ranges, task=audit for exact records, and task=all for a bounded combination. Incremental never guesses a previous snapshot, invokes a parent runner, reparses a baseline report, or reruns tests: provide measurement.snapshot_id or measurement.composite_snapshot_id or a run_id resolving to one or more ordinary ingested measurements, plus baseline.kind=explicit with the matching baseline selector. When multiple ordinary artifacts are attached to one run, their snapshot IDs are merged as one selected measurement set. The primary ordinary incremental result is the deduplicated baseline-union-current measurement; incremental adds run-specific deltas and its nested diff is a separate replacement-style diagnostic. A selected subset reports missing baseline hits as not_observed rather than regression; only complete_snapshot supports regression claims. Composite reviews aggregate an authoritative inventory across Rust/WGSL, Python, and JavaScript, require explicit logical-source aliases and every declared package variant, and return one exact canonical-region denominator plus three component summaries. Composite baselines must match repository, mapping version, and inventory hash. Ordinary snapshots must belong to the same repository and normalized coverage format; suite, branch, commit, command, cwd, and execution case are provenance only, never test identity. The result reports grouped affected lines, metric_deltas, newly_covered, regressed, hit_count_only, added, and removed categories, bounded opaque test_id added/removed observations, explicit attribution status when named observations are unavailable, and whether detail came from relational rows or a compacted payload. Independent reviews may use multiple calls in parallel. Compact is the default representation; request review or audit deliberately. Normal compact limits are three files and five ranked targets; increase max_files, max_regions, or max_test_ids explicitly for wider review. Compact insight targets return at most three regions per target as [start,end,line_count], with region_count and regions_truncated; audit is the opt-in exact projection. Carry snapshot/run/baseline selectors in the structured request. Successful tools return {context,data,page} in structuredContent; the text content is only a short compatibility hint. Keep detailed=false, source ranges bounded, and max_words within 50–5000 (default 600); review, run, and import also enforce max_bytes. claim_status and reasons are authoritative. In compact output, changed_code uses + for covered added executable lines, ! for uncovered added executable lines, ~ for branch gaps, . for non-executable additions, and ? for unavailable coverage; compact regions use + for improved/new, ! for regressed, - for removed, and ~ for changed regions. Legends define the short fields.
 
 Use coverage_import for an external report before coverage_review; never infer lineage from a raw report. The stdio bridge recovers one refused daemon connection without replaying ambiguous writes. Ingestion is capped at 64 MiB and malformed numeric fields are validation errors.
 
 Use find_duplicate_coverage_tests for read-only candidate reduction of large named test inventories. It compares exact normalized covered line, branch, and function observation sets, ignores hit counts, returns only bounded groups, and paginates with page.next_cursor. This is coverage equivalence rather than logic equivalence: review candidates before deleting anything. LCOV TN records currently provide named observations; other formats return status=unavailable.
 
-Incremental result semantics: the primary incremental coverage is the deduplicated union of baseline plus the selected current measurement, with line, branch, function, and LLVM region identities merged where the parser provides them. The primary metric_deltas are calculated from that union against the baseline, so an incremental subset cannot lower the displayed aggregate coverage. When detailed line rows are sparse relative to a file summary, the aggregate preserves the summary counts and marks that metric family with merge.exact=false and conservative_max_fallback. The separate diff object retains replacement-style current-versus-baseline evidence; when measurement_scope.kind is selected_subset, missing baseline hits are not_observed and diff.claim_status is limited, not a regression. A complete_snapshot scope may report genuine regressions. If one run ingests multiple ordinary coverage artifacts, use their snapshot IDs as one selected measurement set; the aggregate must be interpreted together, while composite snapshots remain the cross-language path."#
+Incremental result semantics: the canonical measurement is the deduplicated union of baseline plus the selected current measurement, with line, branch, function, and LLVM region identities merged where the parser provides them. The primary metric_deltas are calculated from that union against the baseline, so an incremental subset cannot lower the displayed union coverage. When detailed line rows are sparse relative to a file summary, the union preserves the summary counts and marks that metric family with merge.exact=false and conservative_max_fallback. The separate diff object retains replacement-style current-versus-baseline evidence; when measurement_scope.kind is selected_subset, missing baseline hits are not_observed and diff.claim_status is limited, not a regression. A complete_snapshot scope may report genuine regressions. If one run ingests multiple ordinary coverage artifacts, use their snapshot IDs as one selected measurement set; the standard measurement is the union, while composite snapshots remain the cross-language path."#
 );
 
 /// Returns the MCP initialize result.
@@ -125,7 +125,7 @@ fn public_tools_list() -> Value {
         ),
         tool_with_output(
             "run_test",
-            "Submit one approved command. Register the command once, then pass optional case-specific arguments on each run; the server shell-quotes them and appends them to the registered command, or substitutes its single {{args}} placeholder. For an incremental case, pass execution.mode=incremental plus baseline.kind=explicit and exactly one of baseline.snapshot_id or baseline.composite_snapshot_id; execution.identity is optional because the server fingerprints mode, arguments, and baseline and persists that context. After terminal ingestion, the response and run_review(view=status) automatically include incremental_review. If several ordinary coverage artifacts are ingested, incremental_review unions all of their snapshot IDs with the baseline; a composite run includes composite_snapshot_id and an automatic composite incremental review. Standalone coverage_review(task=incremental) remains the explicit comparison tool for stored snapshots or composite snapshots. Prefer wait=false with a stable idempotency_key; managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use run_review(view=status, run_id=...) after waiting poll_after_ms.",
+            "Submit one approved command. Register the command once, then pass optional case-specific arguments on each run; the server shell-quotes them and appends them to the registered command, or substitutes its single {{args}} placeholder. Incremental uses the same execution input as full mode and adds baseline.kind=explicit with exactly one of baseline.snapshot_id or baseline.composite_snapshot_id; execution.identity is optional because the server fingerprints mode, arguments, and baseline and persists that context. After terminal ingestion, the response and run_review(view=status) automatically include incremental_review with the standard measurement/baseline shape plus incremental run data. If several ordinary coverage artifacts are ingested, the standard measurement unions all of their snapshot IDs with the baseline; a composite run includes composite_snapshot_id and an automatic composite incremental review. Standalone coverage_review(task=incremental) remains the explicit comparison tool for stored snapshots or composite snapshots. Prefer wait=false with a stable idempotency_key; managed output is byte-capped and setup, persistence, timeout, cancellation, or shutdown failures become terminal failed jobs. Use run_review(view=status, run_id=...) after waiting poll_after_ms.",
             command_execution(),
             object_schema(
                 &[
@@ -298,7 +298,7 @@ fn public_tools_list() -> Value {
         ),
         tool_with_output(
             "coverage_review",
-            "Return one bounded, task-oriented coverage review. Compact is the default representation; request review for readable grouped ranges or audit for exact records. Use task=change for changed-code coverage and regressions, task=incremental for an explicit ordinary snapshot set or composite snapshot versus an explicit matching baseline without invoking a parent runner, reparsing a baseline report, or rerunning tests, task=history for line over time using the last two points plus an aggregate, task=insight for ranked uncovered regions (at most three compact ranges per target), task=source for grouped ranges, or task=all for a bounded combination. Ordinary incremental comparisons require the same repository and normalized format; composite comparisons additionally require the same mapping version and inventory hash. The ordinary incremental primary result is the deduplicated baseline-union-current aggregate; its nested diff is a separate scope-aware replacement diagnostic. A selected subset reports missing baseline hits as not_observed, never as a regression; complete_snapshot may report genuine regressions. Incremental returns grouped affected lines, metric_deltas, newly_covered/regressed/hit_count_only/added/removed categories, and bounded opaque test_id attribution with an explicit unavailable status when named observations are absent. Suite, branch, commit, command, cwd, and execution case are provenance only. Compact defaults to three files, five regions, and ten affected test IDs; raise limits explicitly for wider review. Sparse detailed line rows never lower the primary file-summary aggregate; affected families expose merge.exact=false with conservative_max_fallback. The server reads materialized or compacted snapshot detail and groups regions.",
+            "Return one bounded, task-oriented coverage review. Compact is the default representation; request review for readable grouped ranges or audit for exact records. Use task=change for changed-code coverage and regressions, task=incremental for an explicit ordinary snapshot set or composite snapshot versus an explicit matching baseline without invoking a parent runner, reparsing a baseline report, or rerunning tests, task=history for line over time using the last two points plus an aggregate, task=insight for ranked uncovered regions (at most three compact ranges per target), task=source for grouped ranges, or task=all for a bounded combination. Ordinary incremental comparisons require the same repository and normalized format; composite comparisons additionally require the same mapping version and inventory hash. Incremental uses the same measurement and baseline shape as full mode: the standard measurement is the deduplicated baseline-union-current result, while the incremental block contains run-specific deltas and a separate scope-aware replacement diagnostic. A selected subset reports missing baseline hits as not_observed, never as a regression; complete_snapshot may report genuine regressions. Incremental returns grouped affected lines, metric_deltas, newly_covered/regressed/hit_count_only/added/removed categories, and bounded opaque test_id attribution with an explicit unavailable status when named observations are absent. Suite, branch, commit, command, cwd, and execution case are provenance only. Compact defaults to three files, five regions, and ten affected test IDs; raise limits explicitly for wider review. Sparse detailed line rows never lower the canonical union measurement; affected families expose merge.exact=false with conservative_max_fallback. The server reads materialized or compacted snapshot detail and groups regions.",
             read_only(),
             coverage_review_input_schema(),
             coverage_review_output_schema(),
@@ -1501,7 +1501,7 @@ fn run_execution_output_schema() -> Value {
             "context":{"type":"object","description":"Request repository, checkout, suite, and schema context."},
             "data":{
                 "type":"object",
-                "description":"Bounded durable run state. Incremental executions expose their persisted arguments and explicit baseline under execution; after terminal coverage ingestion, incremental_review reports the deduplicated baseline-union-current coverage plus a separate scope-aware snapshot diff.",
+                "description":"Bounded durable run state. Incremental executions expose their persisted arguments and explicit baseline under execution; after terminal coverage ingestion, incremental_review uses the same full-shaped measurement and baseline fields as coverage_review; ordinary measurement is the deduplicated union and incremental holds run-specific data.",
                 "properties":{
                     "id":{"type":"string"},
                     "status":{"type":"string"},
@@ -1511,12 +1511,19 @@ fn run_execution_output_schema() -> Value {
                     "composite_snapshot_id":{"type":["string","null"],"description":"Immutable composite coverage snapshot produced by this run, when composite artifacts were declared."},
                     "incremental_review":{
                         "type":"object",
-                        "description":"Automatic incremental review for execution.mode=incremental. Pending means the run is not terminal; not_measured includes reasons; measured contains the same bounded data projection as coverage_review task=incremental.",
+                        "description":"Automatic incremental review for execution.mode=incremental. It uses the same bounded measurement and baseline shape as a full review; measured ordinary coverage places the deduplicated union in measurement and keeps run-specific deltas under incremental.",
                         "properties":{
+                            "automatic":{"type":"boolean"},
                             "status":{"type":"string","enum":["pending","measured","not_measured"]},
+                            "focus":{"type":"string","enum":["incremental"]},
+                            "task":{"type":"string","enum":["incremental"]},
+                            "representation":{"type":"string","enum":["review","compact","audit"]},
                             "claim_status":{"type":"string"},
                             "reasons":{"type":"array","items":{"type":"string"}},
-                            "incremental":{"type":"object"}
+                            "measurement":{"type":["object","null"],"description":"Canonical full-shaped measurement. For ordinary incremental reviews this is the deduplicated baseline-union-current result."},
+                            "baseline":{"type":["object","null"],"description":"Canonical full-shaped baseline measurement when review is measured."},
+                            "baseline_selector":{"type":["object","null"],"description":"Explicit baseline selector retained while an automatic review is pending or unavailable."},
+                            "incremental":{"type":"object","description":"Supplemental run data: selected snapshot IDs, signed deltas, coverage gain/decrement categories, scope, attribution, merge provenance, and the replacement-style diagnostic diff."}
                         },
                         "required":["status"]
                     }
@@ -1657,7 +1664,7 @@ fn coverage_review_output_schema() -> Value {
                     "task":{"type":"string","enum":["change","incremental","history","insight","source","audit","all"]},
                     "representation":{"type":"string","enum":["review","compact","audit"]},
                     "claim_status":{"type":"string","enum":["supported","limited","not_measured","stale","invalid"]},
-                    "measurement":{"type":["object","null"]},
+                    "measurement":{"type":["object","null"],"description":"Canonical full-shaped measurement. In ordinary incremental mode this is the deduplicated baseline-union-current result; incremental-only run data lives under incremental."},
                     "baseline":{"type":["object","null"]},
                     "composite":{"type":"object","description":"Exact composite inventory score and three component summaries when measurement.composite_snapshot_id is selected."},
                     "change":{"type":"object"},
@@ -1668,14 +1675,13 @@ fn coverage_review_output_schema() -> Value {
                             "status":{"type":"string","enum":["measured","not_measured"]},
                             "comparison_mode":{"type":"string","enum":["additive_union","snapshot_diff"]},
                             "measurement_scope":{"type":["object","null"],"description":"Whether the selected measurement is a complete report or a subset of cases; regressions are only claimable for complete_snapshot.","properties":{"kind":{"type":"string","enum":["selected_subset","complete_snapshot"]},"complete":{"type":"boolean"},"interpretation":{"type":"string"}},"required":["kind","complete"]},
-                            "baseline":{"type":["object","null"]},
-                            "current":{"type":["object","null"]},
-                            "current_snapshot_ids":{"type":"array","items":{"type":"string"},"description":"All ordinary current snapshot IDs selected by the run; current is the first compatibility projection."},
-                            "aggregate":{"type":["object","null"],"description":"Deduplicated baseline-union-current coverage summary. Its rates and counts are the primary incremental result; sparse detailed rows preserve file-summary counts and expose merge.exact=false with conservative_max_fallback."},
-                            "overall":{"type":"object","description":"Backward-compatible aggregate metric deltas."},
+                            "run":{"type":["object","null"],"description":"The first raw selected artifact, retained only as incremental run provenance; the canonical measurement at data.measurement is the deduplicated union."},
+                            "current_snapshot_id":{"type":["string","null"],"description":"First ordinary current snapshot ID for an automatic managed-run review."},
+                            "current_snapshot_ids":{"type":"array","items":{"type":"string"},"description":"All ordinary current snapshot IDs selected by the run; their union is the canonical data.measurement."},
+                            "merge":{"type":["object","null"],"description":"Union identity and fallback provenance. exact=false identifies metric families whose detailed identities were unavailable."},
                             "metric_deltas":{
                                 "type":"object",
-                                "description":"Aggregate line, branch, function, and region metric deltas.",
+                                "description":"Signed deltas from baseline to the canonical union measurement; rates are server-provided and are not recomputed by consumers.",
                                 "properties":{
                                     "line_rate_delta":{"type":["number","null"]},
                                     "covered_lines_delta":{"type":"integer"},
@@ -1691,13 +1697,12 @@ fn coverage_review_output_schema() -> Value {
                                     "total_regions_delta":{"type":"integer"}
                                 }
                             },
-                            "files":{"type":"array","description":"Bounded per-file aggregate metrics for the primary union."},
+                            "files":{"type":"array","description":"Bounded per-file metrics for the canonical union measurement, with baseline/current comparison fields for incremental detail."},
                             "files_truncated":{"type":"boolean"},
                             "changed_lines":{"type":"array","description":"Bounded exact changed-line records in review and audit representations."},
                             "changed_lines_truncated":{"type":"boolean"},
                             "regions":{"type":"array","description":"Grouped affected lines; compact uses grouped path/status ranges."},
                             "regions_truncated":{"type":"boolean"},
-                            "aggregate_regions_truncated":{"type":"boolean"},
                             "coverage_gain":{
                                 "type":"object",
                                 "properties":{
@@ -1750,7 +1755,7 @@ fn coverage_review_output_schema() -> Value {
                             },
                             "next_action":{"type":"object"}
                         },
-                        "required":["status","baseline","current","metric_deltas","coverage_gain","regions","regions_truncated","test_attribution","detail_source"]
+                        "required":["status","comparison_mode","measurement_scope","current_snapshot_ids","run","metric_deltas","coverage_gain","regions","regions_truncated","test_attribution","detail_source"]
                     },
                     "next_action":{"type":"object"},
                     "source":{"type":"array"},
@@ -2441,7 +2446,12 @@ mod tests {
             ordinary_incremental["current_snapshot_ids"],
             json!([snapshot_id, second_snapshot_id])
         );
-        assert_eq!(ordinary_incremental["aggregate"]["covered_lines"], 2);
+        assert_eq!(
+            ordinary_run_review["data"]["measurement"]["covered_lines"],
+            2
+        );
+        assert_eq!(ordinary_incremental["run"]["id"], snapshot_id);
+        assert!(ordinary_incremental.get("aggregate").is_none());
         assert_eq!(
             ordinary_incremental["diff"]["comparison_mode"],
             "snapshot_diff"
@@ -3073,7 +3083,7 @@ mod tests {
         let initialize = initialize_result();
         let instructions = initialize["instructions"].as_str().unwrap();
         assert_eq!(initialize["serverInfo"]["version"], VERSION);
-        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 15")));
+        assert!(instructions.starts_with(&format!("Coverage MCP {VERSION} schema 16")));
         assert!(instructions.contains("multiple calls"));
         assert!(instructions.contains("task=source"));
         assert!(instructions.contains("last two points"));
@@ -3152,7 +3162,9 @@ mod tests {
         }
         assert!(incremental_schema["properties"]["metric_deltas"].is_object());
         assert!(incremental_schema["properties"]["measurement_scope"].is_object());
-        assert!(incremental_schema["properties"]["aggregate"].is_object());
+        assert!(incremental_schema["properties"]["run"].is_object());
+        assert!(incremental_schema["properties"]["merge"].is_object());
+        assert!(incremental_schema["properties"].get("aggregate").is_none());
         assert!(incremental_schema["properties"]["diff"].is_object());
         assert!(incremental_schema["properties"]["test_attribution"].is_object());
         assert!(

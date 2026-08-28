@@ -1885,9 +1885,9 @@ impl CoverageStore {
     }
 
     /// Compares two explicitly selected snapshots without requiring the same
-    /// suite. This is the fast incremental projection: aggregate coverage is
-    /// compared immediately, while named test attribution is included when
-    /// both snapshots carry compatible named observations.
+    /// suite. This is the fast replacement projection: coverage is compared
+    /// immediately, while named test attribution is included when both
+    /// snapshots carry compatible named observations.
     pub fn incremental_compare(
         &self,
         snapshot_id: &str,
@@ -2007,8 +2007,9 @@ impl CoverageStore {
     }
 
     /// Computes additive coverage for several ordinary artifacts selected by
-    /// one run. The first snapshot remains the compatibility `current` field;
-    /// `current_snapshot_ids` identifies the complete selected set.
+    /// one run. `current` is the canonical full-shaped measurement with the
+    /// deduplicated union metrics applied; `run` preserves the first raw
+    /// selected artifact for incremental-only diagnostics.
     #[allow(clippy::too_many_arguments)]
     pub fn incremental_union_compare_many_with_scope(
         &self,
@@ -2127,6 +2128,7 @@ impl CoverageStore {
         };
         let aggregate_delta = overall_delta(&aggregate.summary, &baseline)
             .expect("union summary and baseline contain complete metrics");
+        let union_current = union_snapshot_projection(&current, &aggregate.summary);
         let mut diff = if snapshot_ids.len() == 1 {
             direct
         } else {
@@ -2194,11 +2196,11 @@ impl CoverageStore {
                 },
             },
             "baseline": baseline,
-            "current": current,
+            "current": union_current,
+            "run": current,
             "current_snapshot_ids": snapshot_ids,
-            "aggregate": aggregate.summary,
-            "overall": aggregate_delta.clone(),
             "metric_deltas": aggregate_delta,
+            "merge": aggregate.summary["merge"].clone(),
             "files": aggregate_files,
             "files_truncated": aggregate_files_truncated,
             "changed_lines": aggregate_lines,
@@ -2229,7 +2231,6 @@ impl CoverageStore {
                     json!([])
                 },
             },
-            "aggregate_regions_truncated": aggregate_regions_truncated,
             "test_attribution": diff["test_attribution"].clone(),
             "detail_source": diff["detail_source"].clone(),
         }))
@@ -2415,9 +2416,9 @@ impl CoverageStore {
         }
 
         files.sort_by(|left, right| {
-            left.get("aggregate_line_rate")
+            left.get("line_rate")
                 .and_then(Value::as_f64)
-                .partial_cmp(&right.get("aggregate_line_rate").and_then(Value::as_f64))
+                .partial_cmp(&right.get("line_rate").and_then(Value::as_f64))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     left.get("file_path")
@@ -2428,9 +2429,9 @@ impl CoverageStore {
         let file_count = files.len();
         let current_file_count = current_files.len();
         current_files.sort_by(|left, right| {
-            left.get("aggregate_line_rate")
+            left.get("line_rate")
                 .and_then(Value::as_f64)
-                .partial_cmp(&right.get("aggregate_line_rate").and_then(Value::as_f64))
+                .partial_cmp(&right.get("line_rate").and_then(Value::as_f64))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
                     left.get("file_path")
@@ -9541,18 +9542,6 @@ fn aggregate_file_projection(
         "total_regions": regions.total,
         "covered_regions": regions.covered,
         "region_rate": rate(regions.covered, regions.total),
-        "aggregate_total_lines": lines.total,
-        "aggregate_covered_lines": lines.covered,
-        "aggregate_line_rate": rate(lines.covered, lines.total),
-        "aggregate_total_branches": branches.total,
-        "aggregate_covered_branches": branches.covered,
-        "aggregate_branch_rate": rate(branches.covered, branches.total),
-        "aggregate_total_functions": functions.total,
-        "aggregate_covered_functions": functions.covered,
-        "aggregate_function_rate": rate(functions.covered, functions.total),
-        "aggregate_total_regions": regions.total,
-        "aggregate_covered_regions": regions.covered,
-        "aggregate_region_rate": rate(regions.covered, regions.total),
     });
     for (metric, rate_key) in [
         ("lines", "line_rate"),
@@ -9572,15 +9561,36 @@ fn aggregate_file_projection(
             baseline_rate.map_or(Value::Null, |value| json!(value));
         value[format!("current_{rate_key}")] =
             current_rate.map_or(Value::Null, |value| json!(value));
-        let aggregate_rate = value
-            .get(format!("aggregate_{rate_key}"))
-            .and_then(Value::as_f64);
-        value[format!("{rate_key}_delta")] = match (aggregate_rate, baseline_rate) {
+        let union_rate = value.get(rate_key).and_then(Value::as_f64);
+        value[format!("{rate_key}_delta")] = match (union_rate, baseline_rate) {
             (Some(current), Some(baseline)) => json!(current - baseline),
             _ => Value::Null,
         };
     }
     value
+}
+
+fn union_snapshot_projection(snapshot: &Value, summary: &Value) -> Value {
+    let mut result = snapshot.clone();
+    for key in [
+        "total_lines",
+        "covered_lines",
+        "line_rate",
+        "total_branches",
+        "covered_branches",
+        "branch_rate",
+        "total_functions",
+        "covered_functions",
+        "function_rate",
+        "total_regions",
+        "covered_regions",
+        "region_rate",
+    ] {
+        if let Some(value) = summary.get(key) {
+            result[key] = value.clone();
+        }
+    }
+    result
 }
 
 fn grouped_incremental_lines(numbers: &BTreeMap<String, Vec<i64>>) -> Vec<Value> {
@@ -18670,9 +18680,12 @@ mod tests {
             .unwrap();
         assert_eq!(union["comparison_mode"], "additive_union");
         assert_eq!(union["measurement_scope"]["kind"], "selected_subset");
-        assert_eq!(union["aggregate"]["total_lines"], 6);
-        assert_eq!(union["aggregate"]["covered_lines"], 6);
-        assert_eq!(union["aggregate"]["line_rate"], 1.0);
+        assert_eq!(union["current"]["id"], current_id);
+        assert_eq!(union["run"]["id"], current_id);
+        assert_eq!(union["current"]["total_lines"], 6);
+        assert_eq!(union["current"]["covered_lines"], 6);
+        assert_eq!(union["current"]["line_rate"], 1.0);
+        assert!(union.get("aggregate").is_none());
         assert_eq!(union["metric_deltas"]["covered_lines_delta"], 3);
         assert_eq!(union["coverage_gain"]["newly_covered"], 3);
         assert_eq!(union["coverage_gain"]["not_observed"], 2);
@@ -18710,8 +18723,12 @@ mod tests {
         let compacted_union = store
             .incremental_union_compare(current_id, baseline_id, None, 10, 100, 10)
             .unwrap();
-        assert_eq!(compacted_union["aggregate"]["covered_lines"], 6);
+        assert_eq!(compacted_union["current"]["covered_lines"], 6);
         assert_eq!(compacted_union["coverage_gain"]["newly_covered"], 3);
+        assert_eq!(
+            union_snapshot_projection(&json!({"id":"raw"}), &json!({}))["id"],
+            "raw"
+        );
         let inventory = store.compaction_summary().unwrap();
         assert_eq!(inventory["snapshot_count"], 2);
         assert_eq!(inventory["compacted_snapshot_count"], 1);
@@ -19058,8 +19075,10 @@ mod tests {
             comparison["current_snapshot_ids"],
             json!([first_id, second_id])
         );
-        assert_eq!(comparison["aggregate"]["total_lines"], 7);
-        assert_eq!(comparison["aggregate"]["covered_lines"], 4);
+        assert_eq!(comparison["current"]["total_lines"], 7);
+        assert_eq!(comparison["current"]["covered_lines"], 4);
+        assert_eq!(comparison["run"]["id"], first_id);
+        assert!(comparison.get("aggregate").is_none());
         assert_eq!(comparison["coverage_gain"]["newly_covered"], 3);
         assert_eq!(comparison["coverage_gain"]["regressed"], 0);
         assert_eq!(comparison["diff"]["coverage_gain"]["newly_covered"], 1);

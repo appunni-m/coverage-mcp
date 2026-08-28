@@ -12,7 +12,7 @@
 
 Local-first coverage history, test execution, and an MCP server in one Rust
 binary. Coverage MCP keeps immutable coverage snapshots in DuckDB, exposes a
-dashboard and REST API, and provides the consolidated schema-15 projections over
+dashboard and REST API, and provides the consolidated schema-16 projections over
 loopback HTTP and native MCP stdio.
 
 The project is designed for one user-level daemon shared by agents and Git
@@ -22,7 +22,7 @@ frontend build or a separate language runtime.
 ## Status
 
 The Rust implementation is the only runtime and the checked-in Rust test suite
-is the source of truth. The public contract is schema revision 15 with eight
+is the source of truth. The public contract is schema revision 16 with eight
 agent-facing tools. The local gate is configured to require 100% region, line,
 and function coverage for the measured Rust library/runtime targets. `src/main.rs`
 is exercised by child-process smoke tests and excluded from aggregate LLVM
@@ -339,19 +339,23 @@ server never infers it from the latest or previous snapshot.
 An incremental `run_test` automatically attaches `incremental_review` after
 terminal ingestion. If the run produces several ordinary artifacts, all
 `data.coverage_ingest.snapshot_ids` are one selected measurement set. The
-primary result is the deduplicated union of the fixed base and that set, so a
-selected case cannot lower the displayed aggregate simply because it did not
-hit every base region. `status="pending"` means the run is still active;
-`status="not_measured"` and `reasons` mean no valid measurement is available.
-`run_review(view="status")` returns the same durable review. This automatic
-review is the normal path for fewer-test-case runs.
+result keeps the same top-level `measurement` and `baseline` shape as a full
+review: `measurement` is the canonical deduplicated union of the fixed base and
+that set, so a selected case cannot lower displayed coverage simply because it
+did not hit every base region. Incremental-only provenance and gain/decrement
+data lives under `data.incremental`, including `run`, `metric_deltas`,
+`coverage_gain`, `merge`, and the separate diagnostic `diff`.
+`status="pending"` means the run is still active; `status="not_measured"` and
+`reasons` mean no valid measurement is available. `run_review(view="status")`
+returns the same durable review. This automatic review is the normal path for
+fewer-test-case runs.
 
-The incremental response deliberately has two blocks. `incremental.aggregate`
-and its `metric_deltas` are the final base ∪ selected-run coverage. The nested
-`incremental.diff` is a diagnostic current-versus-base replacement comparison;
-for a selected subset, baseline hits missing from that run are
+The nested `incremental.diff` is a diagnostic current-versus-base replacement
+comparison; for a selected subset, baseline hits missing from that run are
 `not_observed`, not regressions. A complete snapshot can still report genuine
-regressions.
+regressions. Consumers must use the server-provided union counts and rates in
+`data.measurement` and must not reconstruct them from a numerator/denominator
+calculation in `data.incremental`.
 
 Use standalone `coverage_review(task="incremental")` when the ordinary
 snapshots, ordinary snapshot set, or composite snapshots already exist and only
@@ -437,7 +441,8 @@ version, and non-null inventory hash. `newly_covered` is the incremental gain;
 Source and audit requests accept the same composite measurement selector, and
 the bounded response exposes provenance, exact component deltas, truncation,
 and named-test attribution status. If a producer has no named observations,
-attribution is explicitly `unavailable`; aggregate coverage remains valid.
+attribution is explicitly `unavailable`; the canonical union measurement
+remains valid.
 
 Compaction does not rewrite composite rows. Ordinary child snapshots may be
 compressed, but their file, line, and named-test projections are restored from
@@ -449,7 +454,7 @@ operational cost and retention control.
 | Question | Request |
 | --- | --- |
 | Did new code get covered? | `task="change"`; choose `baseline.kind="worktree_base"`, `"parent_commit"`, `"ref"`, `"previous_snapshot"`, `"explicit"`, or `"none"`. |
-| What did this case add without rerunning the full base? | `task="incremental"` with an explicit ordinary snapshot, an ordinary snapshot set produced by a run, or a composite measurement and `baseline.kind="explicit"` plus the matching baseline selector. The server unions stored detail immediately and keeps the replacement diff separate. |
+| What did this case add without rerunning the full base? | `task="incremental"` with an explicit ordinary snapshot, an ordinary snapshot set produced by a run, or a composite measurement and `baseline.kind="explicit"` plus the matching baseline selector. The server returns the union as `data.measurement`, keeps run data under `data.incremental`, and keeps the replacement diff separate. |
 | What happened over time? | `task="history"`; default is the last two compatible points and an aggregate over those two points. |
 | What should be tested next? | `task="insight"`; returns ranked uncovered regions without a raw line dump. |
 | What source surrounds selected gaps? | `task="source"` with up to ten grouped `{file_path,start,end}` ranges. |
@@ -485,19 +490,20 @@ tests, invokes a parent runner, or reparses either report. It compares stored
 rows from the fixed baseline with the union of one or more immutable ordinary
 snapshots, allows the suites and case-specific execution arguments to differ,
 and requires the same repository and normalized coverage format. The primary
-result includes `aggregate` and `metric_deltas` for the deduplicated union;
-`coverage_gain` reports new line, branch, function, and region identities.
-The nested `diff` retains replacement-style grouped categories and
-`detail_source` for each side (`relational` or `compacted_payload`). In a
-`selected_subset` measurement, baseline identities absent from the selected
-run are `not_observed` and `regressed` is zero; `complete_snapshot` is the
-scope that supports real regression claims. Suite, branch, commit, command,
-cwd, and execution case remain provenance only; they are never test identity.
-A missing named-test projection sets attribution to `status="unavailable"` and
-limits only attribution; aggregate coverage remains measured.
-When detailed line rows are sparse relative to a file summary, the aggregate
-preserves the summary counts and marks the affected metric family with
-`merge.exact=false` and `conservative_max_fallback`.
+result is the same full-shaped `data.measurement` projection used by full mode;
+`data.incremental.run` preserves the first selected artifact for provenance,
+while `metric_deltas` and `coverage_gain` report signed increment/decrement
+categories for the canonical union. The nested `diff` retains replacement-style
+grouped categories and `detail_source` for each side (`relational` or
+`compacted_payload`). In a `selected_subset` measurement, baseline identities
+absent from the selected run are `not_observed` and `regressed` is zero;
+`complete_snapshot` is the scope that supports real regression claims. Suite,
+branch, commit, command, cwd, and execution case remain provenance only; they
+are never test identity. A missing named-test projection sets attribution to
+`status="unavailable"` and limits only attribution; the canonical union
+measurement remains measured. When detailed line rows are sparse relative to a
+file summary, the union preserves the summary counts and marks the affected
+metric family with `merge.exact=false` and `conservative_max_fallback`.
 
 For a long-lived fixed base, import or ingest it with
 `detail_retention="incremental_base"`. This prevents automatic compaction of
@@ -638,7 +644,7 @@ Every successful tool uses this envelope:
 
 ```json
 {
-  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 15},
+  "context": {"repo_key": "…", "checkout_path": "…", "suite": "…", "schema_revision": 16},
   "data": {},
   "page": null
 }

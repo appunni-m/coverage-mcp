@@ -4,7 +4,7 @@ The migration is complete at the runtime boundary: the repository contains
 one Rust implementation, Rust tests, and input-only migration fixtures. A
 separate source runtime is not required, installed, imported, or executed.
 This document preserves the behavior-family mapping so future
-changes can be reviewed against the current schema-15 contract.
+changes can be reviewed against the current schema-16 contract.
 
 This is a maintainer document for a source checkout. Published Cargo packages
 intentionally omit the test corpus, fixtures, and generated evidence described
@@ -27,7 +27,7 @@ here.
 
 ## Compatibility invariants
 
-- The public MCP inventory contains exactly eight tools and schema revision 15.
+- The public MCP inventory contains exactly eight tools and schema revision 16.
   Unsupported names use the ordinary unknown-tool error path.
 - Every successful public projection uses the `{context,data,page}` envelope.
 - Word budgets, opaque query-scoped cursors, defensive collection caps, and
@@ -94,7 +94,7 @@ here.
 ## Fixture and evidence contract
 
 The machine-readable manifest in the source checkout at
-`tests/fixtures/manifest.yaml` identifies the schema-15 contract, Rust target
+`tests/fixtures/manifest.yaml` identifies the schema-16 contract, Rust target
 profile, public surfaces, input-only
 parity cases, coverage plan, and compaction benchmark workload. Inputs contain
 no expected outputs; generated reports, logs, and coverage artifacts are
@@ -154,7 +154,7 @@ profile. The release build still enables bundled DuckDB by default and proves
 the self-contained runtime shipped to users.
 
 The coverage gate requires 100% measured region, function, and line coverage
-for the Rust library/runtime target set. The schema-15 rewrite audit is measured
+for the Rust library/runtime target set. The schema-16 rewrite audit is measured
 by the same command above. The CLI launcher is excluded from aggregate LLVM counters
 because it is exercised in child processes; daemon-only CLI and concurrent
 shared-daemon stdio smoke tests still verify that launcher directly. Branch

@@ -2039,6 +2039,35 @@ fn rust_service_projection_and_mcp_contract_match() {
         direct_incremental
     );
     assert!(direct_incremental["data"]["incremental"]["metric_deltas"].is_object());
+    assert_eq!(
+        direct_incremental["data"]["measurement"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        review["data"]["measurement"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>()
+    );
+    assert!(direct_incremental["data"]["measurement"]["line_rate"].is_number());
+    assert!(direct_incremental["data"]["baseline"]["id"].is_string());
+    assert!(
+        direct_incremental["data"]["incremental"]
+            .get("baseline")
+            .is_none()
+    );
+    assert!(
+        direct_incremental["data"]["incremental"]
+            .get("current")
+            .is_none()
+    );
+    assert!(
+        direct_incremental["data"]["incremental"]
+            .get("aggregate")
+            .is_none()
+    );
 
     let partial_baseline_report = write_file(
         directory.path(),
@@ -2097,16 +2126,18 @@ fn rust_service_projection_and_mcp_contract_match() {
         partial_data["incremental"]["measurement_scope"]["kind"],
         "selected_subset"
     );
-    assert_eq!(partial_data["incremental"]["aggregate"]["total_lines"], 4);
-    assert_eq!(partial_data["incremental"]["aggregate"]["covered_lines"], 3);
+    assert_eq!(partial_data["measurement"]["total_lines"], 4);
+    assert_eq!(partial_data["measurement"]["covered_lines"], 3);
+    assert_eq!(
+        partial_data["incremental"]["run"]["id"],
+        partial_current["id"]
+    );
     assert_eq!(
         partial_data["incremental"]["metric_deltas"]["covered_lines_delta"],
         0
     );
-    assert_eq!(
-        partial_data["incremental"]["aggregate"]["merge"]["exact"],
-        false
-    );
+    assert_eq!(partial_data["incremental"]["merge"]["exact"], false);
+    assert!(partial_data["incremental"].get("aggregate").is_none());
 
     let unavailable_duplicates = service
         .find_duplicate_coverage_tests(
@@ -2542,7 +2573,7 @@ async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
     );
     assert_eq!(
         dashboard_projection["data"]["files"]["source"],
-        "baseline_union_incremental"
+        "current_union"
     );
     let _default_ingest = http_exchange(
         address,
