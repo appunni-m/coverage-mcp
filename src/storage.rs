@@ -5898,6 +5898,50 @@ impl CoverageStore {
         Ok(position.and_then(|position| snapshots.get(position + 1).cloned()))
     }
 
+    /// Finds the nearest earlier compatible snapshot that is not an
+    /// incremental subset. Dashboard unions need a complete or legacy report
+    /// as their implicit base; using the immediately preceding incremental
+    /// report would discard the coverage accumulated by the real full base.
+    pub fn previous_full_snapshot(&self, snapshot_id: &str) -> AppResult<Option<Value>> {
+        let current = self.snapshot(snapshot_id)?;
+        let branch = current.get("branch").and_then(Value::as_str);
+        let suite = required_string_field(&current, "suite", "snapshot")
+            .expect("snapshot projections always contain suite");
+        let repo_path = required_string_field(&current, "repo_path", "snapshot")
+            .expect("snapshot projections always contain repo_path");
+        let format = required_string_field(&current, "format", "snapshot")
+            .expect("snapshot projections always contain format");
+        let branch_value = required_field(&current, "branch", "snapshot")
+            .expect("snapshot projections always contain branch")
+            .clone();
+        let snapshots = self.list_snapshots(
+            Some(&repo_path),
+            branch,
+            Some(&suite),
+            MAX_COLLECTION_RECORDS,
+        )?;
+        let position = snapshots
+            .iter()
+            .position(|snapshot| snapshot.get("id").and_then(Value::as_str) == Some(snapshot_id));
+        Ok(position
+            .and_then(|position| {
+                snapshots
+                    .get(position + 1..)
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|snapshot| {
+                        required_field(snapshot, "branch", "snapshot")
+                            .expect("snapshot projections always contain branch")
+                            == &branch_value
+                            && required_string_field(snapshot, "format", "snapshot")
+                                .expect("snapshot projections always contain format")
+                                == format
+                            && !snapshot_is_incremental(snapshot)
+                    })
+            })
+            .cloned())
+    }
+
     /// Returns file summaries, transparently restoring compacted detail payloads.
     pub fn files(&self, snapshot_id: &str, limit: usize) -> AppResult<Vec<Value>> {
         self.snapshot(snapshot_id)?;
@@ -6984,6 +7028,15 @@ fn snapshot_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {
         json!(row.get::<_, String>(24)?),
     );
     Ok(Value::Object(value))
+}
+
+fn snapshot_is_incremental(snapshot: &Value) -> bool {
+    snapshot
+        .get("metadata")
+        .and_then(|metadata| metadata.get("execution"))
+        .and_then(|execution| execution.get("mode"))
+        .and_then(Value::as_str)
+        == Some("incremental")
 }
 
 fn file_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<Value> {

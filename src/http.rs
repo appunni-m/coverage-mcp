@@ -1680,6 +1680,7 @@ mod tests {
         assert!(dashboard_html().contains("compactionInventory"));
         assert!(dashboard_html().contains("/api/dashboard"));
         assert!(dashboard_html().contains("/api/dashboard/events"));
+        assert!(dashboard_html().contains("Automatic compatible full base"));
         assert!(dashboard_html().contains("visibilitychange"));
         assert!(dashboard_html().contains("refreshTimer"));
         assert!(dashboard_html().contains("setLive('live', 'on')"));
@@ -1726,6 +1727,54 @@ mod tests {
         let dashboard_project = dashboard_store.project().unwrap();
         let dashboard_repo_path = dashboard_project.repo_path.replace('\'', "''");
         let dashboard_repo_key = dashboard_project.repo_key.replace('\'', "''");
+        let dashboard_report = dashboard_directory.path().join("coverage.lcov");
+        std::fs::write(
+            &dashboard_report,
+            "TN:dashboard\nSF:src/a.py\nDA:1,1\nDA:2,0\nend_of_record\n",
+        )
+        .unwrap();
+        let dashboard_full = dashboard_store
+            .ingest_report(
+                &dashboard_report,
+                "lcov",
+                Some(dashboard_directory.path()),
+                Some("main"),
+                Some("dashboard-full"),
+                None,
+                "unit",
+            )
+            .unwrap();
+        let dashboard_incremental_one = dashboard_store
+            .ingest_report_with_execution(
+                &dashboard_report,
+                "lcov",
+                Some(dashboard_directory.path()),
+                Some("main"),
+                Some("dashboard-incremental-one"),
+                None,
+                "unit",
+                Some(&json!({"mode":"incremental","identity":"dashboard-http-case-1"})),
+                "compactable",
+            )
+            .unwrap();
+        let dashboard_incremental_two = dashboard_store
+            .ingest_report_with_execution(
+                &dashboard_report,
+                "lcov",
+                Some(dashboard_directory.path()),
+                Some("main"),
+                Some("dashboard-incremental-two"),
+                None,
+                "unit",
+                Some(&json!({"mode":"incremental","identity":"dashboard-http-case-2"})),
+                "compactable",
+            )
+            .unwrap();
+        assert_ne!(dashboard_full["id"], dashboard_incremental_one["id"]);
+        assert_ne!(
+            dashboard_incremental_one["id"],
+            dashboard_incremental_two["id"]
+        );
         dashboard_store
             .execute_sql_for_test(&format!(
                 "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-terminal', 'dashboard-command', 'dashboard-command', 'true', '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{}}', '[]', current_timestamp, 0, NULL, 'full', 'full:v1', 'full'); INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-active', 'dashboard-command', 'dashboard-command', 'true', NULL, '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, NULL, NULL, 30, 20, 'queued', 'stdout.log', 'stderr.log', '', NULL, 'incremental', 'case:v1', 'case')"
@@ -1807,6 +1856,21 @@ mod tests {
         assert!(response_text.contains("200 OK"));
         assert!(response_text.contains("\"incremental\""));
         assert!(response_text.contains("\"composite\""));
+        let dashboard_payload: Value = serde_json::from_str(
+            response_text
+                .split_once("\r\n\r\n")
+                .expect("dashboard response has an HTTP body")
+                .1,
+        )
+        .expect("dashboard response is JSON");
+        assert_eq!(
+            dashboard_payload["data"]["selection"]["baseline_snapshot_id"],
+            dashboard_full["id"]
+        );
+        assert_eq!(
+            dashboard_payload["data"]["current"]["execution"]["mode"],
+            "incremental"
+        );
         async fn rest_request(
             address: std::net::SocketAddr,
             method: &str,

@@ -4,6 +4,15 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.15.3 - 2026-08-28
+
+### Fixed
+
+- Dashboard incremental unions now use the nearest earlier compatible full or
+  legacy snapshot as their automatic base, skipping incremental subset runs.
+  Projects without a complete base no longer report an incremental subset as a
+  rolling comparison baseline.
+
 ## 0.15.2 - 2026-08-28
 
 ### Fixed

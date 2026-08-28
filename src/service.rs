@@ -1675,10 +1675,10 @@ impl CoverageService {
     /// Returns the bounded, single-request projection used by the live
     /// dashboard.
     ///
-    /// The dashboard intentionally uses a rolling previous snapshot when no
-    /// baseline is supplied. That convenience belongs to this presentation
-    /// projection only; the public incremental MCP task still requires an
-    /// explicit baseline and never infers one.
+    /// The dashboard uses the nearest earlier compatible full or legacy
+    /// snapshot when no baseline is supplied. That convenience belongs to
+    /// this presentation projection only; the public incremental MCP task
+    /// still requires an explicit baseline and never infers one.
     pub fn dashboard(
         &self,
         snapshot_id: Option<&str>,
@@ -1728,6 +1728,9 @@ impl CoverageService {
     /// `current_snapshot_ids` is the additive measurement set. Its first ID
     /// remains the compatibility `current` snapshot used by existing callers;
     /// all IDs are merged into the incremental union when a baseline exists.
+    /// Without an explicit baseline, the dashboard selects the nearest
+    /// earlier compatible full or legacy snapshot and skips incremental
+    /// subset snapshots.
     #[allow(clippy::too_many_arguments)]
     pub fn dashboard_with_snapshot_ids(
         &self,
@@ -1812,13 +1815,13 @@ impl CoverageService {
             }
             (Some(snapshot), "explicit")
         } else if let Some(current_id) = initial_current_id {
-            let rolling = snapshots
-                .iter()
-                .find(|value| value.get("id").and_then(Value::as_str) != Some(current_id))
-                .cloned()
-                .or(self.store.previous_snapshot(current_id)?)
-                .filter(|value| value.get("id").and_then(Value::as_str) != Some(current_id));
-            (rolling, "rolling_previous")
+            let rolling = self.store.previous_full_snapshot(current_id)?;
+            let kind = if rolling.is_some() {
+                "rolling_previous"
+            } else {
+                "none"
+            };
+            (rolling, kind)
         } else {
             (None, "none")
         };
@@ -5244,6 +5247,55 @@ mod tests {
                 .is_none()
         );
         let current_id = many_current["id"].as_str().unwrap();
+        let dashboard_incremental_execution =
+            json!({"mode":"incremental","identity":"dashboard-case-1"});
+        let dashboard_incremental_one = store
+            .ingest_report_with_execution(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("dashboard-incremental-one"),
+                None,
+                "unit",
+                Some(&dashboard_incremental_execution),
+                "compactable",
+            )
+            .expect("first dashboard incremental snapshot");
+        let dashboard_incremental_two_execution =
+            json!({"mode":"incremental","identity":"dashboard-case-2"});
+        let dashboard_incremental_two = store
+            .ingest_report_with_execution(
+                &report,
+                "lcov",
+                Some(directory.path()),
+                Some("main"),
+                Some("dashboard-incremental-two"),
+                None,
+                "unit",
+                Some(&dashboard_incremental_two_execution),
+                "compactable",
+            )
+            .expect("second dashboard incremental snapshot");
+        let rolling_incremental_dashboard = service
+            .dashboard(
+                Some(dashboard_incremental_two["id"].as_str().unwrap()),
+                None,
+                18,
+            )
+            .expect("dashboard skips incremental snapshots as its implicit base");
+        assert_eq!(
+            rolling_incremental_dashboard["data"]["selection"]["baseline_snapshot_id"],
+            current_id
+        );
+        assert_eq!(
+            rolling_incremental_dashboard["data"]["incremental"]["status"],
+            "measured"
+        );
+        assert_ne!(
+            rolling_incremental_dashboard["data"]["selection"]["baseline_snapshot_id"],
+            dashboard_incremental_one["id"]
+        );
         let dashboard = service
             .dashboard(Some(current_id), Some(baseline["id"].as_str().unwrap()), 18)
             .expect("dashboard projection");
@@ -5373,7 +5425,7 @@ mod tests {
             .expect("older rolling dashboard projection");
         assert_eq!(
             older_dashboard["data"]["selection"]["baseline_kind"],
-            "rolling_previous"
+            "none"
         );
         assert!(service.dashboard(Some(current_id), None, 1).is_err());
 

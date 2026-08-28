@@ -735,7 +735,9 @@ MCP. Important routes are:
   all four metric families, history, incremental categories, bounded
   file/region/test detail, run activity, compaction inventory, and a separate
   exact production-region projection with Rust, Python, and JavaScript
-  component summaries;
+  component summaries. When no ordinary baseline is supplied, the dashboard
+  chooses the nearest earlier compatible full or legacy snapshot and never
+  uses an incremental subset as its automatic union base;
 - `GET /api/dashboard/events` — an SSE stream for the selected repository.
   It emits `ready` with a 10-second refresh interval, then `refresh` only when
   the dashboard revision changes, with heartbeat comments between changes and
@@ -782,8 +784,10 @@ untrusted Host headers.
 
 The embedded dashboard has dedicated Incremental and Production region
 coverage panels. Select the current report and an explicit fixed baseline, or
-select the composite current/base IDs for the combined inventory view. The
-incremental panel shows final deduplicated base ∪ selected-run coverage first,
+leave the ordinary baseline automatic to use the nearest compatible full or
+legacy report; incremental snapshots are excluded from that automatic base
+choice. Select the composite current/base IDs for the combined inventory view.
+The incremental panel shows final deduplicated base ∪ selected-run coverage first,
 then puts the raw snapshot diff in a separate diagnostic block. It shows
 line/branch/function/region gains, not-observed evidence, regression counters
 only for complete reports, file deltas, changed regions,
