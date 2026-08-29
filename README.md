@@ -77,6 +77,9 @@ artifacts, and the project compaction policy. Its main view is one bounded
 dashboard projection, and the foreground page subscribes to a server-sent event
 stream. It checks for new snapshots, runs, or compaction work at most once every
 10 seconds; hidden tabs close the stream and pause automatic refreshes.
+When no current artifact is explicitly selected, the foreground view follows the
+newest snapshot as refresh events arrive; selecting one or more current artifacts
+pins that selection until the project is changed or the page is reloaded.
 
 ## MCP transports
 
@@ -787,6 +790,9 @@ coverage panels. Select the current report and an explicit fixed baseline, or
 leave the ordinary baseline automatic to use the nearest compatible full or
 legacy report; incremental snapshots are excluded from that automatic base
 choice. Select the composite current/base IDs for the combined inventory view.
+The default current-artifact selection follows the newest snapshot when the live
+dashboard refreshes; choosing current artifacts explicitly pins them for
+comparison.
 The incremental panel shows final deduplicated base ∪ selected-run coverage first,
 then puts the raw snapshot diff in a separate diagnostic block. It shows
 line/branch/function/region gains, not-observed evidence, regression counters

@@ -4,6 +4,13 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.15.4 - 2026-08-29
+
+### Fixed
+
+- Live dashboard refreshes now follow the newest current snapshot unless the
+  user explicitly pins one or more current artifacts.
+
 ## 0.15.3 - 2026-08-28
 
 ### Fixed

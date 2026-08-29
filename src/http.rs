@@ -1681,6 +1681,14 @@ mod tests {
         assert!(dashboard_html().contains("/api/dashboard"));
         assert!(dashboard_html().contains("/api/dashboard/events"));
         assert!(dashboard_html().contains("Automatic compatible full base"));
+        assert!(dashboard_html().contains("currentSelectionPinned"));
+        assert!(dashboard_html().contains(
+            "const requestCurrentIds = () => state.currentSelectionPinned ? state.currentIds : [];"
+        ));
+        assert!(dashboard_html().contains("const selectedIds = requestCurrentIds();"));
+        assert!(
+            dashboard_html().contains("state.currentSelectionPinned=state.currentIds.length>0")
+        );
         assert!(dashboard_html().contains("visibilitychange"));
         assert!(dashboard_html().contains("refreshTimer"));
         assert!(dashboard_html().contains("setLive('live', 'on')"));
