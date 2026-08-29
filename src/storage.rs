@@ -5441,6 +5441,7 @@ impl CoverageStore {
                     detail_retention
                 ];
                 connection.execute(INSERT_SNAPSHOT_SQL, snapshot_values)?;
+                let mut file_statement = connection.prepare(INSERT_FILE_SQL)?;
                 for file in &report.files {
                     let raw_metrics = serde_json::to_string(&file.raw_metrics)
                         .expect("file metrics serialization is infallible");
@@ -5461,8 +5462,10 @@ impl CoverageStore {
                         file.region_rate(),
                         raw_metrics
                     ];
-                    connection.execute(INSERT_FILE_SQL, file_values)?;
+                    file_statement.execute(file_values)?;
                 }
+                drop(file_statement);
+                let mut line_statement = connection.prepare(INSERT_LINE_SQL)?;
                 for line in &report.lines {
                     let details = serde_json::to_string(&line.details)
                         .expect("line details serialization is infallible");
@@ -5479,14 +5482,16 @@ impl CoverageStore {
                         line.covered_functions,
                         details
                     ];
-                    connection.execute(INSERT_LINE_SQL, line_values)?;
+                    line_statement.execute(line_values)?;
                 }
+                drop(line_statement);
+                let mut test_statement = connection.prepare(INSERT_TEST_COVERAGE_TEST_SQL)?;
                 for test_name in &report.test_names {
-                    connection.execute(
-                        INSERT_TEST_COVERAGE_TEST_SQL,
-                        params![snapshot_id, test_name],
-                    )?;
+                    test_statement.execute(params![snapshot_id, test_name])?;
                 }
+                drop(test_statement);
+                let mut observation_statement =
+                    connection.prepare(INSERT_TEST_COVERAGE_OBSERVATION_SQL)?;
                 for observation in &report.test_coverage {
                     let observation_values = params![
                         snapshot_id,
@@ -5496,7 +5501,7 @@ impl CoverageStore {
                         observation.line_number,
                         observation.region_key,
                     ];
-                    connection.execute(INSERT_TEST_COVERAGE_OBSERVATION_SQL, observation_values)?;
+                    observation_statement.execute(observation_values)?;
                 }
                 Ok::<(), AppError>(())
             })();
@@ -9824,7 +9829,7 @@ fn insight_order(value: &Value) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{FileCoverage, LineCoverage};
+    use crate::models::{FileCoverage, LineCoverage, TestCoverageObservation};
     use crate::pool::{checkout, inject_watchdog_failure};
     use std::fmt::Write as _;
     use std::io::{self, Write};
@@ -17403,6 +17408,181 @@ mod tests {
             .unwrap();
         assert!(store.dependencies(&snapshot, 10).is_err());
         store.close().unwrap();
+    }
+
+    #[test]
+    fn large_report_detail_rows_are_persisted_completely() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let store =
+            CoverageStore::open(directory.path().join("large-report.duckdb"), test_config())
+                .unwrap();
+        let git = store.ensure_project(directory.path()).unwrap();
+        let line_count = 50_000_i64;
+        let report = CoverageReport {
+            format: "llvm".to_owned(),
+            report_path: "coverage.json".to_owned(),
+            files: vec![FileCoverage {
+                file_path: "src/a.py".to_owned(),
+                total_lines: line_count,
+                covered_lines: line_count / 2,
+                total_branches: 0,
+                covered_branches: 0,
+                total_functions: 0,
+                covered_functions: 0,
+                total_regions: 0,
+                covered_regions: 0,
+                raw_metrics: Value::Null,
+            }],
+            lines: (1..=line_count)
+                .map(|line_number| LineCoverage {
+                    file_path: "src/a.py".to_owned(),
+                    line_number,
+                    hits: i64::from(line_number <= line_count / 2),
+                    covered: line_number <= line_count / 2,
+                    count_line: true,
+                    total_branches: 0,
+                    covered_branches: 0,
+                    total_functions: 0,
+                    covered_functions: 0,
+                    details: Value::Null,
+                })
+                .collect(),
+            test_names: Vec::new(),
+            test_coverage: Vec::new(),
+            warnings: Vec::new(),
+            metadata: Value::Null,
+        };
+
+        let snapshot_id = store
+            .store_report(
+                &report,
+                &git,
+                Some("main"),
+                Some("large-report"),
+                None,
+                "unit",
+            )
+            .unwrap();
+        let persisted_lines = store
+            .with_connection(|connection| {
+                Ok(connection
+                    .query_row(
+                        "SELECT count(*) FROM lines WHERE snapshot_id = ?",
+                        params![snapshot_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap())
+            })
+            .unwrap();
+        assert_eq!(persisted_lines, line_count);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn prepared_detail_insertions_propagate_constraint_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        init_test_git(directory.path());
+        let file = || FileCoverage {
+            file_path: "src/a.py".to_owned(),
+            total_lines: 1,
+            covered_lines: 1,
+            total_branches: 0,
+            covered_branches: 0,
+            total_functions: 0,
+            covered_functions: 0,
+            total_regions: 0,
+            covered_regions: 0,
+            raw_metrics: Value::Null,
+        };
+        let line = || LineCoverage {
+            file_path: "src/a.py".to_owned(),
+            line_number: 1,
+            hits: 1,
+            covered: true,
+            count_line: true,
+            total_branches: 0,
+            covered_branches: 0,
+            total_functions: 0,
+            covered_functions: 0,
+            details: Value::Null,
+        };
+        let observation = || TestCoverageObservation {
+            test_name: "test".to_owned(),
+            kind: "line".to_owned(),
+            file_path: "src/a.py".to_owned(),
+            line_number: 1,
+            region_key: "line:1".to_owned(),
+        };
+        let run_case = |name: &str, index_sql: &str, report: CoverageReport| {
+            let store = CoverageStore::open(directory.path().join(name), test_config()).unwrap();
+            let git = store.ensure_project(directory.path()).unwrap();
+            stop_compaction_worker(&store);
+            store.execute_sql_for_test(index_sql).unwrap();
+            assert!(
+                store
+                    .store_report(&report, &git, Some("main"), Some(name), None, "unit")
+                    .is_err()
+            );
+            store.close().unwrap();
+        };
+
+        run_case(
+            "files.duckdb",
+            "CREATE UNIQUE INDEX duplicate_files ON files(snapshot_id, file_path)",
+            CoverageReport {
+                format: "llvm".to_owned(),
+                report_path: "coverage.json".to_owned(),
+                files: vec![file(), file()],
+                lines: Vec::new(),
+                test_names: Vec::new(),
+                test_coverage: Vec::new(),
+                warnings: Vec::new(),
+                metadata: Value::Null,
+            },
+        );
+        run_case(
+            "lines.duckdb",
+            "CREATE UNIQUE INDEX duplicate_lines ON lines(snapshot_id, file_path, line_number)",
+            CoverageReport {
+                format: "llvm".to_owned(),
+                report_path: "coverage.json".to_owned(),
+                files: vec![file()],
+                lines: vec![line(), line()],
+                test_names: Vec::new(),
+                test_coverage: Vec::new(),
+                warnings: Vec::new(),
+                metadata: Value::Null,
+            },
+        );
+        run_case(
+            "tests.duckdb",
+            "CREATE UNIQUE INDEX duplicate_tests ON test_coverage_tests(snapshot_id, test_name)",
+            CoverageReport {
+                format: "llvm".to_owned(),
+                report_path: "coverage.json".to_owned(),
+                files: vec![file()],
+                lines: Vec::new(),
+                test_names: vec!["test".to_owned(), "test".to_owned()],
+                test_coverage: Vec::new(),
+                warnings: Vec::new(),
+                metadata: Value::Null,
+            },
+        );
+        run_case(
+            "observations.duckdb",
+            "CREATE UNIQUE INDEX duplicate_observations ON test_coverage_observations(snapshot_id, test_name, kind, file_path, line_number, region_key)",
+            CoverageReport {
+                format: "llvm".to_owned(),
+                report_path: "coverage.json".to_owned(),
+                files: vec![file()],
+                lines: Vec::new(),
+                test_names: vec!["test".to_owned()],
+                test_coverage: vec![observation(), observation()],
+                warnings: Vec::new(),
+                metadata: Value::Null,
+            },
+        );
     }
 
     #[test]

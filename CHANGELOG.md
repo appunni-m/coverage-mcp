@@ -4,6 +4,14 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## 0.15.5 - 2026-08-29
+
+### Fixed
+
+- Large LLVM coverage reports no longer re-prepare every DuckDB detail insert,
+  preventing valid imports and managed-run ingestion from hitting the database
+  operation watchdog.
+
 ## 0.15.4 - 2026-08-29
 
 ### Fixed

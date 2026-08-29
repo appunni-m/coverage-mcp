@@ -149,7 +149,7 @@ it with `uvx`, `uv run`, or `python`; a Git checkout of this repository has no
 not running from a checkout:
 
 ```sh
-cargo install coverage-mcp --version '=0.15.0' --locked
+cargo install coverage-mcp --version '=0.15.5' --locked
 ```
 
 ### Marketplace bootstrap contract
