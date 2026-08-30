@@ -1,7 +1,11 @@
 # Coverage MCP evaluation suite
 
-This directory defines the opt-in evaluation contract for the Coverage MCP.
-It evaluates whether an independent agent can discover and use the server,
+Use this contributor-only suite to check whether an independent agent can
+discover and use the server, choose bounded projections, recover from errors,
+and follow the approval workflow. It is not part of user installation.
+
+This directory defines the opt-in evaluation contract for Coverage MCP. It
+evaluates whether an independent agent can discover and use the server,
 choose outcome-driven projections, stay within a response budget, recover from
 invalid requests, and complete the approved test workflow safely.
 
@@ -122,6 +126,6 @@ Review these as trend metrics rather than fixed universal thresholds:
 5. Keep the suite opt-in; do not add it to `ci`, `test-ci`, or the default
    workspace test command.
 
-When changing a public MCP tool, also update `src/mcp.rs`, the README MCP Usage
-Guide, the lowest-layer tests, and the live transport tests as required by
-`AGENTS.md`.
+When changing a public MCP tool, also update `src/mcp.rs`,
+`docs/mcp-reference.md`, any affected user journey, the lowest-layer tests, and
+the live transport tests as required by `AGENTS.md`.

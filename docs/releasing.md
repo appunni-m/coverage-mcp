@@ -1,5 +1,9 @@
 # Releasing
 
+Use this checklist to publish a crates.io package, native release archives, and
+the matching codegen-marketplace runtime pin without sending users to a source
+checkout. It is for maintainers with release permissions.
+
 Releases are Rust binaries and crates.io packages built from an annotated Git
 tag. The release workflow must reproduce the local gate before publishing an
 artifact.

@@ -9,7 +9,7 @@ Describe the problem and the user-visible result.
 - [ ] `make clippy`
 - [ ] Full suite and 100% region/line/function coverage gate
 - [ ] Rustdoc builds with warnings denied
-- [ ] Documentation/changelog updated when user-visible
+- [ ] README/user guide/reference/changelog updated at the appropriate layer
 - [ ] No private source, logs, databases, or credentials included
 
 ## Contract and storage impact

@@ -1,7 +1,19 @@
-//! Rust implementation of the Coverage MCP service.
+//! Run approved local tests, retain coverage snapshots, and return bounded
+//! coverage evidence to MCP, HTTP, and dashboard clients.
 //!
-//! This crate owns the production daemon, storage, parsers, REST surface, MCP
-//! transports, dashboard, and background maintenance lifecycle.
+//! Most users should install the `testing` plugin from
+//! [codegen-marketplace](https://github.com/appunni-m/codegen-marketplace) and
+//! interact through its coverage-review workflow. The public Rust modules are
+//! primarily shared building blocks for the `coverage-mcp` binary, integration
+//! tests, and embedders that deliberately adopt the server's storage and wire
+//! contracts; they are not a separate high-level coverage SDK.
+//!
+//! The crate contains the production daemon, storage, parsers, REST surface,
+//! MCP dispatcher, dashboard, and background maintenance lifecycle. Start with
+//! [`CoverageServer`] for an embedded HTTP service, [`CoverageStore`] for the
+//! repository store, or [`mcp`] for the transport-neutral JSON-RPC contract.
+//! The installed binary and its `initialize`/`tools/list` responses are the
+//! authoritative agent-facing interface.
 
 #![warn(missing_docs)]
 #![recursion_limit = "256"]

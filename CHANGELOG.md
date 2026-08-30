@@ -4,6 +4,18 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
+## Unreleased
+
+### Changed
+
+- Reworked the documentation around user outcomes: the README now leads with
+  coverage-review use cases, codegen-marketplace is the primary Codex
+  installation path, and the published crates.io package is the manual
+  alternative.
+- Moved MCP schemas, HTTP routes, daemon configuration, storage behavior, and
+  troubleshooting out of the README into focused getting-started, user,
+  operations, MCP, and HTTP guides.
+
 ## 0.15.5 - 2026-08-29
 
 ### Fixed
@@ -151,8 +163,6 @@ breaking public-contract changes.
   observations. It ignores hit counts, preserves named observations through
   compaction, and reports unavailable evidence when the format has no test
   names; coverage equality is not logic equality.
-
-## Unreleased
 
 ## 0.10.1 - 2026-08-23
 

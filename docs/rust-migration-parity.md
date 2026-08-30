@@ -1,12 +1,16 @@
 # Rust migration and parity evidence
 
+Use this maintainer reference when changing migration fixtures, verifying the
+Rust-only runtime boundary, or interpreting generated parity evidence. It is
+not required for installation or a coverage review.
+
 The migration is complete at the runtime boundary: the repository contains
 one Rust implementation, Rust tests, and input-only migration fixtures. A
 separate source runtime is not required, installed, imported, or executed.
 This document preserves the behavior-family mapping so future
 changes can be reviewed against the current schema-16 contract.
 
-This is a maintainer document for a source checkout. Published Cargo packages
+Published Cargo packages
 intentionally omit the test corpus, fixtures, and generated evidence described
 here.
 

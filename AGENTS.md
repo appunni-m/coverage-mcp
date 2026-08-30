@@ -15,8 +15,9 @@ safety annotations, resources, pagination, or workflow:
 2. Update the service/storage implementation when validation or side effects
    change. Keep compact envelopes and hidden detailed fields consistent across
    HTTP and stdio.
-3. Update `README.md` MCP Usage Guide with every tool, input, return shape,
-   error class, resource, and workflow rule.
+3. Update `docs/mcp-reference.md` with every tool, input, return shape, error
+   class, resource, and workflow rule. Update the README, getting-started
+   guide, or user guide only when their shorter user journey changes.
 4. Add the lowest-layer behavior test and one public HTTP or stdio test when a
    public input/output changes.
 5. Verify both transports. The shared dispatcher is
@@ -55,5 +56,7 @@ live `tools/list` call over both transports.
 
 When external marketplace/plugin guidance changes, update the corresponding
 documentation in the marketplace checkout only after the Rust contract and
-local tests are green. Do not restore or add a second runtime to satisfy
-connector documentation.
+local tests are green. The codegen marketplace is the normal Codex installation
+route; keep source-checkout commands scoped to contributors and local runtime
+development. Do not restore or add a second runtime to satisfy connector
+documentation.

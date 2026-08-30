@@ -27,7 +27,7 @@ const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 #[command(
     name = "coverage-mcp",
     version,
-    about = "Local-first coverage MCP server"
+    about = "Run approved tests and review historical coverage through MCP"
 )]
 struct Cli {
     #[command(subcommand)]

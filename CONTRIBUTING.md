@@ -1,6 +1,11 @@
 # Contributing
 
-Coverage MCP is a Rust workspace with a public REST/MCP contract, persistent
+Use this guide to build Coverage MCP from source, make a focused change, and
+run the same checks used by CI. If you only want to install or use Coverage MCP,
+follow [Getting started](docs/getting-started.md); a source checkout is not the
+normal installation path.
+
+The repository is a Rust workspace with a public REST/MCP contract, persistent
 DuckDB behavior, and an embedded dashboard. Keep those surfaces synchronized
 when changing behavior.
 
@@ -31,9 +36,11 @@ cargo build --locked
 1. Read [`docs/architecture.md`](docs/architecture.md) and the relevant
    module documentation.
 2. For MCP tool, resource, instruction, schema, or safety changes, update
-   `src/mcp.rs`, the affected service/storage layer, tests, and the MCP Usage
-   Guide in `README.md` together.
-3. For REST changes, update route tests and the README REST surface.
+   `src/mcp.rs`, the affected service/storage layer, tests,
+   [`docs/mcp-reference.md`](docs/mcp-reference.md), and any affected user
+   journey together.
+3. For REST changes, update route tests and
+   [`docs/http-api.md`](docs/http-api.md).
 4. For dashboard changes, keep the embedded document dependency-free and run
    its JavaScript syntax check.
 5. For storage changes, add migration-safe tests and verify compaction,
@@ -41,6 +48,11 @@ cargo build --locked
 6. Keep public Rust APIs documented with errors, panic behavior, and safety
    invariants where relevant. Prefer `Result` for recoverable failures.
 7. Update the changelog for user-visible changes.
+
+Documentation changes should preserve the split between audiences: the root
+README is the short front door, `docs/getting-started.md` is the first-success
+tutorial, `docs/user-guide.md` explains tasks and concepts, and technical
+contracts belong in the MCP, HTTP, operations, or architecture references.
 
 ## Required local gate
 

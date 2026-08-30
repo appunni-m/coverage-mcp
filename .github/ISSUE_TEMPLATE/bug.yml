@@ -21,12 +21,21 @@ body:
     id: version
     attributes:
       label: Coverage MCP version and schema revision
+      description: Use the values from /health when it is available.
+    validations:
+      required: true
+  - type: input
+    id: installation
+    attributes:
+      label: Installation method
+      description: Include the testing-plugin version or the exact Cargo install command.
     validations:
       required: true
   - type: input
     id: environment
     attributes:
-      label: Rust version, target, and operating system
+      label: Operating system and CPU architecture
+      description: Include the Rust version only if Cargo built the binary.
     validations:
       required: true
   - type: checkboxes

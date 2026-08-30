@@ -1,9 +1,14 @@
 # Architecture
 
-Coverage MCP is a local-first Rust service for coverage history, approved test
-execution, composite production coverage, and agent-facing MCP access. The binary contains the HTTP daemon,
-native stdio transport, dashboard, storage engine, parsers, and background
-maintenance worker.
+Use this document when you are changing or reviewing Coverage MCP's process,
+storage, concurrency, or trust boundaries. For installation and normal coverage
+work, begin with [Getting started](getting-started.md) or the
+[user guide](user-guide.md).
+
+Coverage MCP's job is to preserve trustworthy local coverage evidence and
+return bounded answers to agents, dashboards, and API clients. The Rust binary
+implements that job with an HTTP daemon, native stdio transport, dashboard,
+storage engine, parsers, and background maintenance worker.
 
 ## Runtime topology
 

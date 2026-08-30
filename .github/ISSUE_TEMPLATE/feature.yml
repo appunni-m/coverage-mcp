@@ -20,5 +20,5 @@ body:
   - type: textarea
     id: invariants
     attributes:
-      label: Architecture or contract impact
-      description: Note daemon, storage, MCP, REST, dashboard, security, and token-budget implications.
+      label: Technical or safety considerations (optional)
+      description: If known, note affected interfaces, stored data, permissions, compatibility, or response size. No architecture analysis is required.
