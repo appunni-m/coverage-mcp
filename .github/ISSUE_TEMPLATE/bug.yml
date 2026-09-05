@@ -3,6 +3,9 @@ description: Report a reproducible Coverage MCP defect
 title: "bug: "
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: "For an undisclosed vulnerability, use [private security reporting](https://github.com/appunni-m/coverage-mcp/security/advisories/new), not this public form."
   - type: textarea
     id: description
     attributes:

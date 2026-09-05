@@ -1,230 +1,148 @@
-# Use Coverage MCP for day-to-day coverage work
+# Find a gap and learn whether a test helped
 
-This guide explains the questions Coverage MCP can answer and how to interpret
-the result. If you have not installed the testing plugin or created a first
-snapshot, begin with [Getting started](getting-started.md).
+Start from a specific coverage report or saved snapshot. Use a literal path or
+function substring to narrow the result:
 
-## The five terms you need
-
-You can use Coverage MCP without learning its storage or protocol design. These
-five terms are enough for normal work:
-
-1. **Approved command** — the exact test-and-coverage command you allowed
-   Coverage MCP to run. Its working directory, shell, and expected reports are
-   recorded with the approval.
-2. **Run** — one durable execution of an approved command. A run has its own ID,
-   state, output summary, and artifact results.
-3. **Snapshot** — an immutable, normalized coverage measurement created from a
-   valid report. A passing test run without a valid report is not a snapshot.
-4. **Baseline** — the older compatible snapshot used for a comparison. Coverage
-   MCP records why a baseline was selected and refuses incompatible evidence.
-5. **Claim status** — whether the requested conclusion is `supported`,
-   `limited`, `not_measured`, `stale`, or `invalid`. Read the accompanying
-   reasons whenever the status is not `supported`.
-
-The usual flow is:
-
-```text
-approve once → run when needed → ingest report → review a bounded answer
+```sh
+coverage-mcp gaps --measurement target/coverage.json --query decode --limit 3
+coverage-mcp gaps --measurement target/coverage.json --query src/reader.rs --line 42
 ```
 
-## Ask for the outcome, not a tool call
+Default metric is regions when the report supplies them, otherwise lines.
+Choose `--metric branches` for native LLVM true/false outcomes or `--metric
+lines` for line coverage. An unavailable exact metric produces
+`detail_unavailable`; it is not a claim of zero gaps.
 
-The marketplace's `coverage-review` workflow chooses the smallest Coverage MCP
-projection for your request. State the result you want in plain language.
+LLVM observations are grouped by function. Other formats use source lines with
+an unknown function name. Groups are ordered by missing observations and then
+source location. Each group shows up to three spans and the omitted location
+count. `group_count` includes groups outside the displayed page. Use the same
+immutable report/snapshot and filters with `--offset` to continue. Prefer a
+specific query over reading every page into a conversation. Scripts can read
+the original complete artifact for exhaustive bookkeeping.
 
-| What you want to know | Example request |
+Search the returned path and function with `rg` and inspect nearby tests. A text
+reference is a navigation clue, not proof that a particular test covers a region.
+Use the repository's existing command to produce the next report.
+
+## Interpret a comparison
+
+```sh
+coverage-mcp compare --baseline target/before.json --measurement target/after.json
+```
+
+`newly_observed` counts identical observations with zero baseline hits and
+positive current hits. `not_observed` counts previously hit observations now
+zero or absent. `added` and `removed` are differences in the observation
+inventory; they are not verified gains. `remaining` is missing coverage in the
+current measurement, not an accumulated union of every selected test.
+
+Default scope is `selected_tests`. Unrelated absences are never regressions.
+`--scope full` permits a regression claim only when both producer receipts
+declare full scope and agree on measured source/build identity. Without those
+receipts, results remain a limited coordinate comparison. Known source/build
+conflicts, incompatible formats, unavailable detail, or unmeasured composite
+entries make the comparison incomparable.
+
+| Status | Meaning |
 | --- | --- |
-| Best next test work | “Show the three highest-priority uncovered regions and explain why they rank first.” |
-| Changed-code coverage | “Which executable lines changed in this worktree, and which of them are still uncovered?” |
-| Coverage movement | “Compare this measurement with its parent commit and explain gains, regressions, and any limited claims.” |
-| Recent history | “Show the recent line, branch, function, and region trend without returning raw records.” |
-| Source around one gap | “Show bounded source context around the top uncovered region.” |
-| Exact verification data | “Return the audit representation for this one file and snapshot.” |
-| Possible duplicate tests | “Find named tests with exactly equal coverage and give me review candidates; do not remove anything.” |
+| `improved` | Compatible measured source/build; previously missing observations were hit |
+| `no_gain` | Compatible comparison found no newly hit observations |
+| `regression` | Verified full-scope comparison lost previously hit observations |
+| `limited` | Coordinate changes available, measured source/build unverified |
+| `incomparable` | Exact change cannot be claimed; read the reason |
+| `tests_failed` | Current receipt says tests failed, regardless of coverage changes |
 
-The agent normally starts from project context, reuses a fresh matching run when
-possible, and keeps response limits small. Ask for a wider result only after the
-first bounded answer shows that more evidence is needed.
+A zero-gain test can still protect behavior. Do not remove it based only on
+coverage. Source state is separate from comparison compatibility: two reports
+can match each other while both describe an older checkout. `changed_or_missing`
+requires matching source or remeasurement before applying locations to current
+code. Historical snapshots expose their recorded revision when available.
 
-## Understand the available metrics
+## Run only the new tests
 
-A report may provide up to four different metric families:
+Keep the existing baseline report and its `.context.json` receipt, if present.
+Use the repository runner's case selector
+to run only the new tests and export their coverage to a separate report.
+When the measured source and instrumented build remain compatible, Coverage MCP
+can reuse the baseline without running its tests again:
 
-- **Lines** — executable source lines that ran at least once.
-- **Branches** — alternative control-flow outcomes that ran.
-- **Functions** — instrumented functions that ran.
-- **Regions** — finer-grained compiler or producer regions, which may separate
-  several expressions on one line.
+```sh
+coverage-mcp compare --scope incremental \
+  --baseline target/base.json --measurement target/new-tests.json
+```
 
-Do not compare unlike metric families. A line percentage is not a branch or
-region percentage, and a report format may not provide every family. Coverage
-MCP keeps unavailable data explicit rather than turning it into zero.
+For example, a baseline covers 800 of 1,000 regions. The new tests hit 50 regions,
+20 already in the baseline. The result is **30 new regions**, **830 / 1,000
+combined**, **+3 percentage points**, and **170 remaining gaps**. Baseline hits
+absent from the new run stay covered; a selected run cannot establish regressions.
 
-The repository and suite also matter. Two percentages are comparable only when
-their reports, repository identity, and baseline rules are compatible.
+To measure another batch against the baseline plus an earlier accepted batch:
 
-## Choose the right comparison
+```sh
+coverage-mcp compare --scope incremental --baseline target/base.json \
+  --previous target/new-tests.json --measurement target/next-tests.json
+```
 
-### Review changed code
+Repeat `--previous` for up to 16 batches. Repeated hits count once. Keep reports
+in separate files; these commands never overwrite a baseline or update history.
+For a longer chain, merge compatible raw coverage with the provider's native
+merge command and retain its producer evidence, or establish a new baseline.
 
-Use a change review when you want to know how the current work relates to an
-older point. Common baselines are:
+The dashboard defaults to **Incremental · baseline + new tests**. It separates
+the batch-only report from baseline + earlier batches, added coverage, and the
+combined total. **Keep this batch for the next comparison** adds a verified,
+improving report to the earlier-batch selector for the current page; the original
+baseline stays unchanged. Full-suite regression remains **not checked**.
+Unverified estimates are labeled; failed or incompatible evidence has no
+combined total. Source filters affect displayed locations, not these totals.
 
-- the parent commit;
-- a named Git ref;
-- the previous compatible snapshot;
-- a durable worktree base;
-- an exact snapshot ID.
+Keep the measured production source, toolchain, features, target, and coverage
+mapping fixed. New external test inputs can use the same instrumented build.
+If adding tests changes measured source or instrumentation, establish a fresh
+compatible baseline. Exclude test implementation files consistently when the
+intended denominator is production code. Missing reports, changed inventory,
+or summary/detail disagreement cannot be combined. Receipts below establish
+identity and test status; without them, results are coordinate estimates.
 
-An exact snapshot is the least ambiguous choice when the same baseline will be
-reused across many smaller cases. If no baseline is appropriate, request a
-no-baseline review and avoid language such as “improved” or “regressed.”
+## Optional producer receipts
 
-### Run one smaller incremental case
+A runner/CI producer may write `REPORT.context.json` automatically. This is
+optional metadata, not a prerequisite for ordinary investigation:
 
-An incremental run answers: “What extra coverage did this selected case add to
-a fixed full-suite result?” It does not pretend that the smaller case is a
-replacement for the full suite.
+```json
+{
+  "report_sha256": "SHA-256 of the exact report bytes",
+  "source_hashes": {"src/reader.rs": "SHA-256 of measured source bytes"},
+  "build_id": "identity of toolchain, target, features and coverage mapping",
+  "scope": "selected_tests",
+  "test_status": "passed"
+}
+```
 
-The workflow needs:
+The producer must capture measured inputs before execution, ensure they did not
+change during the run, and bind the output artifact to them. Hashing today's
+source after finding an old report cannot establish provenance. A build ID
+must change when relevant build configuration changes. The reader checks the
+report digest, compares source hashes to the checkout, and requires complete
+matching per-file identities for verified comparisons. Receipts are trusted
+producer assertions, not signed attestations. `test_status` accepts `passed`,
+`failed`, or `unknown`; `scope` accepts `full` or `selected_tests`.
 
-- an existing approved command that accepts the intended case arguments;
-- an explicit immutable baseline snapshot;
-- the case-specific arguments;
-- a distinct idempotency key for a materially different case.
+Ordinary saved 0.15 snapshots lack this complete identity and remain unverified.
+Composite snapshots retain inventory identities and unknown/missing component
+states. Missing evidence stays in the denominator and appears with a reason;
+it does not become an ordinary uncovered branch.
 
-Coverage MCP forms a deduplicated union of the baseline and selected case. That
-union is the primary measurement. Evidence present in the baseline but absent
-from a selected subset is `not_observed`, not a regression. A genuine regression
-claim is available only when the current measurement is marked as a complete
-snapshot.
+## Upgrade from 0.15
 
-This distinction prevents a one-test run from appearing to erase everything
-covered by the full suite.
+Update the runtime and client guidance together, then start a new task/MCP
+session. The two tools are `coverage_gaps` and `coverage_compare`; all old tool
+names and resources were removed without aliases. Use the existing test runner
+for execution, local source search for investigation, and explicit reports for
+comparison. HTTP ingest remains an optional archive operation.
 
-### Compare existing snapshots without running tests
-
-If both measurements already exist, ask for a stored incremental comparison.
-Supply the exact current and baseline IDs. This operation reads stored detail;
-it does not run tests, invoke another coverage runner, or reparse the original
-reports.
-
-## Use composite coverage only when you need one cross-language denominator
-
-A composite snapshot combines production coverage from Rust or WGSL, Python,
-and JavaScript into one canonical region inventory. It is useful for a product
-whose runtime spans several languages or generated variants and whose team has
-defined one authoritative production-source inventory.
-
-Composite setup is advanced. Every required package or backend variant must
-produce compatible evidence, and shared source is deduplicated only through an
-explicit logical-source alias. Missing, stale, malformed, unsupported, or
-source-mismatched evidence leaves the result incomplete; it never silently
-shrinks the denominator.
-
-A composite result includes:
-
-- exact covered and total canonical regions;
-- one combined percentage;
-- Rust (including WGSL), Python, and JavaScript summaries;
-- blocking reasons and remediation categories;
-- the inventory and snapshot provenance used for the result.
-
-See [Composite coverage in the MCP reference](mcp-reference.md#composite-coverage)
-for descriptor and comparison details.
-
-## Interpret compact results
-
-Coverage MCP defaults to compact output so a large report does not consume the
-agent's context. Paths are grouped and line ranges use short status symbols.
-The response includes a legend; the common changed-code symbols are:
-
-| Symbol | Meaning |
-| --- | --- |
-| `+` | Added executable line is covered |
-| `!` | Added executable line is uncovered |
-| `~` | Changed line has a branch gap |
-| `.` | Added line is not executable |
-| `?` | Coverage is unavailable or unmeasured |
-
-Composite and region comparisons use a separate legend:
-
-| Symbol | Meaning |
-| --- | --- |
-| `+` | Region is new or coverage improved |
-| `!` | Previously measured region regressed |
-| `-` | Region was removed |
-| `~` | Region exists on both sides with changed coverage |
-
-Ask for the readable `review` representation when grouped prose is more useful
-than compressed ranges. Reserve `audit` for exact records needed for
-verification or export.
-
-## Distinguish test, report, and comparison failures
-
-These outcomes mean different things and should not be collapsed into one
-“coverage failed” message:
-
-| Outcome | Meaning |
-| --- | --- |
-| Test command failed | The approved process returned a failure or was interrupted. |
-| Artifact missing or stale | The command did not create or update the declared report. |
-| Parser failure | A report existed but did not match the declared supported format. |
-| Coverage regression | A compatible complete measurement lost previously covered evidence. |
-| Missing baseline | The requested comparison has no valid older measurement. |
-| Not measured | The available evidence cannot support a coverage claim. |
-
-For a failed run, ask for a bounded literal search of its retained stdout or
-stderr. Do not request the entire log unless the small search cannot explain
-the failure.
-
-## Import a report produced elsewhere
-
-Use an import when a coverage report was created outside Coverage MCP's managed
-runner—for example, by CI or a historical local command. Tell the agent the
-repository-relative report path, format, suite, branch, commit, and comparison
-base when known.
-
-An import records external evidence. It does not claim that Coverage MCP ran
-the tests, and it does not infer missing Git lineage from the file contents.
-After import, use the returned snapshot ID in a normal review.
-
-Coverage reports are limited to 64 MiB. Numeric fields must be valid for the
-declared format; malformed values are rejected instead of being changed to
-zero.
-
-## Review duplicate-coverage candidates carefully
-
-For LCOV reports with named `TN:` records, Coverage MCP can group tests whose
-complete normalized covered line, branch, and function observation sets are
-identical. The result is bounded and paginated, so large test inventories do
-not enter the agent context.
-
-Coverage equality is not test equivalence. The comparison does not inspect
-assertions, inputs, side effects, dependencies, or test source. Treat every
-group as a human review candidate; Coverage MCP never deletes tests.
-
-Formats without named per-test observations return `status="unavailable"`.
-That does not mean that no duplicates exist.
-
-## Use the dashboard for exploration
-
-The dashboard at <http://127.0.0.1:59471/> is useful when you want to browse
-several snapshots or files interactively. It includes:
-
-- project and snapshot selection;
-- line, branch, function, and region trends;
-- changed and incremental coverage;
-- bounded file and source detail;
-- managed-run state and retained artifacts;
-- composite production coverage;
-- storage-compaction status.
-
-The dashboard follows the newest snapshot until you explicitly pin a current
-selection. It refreshes only while the tab is in the foreground and never runs
-tests on its own.
-
-For exact tool inputs and return envelopes, continue to the
-[MCP reference](mcp-reference.md). For local files, limits, and recovery, see
-the [operations guide](operations.md).
+Existing ordinary/composite snapshots and compacted detail remain readable.
+Queued/running legacy jobs become interrupted on storage open and are never
+restarted. Do not delete databases to upgrade. See [runtime recovery](operations.md#recovery)
+for daemon replacement and backup requirements.

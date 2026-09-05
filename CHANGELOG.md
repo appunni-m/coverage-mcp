@@ -4,17 +4,35 @@ Notable user-visible changes are documented here. Coverage MCP follows
 Semantic Versioning after 1.0.0; before 1.0, minor versions may contain
 breaking public-contract changes.
 
-## Unreleased
+## 0.16.0 - 2026-09-05 (schema 18)
+
+- Added incremental comparison against a fixed baseline and up to 16 earlier
+  batches. CLI, MCP, HTTP, and dashboard show marginal gain and combined coverage
+  without treating selected-test absences as regressions.
+
+### Breaking changes
+
+- Replaced eight orchestration/review tools with read-only `coverage_gaps` and
+  `coverage_compare`; removed legacy resources and source, run, command,
+  artifact, topology, worktree, duplicate-test, and streaming dashboard routes.
+- Added standalone report-file CLI queries; saved history remains optional.
+- Rebuilt the dashboard around source locations and comparison outcomes.
+- Added explicit source/build compatibility, selected-test absence semantics,
+  optional producer receipts, and bounded function groups without source dumps.
+- Legacy queued jobs are interrupted on open, never automatically restarted.
+- Retained parsers, historical ordinary/composite data, and compaction.
+- Upgrade the runtime and marketplace connector together, then start a new MCP
+  session. Use the repository test runner directly; removed tools have no aliases.
+- Incremental baseline reuse requires compatible measured source and
+  instrumentation. It measures added coverage, not full-suite regression status.
+
 
 ### Changed
 
-- Reworked the documentation around user outcomes: the README now leads with
-  coverage-review use cases, codegen-marketplace is the primary Codex
-  installation path, and the published crates.io package is the manual
-  alternative.
-- Moved MCP schemas, HTTP routes, daemon configuration, storage behavior, and
-  troubleshooting out of the README into focused getting-started, user,
-  operations, MCP, and HTTP guides.
+- Consolidated onboarding into the README and migration into the user guide;
+  architecture and fixture guidance now live in the contributor guide.
+- Corrected restart/release instructions and restored symptom-based support.
+- Added a tested Rust query example and shipped user guides with native archives.
 
 ## 0.15.5 - 2026-08-29
 

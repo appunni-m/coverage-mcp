@@ -14,9 +14,10 @@ Maintainers may edit or remove inappropriate content and may warn, temporarily r
 participants whose conduct harms the community. Enforcement decisions should be proportionate, documented privately,
 and made without retaliation.
 
-Report conduct concerns privately through the
-[repository maintainer's GitHub profile](https://github.com/appunni-m). Do not
-publish personal or sensitive details in an issue. Good-faith reporters and
+For a conduct concern, request a private contact channel from the maintainer
+through [an issue](https://github.com/appunni-m/coverage-mcp/issues), without
+including the concern's personal or sensitive details. Share those details only
+once a private channel is agreed. Good-faith reporters and
 participants in an investigation must not be retaliated against.
 
 This document is part of Coverage MCP and is licensed under the repository's MIT License.

@@ -2003,141 +2003,105 @@ fn rust_service_projection_and_mcp_contract_match() {
     assert_eq!(context["context"]["schema_revision"], SCHEMA_REVISION);
     assert!(context["data"]["project"].is_object());
 
-    let review_args = json!({
-        "task":"all",
-        "measurement":{"snapshot_id":current["id"]},
-        "baseline":{"kind":"explicit","snapshot_id":baseline["id"]},
-        "source":{"include":true,"context_lines":0},
-        "limits":{"max_files":5,"max_regions":10,"max_source_lines":40,"max_words":1200,"max_bytes":12000}
-    });
-    let review = mcp::call_tool(&service, "coverage_review", &review_args).unwrap();
-    assert_eq!(review["context"]["schema_revision"], SCHEMA_REVISION);
-    assert_eq!(review["data"]["task"], "all");
-    assert!(review["data"]["change"]["files"].is_array());
-    assert!(review["data"]["history"].is_object());
-    assert!(review["data"]["insight"].is_object());
-    let incremental_arguments = json!({
-        "task":"incremental",
-        "measurement":{"snapshot_id":current["id"]},
-        "baseline":{"kind":"explicit","snapshot_id":baseline["id"]},
-        "limits":{"max_test_ids":3,"max_words":600,"max_bytes":12000}
-    });
-    let direct_incremental =
-        mcp::call_tool(&service, "coverage_review", &incremental_arguments).unwrap();
-    let stdio_incremental = mcp::dispatch_json_rpc(
-        Some(&service),
-        &json!({
-            "jsonrpc":"2.0",
-            "id":42,
-            "method":"tools/call",
-            "params":{"name":"coverage_review","arguments":incremental_arguments}
-        }),
+    let gaps = mcp::call_tool(
+        &service,
+        "coverage_gaps",
+        &json!({"measurement":current["id"]}),
     )
     .unwrap();
-    assert_eq!(
-        stdio_incremental["result"]["structuredContent"],
-        direct_incremental
-    );
-    assert!(direct_incremental["data"]["incremental"]["metric_deltas"].is_object());
-    assert_eq!(
-        direct_incremental["data"]["measurement"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        review["data"]["measurement"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>()
-    );
-    assert!(direct_incremental["data"]["measurement"]["line_rate"].is_number());
-    assert!(direct_incremental["data"]["baseline"]["id"].is_string());
-    assert!(
-        direct_incremental["data"]["incremental"]
-            .get("baseline")
-            .is_none()
-    );
-    assert!(
-        direct_incremental["data"]["incremental"]
-            .get("current")
-            .is_none()
-    );
-    assert!(
-        direct_incremental["data"]["incremental"]
-            .get("aggregate")
-            .is_none()
-    );
-
-    let partial_baseline_report = write_file(
-        directory.path(),
-        "partial-baseline.json",
-        r#"{"data":[{"files":[{"filename":"src/a.py","segments":[[1,0,1,true],[2,0,0,true]],"summary":{"lines":{"count":4,"covered":3}}}]}]}"#,
-    );
-    let partial_baseline = store
-        .ingest_report(
-            &partial_baseline_report,
-            "llvm",
-            Some(directory.path()),
-            Some("main"),
-            Some("base"),
+    assert_eq!(gaps["data"]["groups"][0]["path"], "src/a.py");
+    let compare = mcp::call_tool(
+        &service,
+        "coverage_compare",
+        &json!({"measurement":current["id"],"baseline":baseline["id"]}),
+    )
+    .unwrap();
+    assert_eq!(compare["data"]["status"], "limited");
+    // Legacy Rust adapters remain usable by embedders, despite having no public transport routes.
+    service.validate_repository_path(None).unwrap();
+    let command = service
+        .command_registration(
+            "embedder",
+            "true",
+            true,
+            "test",
+            "adapter regression",
             None,
-            "partial",
+            "/bin/sh",
+            None,
+            false,
         )
         .unwrap();
-    let partial_current_report = write_file(
-        directory.path(),
-        "partial-current.json",
-        r#"{"data":[{"files":[{"filename":"src/a.py","segments":[[3,0,1,true]],"summary":{"lines":{"count":3,"covered":1}}}]}]}"#,
-    );
-    let partial_execution = json!({"mode":"incremental","identity":"partial-case"});
-    let partial_current = store
-        .ingest_report_with_execution(
-            &partial_current_report,
-            "llvm",
-            Some(directory.path()),
-            Some("main"),
-            Some("head"),
+    let run = service
+        .run_submission(
+            command["data"]["id"].as_str().unwrap(),
             None,
-            "partial",
-            Some(&partial_execution),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+    assert_eq!(run["data"]["status"], "passed");
+    let base_id = baseline["id"].as_str().unwrap();
+    let current_id = current["id"].as_str().unwrap();
+    for detailed in [false, true] {
+        service
+            .file_detail(current_id, "src/a.py", None, 1200, detailed)
+            .unwrap();
+    }
+    write_file(directory.path(), "src/a.py", "one\ntwo\n");
+    service
+        .source(current_id, "src/a.py", 1, 2, None, 1200)
+        .unwrap();
+    service
+        .ingest(
+            report.to_str().unwrap(),
+            "lcov",
+            "absolute",
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    service
+        .coverage_import_with_options(
+            "coverage.lcov",
+            "lcov",
+            "import",
+            None,
+            None,
+            None,
+            1200,
+            12000,
+            None,
             "compactable",
         )
         .unwrap();
-    let partial_incremental_arguments = json!({
-        "task":"incremental",
-        "measurement":{"snapshot_id":partial_current["id"]},
-        "baseline":{"kind":"explicit","snapshot_id":partial_baseline["id"]},
-        "limits":{"max_words":1200,"max_bytes":12000}
-    });
-    let partial_incremental = mcp::dispatch_json_rpc(
-        Some(&service),
-        &json!({
-            "jsonrpc":"2.0",
-            "id":43,
-            "method":"tools/call",
-            "params":{"name":"coverage_review","arguments":partial_incremental_arguments}
-        }),
-    )
-    .unwrap();
-    let partial_data = &partial_incremental["result"]["structuredContent"]["data"];
-    assert_eq!(partial_data["incremental"]["status"], "measured");
-    assert_eq!(
-        partial_data["incremental"]["measurement_scope"]["kind"],
-        "selected_subset"
-    );
-    assert_eq!(partial_data["measurement"]["total_lines"], 4);
-    assert_eq!(partial_data["measurement"]["covered_lines"], 3);
-    assert_eq!(
-        partial_data["incremental"]["run"]["id"],
-        partial_current["id"]
-    );
-    assert_eq!(
-        partial_data["incremental"]["metric_deltas"]["covered_lines_delta"],
-        0
-    );
-    assert_eq!(partial_data["incremental"]["merge"]["exact"], false);
-    assert!(partial_data["incremental"].get("aggregate").is_none());
+    for focus in ["all", "incremental", "change", "history", "insight"] {
+        service
+            .coverage_review(
+                focus,
+                Some(current_id),
+                Some(base_id),
+                None,
+                None,
+                None,
+                None,
+                2,
+                5,
+                5,
+                10,
+                false,
+                0,
+                20,
+                1200,
+                12000,
+                "compact",
+            )
+            .unwrap();
+    }
+    assert!(coverage_mcp::git::parent_commit(directory.path().to_str().unwrap(), "HEAD").is_none());
 
     let unavailable_duplicates = service
         .find_duplicate_coverage_tests(
@@ -2212,1579 +2176,127 @@ fn rust_service_projection_and_mcp_contract_match() {
         json!(["service-test-c", "service-test-d"])
     );
     assert_eq!(second_duplicate_page["page"]["next_cursor"], Value::Null);
-    let duplicate_mcp = mcp::call_tool(
-        &service,
-        "find_duplicate_coverage_tests",
-        &json!({
-            "snapshot_id":duplicate_snapshot["id"],
-            "suite":"unit",
-            "max_groups":10,
-            "max_tests_per_group":10,
-            "max_words":1200,
-            "max_bytes":12000
-        }),
-    )
-    .unwrap();
-    assert_eq!(duplicate_mcp["data"], duplicate["data"]);
-    let duplicate_mcp_defaults =
-        mcp::call_tool(&service, "find_duplicate_coverage_tests", &json!({})).unwrap();
-    assert_eq!(duplicate_mcp_defaults["data"]["status"], "measured");
-    for arguments in [
-        json!({"snapshot_id":7}),
-        json!({"suite":7}),
-        json!({"cursor":7}),
-        json!({"max_groups":"10"}),
-        json!({"max_tests_per_group":"10"}),
-        json!({"max_bytes":"12000"}),
-    ] {
-        assert!(mcp::call_tool(&service, "find_duplicate_coverage_tests", &arguments).is_err());
-    }
-    assert!(
-        mcp::call_tool(
-            &service,
-            "find_duplicate_coverage_tests",
-            &json!({"unexpected":true})
-        )
-        .is_err()
-    );
-
-    for (task, arguments) in [
-        (
-            "change",
-            json!({"task":"change","measurement":{"snapshot_id":current["id"]},"baseline":{"kind":"explicit","snapshot_id":baseline["id"]},"limits":{"max_words":600,"max_bytes":12000}}),
-        ),
-        (
-            "history",
-            json!({"task":"history","measurement":{"snapshot_id":current["id"]},"limits":{"max_words":600,"max_bytes":12000}}),
-        ),
-        (
-            "insight",
-            json!({"task":"insight","measurement":{"snapshot_id":current["id"]},"limits":{"max_regions":5,"max_words":600,"max_bytes":12000}}),
-        ),
-        (
-            "source",
-            json!({"task":"source","measurement":{"snapshot_id":current["id"]},"source":{"ranges":[{"file_path":"src/a.py","start":1,"end":2}]},"limits":{"max_words":600,"max_bytes":12000}}),
-        ),
-        (
-            "audit",
-            json!({"task":"audit","measurement":{"snapshot_id":current["id"]},"baseline":{"kind":"explicit","snapshot_id":baseline["id"]},"limits":{"max_words":600,"max_bytes":12000}}),
-        ),
-    ] {
-        let response = mcp::call_tool(&service, "coverage_review", &arguments).unwrap();
-        assert_eq!(response["data"]["task"], task);
-    }
-
-    let command = mcp::call_tool(
-        &service,
-        "register_test_command",
-        &json!({
-            "name":"current-contract-command",
-            "command":"printf current",
-            "human_approved":true,
-            "approved_by":"test",
-            "approval_note":"current contract test",
-            "cwd":directory.path(),
-            "shell":"/bin/sh"
-        }),
-    )
-    .unwrap();
-    let run = mcp::call_tool(
-        &service,
-        "run_test",
-        &json!({"command_ref":command["data"]["id"],"wait":true,"idempotency_key":"current-contract"}),
-    )
-    .unwrap();
-    let run_id = run["data"]["id"].as_str().unwrap();
-    let run_review = mcp::call_tool(
-        &service,
-        "run_review",
-        &json!({"run_id":run_id,"view":"status","max_words":600,"max_bytes":12000}),
-    )
-    .unwrap();
-    assert_eq!(run_review["data"]["terminal"], true);
-
-    let imported = mcp::call_tool(
-        &service,
-        "coverage_import",
-        &json!({"report_path":"coverage.lcov","format":"lcov","suite":"external","max_words":600,"max_bytes":12000}),
-    )
-    .unwrap();
-    assert!(imported["data"]["id"].is_string());
-
-    let resource = mcp::read_resource(
-        &service,
-        &format!(
-            "coverage://snapshot/{}/summary",
-            current["id"].as_str().unwrap()
-        ),
-    )
-    .unwrap();
-    assert_eq!(resource["context"]["schema_revision"], SCHEMA_REVISION);
-    assert_eq!(resource["data"]["id"], current["id"]);
-
-    let tool_inventory = mcp::tools_list();
-    let names = tool_inventory
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tool| tool["name"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        vec![
-            "project_context",
-            "register_test_command",
-            "run_test",
-            "run_review",
-            "cancel_run",
-            "coverage_import",
-            "coverage_review",
-            "find_duplicate_coverage_tests",
-        ]
-    );
-    let wire = mcp::dispatch_json_rpc(
-        Some(&service),
-        &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
-    )
-    .unwrap();
-    assert_eq!(
-        wire["result"]["contract"]["schema_revision"],
-        SCHEMA_REVISION
-    );
-    assert!(
-        mcp::dispatch_json_rpc(
-            None,
-            &json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .is_none()
-    );
-    assert!(mcp::call_tool(&service, "unknown_tool", &json!({})).is_err());
+    assert_eq!(mcp::tools_list().as_array().unwrap().len(), 2);
+    assert!(mcp::call_tool(&service, "find_duplicate_coverage_tests", &json!({})).is_err());
     store.close().unwrap();
 }
 
 #[tokio::test]
-async fn rust_http_rest_dashboard_health_and_mcp_wire_are_live() {
+async fn rust_http_queries_match_stdio_dispatch_and_retired_routes_are_gone() {
     let directory = tempfile::tempdir().unwrap();
-    write_file(directory.path(), "a.py", "one\ntwo\nthree\n");
     git_repo(directory.path());
-    let mut invalid_host = config();
-    invalid_host.host = "0.0.0.0".to_owned();
-    assert!(
-        CoverageServer::new(invalid_host)
-            .unwrap()
-            .run()
-            .await
-            .is_err()
-    );
-    let report = write_file(
+    write_file(directory.path(), "a.py", "one\ntwo\n");
+    write_file(
         directory.path(),
         "coverage.lcov",
-        "TN:http-test-a\nSF:a.py\nDA:1,1\nend_of_record\nTN:http-test-b\nSF:a.py\nDA:1,7\nend_of_record\n",
+        "TN:\nSF:a.py\nDA:1,1\nDA:2,0\nend_of_record\n",
     );
-    let probe_listener = match TcpListener::bind(("127.0.0.1", 0)).await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-        Err(error) => panic!("could not bind probe listener: {error}"),
-    };
-    let probe_address = probe_listener.local_addr().unwrap();
-    let run_server = CoverageServer::new(config()).unwrap();
-    let run_task = tokio::spawn(run_server.serve_listener(probe_listener));
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let _run_health = http_exchange(probe_address, "GET", "/health", None, None).await;
-    assert!(
-        http_raw(probe_address, "GET", "/api/snapshots", None, None,)
-            .await
-            .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(
-            probe_address,
-            "GET",
-            "/api/snapshots?repo_path=%00",
-            None,
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(probe_address, "GET", "/api/projects", None, None)
-            .await
-            .contains("200 OK")
-    );
-    run_task.abort();
-    let _ = run_task.await;
     let mut server_config = config();
+    server_config.common_db_path = directory.path().join("common.duckdb");
     server_config.default_repository_path = Some(directory.path().to_path_buf());
     let server = CoverageServer::new(server_config).unwrap();
-    let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("skipping live HTTP assertion because this sandbox forbids local listeners");
-            return;
-        }
-        Err(error) => panic!("could not bind local test listener: {error}"),
-    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(server.clone().serve_listener(listener));
-    let invalid_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let invalid_address = invalid_listener.local_addr().unwrap();
-    let invalid_server = tokio::spawn(async move {
-        let (mut socket, _) = invalid_listener.accept().await.unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = socket.read(&mut request).await;
-        socket
-            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 8\r\n\r\nnot-json")
-            .await
-            .unwrap();
-    });
-    assert!(
-        tokio::spawn(http_exchange(invalid_address, "GET", "/", None, None))
-            .await
-            .unwrap_err()
-            .is_panic()
-    );
-    invalid_server.await.unwrap();
-    let mut malformed = TcpStream::connect(address).await.unwrap();
-    malformed
-        .write_all(b"not an HTTP request\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    drop(malformed);
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let health = http_exchange(address, "GET", "/health", None, None).await;
     assert_eq!(health["schema_revision"], SCHEMA_REVISION);
     assert!(
-        http_raw(address, "GET", "/mcp/", None, None)
+        http_raw(address, "GET", "/", None, None)
             .await
-            .contains("405 Method Not Allowed")
+            .contains("Find the next useful test")
     );
-    assert!(
-        http_raw(address, "GET", "/favicon.ico", None, None)
+    let args = json!({"measurement":"coverage.lcov"});
+    let rest = http_exchange(address, "POST", "/api/coverage/gaps", Some(&args), None).await;
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coverage_gaps","arguments":args}});
+    let wire = http_exchange(address, "POST", "/mcp", Some(&request), None).await;
+    assert_eq!(rest, wire["result"]["structuredContent"]);
+    assert_eq!(rest["data"]["groups"][0]["locations"][0]["span"][0], 2);
+    let local =
+        coverage_mcp::query::read_reports(directory.path(), "coverage_gaps", &args).unwrap();
+    assert_eq!(rest, local);
+    let compared = http_exchange(
+        address,
+        "POST",
+        "/api/coverage/compare",
+        Some(&json!({"measurement":"coverage.lcov","baseline":"coverage.lcov"})),
+        None,
+    )
+    .await;
+    assert_eq!(compared["data"]["status"], "limited");
+    let tools = http_exchange(
+        address,
+        "POST",
+        "/mcp/",
+        Some(&json!({"id":2,"method":"tools/list"})),
+        None,
+    )
+    .await;
+    assert_eq!(tools["result"]["tools"], mcp::tools_list());
+    for path in [
+        "/graph",
+        "/api/source-lines",
+        "/api/dashboard",
+        "/api/dashboard/events",
+        "/api/commands",
+        "/api/commands/register",
+        "/api/runs/profiled",
+        "/api/topology/run/old",
+        "/api/worktrees",
+        "/api/duplicate-coverage-tests",
+        "/api/compare",
+        "/api/incremental",
+        "/api/snapshots/old/files",
+    ] {
+        assert!(
+            http_raw(address, "GET", path, None, None)
+                .await
+                .contains("404 Not Found"),
+            "{path}"
+        );
+    }
+    for path in ["/api/coverage/gaps", "/api/coverage/compare"] {
+        assert!(
+            http_raw(
+                address,
+                "POST",
+                path,
+                Some(&json!({"unexpected":true})),
+                None
+            )
             .await
-            .contains("204 No Content")
-    );
-    assert!(
-        http_raw(address, "GET", "/not-a-route", None, None)
-            .await
-            .contains("404 Not Found")
-    );
-    assert!(
-        http_raw(address, "POST", "/health", Some(&json!({})), None)
-            .await
-            .contains("404 Not Found")
-    );
+            .contains("400 Bad Request")
+        );
+    }
     assert!(
         http_raw(
             address,
             "GET",
             "/health",
             None,
-            Some(("Host", "evil.example")),
+            Some(("Host", "evil.example"))
         )
         .await
         .contains("400 Bad Request")
     );
-    let dashboard = http_raw(address, "GET", "/", None, None).await;
-    assert!(dashboard.contains("projectSelect") && dashboard.contains("metricsGrid"));
-    let mut events = TcpStream::connect(address).await.unwrap();
-    events
-        .write_all(
-            b"GET /api/dashboard/events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        )
-        .await
-        .unwrap();
-    let ready = read_http_until(&mut events, "event: ready", Duration::from_secs(2)).await;
-    assert!(ready.contains("200 OK"));
-    assert!(ready.contains("text/event-stream"));
-    assert!(ready.contains("event: ready"));
-    let refresh = read_http_until(&mut events, "event: refresh", Duration::from_secs(12)).await;
-    assert!(refresh.contains("event: refresh"));
-    drop(events);
-    let body = json!({"report_path":report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head","detail_retention":"incremental_base","execution":{"mode":"full","identity":"fixed-base:v1","label":"fixed base"}});
-    let ingested = http_exchange(address, "POST", "/api/ingest", Some(&body), None).await;
-    let snapshot_id = ingested["data"]["id"].as_str().unwrap().to_owned();
-    assert_eq!(ingested["data"]["detail_retention"], "incremental_base");
-    assert_eq!(ingested["data"]["execution"]["identity"], "fixed-base:v1");
-    let duplicate_rest = http_exchange(
-        address,
-        "GET",
-        &format!(
-            "/api/duplicate-coverage-tests?snapshot_id={snapshot_id}&max_groups=10&max_tests_per_group=10"
-        ),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(duplicate_rest["data"]["status"], "measured");
-    assert_eq!(
-        duplicate_rest["data"]["summary"]["duplicate_group_count"],
-        1
-    );
-    assert_eq!(
-        duplicate_rest["data"]["duplicate_test_groups"][0]["tests"],
-        json!(["http-test-a", "http-test-b"])
-    );
-    assert!(
-        http_raw_payload(address, "POST", "/api/ingest", "not-json", None)
-            .await
-            .contains("500 Internal Server Error")
-    );
-    assert!(
-        http_raw(address, "POST", "/api/ingest", Some(&json!({})), None)
-            .await
-            .contains("400 Bad Request")
-    );
-    let second_report = write_file(
-        directory.path(),
-        "coverage-second.lcov",
-        "TN:\nSF:a.py\nDA:1,0\nDA:2,1\nend_of_record\n",
-    );
-    let second_body = json!({"report_path":second_report.to_string_lossy(),"repo_path":directory.path(),"format":"lcov","suite":"unit","branch":"main","commit_sha":"head-2","execution":{"mode":"incremental","identity":"case:branch-a:v3","label":"branch A"}});
-    let second = http_exchange(address, "POST", "/api/ingest", Some(&second_body), None).await;
-    let second_snapshot_id = second["data"]["id"].as_str().unwrap().to_owned();
-    assert_eq!(second["data"]["execution"]["mode"], "incremental");
-    let dashboard_projection = http_exchange(
-        address,
-        "GET",
-        &format!(
-            "/api/dashboard?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}"
-        ),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(
-        dashboard_projection["data"]["selection"]["snapshot_id"],
-        second_snapshot_id
-    );
-    assert_eq!(
-        dashboard_projection["data"]["selection"]["baseline_kind"],
-        "explicit"
-    );
-    assert_eq!(
-        dashboard_projection["data"]["incremental"]["status"],
-        "measured"
-    );
-    assert!(dashboard_projection["data"]["history"]["points"].is_array());
-    assert_eq!(
-        dashboard_projection["data"]["compaction"]["inventory"]["payload_inventory_consistent"],
-        true
-    );
-    assert_eq!(
-        dashboard_projection["data"]["files"]["source"],
-        "current_union"
-    );
-    let _default_ingest = http_exchange(
+    let archived = http_exchange(
         address,
         "POST",
         "/api/ingest",
-        Some(&json!({"report_path":report})),
+        Some(&json!({"report_path":"coverage.lcov","suite":"unit"})),
         None,
     )
     .await;
-    let _validated_repo_error = http_raw(
-        address,
-        "POST",
-        "/api/ingest",
-        Some(&json!({"report_path":report,"repo_path":"/tmp"})),
-        None,
-    )
-    .await;
-    for body in [
-        json!({"report_path":report,"format":7}),
-        json!({"report_path":report,"suite":7}),
-        json!({"report_path":report,"branch":7}),
-        json!({"report_path":report,"commit_sha":7}),
-        json!({"report_path":report,"base_ref":7}),
-        json!({"report_path":report,"repo_path":7}),
-        json!({"report_path":report,"detail_retention":7}),
-        json!({"report_path":report,"execution":7}),
-        json!({"report_path":report,"execution":{"mode":"incremental"}}),
-    ] {
-        assert!(
-            http_raw(address, "POST", "/api/ingest", Some(&body), None)
-                .await
-                .contains("400 Bad Request")
-        );
-    }
-    assert!(
-        http_raw(
-            address,
-            "POST",
-            "/api/projects",
-            Some(&json!({"compaction_after_days":"bad"})),
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "POST", "/api/projects", Some(&json!({})), None)
-            .await
-            .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(
-            address,
-            "PATCH",
-            "/api/projects/project",
-            Some(&json!({"compaction":[]})),
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "GET", "/api/snapshots?detailed=maybe", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "GET", "/api/trend?limit=bad", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
+    assert!(archived["data"]["id"].is_string());
     let snapshots = http_exchange(address, "GET", "/api/snapshots", None, None).await;
-    assert!(snapshots["data"].as_array().unwrap().len() >= 2);
-    let _filtered_snapshots = http_raw(
-        address,
-        "GET",
-        &format!(
-            "/api/snapshots?repo_path={}&branch=main&suite=unit&cursor=invalid",
-            directory.path().display()
-        ),
-        None,
-        None,
-    )
-    .await;
-    let _projects_cursor =
-        http_raw(address, "GET", "/api/projects?cursor=invalid", None, None).await;
-    let _projects = http_exchange(address, "GET", "/api/projects?max_words=5000", None, None).await;
-    let _project = http_exchange(address, "GET", "/api/projects/project", None, None).await;
+    assert!(snapshots["data"].is_array());
     assert!(
-        http_raw(address, "GET", "/api/projects/unknown-project", None, None)
+        http_raw(address, "GET", "/api/projects", None, None)
             .await
-            .contains("404 Not Found")
-    );
-    let _latest = http_exchange(
-        address,
-        "GET",
-        "/api/snapshots/latest?suite=unit",
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            "/api/snapshots/latest?suite=missing",
-            None,
-            None
-        )
-        .await
-        .contains("404 Not Found")
-    );
-    let _snapshot = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}"),
-        None,
-        None,
-    )
-    .await;
-    let _files = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/files"),
-        None,
-        None,
-    )
-    .await;
-    let functions = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/functions"),
-        None,
-        None,
-    )
-    .await;
-    assert!(functions["data"].as_array().unwrap().is_empty());
-    let dependencies = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/dependencies"),
-        None,
-        None,
-    )
-    .await;
-    assert!(dependencies["data"].as_array().unwrap().is_empty());
-    let _file_filter = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/files?file_path=a.py&detailed=true"),
-        None,
-        None,
-    )
-    .await;
-    let _file_filter_cursor = http_raw(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/files?file_path=a.py&cursor=invalid"),
-        None,
-        None,
-    )
-    .await;
-    let _file_detail = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/files/a.py"),
-        None,
-        None,
-    )
-    .await;
-    let _file_detail_cursor = http_raw(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/files/a.py?cursor=invalid"),
-        None,
-        None,
-    )
-    .await;
-    let _files_cursor = http_raw(
-        address,
-        "GET",
-        &format!("/api/snapshots/{snapshot_id}/files?cursor=invalid"),
-        None,
-        None,
-    )
-    .await;
-    let _insights = http_exchange(
-        address,
-        "GET",
-        &format!("/api/snapshots/{second_snapshot_id}/insights?baseline_snapshot_id={snapshot_id}"),
-        None,
-        None,
-    )
-    .await;
-    let _trend = http_exchange(
-        address,
-        "GET",
-        "/api/trend?suite=unit&limit=10&file_path=a.py",
-        None,
-        None,
-    )
-    .await;
-    let compare_query =
-        format!("/api/compare?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}");
-    let _compare = http_exchange(address, "GET", &compare_query, None, None).await;
-    let incremental_query = format!(
-        "/api/incremental?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}&max_files=4&max_regions=8&max_test_ids=3"
-    );
-    let incremental = http_exchange(address, "GET", &incremental_query, None, None).await;
-    assert_eq!(
-        incremental["data"]["detail_source"]["baseline"],
-        "relational"
-    );
-    assert_eq!(incremental["data"]["comparison_mode"], "additive_union");
-    assert_eq!(incremental["data"]["coverage_gain"]["added"], 0);
-    assert_eq!(incremental["data"]["diff"]["coverage_gain"]["added"], 1);
-    for invalid_limit in [
-        "max_files=bad",
-        "max_files=0",
-        "max_regions=0",
-        "max_test_ids=0",
-    ] {
-        assert!(
-            http_raw(
-                address,
-                "GET",
-                &format!(
-                    "/api/incremental?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}&{invalid_limit}"
-                ),
-                None,
-                None,
-            )
-            .await
-            .contains("400 Bad Request")
-        );
-    }
-    let _compare_post = http_exchange(
-        address,
-        "POST",
-        "/api/compare",
-        Some(&json!({"snapshot_id":second_snapshot_id,"baseline_snapshot_id":snapshot_id})),
-        None,
-    )
-    .await;
-    let changed_query = format!(
-        "/api/changed-lines?snapshot_id={second_snapshot_id}&baseline_snapshot_id={snapshot_id}&only_regressions=true"
-    );
-    let _changed = http_exchange(address, "GET", &changed_query, None, None).await;
-    assert!(
-        http_raw(address, "GET", "/api/changed-lines", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    let _history = http_exchange(
-        address,
-        "GET",
-        "/api/line-history?file_path=a.py&line_number=1&suite=unit",
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            "/api/line-history?file_path=a.py&line_number=bad",
-            None,
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    let _source = http_exchange(
-        address,
-        "GET",
-        &format!("/api/source-lines?snapshot_id={second_snapshot_id}&file_path=a.py&start=1&end=2&cursor=invalid"),
-        None,
-        None,
-    )
-    .await;
-    let _source_bad_end = http_raw(
-        address,
-        "GET",
-        &format!(
-            "/api/source-lines?snapshot_id={second_snapshot_id}&file_path=a.py&start=1&end=bad"
-        ),
-        None,
-        None,
-    )
-    .await;
-    let _worktrees = http_exchange(address, "GET", "/api/worktrees", None, None).await;
-    let registered_worktree = http_exchange(
-        address,
-        "POST",
-        "/api/worktrees/register",
-        Some(&json!({"path":directory.path(),"base_ref":"main","name":"http-worktree"})),
-        None,
-    )
-    .await;
-    let _unnamed_worktree = http_exchange(
-        address,
-        "POST",
-        "/api/worktrees/register",
-        Some(&json!({"path":directory.path(),"base_ref":"main"})),
-        None,
-    )
-    .await;
-    if let Some(registered_worktree_id) = registered_worktree["data"]["id"].as_str() {
-        let _worktree_progress = http_exchange(
-            address,
-            "GET",
-            &format!("/api/worktrees/{registered_worktree_id}/progress?suite=unit"),
-            None,
-            None,
-        )
-        .await;
-        let _worktree_compare = http_exchange(
-            address,
-            "GET",
-            &format!(
-                "/api/worktrees/{registered_worktree_id}/compare?snapshot_id={second_snapshot_id}"
-            ),
-            None,
-            None,
-        )
-        .await;
-    }
-    assert!(
-        http_raw(
-            address,
-            "POST",
-            "/api/worktrees/register",
-            Some(&json!({})),
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    let created_project = http_exchange(
-        address,
-        "POST",
-        "/api/projects",
-        Some(&json!({"repo_path":directory.path(),"compaction_after_days":7,"compaction_enabled":false})),
-        None,
-    )
-    .await;
-    assert_eq!(created_project["data"]["compaction_after_days"], 7);
-    let _default_project = http_exchange(
-        address,
-        "POST",
-        "/api/projects",
-        Some(&json!({"repo_path":directory.path()})),
-        None,
-    )
-    .await;
-    let edited_project = http_exchange(
-        address,
-        "PATCH",
-        "/api/projects/project",
-        Some(&json!({"compaction":{"compaction_enabled":true,"compaction_batch_size":5}})),
-        None,
-    )
-    .await;
-    assert_eq!(edited_project["data"]["compaction_batch_size"], 5);
-    let compacted =
-        http_exchange(address, "POST", "/api/projects/project/compact", None, None).await;
-    assert_eq!(compacted["data"]["status"], "completed");
-    let command = http_exchange(
-        address,
-        "POST",
-        "/api/commands/register",
-        Some(&json!({"name":"http-unit","command":"printf 'passed\\n'","cwd":directory.path(),"shell":"/bin/sh","human_approved":true,"approved_by":"tester","approval_note":"approved for Rust transport test","artifact_paths":{}})),
-        None,
-    )
-    .await;
-    let command_id = command["data"]["id"].as_str().unwrap().to_owned();
-    let _minimal_command = http_exchange(
-        address,
-        "POST",
-        "/api/commands/register",
-        Some(&json!({"name":"http-minimal","command":"true","approved_by":"tester","approval_note":"minimal approval"})),
-        None,
-    )
-    .await;
-    let _commands = http_exchange(address, "GET", "/api/commands", None, None).await;
-    let _command = http_exchange(
-        address,
-        "GET",
-        &format!("/api/commands/{command_id}"),
-        None,
-        None,
-    )
-    .await;
-    let run = http_exchange(address, "POST", "/api/runs/profiled", Some(&json!({"command_ref":command_id,"wait":true,"idempotency_key":"http-one","timeout_seconds":20})), None).await;
-    let run_id = run["data"]["id"].as_str().unwrap().to_owned();
-    let _queued_run = http_exchange(
-        address,
-        "POST",
-        "/api/runs/profiled",
-        Some(&json!({"command_ref":command_id,"wait":false,"idempotency_key":"http-queued"})),
-        None,
-    )
-    .await;
-    let mcp_run_review = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({
-            "jsonrpc":"2.0",
-            "id":30,
-            "method":"tools/call",
-            "params":{"name":"run_review","arguments":{"run_id":run_id,"view":"status","max_words":600,"max_bytes":12000}}
-        })),
-        None,
-    )
-    .await;
-    assert_eq!(mcp_run_review["result"]["isError"], false);
-    assert_eq!(
-        mcp_run_review["result"]["structuredContent"]["data"]["id"],
-        run_id
-    );
-    let mcp_incremental_run = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({
-            "jsonrpc":"2.0",
-            "id":32,
-            "method":"tools/call",
-            "params":{
-                "name":"run_test",
-                "arguments":{
-                    "command_ref":command_id,
-                    "arguments":["case-specific-filter"],
-                    "execution":{"mode":"incremental","label":"http-case"},
-                    "baseline":{"kind":"explicit","snapshot_id":snapshot_id},
-                    "wait":true,
-                    "idempotency_key":"http-incremental-case"
-                }
-            }
-        })),
-        None,
-    )
-    .await;
-    assert_eq!(mcp_incremental_run["result"]["isError"], false);
-    assert_eq!(
-        mcp_incremental_run["result"]["structuredContent"]["data"]["execution"]["mode"],
-        "incremental"
-    );
-    assert_eq!(
-        mcp_incremental_run["result"]["structuredContent"]["data"]["execution"]["arguments"][0],
-        "case-specific-filter"
-    );
-    assert_eq!(
-        mcp_incremental_run["result"]["structuredContent"]["data"]["execution"]["baseline"]["snapshot_id"],
-        snapshot_id
-    );
-    assert_eq!(
-        mcp_incremental_run["result"]["structuredContent"]["data"]["incremental_review"]["status"],
-        "not_measured"
-    );
-    let mcp_run_logs = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({
-            "jsonrpc":"2.0",
-            "id":31,
-            "method":"tools/call",
-            "params":{"name":"run_review","arguments":{"run_id":run_id,"view":"logs","query":"passed","max_words":300,"max_bytes":12000}}
-        })),
-        None,
-    )
-    .await;
-    assert_eq!(mcp_run_logs["result"]["isError"], false);
-    assert!(mcp_run_logs["result"]["structuredContent"]["data"]["match_count"].is_number());
-    let _queue = http_exchange(address, "GET", "/api/runs/queue", None, None).await;
-    let _latest_run = http_exchange(
-        address,
-        "GET",
-        &format!("/api/runs/latest?command_ref={command_id}"),
-        None,
-        None,
-    )
-    .await;
-    let run_state = http_exchange(
-        address,
-        "GET",
-        &format!("/api/runs/{run_id}?detailed=true"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(run_state["data"]["parsed_summary"]["truncated"], false);
-    let _logs = http_exchange(
-        address,
-        "GET",
-        &format!("/api/runs/{run_id}/logs/search?query=passed&stream=stdout&context_lines=1&max_matches=5&case_sensitive=true"),
-        None,
-        None,
-    )
-    .await;
-    let _multi_query_logs = http_exchange(
-        address,
-        "GET",
-        &format!("/api/runs/{run_id}/logs/search?query=passed&query=warning&stream=both&case_sensitive=false"),
-        None,
-        None,
-    )
-    .await;
-    for path in [
-        format!("/api/runs/{run_id}/logs/search"),
-        format!("/api/runs/{run_id}/logs/search?query=passed&stream=invalid"),
-        format!("/api/runs/{run_id}/logs/search?query=passed&context_lines=21"),
-        format!("/api/runs/{run_id}/logs/search?query=passed&max_matches=0"),
-    ] {
-        let _ = http_raw(address, "GET", &path, None, None).await;
-    }
-    let _artifact = http_exchange(
-        address,
-        "GET",
-        "/api/artifacts/latest?kind=coverage",
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        http_raw(address, "GET", "/api/artifacts/latest", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    let _run_topology = http_exchange(
-        address,
-        "GET",
-        &format!("/api/topology/run/{run_id}"),
-        None,
-        None,
-    )
-    .await;
-    let _snapshot_topology = http_exchange(
-        address,
-        "GET",
-        &format!("/api/topology/snapshot/{second_snapshot_id}"),
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        http_raw(address, "GET", "/api/topology/unknown/id", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    let _cancel = http_exchange(
-        address,
-        "POST",
-        &format!("/api/runs/{run_id}/cancel"),
-        None,
-        None,
-    )
-    .await;
-    let _bad_worktree = http_exchange(
-        address,
-        "POST",
-        "/api/worktrees/register",
-        Some(&json!({"path":directory.path(),"base_ref":"main"})),
-        None,
-    )
-    .await;
-    let _bad_progress = http_exchange(
-        address,
-        "GET",
-        "/api/worktrees/missing/progress?suite=unit",
-        None,
-        None,
-    )
-    .await;
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            "/api/worktrees/missing/progress",
-            None,
-            None
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "GET", "/api/worktrees/missing/compare", None, None)
-            .await
-            .contains("404 Not Found")
-    );
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            "/api/source-lines?snapshot_id=missing&file_path=a.py&start=bad&end=2",
-            None,
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "GET", "/api/compare", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "GET", "/api/incremental", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            &format!("/api/compare?snapshot_id={second_snapshot_id}"),
-            None,
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            &format!("/api/incremental?snapshot_id={second_snapshot_id}"),
-            None,
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(address, "POST", "/api/compare", Some(&json!({})), None,)
-            .await
-            .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(
-            address,
-            "POST",
-            "/api/compare",
-            Some(&json!({"snapshot_id":second_snapshot_id})),
-            None,
-        )
-        .await
-        .contains("400 Bad Request")
-    );
-    assert!(
-        http_raw(
-            address,
-            "GET",
-            &format!("/api/snapshots/{second_snapshot_id}/files/missing.py"),
-            None,
-            None,
-        )
-        .await
-        .contains("404 Not Found")
-    );
-    assert!(
-        http_raw(address, "GET", "/api/unknown", None, None)
-            .await
-            .contains("404 Not Found")
-    );
-    let _unscoped_projects = http_exchange(address, "GET", "/api/projects", None, None).await;
-    for (method, path, body) in [
-        ("GET", "/api/snapshots?max_words=bad", None),
-        ("GET", "/api/duplicate-coverage-tests?max_groups=bad", None),
-        (
-            "GET",
-            "/api/duplicate-coverage-tests?max_tests_per_group=bad",
-            None,
-        ),
-        ("GET", "/api/duplicate-coverage-tests?max_bytes=bad", None),
-        ("POST", "/api/ingest", Some(json!({"report_path": 7}))),
-        (
-            "POST",
-            "/api/ingest",
-            Some(json!({"report_path": report, "repo_path": 7})),
-        ),
-        (
-            "POST",
-            "/api/ingest",
-            Some(json!({"report_path": "/missing-coverage-report"})),
-        ),
-        ("POST", "/api/projects", Some(json!({"repo_path": 7}))),
-        (
-            "POST",
-            "/api/projects",
-            Some(json!({"repo_path": "/missing-repository"})),
-        ),
-        (
-            "POST",
-            "/api/projects",
-            Some(json!({
-                "repo_path": directory.path(),
-                "compaction": {"compaction_after_days": "bad"}
-            })),
-        ),
-        (
-            "POST",
-            "/api/projects",
-            Some(json!({
-                "repo_path": directory.path(),
-                "compaction": {"compaction_after_days": 0}
-            })),
-        ),
-        (
-            "PATCH",
-            "/api/projects/project",
-            Some(json!({"compaction": {"compaction_enabled": "bad"}})),
-        ),
-        (
-            "PATCH",
-            "/api/projects/project",
-            Some(json!({"compaction": {"compaction_after_days": 0}})),
-        ),
-        ("GET", "/api/changed-lines?snapshot_id=missing", None),
-        (
-            "GET",
-            "/api/changed-lines?snapshot_id=missing&baseline_snapshot_id=missing&only_regressions=bad",
-            None,
-        ),
-        ("GET", "/api/line-history?file_path=a.py", None),
-        ("GET", "/api/line-history?line_number=1", None),
-        (
-            "GET",
-            "/api/line-history?file_path=a.py&line_number=bad",
-            None,
-        ),
-        (
-            "GET",
-            "/api/source-lines?file_path=a.py&start=1&end=2",
-            None,
-        ),
-        (
-            "GET",
-            "/api/source-lines?snapshot_id=missing&file_path=a.py&start=1",
-            None,
-        ),
-        (
-            "GET",
-            "/api/source-lines?snapshot_id=missing&start=1&end=2",
-            None,
-        ),
-        (
-            "GET",
-            "/api/source-lines?snapshot_id=missing&file_path=a.py&end=2",
-            None,
-        ),
-        (
-            "POST",
-            "/api/worktrees/register",
-            Some(json!({"path": directory.path()})),
-        ),
-        (
-            "POST",
-            "/api/worktrees/register",
-            Some(json!({"path": directory.path(), "base_ref": "main", "name": 7})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"name": "missing-command"})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"command": "true"})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"name": "bad-approval", "command": "true", "human_approved": 7})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"name": "bad-cwd", "command": "true", "cwd": 7})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"name": "bad-approved-by", "command": "true", "approved_by": 7})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"name": "bad-approval-note", "command": "true", "approval_note": 7})),
-        ),
-        (
-            "POST",
-            "/api/commands/register",
-            Some(json!({"name": "bad-shell", "command": "true", "shell": 7})),
-        ),
-        (
-            "POST",
-            "/api/runs/profiled",
-            Some(json!({"command_ref": command_id, "timeout_seconds": "bad"})),
-        ),
-        ("POST", "/api/runs/profiled", Some(json!({}))),
-        (
-            "POST",
-            "/api/runs/profiled",
-            Some(json!({"command_ref": command_id, "wait": "bad"})),
-        ),
-        (
-            "POST",
-            "/api/runs/profiled",
-            Some(json!({"command_ref": command_id, "idempotency_key": 7})),
-        ),
-        (
-            "GET",
-            &format!("/api/runs/{run_id}/logs/search?query=passed&context_lines=bad"),
-            None,
-        ),
-        (
-            "GET",
-            &format!("/api/runs/{run_id}/logs/search?query=passed&max_matches=bad"),
-            None,
-        ),
-        (
-            "GET",
-            &format!("/api/runs/{run_id}/logs/search?query=passed&case_sensitive=bad"),
-            None,
-        ),
-    ] {
-        let payload = body.as_ref();
-        let response = http_raw(address, method, path, payload, None).await;
-        assert!(
-            response.contains("400 Bad Request")
-                || response.contains("404 Not Found")
-                || response.contains("500 Internal Server Error"),
-            "unexpected response for {method} {path}: {response}"
-        );
-    }
-    for (method, path, body) in [
-        ("GET", "/api/projects?max_words=49", None),
-        ("GET", "/api/snapshots/missing", None),
-        ("GET", "/api/snapshots/missing/files", None),
-        ("GET", "/api/snapshots/missing/insights", None),
-        ("GET", "/api/trend?worktree_id=missing", None),
-        (
-            "GET",
-            "/api/compare?snapshot_id=missing&baseline_snapshot_id=missing",
-            None,
-        ),
-        (
-            "GET",
-            "/api/changed-lines?snapshot_id=missing&baseline_snapshot_id=missing",
-            None,
-        ),
-        (
-            "GET",
-            "/api/source-lines?snapshot_id=missing&file_path=a.py&start=1&end=2",
-            None,
-        ),
-        ("GET", "/api/commands/missing", None),
-        ("GET", "/api/runs/latest?command_ref=missing", None),
-        ("GET", "/api/runs/missing", None),
-        ("POST", "/api/runs/missing/cancel", None),
-        ("GET", "/api/runs/missing/logs/search?query=missing", None),
-        ("GET", "/api/artifacts/latest?kind=coverage", None),
-        ("GET", "/api/topology/run/missing", None),
-        ("GET", "/api/topology/snapshot/missing", None),
-    ] {
-        let _ = http_raw(address, method, path, body, None).await;
-    }
-    let summary = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})),
-        None,
-    )
-    .await;
-    assert_eq!(summary["result"]["serverInfo"]["name"], "coverage-mcp");
-    let tools = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})),
-        None,
-    )
-    .await;
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
-    assert_eq!(
-        tools["result"]["contract"]["schema_revision"],
-        SCHEMA_REVISION
-    );
-    assert_eq!(tools["result"]["contract"]["tool_count"], 8);
-    let mcp_duplicates = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({
-            "jsonrpc":"2.0",
-            "id":201,
-            "method":"tools/call",
-            "params":{
-                "name":"find_duplicate_coverage_tests",
-                "arguments":{
-                    "snapshot_id":snapshot_id,
-                    "max_groups":10,
-                    "max_tests_per_group":10,
-                    "max_words":1200,
-                    "max_bytes":12000
-                }
-            }
-        })),
-        None,
-    )
-    .await;
-    assert_eq!(mcp_duplicates["result"]["isError"], false);
-    assert_eq!(
-        mcp_duplicates["result"]["structuredContent"]["data"]["status"],
-        "measured"
-    );
-    assert_eq!(
-        mcp_duplicates["result"]["structuredContent"]["data"]["summary"]["duplicate_group_count"],
-        1
-    );
-    let _resources = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}})),
-        None,
-    )
-    .await;
-    let _templates = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":5,"method":"resources/templates/list","params":{}})),
-        None,
-    )
-    .await;
-    let _context_resource = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"coverage://context"}})), None).await;
-    let _snapshot_resource = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":format!("coverage://snapshot/{second_snapshot_id}/summary")}})), None).await;
-    let _notification = http_raw(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","method":"notifications/initialized"})),
-        None,
-    )
-    .await;
-    let _unknown_method = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":8,"method":"unknown"})),
-        None,
-    )
-    .await;
-    let _mcp_context = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"project_context","arguments":{}}})), None).await;
-    let mcp_insight = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":106,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"insight","measurement":{"snapshot_id":second_snapshot_id},"limits":{"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_insight["result"]["isError"], false);
-    assert!(mcp_insight["result"]["structuredContent"]["data"]["insight"]["items"].is_array());
-    assert_eq!(
-        mcp_insight["result"]["content"][0]["text"],
-        "See structuredContent for the bounded result."
-    );
-    let mcp_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":103,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"change","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_review["result"]["isError"], false);
-    assert!(
-        mcp_review["result"]["structuredContent"]["data"]["change"]["changed_code"]["status"]
-            .is_string()
-    );
-    let mcp_incremental = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":107,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"incremental","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_test_ids":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_incremental["result"]["isError"], false);
-    assert_eq!(
-        mcp_incremental["result"]["structuredContent"]["data"]["task"],
-        "incremental"
-    );
-    assert_eq!(
-        mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["status"],
-        "measured"
-    );
-    assert!(
-        mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["metric_deltas"]
-            .is_object()
-    );
-    for category in [
-        "newly_covered",
-        "regressed",
-        "hit_count_only",
-        "added",
-        "removed",
-    ] {
-        assert!(
-            mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["coverage_gain"]
-                [category]
-                .is_number()
-        );
-    }
-    assert!(
-        mcp_incremental["result"]["structuredContent"]["data"]["incremental"]["regions_truncated"]
-            .is_boolean()
-    );
-    let mcp_compact_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":104,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"change","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"representation":"compact","limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_compact_review["result"]["isError"], false);
-    assert!(mcp_compact_review["result"]["structuredContent"]["data"]["change"]["changed_code"]["legend"].is_object());
-    assert!(
-        mcp_compact_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["p"]
-            .is_string()
-    );
-    assert!(mcp_compact_review["result"]["structuredContent"]["data"]["reasons"].is_array());
-    let mcp_audit_review = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":105,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"audit","measurement":{"snapshot_id":second_snapshot_id},"baseline":{"kind":"explicit","snapshot_id":snapshot_id},"limits":{"max_files":2,"max_regions":4,"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_audit_review["result"]["isError"], false);
-    assert!(mcp_audit_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["file_path"].is_string());
-    assert_eq!(
-        mcp_compact_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["p"],
-        mcp_audit_review["result"]["structuredContent"]["data"]["change"]["regions"][0]["file_path"]
-    );
-    assert!(
-        mcp_compact_review["result"]["structuredContent"]["data"]["change"]["next_action"]["kind"]
-            .is_string()
-    );
-    let mcp_source = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":121,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"source","measurement":{"snapshot_id":second_snapshot_id},"source":{"ranges":[{"file_path":"a.py","start":1,"end":2}]},"limits":{"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_source["result"]["isError"], false);
-    assert_eq!(
-        mcp_source["result"]["structuredContent"]["data"]["source"][0]["source_resolution"],
-        "current_checkout_fallback"
-    );
-    assert!(
-        mcp_source["result"]["structuredContent"]["data"]
-            .get("sources")
-            .is_none()
-    );
-    let mcp_source_batch = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":120,"method":"tools/call","params":{"name":"coverage_review","arguments":{"task":"source","measurement":{"snapshot_id":second_snapshot_id},"source":{"ranges":[{"file_path":"a.py","start":1,"end":1},{"file_path":"a.py","start":3,"end":3}]},"limits":{"max_words":1200,"max_bytes":12000}}}})), None).await;
-    assert_eq!(mcp_source_batch["result"]["isError"], false);
-    assert_eq!(
-        mcp_source_batch["result"]["structuredContent"]["data"]["source"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert_eq!(
-        mcp_source_batch["result"]["structuredContent"]["data"]["source"][0]["ranges"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    let mcp_bad_nested = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({
-            "jsonrpc":"2.0",
-            "id":122,
-            "method":"tools/call",
-            "params":{"name":"coverage_review","arguments":{"task":"change","measurement":"invalid"}}
-        })),
-        None,
-    )
-    .await;
-    assert_eq!(mcp_bad_nested["result"]["isError"], true);
-    let _mcp_missing_uri = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":13,"method":"resources/read","params":{}})),
-        None,
-    )
-    .await;
-    let _mcp_unknown_resource = http_exchange(address, "POST", "/mcp/", Some(&json!({"jsonrpc":"2.0","id":14,"method":"resources/read","params":{"uri":"coverage://unknown"}})), None).await;
-    let _mcp_missing_name = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":15,"method":"tools/call","params":{}})),
-        None,
-    )
-    .await;
-    let _mcp_missing_params = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":17,"method":"tools/call"})),
-        None,
-    )
-    .await;
-    let _mcp_unknown_tool = http_exchange(
-        address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"unknown"}})),
-        None,
-    )
-    .await;
-    assert!(
-        http_raw(address, "POST", "/mcp/", None, None)
-            .await
-            .contains("400 Bad Request")
+            .contains("200 OK")
     );
     task.abort();
     let _ = task.await;
-
-    let mut common_config = config();
-    common_config.common_db_path = directory.path().join("common-registry.duckdb");
-    let common_repository = tempfile::tempdir().unwrap();
-    git_repo(common_repository.path());
-    let common_server = CoverageServer::new(common_config).unwrap();
-    let common_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let common_address = common_listener.local_addr().unwrap();
-    let common_task = tokio::spawn(common_server.serve_listener(common_listener));
-    let _empty_projects = http_exchange(common_address, "GET", "/api/projects", None, None).await;
-    let repo_header = (
-        "x-coverage-mcp-repo",
-        common_repository.path().to_str().unwrap(),
-    );
-    let _empty_latest_run = http_exchange(
-        common_address,
-        "GET",
-        "/api/runs/latest",
-        None,
-        Some(repo_header),
-    )
-    .await;
-    let selected = http_exchange(
-        common_address,
-        "GET",
-        "/api/projects",
-        None,
-        Some(repo_header),
-    )
-    .await;
-    let project_id = selected["data"][0]["id"].as_str().unwrap().to_owned();
-    let selected_by_id = http_exchange(
-        common_address,
-        "GET",
-        &format!("/api/projects/{project_id}"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(selected_by_id["data"]["id"], project_id);
-    let updated_by_id = http_exchange(
-        common_address,
-        "PATCH",
-        &format!("/api/projects/{project_id}"),
-        Some(&json!({"compaction":{"compaction_batch_size":5}})),
-        None,
-    )
-    .await;
-    assert_eq!(updated_by_id["data"]["compaction_batch_size"], 5);
-    let compacted_by_id = http_exchange(
-        common_address,
-        "POST",
-        &format!("/api/projects/{project_id}/compact"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(compacted_by_id["data"]["status"], "completed");
-    assert!(
-        http_raw(
-            common_address,
-            "GET",
-            "/api/projects/unknown-project",
-            None,
-            None,
-        )
-        .await
-        .contains("404 Not Found")
-    );
-    let _unscoped_with_store =
-        http_exchange(common_address, "GET", "/api/projects", None, None).await;
-    assert!(
-        http_raw(common_address, "GET", "/api/snapshots", None, None)
-            .await
-            .contains("400 Bad Request")
-    );
-    common_task.abort();
-    let _ = common_task.await;
-
-    let bad_directory = tempfile::tempdir().unwrap();
-    git_repo(bad_directory.path());
-    let bad_db_directory = bad_directory.path().join("database-directory");
-    std::fs::create_dir_all(&bad_db_directory).unwrap();
-    let mut bad_config = config();
-    bad_config.common_db_path = bad_db_directory;
-    let bad_server = CoverageServer::new(bad_config).unwrap();
-    let bad_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let bad_address = bad_listener.local_addr().unwrap();
-    let bad_task = tokio::spawn(bad_server.serve_listener(bad_listener));
-    let _bad_resource = http_exchange(
-        bad_address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":20,"method":"resources/read","params":{"uri":"coverage://context"}})),
-        None,
-    )
-    .await;
-    let _bad_tool = http_exchange(
-        bad_address,
-        "POST",
-        "/mcp/",
-        Some(&json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"project_context","arguments":{}}})),
-        None,
-    )
-    .await;
-    bad_task.abort();
-    let _ = bad_task.await;
+    server.close_stores().unwrap();
 }
 
 async fn http_raw(
@@ -3829,26 +2341,6 @@ async fn http_raw_payload(
     let mut bytes = Vec::new();
     stream.read_to_end(&mut bytes).await.unwrap();
     String::from_utf8(bytes).unwrap()
-}
-
-async fn read_http_until(stream: &mut TcpStream, needle: &str, timeout: Duration) -> String {
-    tokio::time::timeout(timeout, async {
-        let mut bytes = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let count = stream.read(&mut buffer).await.unwrap();
-            if count == 0 {
-                panic!("HTTP stream closed before receiving {needle}");
-            }
-            bytes.extend_from_slice(&buffer[..count]);
-            let text = String::from_utf8_lossy(&bytes);
-            if text.contains(needle) {
-                return text.into_owned();
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("HTTP stream did not receive {needle} before timeout"))
 }
 
 async fn http_exchange(

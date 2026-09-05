@@ -16,21 +16,18 @@ safety annotations, resources, pagination, or workflow:
    change. Keep compact envelopes and hidden detailed fields consistent across
    HTTP and stdio.
 3. Update `docs/mcp-reference.md` with every tool, input, return shape, error
-   class, resource, and workflow rule. Update the README, getting-started
-   guide, or user guide only when their shorter user journey changes.
+   class, and resource. Update the README or user guide when the user journey
+   changes.
 4. Add the lowest-layer behavior test and one public HTTP or stdio test when a
    public input/output changes.
 5. Verify both transports. The shared dispatcher is
    `mcp::dispatch_json_rpc`; do not fork transport-specific semantics.
 
-## Workflow ownership
+## Report queries
 
-Operational approval, polling, freshness, lineage, response-budget, and
-reporting rules belong in the marketplace's `testing:coverage-review` skill
-and the campaign skill that composes it. Keep this repository's copy limited to
-the server contract and implementation invariants; do not duplicate workflow
-instructions here. The server must still advertise a complete self-describing
-workflow through `initialize` instructions and `tools/list` descriptions.
+Run tests with the repository's existing commands and inspect code with `rg`.
+Coverage MCP reads reports through `coverage_gaps` and `coverage_compare`;
+keep their inputs, limits, evidence status, and errors self-describing.
 
 ## Rust verification
 

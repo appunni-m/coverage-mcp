@@ -1,19 +1,12 @@
-//! Run approved local tests, retain coverage snapshots, and return bounded
-//! coverage evidence to MCP, HTTP, and dashboard clients.
+//! Find coverage gaps and compare measurements through CLI, MCP, HTTP, and a dashboard.
 //!
-//! Most users should install the `testing` plugin from
-//! [codegen-marketplace](https://github.com/appunni-m/codegen-marketplace) and
-//! interact through its coverage-review workflow. The public Rust modules are
-//! primarily shared building blocks for the `coverage-mcp` binary, integration
-//! tests, and embedders that deliberately adopt the server's storage and wire
-//! contracts; they are not a separate high-level coverage SDK.
-//!
-//! The crate contains the production daemon, storage, parsers, REST surface,
-//! MCP dispatcher, dashboard, and background maintenance lifecycle. Start with
-//! [`CoverageServer`] for an embedded HTTP service, [`CoverageStore`] for the
-//! repository store, or [`mcp`] for the transport-neutral JSON-RPC contract.
-//! The installed binary and its `initialize`/`tools/list` responses are the
-//! authoritative agent-facing interface.
+//! Use [`query::read_reports`] for standalone artifact queries without storage or
+//! execution. [`CoverageServer`] adds shared MCP/HTTP access and saved history;
+//! [`CoverageStore`] retains immutable ordinary/composite snapshots and compaction.
+//! The installed binary's initialize/tools-list contract is the agent interface.
+//! Public compatibility APIs in [`storage`] and [`service`] remain for Rust embedders,
+//! but execution, source paging, topology, and worktree operations are no longer
+//! exposed through MCP or REST. Opening storage never resumes queued commands.
 
 #![warn(missing_docs)]
 #![recursion_limit = "256"]
@@ -47,6 +40,8 @@ pub mod models;
 pub mod parser;
 /// Bounded DuckDB pooling and query interruption.
 pub mod pool;
+/// Coverage search and observation comparison without test orchestration.
+pub mod query;
 /// Transport-neutral service orchestration.
 pub mod service;
 /// DuckDB storage and execution engine.
@@ -87,7 +82,7 @@ extern crate self as coverage_mcp;
 mod rust_migration;
 
 /// Public Coverage MCP wire-contract schema revision.
-pub const SCHEMA_REVISION: u32 = 16;
+pub const SCHEMA_REVISION: u32 = 18;
 
 /// Rust daemon version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

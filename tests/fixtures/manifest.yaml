@@ -4,7 +4,7 @@ scope:
   mode: full
   inventory:
     authority: README.md-and-src-mcp.rs
-    revision: schema-16
+    revision: schema-18
     command_id: inventory
 oracles:
   - id: frozen-contract
@@ -12,7 +12,7 @@ oracles:
     version: "14"
     runtime: specification
     identity_command_id: frozen-contract-identity
-    contract: docs/rust-migration-parity.md and the input-only fixture corpus
+    contract: Historical schema-14 reference; no independently executable source oracle
     components: []
 targets:
   - id: rust
@@ -115,7 +115,7 @@ surfaces:
         lifecycle: {status: current}
         source:
           oracle_id: frozen-contract
-          path: docs/rust-migration-parity.md#surface-mapping
+          path: CONTRIBUTING.md#source-map-and-contracts
           signature: parse report into normalized coverage data
           parameters:
             - id: input
@@ -156,7 +156,7 @@ surfaces:
         lifecycle: {status: current}
         source:
           oracle_id: frozen-contract
-          path: docs/rust-migration-parity.md#compaction-policy-carried-forward
+          path: docs/operations.md#limits-and-compaction
           signature: compact project detail according to persisted policy
           parameters:
             - id: input
@@ -205,8 +205,8 @@ surfaces:
         lifecycle: {status: current}
         source:
           oracle_id: frozen-contract
-          path: docs/rust-migration-parity.md#compatibility-invariants
-          signature: schema-16 REST and MCP protocol surface
+          path: docs/mcp-reference.md
+          signature: schema-18 REST and MCP protocol surface
           parameters:
             - id: input
               style: positional
@@ -227,9 +227,9 @@ surfaces:
             signature: shared HTTP and native stdio JSON-RPC dispatcher
             support: {status: supported}
         requirements:
-          - id: coverage-mcp.transport.contract.schema16
+          - id: coverage-mcp.transport.contract.schema18
             dimension: protocol_variant
-            description: Health, dashboard, REST, MCP tools, resources, stdio, and bounded envelopes remain schema-16 compatible, including parameterized command runs, automatic incremental review with a canonical full-shaped union measurement plus supplemental run data and a separate diagnostic diff, bounded exact duplicate-coverage test groups, explicit stored-snapshot incremental review, and composite production coverage.
+            description: Schema-17 health, dashboard, HTTP/stdio query contracts, bounded evidence, and rejection of removed tools; saved history and compaction remain readable.
             lanes: [parity, coverage]
             target_profiles: [rust-default]
           - id: coverage-mcp.transport.contract.shared-daemon-stdio

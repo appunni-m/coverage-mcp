@@ -1,131 +1,44 @@
-# Coverage MCP evaluation suite
+# Evaluate outcomes and workflow cost
 
-Use this contributor-only suite to check whether an independent agent can
-discover and use the server, choose bounded projections, recover from errors,
-and follow the approval workflow. It is not part of user installation.
+Run `make mcp-evals` for deterministic evaluations of the two-query contract.
+The runner creates temporary report artifacts, asks the user questions in
+`cases.json`, and verifies actual statuses, source locations, denominator,
+change categories, explicit errors, read-only annotations, and response sizes.
+It writes `target/evals/mcp-eval-report.json` and fails if any check fails.
 
-This directory defines the opt-in evaluation contract for Coverage MCP. It
-evaluates whether an independent agent can discover and use the server,
-choose outcome-driven projections, stay within a response budget, recover from
-invalid requests, and complete the approved test workflow safely.
+Cases cover selected-test gains, full regressions, zero gain, failed tests,
+unverified artifacts, unavailable branch detail, missing reports, removed
+execution tools, and invalid arguments. Unit and public transport tests cover
+receipt conflicts, compacted history, malformed native records, pagination,
+and HTTP/stdio consistency.
 
-The suite is deliberately not part of CI. It creates a temporary Git repository,
-DuckDB store, coverage history, and managed test run. Run it locally when a
-release candidate, contract change, prompt change, or performance change needs
-agent-facing evaluation:
+For a workflow trial, preserve pinned report artifacts and source/build identity,
+ask for a few gaps, investigate with `rg` and bounded reads, run an existing
+repository command, and compare explicit before/after reports. Record failures
+before measurement as failures, not coverage gains. Compare equivalent tasks:
+a targeted investigation and a whole-project inventory scan are different
+workloads.
 
-```sh
-make mcp-evals
-```
+Measure query count, serialized visible bytes, errors/retries, latency, and
+whether the result enabled a correct next step. Bytes and call counts are
+proxies, not billed tokens. A deterministic evaluation is not a blinded live
+model A/B trial. Do not claim token savings without account-level measurements.
 
-The direct command is:
+The reproducible local trial is `python3 evals/selected-test-trial.py`. It runs
+two existing parser tests with ordinary Cargo coverage commands, records producer
+receipts, uses `rg`, and checks both selected-test comparison and incremental union. Repeating the
+same batch must add zero coverage, keep the denominator fixed, and leave the
+baseline file unchanged. Only the two selected tests are executed. See
+[the measured evaluation](overhaul-2026-09-05.md) for results and limits.
 
-```sh
-cargo run --offline --locked --bin mcp-evals -- \
-  --report target/evals/mcp-eval-report.json
-```
-
-The runner does not call a hosted model or the network. It is the deterministic
-server-side gate. [`cases.json`](cases.json) is the golden task corpus that a
-model-backed runner can reuse with a selected client/model and an external
-grader.
-
-## Evaluation dimensions
-
-### Usability and independent discovery
-
-Checks that a client can understand the server from `initialize` and
-`tools/list` without opening the README:
-
-- instructions identify the first call and the safe run/poll workflow;
-- descriptions explain purpose, projection choice, budgets, and follow-ups;
-- input properties have descriptions and safe defaults;
-- output schemas describe the stable `{context,data,page}` envelope;
-- safety annotations distinguish read-only, local-write, and command-execution
-  tools;
-- every golden user outcome maps to a clear first tool and next step.
-
-### Confusion and token efficiency
-
-Checks that the tool catalog and projections do not force an agent to request a
-large raw report:
-
-- compact views omit unrelated line, parser, and provenance detail;
-- `coverage_review` returns one bounded task-level answer instead of requiring
-  target/file/source fan-out;
-- unchanged `run_test` submissions reuse the latest compatible terminal run,
-  even without an idempotency key;
-- `task=insight` exposes ranked red regions rather than all covered lines;
-- `task=change` with grouped regions is smaller than exact audit output;
-- `max_words` is honored and collection cursors continue without duplicates;
-- detailed fields are opt-in and measurably larger than normal projections;
-- multiple narrow calls can compose a task without repeating the full snapshot.
-
-### Outcome-driven behavior
-
-Golden workflows cover:
-
-- next coverage work: `task=insight` → selected `task=source` ranges;
-- previous-session impact: `task=change` with an explicit baseline;
-- one-file red regions: `task=change` with a file selector;
-- exact source inspection: `task=source` with one or more bounded ranges and
-  source provenance;
-- `task=history` and audit-only exact records;
-- changed-code review in one bounded projection;
-- two detailed history points plus an aggregate ten-snapshot summary;
-- approved test execution, polling, and targeted `run_review` log search.
-
-The suite also verifies that the first response contains the information needed
-to select the next action, rather than merely returning an implementation-shaped
-database dump.
-
-### Standard protocol, safety, and reliability suites
-
-The runner covers:
-
-- JSON-RPC initialization, inventory, resources, notifications, and errors;
-- response envelope and structured tool output;
-- invalid types, missing fields, bad views, bad ranges, stale cursors, and
-  unknown snapshots;
-- rejected unapproved command registration;
-- stable idempotent run submission;
-- terminal run state, bounded retained logs, and explicit failure behavior;
-- repeated bounded queries and latency measurements.
-
-The existing default integration tests remain the live HTTP and native stdio
-transport gate. The eval runner exercises the shared dispatcher directly so the
-agent-facing evaluation remains deterministic and does not open sockets.
-
-## Report and release interpretation
-
-The report is JSON so it can be attached to a release review. Each section has
-individual checks and metrics. Treat these as hard failures:
-
-- protocol/schema mismatch;
-- unclear or missing safety annotation;
-- an unapproved command being accepted;
-- silent fallback or a wrong error class;
-- incorrect coverage region, source range, or comparison result;
-- duplicate or unbounded pagination;
-- a non-terminal run left without a durable state.
-
-Review these as trend metrics rather than fixed universal thresholds:
-
-- task calls and words per outcome;
-- compact-to-detailed and regions-to-lines size ratios;
-- p50/p95 query latency;
-- response budget utilization;
-- number of follow-up calls needed to reach source evidence.
-
-## Extending the suite
-
-1. Add or revise a user outcome in `cases.json`.
-2. Define the required first projection and follow-up tools.
-3. Add a deterministic fixture assertion in `src/bin/mcp-evals.rs`.
-4. Record both correctness checks and a measurable efficiency metric.
-5. Keep the suite opt-in; do not add it to `ci`, `test-ci`, or the default
-   workspace test command.
-
-When changing a public MCP tool, also update `src/mcp.rs`,
-`docs/mcp-reference.md`, any affected user journey, the lowest-layer tests, and
-the live transport tests as required by `AGENTS.md`.
+`python3 evals/new-input-trial.py` tests genuinely new external inputs. It saves
+a baseline from one LCOV case, authors another case afterward, and runs only that
+new case against the same instrumented Coverage MCP executable. It checks output
+assertions, verified marginal gain, a fixed denominator, zero gain on repetition,
+and unchanged baseline artifacts. Native LLVM export is restricted to the measured
+executable; Python assertions and input files are outside the coverage inventory.
+Evidence and command timings go to
+`target/incremental-verification/new-input-trial/result.json`. Run this trial
+without concurrent coverage jobs: it clears shared raw profiles between cases.
+It proves fixed-build external-input reuse, not reuse after changing Rust source
+or a measured test harness.

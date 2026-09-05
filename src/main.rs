@@ -27,7 +27,7 @@ const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 #[command(
     name = "coverage-mcp",
     version,
-    about = "Run approved tests and review historical coverage through MCP"
+    about = "Find coverage gaps and compare measurements"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -54,6 +54,66 @@ enum Command {
         /// Repository checkout used for project selection, defaulting to `.`.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+    },
+    /// Find missing coverage, then inspect the returned locations with rg.
+    Gaps {
+        /// Repository checkout.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Report path or saved snapshot ID; omit only for an unambiguous saved suite.
+        #[arg(long)]
+        measurement: Option<String>,
+        /// Saved suite selector.
+        #[arg(long)]
+        suite: Option<String>,
+        /// Literal path or function substring.
+        #[arg(long)]
+        query: Option<String>,
+        /// One-based source line to inspect.
+        #[arg(long)]
+        line: Option<i64>,
+        /// auto, regions, branches, or lines.
+        #[arg(long, default_value = "auto")]
+        metric: String,
+        /// Maximum function groups, 1–20.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Continue at the returned next_offset.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Emit structured JSON instead of the compact text view.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare measurements without running tests or reading source into the result.
+    Compare {
+        /// Repository checkout.
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Current report path or snapshot ID.
+        #[arg(long)]
+        measurement: String,
+        /// Explicit baseline report path or snapshot ID.
+        #[arg(long)]
+        baseline: String,
+        /// Literal path or function substring.
+        #[arg(long)]
+        query: Option<String>,
+        /// auto, regions, branches, or lines.
+        #[arg(long, default_value = "auto")]
+        metric: String,
+        /// selected_tests, full, or incremental (new batch contribution to a baseline).
+        #[arg(long, default_value = "selected_tests")]
+        scope: String,
+        /// Earlier accepted batch report or snapshot; repeat up to 16 times (incremental only).
+        #[arg(long)]
+        previous: Vec<String>,
+        /// Maximum changed and remaining groups, 1–20 each.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Run one compaction pass for a project and exit.
     Compact {
@@ -83,12 +143,87 @@ async fn main() -> AppResult<()> {
             CoverageServer::new(config)?.run().await?;
         }
         Command::Connect { repo } => run_shared_stdio(repo).await?,
+        Command::Gaps {
+            repo,
+            measurement,
+            suite,
+            query,
+            line,
+            metric,
+            limit,
+            offset,
+            json,
+        } => {
+            run_query(repo, "coverage_gaps", json!({"measurement":measurement,"suite":suite,"query":query,"line":line,"metric":metric,"limit":limit,"offset":offset}), json).await?;
+        }
+        Command::Compare {
+            repo,
+            measurement,
+            baseline,
+            query,
+            metric,
+            scope,
+            previous,
+            limit,
+            json,
+        } => {
+            run_query(repo, "coverage_compare", json!({"measurement":measurement,"baseline":baseline,"query":query,"metric":metric,"scope":scope,"previous":previous,"limit":limit}), json).await?;
+        }
         Command::Compact {
             repo,
             older_than_days,
         } => {
             run_compact(repo, older_than_days).await?;
         }
+    }
+    Ok(())
+}
+
+async fn run_query(
+    repo: PathBuf,
+    tool: &str,
+    mut arguments: Value,
+    as_json: bool,
+) -> AppResult<()> {
+    if let Some(object) = arguments.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    let report_reference = |key: &str| {
+        arguments[key].as_str().is_some_and(|value| {
+            value.contains('/')
+                || PathBuf::from(value).extension().is_some()
+                || repo.join(value).is_file()
+        })
+    };
+    let evidence = if report_reference("measurement")
+        && (tool == "coverage_gaps" || report_reference("baseline"))
+        && arguments["previous"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|value| {
+                let path = value.as_str().unwrap_or_default();
+                path.contains('/')
+                    || PathBuf::from(path).extension().is_some()
+                    || repo.join(path).is_file()
+            }) {
+        coverage_mcp::query::read_reports(&repo, tool, &arguments)?
+    } else {
+        let config = ServerConfig::from_environment(None, None, None)?;
+        validate_loopback_host(&config.host)?;
+        let git = inspect_git(&repo)?;
+        ensure_daemon(&config).await?;
+        let response = forward_mcp_request_with_recovery(&config, &git.repo_path, &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":arguments}})).await?
+            .ok_or_else(|| AppError::Runtime("coverage query returned no response".to_owned()))?;
+        if response.get("error").is_some() || response["result"]["isError"] == true {
+            return Err(AppError::Runtime(response.to_string()));
+        }
+        response["result"]["structuredContent"].clone()
+    };
+    if as_json {
+        println!("{evidence}");
+    } else {
+        println!("{}", coverage_mcp::query::render(&evidence));
     }
     Ok(())
 }

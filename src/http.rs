@@ -16,9 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckdb::Connection;
-use futures_util::stream;
-use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
-use hyper::body::{Bytes, Frame, Incoming};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
+use hyper::body::{Bytes, Incoming};
 use hyper::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderMap,
     HeaderValue,
@@ -47,7 +46,6 @@ use crate::{SCHEMA_REVISION, VERSION, stable_project_id};
 pub const REPOSITORY_HEADER: &str = "x-coverage-mcp-repo";
 /// Private loopback route used by a newer connector for graceful daemon handoff.
 pub const DAEMON_HANDOFF_PATH: &str = "/_coverage-mcp/handoff";
-const DASHBOARD_REFRESH_INTERVAL_SECONDS: u64 = 10;
 
 type HttpResponse = Response<UnsyncBoxBody<Bytes, Infallible>>;
 
@@ -316,9 +314,6 @@ impl CoverageServer {
         if path == "/" && request.method() == Method::GET {
             return Ok(dashboard_response());
         }
-        if path == "/graph" && request.method() == Method::GET {
-            return Ok(graph_response());
-        }
         if path == "/mcp" || path == "/mcp/" {
             return self.dispatch_mcp(request).await;
         }
@@ -359,11 +354,15 @@ impl CoverageServer {
             .get("method")
             .and_then(Value::as_str)
             .ok_or_else(|| AppError::Validation("method is required".to_owned()))?;
-        let service = matches!(method, "resources/read" | "tools/call")
+        let service = (method == "tools/call")
             .then(|| {
-                self.service_for_repository_path(
-                    &repository.clone().unwrap_or(self.default_repository_path()),
-                )
+                let repository = repository
+                    .clone()
+                    .or_else(|| self.config.default_repository_path_string())
+                    .ok_or_else(|| {
+                        AppError::Validation(format!("{REPOSITORY_HEADER} header is required"))
+                    })?;
+                self.service_for_repository_path(&repository)
             })
             .transpose()?;
         match mcp::dispatch_json_rpc(service.as_ref(), &body) {
@@ -394,24 +393,14 @@ impl CoverageServer {
         {
             return Ok(json_response(StatusCode::OK, self.unscoped_projects()?));
         }
-        let creating_project =
-            matches!(method, Method::POST) && path.as_slice() == ["api", "projects"];
         let project_reference = match path.as_slice() {
             ["api", "projects", project_id] | ["api", "projects", project_id, "compact"] => {
                 Some(*project_id)
             }
             _ => None,
         };
-        let repository = if creating_project {
-            optional_body_string(&body, "repo_path")?.map(str::to_owned)
-        } else if let Some(project_id) = project_reference {
-            if project_id == "project" {
-                repository_header
-                    .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
-                    .or_else(|| self.config.default_repository_path_string())
-            } else {
-                Some(self.repository_for_project_id(project_id)?)
-            }
+        let repository = if let Some(project_id) = project_reference.filter(|id| *id != "project") {
+            Some(self.repository_for_project_id(project_id)?)
         } else {
             repository_header
                 .or_else(|| query_value(&query, "repo_path").map(str::to_owned))
@@ -425,362 +414,57 @@ impl CoverageServer {
         let service = self.service_for_repository_path(&repository)?;
         let store = service.store().clone();
         let max_words = query_usize(&query, "max_words", DEFAULT_MAX_WORDS)?;
-        let detailed = query_bool(&query, "detailed")?;
-        if method == Method::GET && path.as_slice() == ["api", "dashboard", "events"] {
-            return self.dashboard_stream(repository);
-        }
-        if method == Method::GET
-            && path.len() >= 5
-            && path[0] == "api"
-            && path[1] == "snapshots"
-            && path[3] == "files"
-        {
-            let file_path = path[4..].join("/");
-            let response = service.file_detail(
-                path[2],
-                &file_path,
-                query
-                    .get("cursor")
-                    .and_then(|values| values.first())
-                    .map(String::as_str),
-                max_words,
-                detailed,
-            )?;
-            return Ok(json_response(StatusCode::OK, response));
-        }
         let response = match (method, path.as_slice()) {
+            (Method::POST, ["api", "coverage", "gaps"]) => {
+                mcp::call_tool(&service, "coverage_gaps", &body)?
+            }
+            (Method::POST, ["api", "coverage", "compare"]) => {
+                mcp::call_tool(&service, "coverage_compare", &body)?
+            }
             (Method::POST, ["api", "ingest"]) => {
-                if let Some(repo_path) = optional_body_string(&body, "repo_path")? { service.validate_repository_path(Some(repo_path))?; }
-                service.ingest_with_options(required_body(&body, "report_path")?, optional_body_string(&body, "format")?.unwrap_or("auto"), optional_body_string(&body, "suite")?.unwrap_or("default"), optional_body_string(&body, "branch")?, optional_body_string(&body, "commit_sha")?, optional_body_string(&body, "base_ref")?, detailed, body.get("execution"), optional_body_string(&body, "detail_retention")?.unwrap_or("compactable"))?
-            }
-            (Method::GET, ["api", "projects"]) => self.project_list(service.clone(), query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?,
-            (Method::POST, ["api", "projects"]) => {
-                service.update_project_settings(project_patch(&body)?)?
-            }
-            (Method::PATCH, ["api", "projects", _]) => service.update_project_settings(project_patch(&body)?)?,
-            (Method::POST, ["api", "projects", _, "compact"]) => service.compact_now()?,
-            (Method::GET, ["api", "projects", _]) => service.envelope(store.project_summary()?, None, None),
-            (Method::GET, ["api", "dashboard"]) => {
-                let snapshot_ids = if query.contains_key("snapshot_id") {
-                    let values = required_query_values(&query, "snapshot_id")?;
-                    if values.len() > 64 {
-                        return Err(AppError::Validation(
-                            "at most 64 current snapshot IDs may be selected".to_owned(),
-                        ));
-                    }
-                    Some(values)
-                } else {
-                    None
-                };
-                service.dashboard_with_snapshot_ids(
-                    snapshot_ids.as_deref(),
-                    None,
-                    query_value(&query, "baseline_snapshot_id"),
-                    query_value(&query, "composite_snapshot_id"),
-                    query_value(&query, "baseline_composite_snapshot_id"),
-                    bounded_query_usize(&query, "history_limit", 18, 2, 50)?,
+                if let Some(repo_path) = optional_body_string(&body, "repo_path")? {
+                    service.validate_repository_path(Some(repo_path))?;
+                }
+                service.ingest(
+                    required_body(&body, "report_path")?,
+                    optional_body_string(&body, "format")?.unwrap_or("auto"),
+                    optional_body_string(&body, "suite")?.unwrap_or("default"),
+                    optional_body_string(&body, "branch")?,
+                    optional_body_string(&body, "commit_sha")?,
+                    optional_body_string(&body, "base_ref")?,
+                    false,
                 )?
             }
+            (Method::GET, ["api", "projects"]) => {
+                self.project_list(service.clone(), query_value(&query, "cursor"), max_words)?
+            }
+            (Method::PATCH, ["api", "projects", _]) => {
+                service.update_project_settings(project_patch(&body)?)?
+            }
+            (Method::POST, ["api", "projects", _, "compact"]) => service.compact_now()?,
             (Method::GET, ["api", "snapshots"]) => {
-                let values = store.list_snapshots(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), COLLECTION_FETCH_LIMIT)?;
-                let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, "rest-snapshots", None)?;
-                service.envelope(Value::Array(values), None, Some(page))
-            }
-            (Method::GET, ["api", "snapshots", "latest"]) => {
-                let value = store.latest_snapshot(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"))?.ok_or_else(|| AppError::NotFound("no snapshots found".to_owned()))?;
-                service.envelope(value, None, None)
-            }
-            (Method::GET, ["api", "composite-snapshots", composite_snapshot_id]) => service
-                .composite_review(
-                    "audit",
-                    composite_snapshot_id,
+                let values = store.list_snapshots(
                     None,
-                    None,
-                    bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
-                    max_words,
-                    query_usize(&query, "max_bytes", 12_000)?,
-                    "audit",
-                    query_usize(&query, "max_test_ids", 10)?,
-                )?,
-            (Method::GET, ["api", "composite-snapshots", composite_snapshot_id, "regions"]) => {
-                service.envelope(
-                    Value::Array(store.composite_regions(
-                        composite_snapshot_id,
-                        bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
-                    )?),
-                    None,
-                    None,
-                )
-            }
-            (Method::GET, ["api", "composite-snapshots", composite_snapshot_id, "insights"]) => service
-                .composite_review(
-                    "insight",
-                    composite_snapshot_id,
-                    None,
-                    query_value(&query, "file_path"),
-                    bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
-                    max_words,
-                    query_usize(&query, "max_bytes", 12_000)?,
-                    "compact",
-                    query_usize(&query, "max_test_ids", 10)?,
-                )?,
-            (Method::GET, ["api", "duplicate-coverage-tests"]) => service
-                .find_duplicate_coverage_tests(
-                    query_value(&query, "snapshot_id"),
+                    query_value(&query, "branch"),
                     query_value(&query, "suite"),
+                    COLLECTION_FETCH_LIMIT,
+                )?;
+                let values = values.into_iter().map(|row| json!({"id":row["id"],"suite":row["suite"],"created_at":row["created_at"],"format":row["format"]})).collect::<Vec<_>>();
+                let (values, page) = service.page(
+                    &values,
                     query_value(&query, "cursor"),
-                    query_usize(&query, "max_groups", 10)?,
-                    query_usize(&query, "max_tests_per_group", 10)?,
                     max_words,
-                    query_usize(&query, "max_bytes", 12_000)?,
-                )?,
-            (Method::GET, ["api", "snapshots", snapshot_id]) => service.envelope(store.snapshot(snapshot_id)?, None, None),
-            (Method::GET, ["api", "snapshots", snapshot_id, "files"]) => {
-                if let Some(file_path) = query_value(&query, "file_path") {
-                    service.file_detail(snapshot_id, file_path, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, detailed)?
-                } else {
-                    let values = store.files(snapshot_id, COLLECTION_FETCH_LIMIT)?;
-                    let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, &format!("rest-files:{snapshot_id}"), None)?;
-                    service.envelope(Value::Array(values), None, Some(page))
-                }
-            }
-            (Method::GET, ["api", "snapshots", snapshot_id, "functions"]) => {
-                let values = store.functions(snapshot_id, query_value(&query, "file_path"), COLLECTION_FETCH_LIMIT)?;
-                let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, &format!("rest-functions:{snapshot_id}"), None)?;
+                    "measurement-list",
+                    None,
+                )?;
                 service.envelope(Value::Array(values), None, Some(page))
             }
-            (Method::GET, ["api", "snapshots", snapshot_id, "dependencies"]) => {
-                let values = store.dependencies(snapshot_id, COLLECTION_FETCH_LIMIT)?;
-                let (values, page) = service.page(&values, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words, &format!("rest-dependencies:{snapshot_id}"), None)?;
-                service.envelope(Value::Array(values), None, Some(page))
-            }
-            (Method::GET, ["api", "snapshots", snapshot_id, "insights"]) => service.envelope(store.insights(snapshot_id, query_value(&query, "baseline_snapshot_id"), COLLECTION_FETCH_LIMIT)?, None, None),
-            (Method::GET, ["api", "trend"]) => service.envelope(Value::Array(store.trend(query_value(&query, "repo_path"), query_value(&query, "branch"), query_value(&query, "suite"), query_value(&query, "file_path"), query_value(&query, "worktree_id"), query_usize(&query, "limit", 100)? )?), None, None),
-            (Method::GET, ["api", "incremental"]) => {
-                let max_files = bounded_query_usize(&query, "max_files", 8, 1, 100)?;
-                let max_regions = bounded_query_usize(&query, "max_regions", 24, 1, 500)?;
-                let max_test_ids = bounded_query_usize(&query, "max_test_ids", 10, 1, 100)?;
-                if let Some(composite_snapshot_id) = query_value(&query, "composite_snapshot_id") {
-                    if query_value(&query, "snapshot_id").is_some()
-                        || query_value(&query, "baseline_snapshot_id").is_some()
-                    {
-                        return Err(AppError::Validation(
-                            "ordinary and composite selectors cannot be mixed".to_owned(),
-                        ));
-                    }
-                    service.composite_review(
-                        "incremental",
-                        composite_snapshot_id,
-                        Some(required_query(&query, "baseline_composite_snapshot_id")?),
-                        query_value(&query, "file_path"),
-                        max_regions.min(100),
-                        max_words,
-                        query_usize(&query, "max_bytes", 12_000)?,
-                        "compact",
-                        max_test_ids,
-                    )?
-                } else {
-                    let snapshot_ids = required_query_values(&query, "snapshot_id")?;
-                    if snapshot_ids.len() > 64 {
-                        return Err(AppError::Validation(
-                            "at most 64 current snapshot IDs may be merged".to_owned(),
-                        ));
-                    }
-                    let snapshot_refs = snapshot_ids.iter().map(String::as_str).collect::<Vec<_>>();
-                    service.envelope(store.incremental_union_compare_many_with_scope(&snapshot_refs, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), max_files, max_regions, max_test_ids, "selected_subset")?, None, None)
-                }
-            }
-            (Method::GET, ["api", "compare"]) => {
-                if let Some(composite_snapshot_id) = query_value(&query, "composite_snapshot_id") {
-                    if query_value(&query, "snapshot_id").is_some()
-                        || query_value(&query, "baseline_snapshot_id").is_some()
-                    {
-                        return Err(AppError::Validation(
-                            "ordinary and composite selectors cannot be mixed".to_owned(),
-                        ));
-                    }
-                    service.composite_review(
-                        "incremental",
-                        composite_snapshot_id,
-                        Some(required_query(&query, "baseline_composite_snapshot_id")?),
-                        query_value(&query, "file_path"),
-                        bounded_query_usize(&query, "max_regions", 24, 1, 100)?,
-                        max_words,
-                        query_usize(&query, "max_bytes", 12_000)?,
-                        "review",
-                        query_usize(&query, "max_test_ids", 10)?,
-                    )?
-                } else {
-                    service.envelope(store.compare(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None)
-                }
-            }
-            (Method::POST, ["api", "compare"]) => {
-                if let Some(composite_snapshot_id) = optional_body_string(&body, "composite_snapshot_id")? {
-                    if body.get("snapshot_id").is_some() || body.get("baseline_snapshot_id").is_some() {
-                        return Err(AppError::Validation(
-                            "ordinary and composite selectors cannot be mixed".to_owned(),
-                        ));
-                    }
-                    service.composite_review(
-                        "incremental",
-                        composite_snapshot_id,
-                        Some(required_body(&body, "baseline_composite_snapshot_id")?),
-                        optional_body_string(&body, "file_path")?,
-                        24,
-                        max_words,
-                        optional_body_u64(&body, "max_bytes")?
-                            .map(|value| value.min(2_000_000) as usize)
-                            .unwrap_or(12_000),
-                        "review",
-                        10,
-                    )?
-                } else {
-                    service.envelope(store.compare(required_body(&body, "snapshot_id")?, required_body(&body, "baseline_snapshot_id")?, COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None)
-                }
-            }
-            (Method::GET, ["api", "changed-lines"]) => service.envelope(json!({"lines":store.changed_lines(required_query(&query, "snapshot_id")?, required_query(&query, "baseline_snapshot_id")?, query_value(&query, "file_path"), query_bool(&query, "only_regressions")?, COLLECTION_FETCH_LIMIT)?}), None, None),
-            (Method::GET, ["api", "line-history"]) => service.envelope(Value::Array(store.line_history(required_query(&query, "file_path")?, required_query(&query, "line_number")?.parse().map_err(|_| AppError::Validation("line_number must be an integer".to_owned()))?, query_value(&query, "branch"), query_value(&query, "suite"), COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::GET, ["api", "source-lines"]) => {
-                if let Some(composite_snapshot_id) = query_value(&query, "composite_snapshot_id") {
-                    if query_value(&query, "snapshot_id").is_some() {
-                        return Err(AppError::Validation(
-                            "ordinary and composite selectors cannot be mixed".to_owned(),
-                        ));
-                    }
-                    service.composite_source_review(
-                        composite_snapshot_id,
-                        vec![
-                            (
-                                required_query(&query, "file_path")?.to_owned(),
-                                required_query(&query, "start")?.parse().map_err(|_| AppError::Validation("start must be an integer".to_owned()))?,
-                                required_query(&query, "end")?.parse().map_err(|_| AppError::Validation("end must be an integer".to_owned()))?,
-                            ),
-                        ],
-                        bounded_query_usize(&query, "max_source_lines", 120, 10, 500)?,
-                        max_words,
-                        query_usize(&query, "max_bytes", 12_000)?,
-                    )?
-                } else {
-                    service.source(required_query(&query, "snapshot_id")?, required_query(&query, "file_path")?, required_query(&query, "start")?.parse().map_err(|_| AppError::Validation("start must be an integer".to_owned()))?, required_query(&query, "end")?.parse().map_err(|_| AppError::Validation("end must be an integer".to_owned()))?, query.get("cursor").and_then(|values| values.first()).map(String::as_str), max_words)?
-                }
-            }
-            (Method::GET, ["api", "worktrees"]) => service.envelope(Value::Array(store.list_worktrees(COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::POST, ["api", "worktrees", "register"]) => service.ensure_lineage_baseline(required_body(&body, "path")?, required_body(&body, "base_ref")?, optional_body_string(&body, "name")?)?,
-            (Method::GET, ["api", "worktrees", worktree_id, "progress"]) => service.envelope(store.worktree_progress(worktree_id, query_value(&query, "suite").ok_or_else(|| AppError::Validation("suite is required".to_owned()))?, query_value(&query, "file_path"), COLLECTION_FETCH_LIMIT)?, None, None),
-            (Method::GET, ["api", "worktrees", worktree_id, "compare"]) => service.envelope(store.compare_worktree(worktree_id, query_value(&query, "snapshot_id"), COLLECTION_FETCH_LIMIT, COLLECTION_FETCH_LIMIT)?, None, None),
-            (Method::GET, ["api", "commands"]) => service.envelope(Value::Array(store.list_registered_commands(COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::POST, ["api", "commands", "register"]) => service.command_registration(required_body(&body, "name")?, required_body(&body, "command")?, optional_body_bool(&body, "human_approved")?.unwrap_or(false), optional_body_string(&body, "approved_by")?.unwrap_or_default(), optional_body_string(&body, "approval_note")?.unwrap_or_default(), optional_body_string(&body, "cwd")?, optional_body_string(&body, "shell")?.unwrap_or("/bin/bash"), body.get("artifact_paths").cloned(), detailed)?,
-            (Method::GET, ["api", "commands", reference]) => service.envelope(store.registered_command(reference)?, None, None),
-            (Method::POST, ["api", "runs", "profiled"]) => service.run_submission(required_body(&body, "command_ref")?, optional_body_u64(&body, "timeout_seconds")?, optional_body_string(&body, "idempotency_key")?, optional_body_bool(&body, "wait")?.unwrap_or(false), detailed)?,
-            (Method::GET, ["api", "runs", "queue"]) => service.envelope(Value::Array(store.list_run_queue(COLLECTION_FETCH_LIMIT)?), None, None),
-            (Method::GET, ["api", "runs", "latest"]) => service.envelope(store.latest_run(query_value(&query, "command_ref"))?.ok_or_else(|| AppError::NotFound("no runs found".to_owned()))?, None, None),
-            (Method::GET, ["api", "runs", run_id]) => service.run_state(run_id, "status", detailed)?,
-            (Method::POST, ["api", "runs", run_id, "cancel"]) => service.run_state(run_id, "cancel", detailed)?,
-            (Method::GET, ["api", "runs", run_id, "logs", "search"]) => service.search_logs(run_id, query_values(&query, "query"), query_value(&query, "stream").unwrap_or("both"), query_usize(&query, "context_lines", 3)?, query_usize(&query, "max_matches", 5)?, max_words, query_bool(&query, "case_sensitive")?)?,
-            (Method::GET, ["api", "artifacts", "latest"]) => service.envelope(store.latest_artifact(required_query(&query, "kind")?, query_value(&query, "command_ref"))?.ok_or_else(|| AppError::NotFound("artifact not found".to_owned()))?, None, None),
-            (Method::GET, ["api", "topology", kind, reference]) => service.envelope(topology(&store, kind, reference)?, None, None),
-            _ => return Err(AppError::NotFound("route not found".to_owned())),
+            _ => return Err(AppError::NotFound(
+                "route removed or unknown; use POST /api/coverage/gaps or /api/coverage/compare"
+                    .to_owned(),
+            )),
         };
         Ok(json_response(StatusCode::OK, response))
-    }
-
-    fn default_repository_path(&self) -> String {
-        self.config
-            .default_repository_path_string()
-            .unwrap_or_else(|| ".".to_owned())
-    }
-
-    fn dashboard_stream(&self, repository: String) -> AppResult<HttpResponse> {
-        self.dashboard_stream_with_interval(
-            repository,
-            TokioDuration::from_secs(DASHBOARD_REFRESH_INTERVAL_SECONDS),
-        )
-    }
-
-    fn dashboard_stream_with_interval(
-        &self,
-        repository: String,
-        refresh_interval: TokioDuration,
-    ) -> AppResult<HttpResponse> {
-        let server = self.clone();
-        let stream = stream::unfold(
-            (server, repository, None::<String>, true),
-            move |(server, repository, previous_revision, first)| async move {
-                if first {
-                    let payload = json!({
-                        "schema_revision": SCHEMA_REVISION,
-                        "refresh_interval_ms": DASHBOARD_REFRESH_INTERVAL_SECONDS * 1_000,
-                    });
-                    let frame =
-                        Frame::data(Bytes::from(format!("event: ready\ndata: {}\n\n", payload)));
-                    return Some((Ok(frame), (server, repository, previous_revision, false)));
-                }
-                tokio::time::sleep(refresh_interval).await;
-                let revision = server.dashboard_revision(&repository);
-                let (body, next_revision) = match revision {
-                    Ok(revision) if previous_revision.as_deref() != Some(revision.as_str()) => (
-                        format!("event: refresh\ndata: {{\"revision\":{revision}}}\n\n"),
-                        Some(revision),
-                    ),
-                    Ok(revision) => (": heartbeat\n\n".to_owned(), Some(revision)),
-                    Err(error) => (
-                        format!(
-                            "event: dashboard-error\ndata: {}\n\n",
-                            json!({"detail": error.to_string()})
-                        ),
-                        previous_revision,
-                    ),
-                };
-                Some((
-                    Ok(Frame::data(Bytes::from(body))),
-                    (server, repository, next_revision, false),
-                ))
-            },
-        );
-        let mut response = Response::new(StreamBody::new(stream).boxed_unsync());
-        response.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream; charset=utf-8"),
-        );
-        response.headers_mut().insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-        );
-        response
-            .headers_mut()
-            .insert("x-accel-buffering", HeaderValue::from_static("no"));
-        Ok(harden(response))
-    }
-
-    fn dashboard_revision(&self, repository: &str) -> AppResult<String> {
-        let service = self.service_for_repository_path(repository)?;
-        let project = service.store().project_summary()?;
-        let compaction = service.store().compaction_summary()?;
-        let latest_run = service.store().latest_run(None)?;
-        let active_runs = service.store().list_run_queue(11)?;
-        let policy = project.get("compaction").cloned().unwrap_or(Value::Null);
-        Ok(serde_json::to_string(&json!({
-            "latest_snapshot_id": project.get("latest_snapshot_id"),
-            "snapshot_count": project.get("snapshot_count"),
-            "latest_composite_snapshot_id": project.get("latest_composite_snapshot_id"),
-            "composite_snapshot_count": project.get("composite_snapshot_count"),
-            "compaction_policy": {
-                "enabled": policy.get("compaction_enabled"),
-                "after_days": policy.get("compaction_after_days"),
-                "interval_seconds": policy.get("compaction_interval_seconds"),
-                "batch_size": policy.get("compaction_batch_size"),
-                "last_run_at": policy.get("compaction_last_run_at"),
-                "last_status": policy.get("compaction_last_status"),
-                "last_snapshot_count": policy.get("compaction_last_snapshot_count"),
-                "last_bytes_before": policy.get("compaction_last_bytes_before"),
-                "last_bytes_after": policy.get("compaction_last_bytes_after"),
-            },
-            "compaction": compaction,
-            "latest_run": latest_run.as_ref().and_then(|value| value.get("id")),
-            "latest_run_status": latest_run.as_ref().and_then(|value| value.get("status")),
-            "active_run_ids": active_runs.iter().filter_map(|value| value.get("id")).collect::<Vec<_>>(),
-        }))
-        .expect("dashboard revision serialization is infallible"))
     }
 
     fn repository_for_project_id(&self, project_id: &str) -> AppResult<String> {
@@ -836,7 +520,8 @@ impl CoverageServer {
             .map_err(|_| AppError::Runtime("store lock poisoned".to_owned()))
     }
 
-    fn close_stores(&self) -> AppResult<()> {
+    /// Closes all opened stores after an embedded listener has stopped.
+    pub fn close_stores(&self) -> AppResult<()> {
         let stores = {
             let mut stores = self.stores()?;
             stores.drain().map(|(_, store)| store).collect::<Vec<_>>()
@@ -1026,7 +711,8 @@ fn parse_json_body(bytes: &[u8]) -> AppResult<Value> {
     if bytes.is_empty() {
         return Ok(json!({}));
     }
-    Ok(serde_json::from_slice(bytes)?)
+    serde_json::from_slice(bytes)
+        .map_err(|error| AppError::Validation(format!("invalid request JSON: {error}")))
 }
 
 fn repository_header(headers: &HeaderMap) -> AppResult<Option<String>> {
@@ -1199,21 +885,6 @@ fn query_value<'a>(query: &'a HashMap<String, Vec<String>>, key: &str) -> Option
         .and_then(|values| values.first())
         .map(String::as_str)
 }
-fn query_values(query: &HashMap<String, Vec<String>>, key: &str) -> Vec<String> {
-    query.get(key).cloned().unwrap_or_default()
-}
-fn required_query_values(
-    query: &HashMap<String, Vec<String>>,
-    key: &str,
-) -> AppResult<Vec<String>> {
-    let values = query_values(query, key);
-    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
-        return Err(AppError::Validation(format!(
-            "{key} is required and must not be blank"
-        )));
-    }
-    Ok(values)
-}
 fn query_usize(
     query: &HashMap<String, Vec<String>>,
     key: &str,
@@ -1228,24 +899,6 @@ fn query_usize(
         .transpose()
         .map(|value| value.unwrap_or(default))
 }
-fn bounded_query_usize(
-    query: &HashMap<String, Vec<String>>,
-    key: &str,
-    default: usize,
-    minimum: usize,
-    maximum: usize,
-) -> AppResult<usize> {
-    let value = query_usize(query, key, default)?;
-    if !(minimum..=maximum).contains(&value) {
-        return Err(AppError::Validation(format!(
-            "{key} must be between {minimum} and {maximum}"
-        )));
-    }
-    Ok(value)
-}
-fn required_query<'a>(query: &'a HashMap<String, Vec<String>>, key: &str) -> AppResult<&'a str> {
-    query_value(query, key).ok_or_else(|| AppError::Validation(format!("{key} is required")))
-}
 fn required_body<'a>(body: &'a Value, key: &str) -> AppResult<&'a str> {
     optional_body_string(body, key)?
         .ok_or_else(|| AppError::Validation(format!("{key} is required")))
@@ -1258,34 +911,6 @@ fn optional_body_string<'a>(body: &'a Value, key: &str) -> AppResult<Option<&'a 
                 .ok_or_else(|| AppError::Validation(format!("{key} must be a string")))
         })
         .transpose()
-}
-fn optional_body_bool(body: &Value, key: &str) -> AppResult<Option<bool>> {
-    body.get(key)
-        .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| AppError::Validation(format!("{key} must be a boolean")))
-        })
-        .transpose()
-}
-fn optional_body_u64(body: &Value, key: &str) -> AppResult<Option<u64>> {
-    body.get(key)
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or_else(|| AppError::Validation(format!("{key} must be an unsigned integer")))
-        })
-        .transpose()
-}
-fn query_bool(query: &HashMap<String, Vec<String>>, key: &str) -> AppResult<bool> {
-    match query_value(query, key) {
-        None => Ok(false),
-        Some("true" | "1") => Ok(true),
-        Some("false" | "0") => Ok(false),
-        Some(_) => Err(AppError::Validation(format!(
-            "{key} must be true, false, 1, or 0"
-        ))),
-    }
 }
 fn project_patch(body: &Value) -> AppResult<ProjectSettingsPatch> {
     let source = body
@@ -1330,18 +955,6 @@ fn optional_json_u64(object: &Map<String, Value>, key: &str) -> AppResult<Option
             .ok_or_else(|| AppError::Validation(format!("{key} must be an unsigned integer"))),
     }
 }
-fn topology(store: &CoverageStore, kind: &str, reference: &str) -> AppResult<Value> {
-    match kind {
-        "run" => Ok(json!({"topology":{"kind":"run","run":store.run_result(reference, 20)?}})),
-        "snapshot" => {
-            Ok(json!({"topology":{"kind":"snapshot","snapshot":store.snapshot(reference)?}}))
-        }
-        _ => Err(AppError::Validation(
-            "topology kind must be run or snapshot".to_owned(),
-        )),
-    }
-}
-
 fn json_response(status: StatusCode, value: Value) -> HttpResponse {
     let mut response = Response::new(Full::new(Bytes::from(value.to_string())).boxed_unsync());
     *response.status_mut() = status;
@@ -1388,19 +1001,6 @@ fn dashboard_html() -> &'static str {
     include_str!("dashboard.html")
 }
 
-fn graph_response() -> HttpResponse {
-    let mut response = Response::new(Full::new(Bytes::from(graph_html())).boxed_unsync());
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    harden(response)
-}
-
-fn graph_html() -> &'static str {
-    include_str!("graph.html")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1408,6 +1008,8 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    include!("http_query_tests.rs");
 
     fn listener_or_skip(
         result: std::io::Result<TcpListener>,
@@ -1458,617 +1060,6 @@ mod tests {
             default_compaction_interval_seconds: 3_600,
             default_compaction_batch_size: 100,
         }
-    }
-
-    #[tokio::test]
-    async fn private_http_helpers_cover_routing_and_response_policy() {
-        let request = Request::builder()
-            .header(HOST, "127.0.0.1:59471")
-            .body(())
-            .unwrap();
-        assert!(trusted_host(request.headers()).unwrap());
-        let mut selected_headers = HeaderMap::new();
-        selected_headers.insert(REPOSITORY_HEADER, HeaderValue::from_static("repo"));
-        assert_eq!(
-            repository_header(&selected_headers).unwrap().as_deref(),
-            Some("repo")
-        );
-        let mut invalid_header = HeaderMap::new();
-        invalid_header.insert(
-            REPOSITORY_HEADER,
-            HeaderValue::from_bytes(&[0xff]).expect("invalid header bytes are accepted"),
-        );
-        assert!(repository_header(&invalid_header).is_err());
-        let request = Request::builder()
-            .header(HOST, "localhost:59471")
-            .body(())
-            .unwrap();
-        assert!(trusted_host(request.headers()).unwrap());
-        let request = Request::builder()
-            .header(HOST, "[::1]:59471")
-            .body(())
-            .unwrap();
-        assert!(trusted_host(request.headers()).unwrap());
-        let request = Request::builder()
-            .header(HOST, "testserver")
-            .body(())
-            .unwrap();
-        assert!(trusted_host(request.headers()).unwrap());
-        let request = Request::builder()
-            .header(HOST, "evil.example")
-            .body(())
-            .unwrap();
-        assert!(!trusted_host(request.headers()).unwrap());
-        let request = Request::builder()
-            .header(HOST, "localhost.evil")
-            .body(())
-            .unwrap();
-        assert!(!trusted_host(request.headers()).unwrap());
-        let request = Request::builder()
-            .header(HOST, "127.0.0.1.evil:59471")
-            .body(())
-            .unwrap();
-        assert!(!trusted_host(request.headers()).unwrap());
-        let request = Request::new(());
-        assert!(!trusted_host(request.headers()).unwrap());
-        let request = Request::builder()
-            .header(HOST, HeaderValue::from_bytes(&[0xff]).unwrap())
-            .body(())
-            .unwrap();
-        assert!(trusted_host(request.headers()).is_err());
-        let request = Request::builder().header(HOST, "[").body(()).unwrap();
-        assert!(trusted_host(request.headers()).is_err());
-        #[cfg(unix)]
-        assert!(
-            terminate_signal_future_with(|| {
-                Err(std::io::Error::other("terminate registration failed"))
-            })
-            .is_err()
-        );
-        #[cfg(unix)]
-        {
-            let terminate = terminate_signal_future_with(|| {
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-            })
-            .unwrap();
-            let terminate_task = tokio::spawn(terminate);
-            tokio::time::sleep(TokioDuration::from_millis(10)).await;
-            std::process::Command::new("kill")
-                .args(["-USR1", &std::process::id().to_string()])
-                .status()
-                .unwrap();
-            assert!(terminate_task.await.unwrap().is_ok());
-        }
-
-        let uri: Uri = "/api/items?query=one&query=two&flag=1".parse().unwrap();
-        let mut query = query_params(&uri);
-        assert_eq!(query_values(&query, "query"), vec!["one", "two"]);
-        assert_eq!(
-            required_query_values(&query, "query").unwrap(),
-            vec!["one", "two"]
-        );
-        assert!(required_query_values(&query, "missing").is_err());
-        assert_eq!(query_value(&query, "flag"), Some("1"));
-        assert!(query_value(&query, "missing").is_none());
-        assert!(query_bool(&query, "flag").unwrap());
-        assert!(!query_bool(&query, "missing").unwrap());
-        query.insert("invalid".to_owned(), vec!["maybe".to_owned()]);
-        assert!(query_bool(&query, "invalid").is_err());
-        assert_eq!(query_usize(&query, "missing", 17).unwrap(), 17);
-        query.insert("limit".to_owned(), vec!["4".to_owned()]);
-        assert_eq!(query_usize(&query, "limit", 17).unwrap(), 4);
-        query.insert("invalid_limit".to_owned(), vec!["many".to_owned()]);
-        assert!(query_usize(&query, "invalid_limit", 17).is_err());
-        assert_eq!(
-            bounded_query_usize(&query, "missing_bounded", 4, 1, 8).unwrap(),
-            4
-        );
-        query.insert("bounded".to_owned(), vec!["6".to_owned()]);
-        assert_eq!(bounded_query_usize(&query, "bounded", 4, 1, 8).unwrap(), 6);
-        query.insert("bounded_low".to_owned(), vec!["0".to_owned()]);
-        query.insert("bounded_high".to_owned(), vec!["9".to_owned()]);
-        assert!(bounded_query_usize(&query, "bounded_low", 4, 1, 8).is_err());
-        assert!(bounded_query_usize(&query, "bounded_high", 4, 1, 8).is_err());
-        assert_eq!(required_query(&query, "query").unwrap(), "one");
-        assert!(required_query(&query, "missing").is_err());
-        assert_eq!(
-            required_body(&json!({"name":"value"}), "name").unwrap(),
-            "value"
-        );
-        assert!(required_body(&json!({}), "name").is_err());
-        assert!(optional_body_string(&json!({"name":9}), "name").is_err());
-        assert!(optional_body_bool(&json!({"enabled":"yes"}), "enabled").is_err());
-        assert!(optional_body_u64(&json!({"timeout":"60"}), "timeout").is_err());
-
-        let patch = project_patch(
-            &json!({"compaction":{"compaction_enabled":true,"compaction_after_days":7,"compaction_interval_seconds":60,"compaction_batch_size":5}}),
-        )
-        .unwrap();
-        assert_eq!(patch.compaction_enabled, Some(true));
-        assert_eq!(patch.compaction_after_days, Some(7));
-        assert_eq!(patch.compaction_interval_seconds, Some(60));
-        assert_eq!(patch.compaction_batch_size, Some(5));
-        assert_eq!(
-            project_patch(&json!({"compaction_after_days":9}))
-                .unwrap()
-                .compaction_after_days,
-            Some(9)
-        );
-        assert!(project_patch(&json!({"compaction_after_days":"9"})).is_err());
-        assert!(project_patch(&json!({"compaction": []})).is_err());
-        assert!(project_patch(&json!({"compaction_enabled":"true"})).is_err());
-        assert!(project_patch(&json!({"compaction_interval_seconds":"60"})).is_err());
-        assert!(project_patch(&json!({"compaction_batch_size":"5"})).is_err());
-
-        assert_eq!(key_hash("repo").len(), 24);
-        let database_directory = tempfile::tempdir().unwrap();
-        let repository = database_directory.path().join("repo");
-        std::fs::create_dir_all(&repository).unwrap();
-        let common = database_directory.path().join("common.duckdb");
-        let repository_local = default_db_path(&repository);
-        let centralized = common
-            .parent()
-            .unwrap()
-            .join("projects")
-            .join(format!("{}.duckdb", key_hash(repository.to_str().unwrap())));
-        assert_eq!(
-            project_database_path(&common, repository.to_str().unwrap()),
-            repository_local
-        );
-        std::fs::create_dir_all(centralized.parent().unwrap()).unwrap();
-        std::fs::write(&centralized, []).unwrap();
-        assert_eq!(
-            project_database_path(&common, repository.to_str().unwrap()),
-            centralized
-        );
-        std::fs::create_dir_all(repository_local.parent().unwrap()).unwrap();
-        std::fs::write(&repository_local, []).unwrap();
-        assert_eq!(
-            project_database_path(&common, repository.to_str().unwrap()),
-            repository_local
-        );
-        assert!(error_string(AppError::Validation("test".to_owned())).contains("test"));
-        let _ = listener_error(std::io::Error::other("listener"));
-        let server = CoverageServer::new(config()).unwrap();
-        let mut invalid_body_config = config();
-        invalid_body_config.http_max_body_bytes = MIN_HTTP_MAX_BODY_BYTES - 1;
-        assert!(CoverageServer::new(invalid_body_config).is_err());
-        let mut body = Vec::new();
-        append_body_chunk(&mut body, &Bytes::from_static(b"{}"), 2).unwrap();
-        assert_eq!(body, b"{}".to_vec());
-        assert!(append_body_chunk(&mut body, &Bytes::from_static(b"!"), 2).is_err());
-        append_body_data(&mut body, None, 2).unwrap();
-        assert_eq!(
-            parse_content_length(&HeaderValue::from_static("2")).unwrap(),
-            2
-        );
-        assert!(parse_content_length(&HeaderValue::from_static("bad")).is_err());
-        assert!(parse_authority("[").is_err());
-        assert_eq!(parse_json_body(&[]).unwrap(), json!({}));
-        assert!(
-            server
-                .process_listener_result(Err(std::io::Error::other("accept")))
-                .is_err()
-        );
-        assert!(
-            combine_shutdown_results(Err(AppError::Runtime("serve".to_owned())), Ok(())).is_err()
-        );
-        assert!(
-            combine_shutdown_results(Ok(()), Err(AppError::Runtime("close".to_owned()))).is_err()
-        );
-        assert!(combine_shutdown_results(Ok(()), Ok(())).is_ok());
-
-        let response = json_response(StatusCode::CREATED, json!({"ok":true}));
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
-        assert_eq!(
-            error_response(AppError::NotFound("missing".to_owned())).status(),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            empty_response(StatusCode::ACCEPTED).status(),
-            StatusCode::ACCEPTED
-        );
-        let dashboard = dashboard_response();
-        assert_eq!(dashboard.status(), StatusCode::OK);
-        let graph = graph_response();
-        assert_eq!(graph.status(), StatusCode::OK);
-        assert!(dashboard_html().contains("EventSource"));
-        assert!(dashboard_html().contains("metricsGrid"));
-        assert!(dashboard_html().contains("compositeCurrentSelect"));
-        assert!(dashboard_html().contains("Production region coverage"));
-        assert!(dashboard_html().contains("compactionInventory"));
-        assert!(dashboard_html().contains("/api/dashboard"));
-        assert!(dashboard_html().contains("/api/dashboard/events"));
-        assert!(dashboard_html().contains("Automatic compatible full base"));
-        assert!(dashboard_html().contains("currentSelectionPinned"));
-        assert!(dashboard_html().contains(
-            "const requestCurrentIds = () => state.currentSelectionPinned ? state.currentIds : [];"
-        ));
-        assert!(dashboard_html().contains("const selectedIds = requestCurrentIds();"));
-        assert!(
-            dashboard_html().contains("state.currentSelectionPinned=state.currentIds.length>0")
-        );
-        assert!(dashboard_html().contains("visibilitychange"));
-        assert!(dashboard_html().contains("refreshTimer"));
-        assert!(dashboard_html().contains("setLive('live', 'on')"));
-        assert!(graph_html().contains("Function hierarchy"));
-        assert!(graph_html().contains("File dependencies"));
-        assert!(graph_html().contains("/api/snapshots/"));
-        assert!(graph_html().contains("source-import edges"));
-        assert!(format!("{:?}", CoverageServer::new(config()).unwrap()).contains("CoverageServer"));
-
-        let dashboard_directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dashboard_directory.path().join("src")).unwrap();
-        std::fs::write(dashboard_directory.path().join("src/a.py"), "one\ntwo\n").unwrap();
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "dashboard@example.com"],
-            vec!["config", "user.name", "Dashboard Tests"],
-            vec!["add", "."],
-            vec!["commit", "-m", "dashboard base"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(dashboard_directory.path())
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let mut dashboard_config = config();
-        dashboard_config.default_repository_path = Some(dashboard_directory.path().to_path_buf());
-        dashboard_config.common_db_path = dashboard_directory.path().join("common.duckdb");
-        let dashboard_server = CoverageServer::new(dashboard_config).unwrap();
-        let dashboard_service = dashboard_server
-            .service_for_repository_path(&dashboard_directory.path().to_string_lossy())
-            .unwrap();
-        dashboard_service
-            .update_project_settings(ProjectSettingsPatch {
-                compaction_enabled: Some(false),
-                ..Default::default()
-            })
-            .unwrap();
-        let dashboard_store = dashboard_service.store().clone();
-        let dashboard_project = dashboard_store.project().unwrap();
-        let dashboard_repo_path = dashboard_project.repo_path.replace('\'', "''");
-        let dashboard_repo_key = dashboard_project.repo_key.replace('\'', "''");
-        let dashboard_report = dashboard_directory.path().join("coverage.lcov");
-        std::fs::write(
-            &dashboard_report,
-            "TN:dashboard\nSF:src/a.py\nDA:1,1\nDA:2,0\nend_of_record\n",
-        )
-        .unwrap();
-        let dashboard_full = dashboard_store
-            .ingest_report(
-                &dashboard_report,
-                "lcov",
-                Some(dashboard_directory.path()),
-                Some("main"),
-                Some("dashboard-full"),
-                None,
-                "unit",
-            )
-            .unwrap();
-        let dashboard_incremental_one = dashboard_store
-            .ingest_report_with_execution(
-                &dashboard_report,
-                "lcov",
-                Some(dashboard_directory.path()),
-                Some("main"),
-                Some("dashboard-incremental-one"),
-                None,
-                "unit",
-                Some(&json!({"mode":"incremental","identity":"dashboard-http-case-1"})),
-                "compactable",
-            )
-            .unwrap();
-        let dashboard_incremental_two = dashboard_store
-            .ingest_report_with_execution(
-                &dashboard_report,
-                "lcov",
-                Some(dashboard_directory.path()),
-                Some("main"),
-                Some("dashboard-incremental-two"),
-                None,
-                "unit",
-                Some(&json!({"mode":"incremental","identity":"dashboard-http-case-2"})),
-                "compactable",
-            )
-            .unwrap();
-        assert_ne!(dashboard_full["id"], dashboard_incremental_one["id"]);
-        assert_ne!(
-            dashboard_incremental_one["id"],
-            dashboard_incremental_two["id"]
-        );
-        dashboard_store
-            .execute_sql_for_test(&format!(
-                "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-terminal', 'dashboard-command', 'dashboard-command', 'true', '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{}}', '[]', current_timestamp, 0, NULL, 'full', 'full:v1', 'full'); INSERT INTO run_jobs (id, command_id, command_name, command, idempotency_key, cwd, repo_path, repo_key, branch, commit_sha, queued_at, started_at, ended_at, timeout_seconds, max_summary_lines, status, stdout_path, stderr_path, error, cancellation_requested_at, execution_mode, execution_identity, execution_label) VALUES ('dashboard-active', 'dashboard-command', 'dashboard-command', 'true', NULL, '{dashboard_repo_path}', '{dashboard_repo_path}', '{dashboard_repo_key}', NULL, NULL, current_timestamp, NULL, NULL, 30, 20, 'queued', 'stdout.log', 'stderr.log', '', NULL, 'incremental', 'case:v1', 'case')"
-            ))
-            .unwrap();
-        dashboard_store
-            .execute_sql_for_test(&format!(
-                "INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('dashboard-composite-base', current_timestamp - INTERVAL '2 seconds', 'dashboard-composite-run-base', 'dashboard-command', '{dashboard_repo_path}', '{dashboard_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'dashboard-inventory', NULL, false, 0, 1, 0.0, '[]', '{{}}', '{{}}', '{{}}', '[]', '[]'); INSERT INTO composite_snapshots (id, created_at, run_id, command_id, repo_path, repo_key, status, mapping_version, inventory_hash, checkout_revision, checkout_dirty, covered_regions, total_regions, region_rate, reasons, remediation, inventory, provenance, components, component_evidence) VALUES ('dashboard-composite-current', current_timestamp, 'dashboard-composite-run-current', 'dashboard-command', '{dashboard_repo_path}', '{dashboard_repo_key}', 'complete', 'coverage-mcp-regions-v1', 'dashboard-inventory', NULL, false, 1, 1, 1.0, '[]', '{{}}', '{{}}', '{{}}', '[]', '[]'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('dashboard-composite-base', 'python:src/a.py:1:1:line-1', '{{\"region_key\":\"python:src/a.py:1:1:line-1\",\"component_id\":\"python\",\"logical_source_id\":\"python:src/a.py\",\"path\":\"src/a.py\",\"start_line\":1,\"end_line\":1,\"discriminator\":\"line-1\",\"state\":\"uncovered\",\"variants\":[{{\"package_variant\":\"cpython\",\"state\":\"uncovered\",\"hits\":0}}]}}'); INSERT INTO composite_regions (composite_snapshot_id, region_key, region) VALUES ('dashboard-composite-current', 'python:src/a.py:1:1:line-1', '{{\"region_key\":\"python:src/a.py:1:1:line-1\",\"component_id\":\"python\",\"logical_source_id\":\"python:src/a.py\",\"path\":\"src/a.py\",\"start_line\":1,\"end_line\":1,\"discriminator\":\"line-1\",\"state\":\"covered\",\"variants\":[{{\"package_variant\":\"cpython\",\"state\":\"covered\",\"hits\":1}}]}}')"
-            ))
-            .unwrap();
-        assert!(
-            dashboard_server
-                .dashboard_revision(&dashboard_directory.path().to_string_lossy())
-                .is_ok()
-        );
-        for skip in 0..=24 {
-            dashboard_store.inject_query_fault_after(skip);
-            let _ =
-                dashboard_server.dashboard_revision(&dashboard_directory.path().to_string_lossy());
-        }
-        dashboard_store.clear_query_fault();
-        let response = dashboard_server
-            .dashboard_stream(dashboard_directory.path().to_string_lossy().into_owned())
-            .unwrap();
-        assert_eq!(
-            response.headers()[CONTENT_TYPE],
-            "text/event-stream; charset=utf-8"
-        );
-        let mut body = response.into_body();
-        let frame_text =
-            |frame: Frame<Bytes>| String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
-        let ready = frame_text(body.frame().await.unwrap().unwrap());
-        assert!(ready.contains("event: ready"));
-        assert!(ready.contains("\"refresh_interval_ms\":10000"));
-        let refresh = frame_text(
-            timeout(TokioDuration::from_secs(12), body.frame())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-        );
-        assert!(refresh.contains("event: refresh"));
-        let heartbeat = frame_text(
-            timeout(TokioDuration::from_secs(12), body.frame())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-        );
-        assert!(heartbeat.contains(": heartbeat"));
-        drop(body);
-        let error_response = dashboard_server
-            .dashboard_stream("\0invalid-dashboard-repository".to_owned())
-            .unwrap();
-        let mut error_body = error_response.into_body();
-        let _ = error_body.frame().await.unwrap().unwrap();
-        let error_frame = frame_text(
-            timeout(TokioDuration::from_secs(12), error_body.frame())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-        );
-        assert!(error_frame.contains("event: dashboard-error"));
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server_task = tokio::spawn(dashboard_server.clone().serve_listener(listener));
-        let mut client = TcpStream::connect(address).await.unwrap();
-        client
-            .write_all(
-                b"GET /api/dashboard?history_limit=2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut response_bytes = Vec::new();
-        client.read_to_end(&mut response_bytes).await.unwrap();
-        let response_text = String::from_utf8(response_bytes).unwrap();
-        assert!(response_text.contains("200 OK"));
-        assert!(response_text.contains("\"incremental\""));
-        assert!(response_text.contains("\"composite\""));
-        let dashboard_payload: Value = serde_json::from_str(
-            response_text
-                .split_once("\r\n\r\n")
-                .expect("dashboard response has an HTTP body")
-                .1,
-        )
-        .expect("dashboard response is JSON");
-        assert_eq!(
-            dashboard_payload["data"]["selection"]["baseline_snapshot_id"],
-            dashboard_full["id"]
-        );
-        assert_eq!(
-            dashboard_payload["data"]["current"]["execution"]["mode"],
-            "incremental"
-        );
-        async fn rest_request(
-            address: std::net::SocketAddr,
-            method: &str,
-            path: &str,
-            payload: &str,
-        ) -> String {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            stream
-                .write_all(
-                    format!(
-                        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
-                        payload.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            String::from_utf8(response).unwrap()
-        }
-        let graph_page = rest_request(address, "GET", "/graph", "").await;
-        assert!(graph_page.contains("200 OK"));
-        assert!(graph_page.contains("Function hierarchy"));
-        for (method, path, payload) in [
-            (
-                "GET",
-                "/api/composite-snapshots/dashboard-composite-current?max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200",
-                "",
-            ),
-            (
-                "GET",
-                "/api/composite-snapshots/dashboard-composite-current/regions?max_regions=10&max_words=1200",
-                "",
-            ),
-            (
-                "GET",
-                "/api/composite-snapshots/dashboard-composite-current/insights?max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200",
-                "",
-            ),
-            (
-                "GET",
-                "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200&file_path=src%2Fa.py",
-                "",
-            ),
-            (
-                "GET",
-                "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=10&max_test_ids=10&max_bytes=12000&max_words=1200&file_path=src%2Fa.py",
-                "",
-            ),
-            (
-                "POST",
-                "/api/compare?max_words=1200",
-                "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\"}",
-            ),
-            (
-                "GET",
-                "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=1&max_source_lines=10&max_words=1200&max_bytes=12000",
-                "",
-            ),
-            (
-                "GET",
-                "/api/dashboard?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&history_limit=2",
-                "",
-            ),
-        ] {
-            let response = rest_request(address, method, path, payload).await;
-            response
-                .contains("200 OK")
-                .then_some(())
-                .expect("composite REST route should return 200 OK");
-        }
-        for path in [
-            "/api/composite-snapshots/dashboard-composite-current?max_words=bad",
-            "/api/composite-snapshots/dashboard-composite-current?max_regions=bad",
-            "/api/composite-snapshots/dashboard-composite-current?max_bytes=bad",
-            "/api/composite-snapshots/dashboard-composite-current?max_test_ids=bad",
-            "/api/composite-snapshots/dashboard-composite-current/regions?max_regions=bad",
-            "/api/composite-snapshots/dashboard-composite-current/insights?max_regions=bad",
-            "/api/composite-snapshots/dashboard-composite-current/insights?max_bytes=bad",
-            "/api/composite-snapshots/dashboard-composite-current/insights?max_test_ids=bad",
-            "/api/incremental?max_files=bad",
-            "/api/incremental?composite_snapshot_id=dashboard-composite-current",
-            "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=bad",
-            "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_test_ids=bad",
-            "/api/incremental?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_bytes=bad",
-            "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_regions=bad",
-            "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_bytes=bad",
-            "/api/compare?composite_snapshot_id=dashboard-composite-current&baseline_composite_snapshot_id=dashboard-composite-base&max_test_ids=bad",
-            "/api/compare?composite_snapshot_id=dashboard-composite-current",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&start=1&end=1",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=bad&end=1",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=bad",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&end=1",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=1&max_source_lines=bad",
-            "/api/source-lines?composite_snapshot_id=dashboard-composite-current&file_path=src%2Fa.py&start=1&end=1&max_bytes=bad",
-        ] {
-            let response = rest_request(address, "GET", path, "").await;
-            response
-                .contains("400 Bad Request")
-                .then_some(())
-                .expect("invalid composite REST query should return 400 Bad Request");
-        }
-        let response = rest_request(
-            address,
-            "POST",
-            "/api/compare",
-            "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\",\"max_bytes\":\"bad\"}",
-        )
-        .await;
-        response
-            .contains("400 Bad Request")
-            .then_some(())
-            .expect("invalid composite POST query should return 400 Bad Request");
-        for payload in [
-            "{\"composite_snapshot_id\":7}",
-            "{\"composite_snapshot_id\":\"dashboard-composite-current\"}",
-            "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\",\"file_path\":7}",
-        ] {
-            let response = rest_request(address, "POST", "/api/compare", payload).await;
-            response
-                .contains("400 Bad Request")
-                .then_some(())
-                .expect("invalid composite POST body should return 400 Bad Request");
-        }
-        let response = rest_request(
-            address,
-            "POST",
-            "/api/compare",
-            "{\"composite_snapshot_id\":\"dashboard-composite-current\",\"baseline_composite_snapshot_id\":\"dashboard-composite-base\",\"max_bytes\":2000001}",
-        )
-        .await;
-        response
-            .contains("200 OK")
-            .then_some(())
-            .expect("large composite POST byte limit should be capped safely");
-        let mut composite_client = TcpStream::connect(address).await.unwrap();
-        composite_client
-            .write_all(
-                b"GET /api/composite-snapshots/missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut composite_response = Vec::new();
-        composite_client
-            .read_to_end(&mut composite_response)
-            .await
-            .unwrap();
-        assert!(
-            String::from_utf8(composite_response)
-                .unwrap()
-                .contains("404 Not Found")
-        );
-        let mut error_client = TcpStream::connect(address).await.unwrap();
-        error_client
-            .write_all(
-                b"GET /api/dashboard?snapshot_id=missing HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut error_response_bytes = Vec::new();
-        error_client
-            .read_to_end(&mut error_response_bytes)
-            .await
-            .unwrap();
-        assert!(
-            String::from_utf8(error_response_bytes)
-                .unwrap()
-                .contains("404 Not Found")
-        );
-        let mut invalid_limit_client = TcpStream::connect(address).await.unwrap();
-        invalid_limit_client
-            .write_all(
-                b"GET /api/dashboard?history_limit=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .unwrap();
-        let mut invalid_limit_response = Vec::new();
-        invalid_limit_client
-            .read_to_end(&mut invalid_limit_response)
-            .await
-            .unwrap();
-        assert!(
-            String::from_utf8(invalid_limit_response)
-                .unwrap()
-                .contains("400 Bad Request")
-        );
-        server_task.abort();
-        let _ = server_task.await;
     }
 
     #[tokio::test]
@@ -2235,7 +1226,7 @@ mod tests {
         );
         server.stores.lock().unwrap().remove(&isolated_repo_key);
         isolated_store.close().unwrap();
-        assert_eq!(server.default_repository_path(), ".");
+        assert_eq!(server.config.default_repository_path_string(), None);
         let directory = tempfile::tempdir().unwrap();
         let store =
             CoverageStore::open(directory.path().join("selected.duckdb"), config()).unwrap();
@@ -2364,14 +1355,6 @@ mod tests {
         );
         helper_store.close().unwrap();
         store.close().unwrap();
-        assert!(
-            topology(
-                &CoverageStore::open(directory.path().join("topology.duckdb"), config()).unwrap(),
-                "unknown",
-                "id"
-            )
-            .is_err()
-        );
         let poisoned_server = CoverageServer::new(config()).unwrap();
         let poisoned_stores = poisoned_server.stores.clone();
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2800,30 +1783,6 @@ mod tests {
         .await;
         assert!(response.contains("404 Not Found"));
 
-        let success_directory = tempfile::tempdir().unwrap();
-        let mut artifact_success_config = isolated_config(&success_directory);
-        artifact_success_config.default_repository_path =
-            Some(success_directory.path().to_path_buf());
-        let artifact_success_server = CoverageServer::new(artifact_success_config).unwrap();
-        let artifact_service = artifact_success_server
-            .service_for_repository_path(success_directory.path().to_str().unwrap())
-            .unwrap();
-        let artifact_project = artifact_service.store().project().unwrap();
-        let repo_path = artifact_project.repo_path.replace('\'', "''");
-        let repo_key = artifact_project.repo_key.replace('\'', "''");
-        artifact_service
-            .store()
-            .execute_sql_for_test(&format!(
-                "INSERT INTO runs (id, command_id, command_name, command, cwd, repo_path, repo_key, branch, commit_sha, started_at, ended_at, duration_ms, exit_code, status, stdout_path, stderr_path, parsed_summary, artifact_paths, queued_at, queue_duration_ms, cancellation_requested_at) VALUES ('artifact-run', 'artifact-command', 'artifact-command', 'true', '{repo_path}', '{repo_path}', '{repo_key}', NULL, NULL, current_timestamp, current_timestamp, 1, 0, 'passed', 'stdout.log', 'stderr.log', '{{}}', '[]', current_timestamp, 0, NULL); INSERT INTO run_artifacts (run_id, kind, path, exists, size_bytes, coverage_format, suite, modified_by_run, ingest_status, snapshot_id, ingest_error) VALUES ('artifact-run', 'coverage', 'coverage.json', true, 1, NULL, NULL, true, NULL, NULL, NULL);"
-            ))
-            .unwrap();
-        let response = raw_once(
-            artifact_success_server,
-            b"GET /api/artifacts/latest?kind=coverage HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_vec(),
-        )
-        .await;
-        assert!(response.contains("200 OK"));
-
         let server = CoverageServer::new(isolated_config(&directory)).unwrap();
         let stores = server.stores.clone();
         let poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2847,9 +1806,7 @@ mod tests {
             .into_bytes(),
         )
         .await;
-        assert!(
-            response.contains("400 Bad Request") || response.contains("500 Internal Server Error")
-        );
+        assert!(response.contains("400 Bad Request"));
 
         let directory = tempfile::tempdir().unwrap();
         let mut invalid_mcp_repository = b"POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\nx-coverage-mcp-repo: ".to_vec();
@@ -3263,385 +2220,6 @@ mod tests {
             );
             task.await.unwrap().unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn rest_error_routes_preserve_storage_failures() {
-        async fn request(
-            address: std::net::SocketAddr,
-            method: &str,
-            path: &str,
-            payload: &str,
-        ) -> String {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            stream
-                .write_all(
-                    format!(
-                        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
-                        payload.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            String::from_utf8(response).unwrap()
-        }
-
-        async fn broken_routes(table: &str, routes: &[(&str, &str, &str)]) {
-            let directory = tempfile::tempdir().unwrap();
-            let mut server_config = config();
-            server_config.default_repository_path = Some(directory.path().to_path_buf());
-            server_config.common_db_path = directory.path().join("common.duckdb");
-            let server = CoverageServer::new(server_config).unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let task = tokio::spawn(server.clone().serve_listener(listener));
-            let initial = request(address, "GET", "/api/projects", "").await;
-            assert!(initial.contains("200 OK"));
-            let store = server
-                .stores
-                .lock()
-                .unwrap()
-                .values()
-                .next()
-                .cloned()
-                .expect("initial request opens the repository store");
-            if table == "lines" {
-                let project = store.project().unwrap();
-                let repo_key = project.repo_key.replace('\'', "''");
-                store
-                    .execute_sql_for_test(&format!(
-                        "INSERT INTO snapshots (id, created_at, minute_bucket, repo_path, repo_key, branch, commit_sha, base_ref, suite, format, report_path, warnings, metadata, total_lines, covered_lines, total_branches, covered_branches, total_functions, covered_functions, total_regions, covered_regions, line_rate, branch_rate, function_rate, region_rate) VALUES ('fault-snapshot', current_timestamp, current_timestamp, '{repo_key}', '{repo_key}', 'main', 'fault-commit', NULL, 'unit', 'lcov', 'fault', '[]', '{{}}', 1, 0, 0, 0, 0, 0, 1, 0, 0.0, NULL, NULL, 0.0)"
-                    ))
-                    .unwrap();
-            }
-            store
-                .execute_sql_for_test(&format!(
-                    "DROP TABLE {table}; CREATE VIEW {table} AS SELECT 1 AS broken;"
-                ))
-                .unwrap();
-            for (method, path, payload) in routes {
-                let response = request(address, method, path, payload).await;
-                assert!(
-                    response.contains("400 Bad Request")
-                        || response.contains("404 Not Found")
-                        || response.contains("500 Internal Server Error")
-                );
-            }
-            task.abort();
-            let _ = task.await;
-            server.close_stores().unwrap();
-        }
-
-        broken_routes(
-            "project_settings",
-            &[
-                ("POST", "/api/projects", "{}"),
-                ("PATCH", "/api/projects/project", "{}"),
-                ("POST", "/api/projects/project/compact", "{}"),
-                ("GET", "/api/projects/project", ""),
-            ],
-        )
-        .await;
-        broken_routes(
-            "snapshots",
-            &[
-                ("GET", "/api/snapshots", ""),
-                ("GET", "/api/snapshots/latest?suite=unit", ""),
-                ("GET", "/api/duplicate-coverage-tests", ""),
-                ("GET", "/api/projects/project", ""),
-                ("GET", "/api/snapshots/missing", ""),
-                ("GET", "/api/snapshots/missing/insights", ""),
-                ("GET", "/api/trend", ""),
-                (
-                    "GET",
-                    "/api/compare?snapshot_id=missing&baseline_snapshot_id=missing",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/incremental?snapshot_id=missing&baseline_snapshot_id=missing",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/incremental?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/incremental?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing&snapshot_id=ordinary",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/compare?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/compare?composite_snapshot_id=missing&baseline_composite_snapshot_id=missing&snapshot_id=ordinary",
-                    "",
-                ),
-                (
-                    "POST",
-                    "/api/compare",
-                    r#"{"snapshot_id":"missing","baseline_snapshot_id":"missing"}"#,
-                ),
-                (
-                    "POST",
-                    "/api/compare",
-                    r#"{"composite_snapshot_id":"missing","baseline_composite_snapshot_id":"missing"}"#,
-                ),
-                (
-                    "POST",
-                    "/api/compare",
-                    r#"{"composite_snapshot_id":"missing","baseline_composite_snapshot_id":"missing","snapshot_id":"ordinary"}"#,
-                ),
-                (
-                    "GET",
-                    "/api/changed-lines?snapshot_id=missing&baseline_snapshot_id=missing",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/source-lines?snapshot_id=missing&file_path=a.py&start=1&end=2",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/source-lines?composite_snapshot_id=missing&file_path=a.py&start=1&end=2",
-                    "",
-                ),
-                (
-                    "GET",
-                    "/api/source-lines?composite_snapshot_id=missing&snapshot_id=ordinary&file_path=a.py&start=1&end=2",
-                    "",
-                ),
-                ("GET", "/api/composite-snapshots/missing", ""),
-                ("GET", "/api/composite-snapshots/missing/regions", ""),
-                ("GET", "/api/composite-snapshots/missing/insights", ""),
-                ("GET", "/api/dashboard", ""),
-                ("GET", "/api/snapshots/missing/files", ""),
-                ("GET", "/api/snapshots/missing/functions", ""),
-                ("GET", "/api/snapshots/missing/dependencies", ""),
-                ("POST", "/api/projects/project/compact", "{}"),
-            ],
-        )
-        .await;
-        broken_routes(
-            "lines",
-            &[("GET", "/api/line-history?file_path=a.py&line_number=1", "")],
-        )
-        .await;
-        broken_routes(
-            "worktrees",
-            &[
-                ("GET", "/api/worktrees", ""),
-                (
-                    "POST",
-                    "/api/worktrees/register",
-                    r#"{"path":".","base_ref":"main","name":7}"#,
-                ),
-                (
-                    "POST",
-                    "/api/worktrees/register",
-                    r#"{"path":".","base_ref":"main"}"#,
-                ),
-            ],
-        )
-        .await;
-        broken_routes(
-            "run_jobs",
-            &[
-                ("GET", "/api/runs/queue", ""),
-                ("GET", "/api/runs/missing", ""),
-                ("POST", "/api/runs/missing/cancel", "{}"),
-                ("GET", "/api/runs/missing/logs/search?query=term", ""),
-            ],
-        )
-        .await;
-        broken_routes(
-            "run_artifacts",
-            &[("GET", "/api/artifacts/latest?kind=coverage", "")],
-        )
-        .await;
-
-        let directory = tempfile::tempdir().unwrap();
-        let mut command_config = config();
-        command_config.default_repository_path = Some(directory.path().to_path_buf());
-        command_config.common_db_path = directory.path().join("command-common.duckdb");
-        let command_server = CoverageServer::new(command_config).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(command_server.clone().serve_listener(listener));
-        let _ = request(address, "GET", "/api/projects", "").await;
-        let command_payload = format!(
-            "{{\"name\":\"http-fault-command\",\"command\":\"true\",\"cwd\":\"{}\",\"human_approved\":true,\"approved_by\":\"tester\",\"approval_note\":\"fault\"}}",
-            directory.path().display()
-        );
-        let registered = request(address, "POST", "/api/commands/register", &command_payload).await;
-        assert!(registered.contains("200 OK"));
-        let command_store = command_server
-            .stores
-            .lock()
-            .unwrap()
-            .values()
-            .next()
-            .cloned()
-            .expect("initial request opens the command store");
-        command_store
-            .execute_sql_for_test(
-                "DROP TABLE registered_commands; CREATE VIEW registered_commands AS SELECT 1 AS broken;",
-            )
-            .unwrap();
-        for (method, path, payload) in [
-            ("GET", "/api/commands", ""),
-            ("GET", "/api/commands/missing", ""),
-            ("POST", "/api/commands/register", command_payload.as_str()),
-            (
-                "POST",
-                "/api/runs/profiled",
-                r#"{"command_ref":"http-fault-command"}"#,
-            ),
-        ] {
-            let response = request(address, method, path, payload).await;
-            assert!(
-                response.contains("400 Bad Request")
-                    || response.contains("500 Internal Server Error")
-            );
-        }
-        task.abort();
-        let _ = task.await;
-        command_server.close_stores().unwrap();
-    }
-
-    #[tokio::test]
-    async fn source_graph_rest_routes_return_projected_collections() {
-        async fn request(address: std::net::SocketAddr, path: &str) -> String {
-            let mut stream = TcpStream::connect(address).await.unwrap();
-            stream
-                .write_all(
-                    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-                        .as_bytes(),
-                )
-                .await
-                .unwrap();
-            let mut response = Vec::new();
-            stream.read_to_end(&mut response).await.unwrap();
-            String::from_utf8(response).unwrap()
-        }
-
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(directory.path().join("src")).unwrap();
-        std::fs::write(
-            directory.path().join("src/lib.rs"),
-            "pub mod dep;\npub fn graph_entry() -> i32 { dep::value() }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            directory.path().join("src/dep.rs"),
-            "pub fn value() -> i32 { 1 }\n",
-        )
-        .unwrap();
-        for args in [
-            vec!["init", "-b", "main"],
-            vec!["config", "user.email", "graph@example.com"],
-            vec!["config", "user.name", "Graph Tests"],
-            vec!["add", "."],
-            vec!["commit", "-m", "graph base"],
-        ] {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(directory.path())
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let mut server_config = config();
-        server_config.default_repository_path = Some(directory.path().to_path_buf());
-        server_config.common_db_path = directory.path().join("graph-common.duckdb");
-        let server = CoverageServer::new(server_config).unwrap();
-        let service = server
-            .service_for_repository_path(&directory.path().to_string_lossy())
-            .unwrap();
-        let report_path = directory.path().join("coverage.json");
-        std::fs::write(
-            &report_path,
-            r#"{"data":[{"files":[{"filename":"src/lib.rs","segments":[[1,1,1,true]],"summary":{"lines":{"count":1,"covered":1},"functions":{"count":1,"covered":1},"regions":{"count":1,"covered":1}}},{"filename":"src/dep.rs","segments":[[1,1,1,true]],"summary":{"lines":{"count":1,"covered":1},"regions":{"count":1,"covered":1}}}],"functions":[{"name":"graph_entry","count":1,"filenames":["src/lib.rs"],"regions":[[1,1,1,1,1,0,0,0]],"branches":[[1,1,1,1,1,0,0,0]]}]}]}"#,
-        )
-        .unwrap();
-        let snapshot_id = service
-            .store()
-            .ingest_report(
-                &report_path,
-                "llvm",
-                Some(directory.path()),
-                Some("main"),
-                None,
-                None,
-                "unit",
-            )
-            .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(server.clone().serve_listener(listener));
-        let functions = request(
-            address,
-            &format!("/api/snapshots/{snapshot_id}/functions?file_path=src%2Flib.rs"),
-        )
-        .await;
-        assert!(functions.contains("200 OK"));
-        assert!(functions.contains("graph_entry"));
-        let function_cursor_error = request(
-            address,
-            &format!("/api/snapshots/{snapshot_id}/functions?cursor=bad"),
-        )
-        .await;
-        assert!(function_cursor_error.contains("400 Bad Request"));
-        let too_many_snapshot_ids = (0..65)
-            .map(|_| format!("snapshot_id={snapshot_id}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let too_many_dashboard = request(
-            address,
-            &format!("/api/dashboard?{too_many_snapshot_ids}&baseline_snapshot_id={snapshot_id}"),
-        )
-        .await;
-        assert!(too_many_dashboard.contains("400 Bad Request"));
-        let too_many_incremental = request(
-            address,
-            &format!("/api/incremental?{too_many_snapshot_ids}&baseline_snapshot_id={snapshot_id}"),
-        )
-        .await;
-        assert!(too_many_incremental.contains("400 Bad Request"));
-        let blank_dashboard_snapshot = request(address, "/api/dashboard?snapshot_id=").await;
-        assert!(blank_dashboard_snapshot.contains("400 Bad Request"));
-        let dependencies = request(
-            address,
-            &format!("/api/snapshots/{snapshot_id}/dependencies"),
-        )
-        .await;
-        assert!(dependencies.contains("200 OK"));
-        assert!(dependencies.contains("rust-source"));
-        let dependency_cursor_error = request(
-            address,
-            &format!("/api/snapshots/{snapshot_id}/dependencies?cursor=bad"),
-        )
-        .await;
-        assert!(dependency_cursor_error.contains("400 Bad Request"));
-        task.abort();
-        let _ = task.await;
-        server.close_stores().unwrap();
     }
 
     #[test]

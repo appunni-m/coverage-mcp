@@ -1,717 +1,85 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Coverage MCP · Project pulse</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f4f6f8;
-      --panel: #fff;
-      --ink: #17202a;
-      --muted: #687385;
-      --line: #dfe4eb;
-      --soft: #f8fafc;
-      --accent: #176b63;
-      --good: #067647;
-      --bad: #b42318;
-      --warn: #b54708;
-      --shadow: 0 1px 2px rgba(15, 23, 42, .05);
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.4 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    button, input, select { font: inherit; min-height: 32px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
-    button { padding: 0 10px; cursor: pointer; }
-    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
-    button:disabled { cursor: default; opacity: .55; }
-    input, select { min-width: 0; padding: 0 8px; }
-    code { font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    header { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 22px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.96); backdrop-filter: blur(8px); }
-    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-    .brand h1 { margin: 0; font-size: 16px; line-height: 1.1; }
-    .brand p { margin: 3px 0 0; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .live { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; white-space: nowrap; }
-    .live::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #98a2b3; }
-    .live.on { color: var(--good); }
-    .live.on::before { background: var(--good); box-shadow: 0 0 0 3px #dcfae6; }
-    .live.busy::before { background: var(--warn); }
-    .toolbar { display: flex; align-items: center; gap: 7px; min-width: 0; }
-    .toolbar select { width: min(340px, 30vw); }
-    main { max-width: 1500px; margin: 0 auto; padding: 16px 22px 34px; }
-    .stack { display: grid; gap: 12px; }
-    .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
-    .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
-    .panel-head h2 { margin: 0; font-size: 13px; }
-    .panel-head p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
-    .panel-body { padding: 12px 14px; }
-    .muted { color: var(--muted); }
-    .empty { padding: 24px 12px; color: var(--muted); text-align: center; }
-    .metricsGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-    .metric { padding: 12px 13px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
-    .metric-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11px; }
-    .metric-value { margin-top: 5px; font-size: 25px; font-weight: 750; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
-    .metric-sub { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-    .delta { font-weight: 700; white-space: nowrap; }
-    .good { color: var(--good); }
-    .bad { color: var(--bad); }
-    .warn { color: var(--warn); }
-    .neutral { color: var(--muted); }
-    .overview { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(300px, .9fr); gap: 12px; align-items: start; }
-    .chart-wrap { padding: 8px 12px 12px; }
-    #progressChart { display: block; width: 100%; height: 230px; }
-    .chart-grid { stroke: #e9edf2; stroke-width: 1; }
-    .chart-axis { fill: var(--muted); font-size: 10px; }
-    .chart-line { fill: none; stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
-    .chart-dot { stroke: #fff; stroke-width: 1.5; }
-    .legend { display: flex; flex-wrap: wrap; gap: 8px 12px; padding: 0 14px 10px; color: var(--muted); font-size: 11px; }
-    .legend span { display: inline-flex; align-items: center; gap: 5px; }
-    .legend i { width: 9px; height: 3px; border-radius: 3px; }
-    a.primary { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 0 11px; border: 1px solid var(--accent); border-radius: 6px; background: var(--accent); color: #fff; text-decoration: none; white-space: nowrap; }
-    .graph-teaser { overflow: visible; }
-    .graph-teaser .panel-head { align-items: center; }
-    .graph-teaser .panel-body { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
-    .graph-teaser-summary { display: flex; flex-wrap: wrap; gap: 7px; color: var(--muted); font-size: 11px; }
-    .progress-table, .file-table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 7px 8px; border-bottom: 1px solid #edf0f3; text-align: left; vertical-align: middle; white-space: nowrap; }
-    th { color: var(--muted); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; }
-    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-    td.path { max-width: 330px; overflow: hidden; text-overflow: ellipsis; }
-    .progress-table tbody tr:last-child td, .file-table tbody tr:last-child td { border-bottom: 0; }
-    .progress-table tbody tr.selected { background: #f0fdf9; }
-    .progress-table .suite { color: var(--muted); font-size: 11px; }
-    .snapshot-bar { display: flex; flex-wrap: wrap; gap: 7px 16px; align-items: center; padding: 9px 14px; border-bottom: 1px solid var(--line); background: var(--soft); }
-    .snapshot-bar label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
-    .snapshot-bar select { max-width: 330px; }
-    .composite-bar { border-top: 1px solid var(--line); }
-    .composite-grid { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(0, 1.5fr); gap: 12px; align-items: start; }
-    .composite-summary { display: grid; grid-template-columns: repeat(3, minmax(90px, 1fr)); gap: 6px; }
-    .component-list { display: grid; gap: 5px; }
-    .component-row { display: grid; grid-template-columns: minmax(90px, .8fr) minmax(0, 1.3fr) auto; gap: 8px; align-items: center; padding: 7px 8px; border: 1px solid #edf0f3; border-radius: 5px; }
-    .component-row strong { font-size: 12px; }
-    .component-row small { color: var(--muted); }
-    .composite-reasons { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-    .composite-reason { padding: 5px 7px; border-radius: 5px; background: #fff8eb; color: var(--warn); font-size: 10px; }
-    .provenance { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
-    .fact { min-width: 0; padding: 8px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
-    .fact span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
-    .fact strong, .fact code { display: block; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .delta-layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, .9fr); gap: 12px; }
-    .incremental-diff { margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 7px; background: #fbfcfe; }
-    .incremental-diff h3 { margin: 0 0 4px; font-size: 11px; }
-    .scope-note { margin-bottom: 10px; padding: 8px 9px; border: 1px solid #b7e3d5; border-radius: 6px; background: #f0fdf9; color: #176b63; font-size: 11px; }
-    .scope-note.limited { border-color: #fedf89; background: #fffaf0; color: var(--warn); }
-    .category-grid { display: grid; grid-template-columns: repeat(6, minmax(75px, 1fr)); gap: 6px; }
-    .category { padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
-    .category span { display: block; color: var(--muted); font-size: 10px; }
-    .category strong { display: block; margin-top: 2px; font-size: 19px; font-variant-numeric: tabular-nums; }
-    .case-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 9px; }
-    .case { min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; }
-    .case h3 { margin: 0 0 6px; font-size: 11px; }
-    .case dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; margin: 0; font-size: 11px; }
-    .case dt { color: var(--muted); }
-    .case dd { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .detail-source { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
-    .pill { display: inline-flex; align-items: center; min-height: 22px; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--soft); color: var(--muted); font-size: 10px; }
-    .pill.good { border-color: #a6e3c5; background: #ecfdf3; }
-    .pill.warn { border-color: #fedf89; background: #fff8eb; }
-    .pill.bad { border-color: #fda29b; background: #fff1f0; }
-    .region-list, .test-list { display: grid; gap: 5px; max-height: 230px; overflow: auto; }
-    .region { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 7px 8px; border: 1px solid #edf0f3; border-radius: 5px; font-size: 11px; }
-    .region code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .region-ranges { color: var(--muted); text-align: right; }
-    .test { display: grid; gap: 2px; padding: 7px 8px; border: 1px solid #edf0f3; border-radius: 5px; }
-    .test small { color: var(--muted); }
-    .maintenance-grid { display: grid; grid-template-columns: auto repeat(3, minmax(90px, 1fr)) auto auto; gap: 7px; align-items: end; }
-    .maintenance-grid label { display: grid; gap: 3px; color: var(--muted); font-size: 10px; }
-    .maintenance-grid label.check { display: flex; align-items: center; gap: 6px; min-height: 32px; }
-    .maintenance-grid input[type="checkbox"] { min-height: auto; }
-    .maintenance-message { grid-column: 1 / -1; min-height: 16px; color: var(--muted); font-size: 11px; }
-    .inventory { display: grid; grid-template-columns: repeat(5, minmax(90px, 1fr)); gap: 6px; margin-bottom: 9px; }
-    .inventory .fact { background: #fff; }
-    .inventory strong { font-size: 16px; }
-    .files-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
-    .files-head h2 { margin: 0; font-size: 13px; }
-    .files-table-wrap { overflow-x: auto; }
-    .file-table tbody tr { cursor: pointer; }
-    .file-table tbody tr:hover { background: #f8fafc; }
-    .rate-cell { min-width: 110px; }
-    .rate-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-variant-numeric: tabular-nums; }
-    .bar { height: 4px; margin-top: 4px; overflow: hidden; border-radius: 3px; background: #edf0f3; }
-    .bar i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
-    .run-line { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid #edf0f3; }
-    .run-line:last-child { border-bottom: 0; }
-    .status { display: inline-flex; align-items: center; min-height: 20px; padding: 0 6px; border-radius: 999px; background: #eef2f6; color: var(--muted); font-size: 10px; }
-    .status.passed, .status.completed, .status.running { background: #ecfdf3; color: var(--good); }
-    .status.failed, .status.cancelled { background: #fff1f0; color: var(--bad); }
-    .status.warning { background: #fff8eb; color: var(--warn); }
-    .drawer { position: fixed; inset: 0; z-index: 8; display: flex; justify-content: flex-end; background: rgba(15,23,42,.3); }
-    .drawer[hidden] { display: none; }
-    .drawer-card { width: min(720px, 96vw); height: 100%; overflow: auto; padding: 15px; background: var(--panel); box-shadow: -8px 0 28px rgba(15,23,42,.16); }
-    .drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-    .drawer-head h2 { margin: 0; font-size: 14px; }
-    .line-table { width: 100%; margin-top: 12px; border-collapse: collapse; }
-    .line-table td { padding: 5px 7px; }
-    .line-table .line-no { color: var(--muted); text-align: right; }
-    .line-table .covered { color: var(--good); }
-    .line-table .missed { color: var(--bad); }
-    .toast { position: fixed; right: 18px; bottom: 18px; z-index: 10; max-width: min(460px, calc(100vw - 36px)); padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--ink); color: #fff; box-shadow: 0 5px 18px rgba(15,23,42,.2); }
-    .toast[hidden] { display: none; }
-    @media (max-width: 1050px) { .overview, .delta-layout { grid-template-columns: 1fr; } .maintenance-grid { grid-template-columns: repeat(3, minmax(90px, 1fr)); } .inventory { grid-template-columns: repeat(3, minmax(90px, 1fr)); } }
-    @media (max-width: 760px) { header { align-items: flex-start; flex-direction: column; padding: 11px 14px; } .toolbar, .toolbar select { width: 100%; } main { padding: 12px 10px 24px; } .metricsGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .provenance, .case-grid { grid-template-columns: 1fr; } .category-grid { grid-template-columns: repeat(3, minmax(75px, 1fr)); } .maintenance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .maintenance-grid .check, .maintenance-grid .maintenance-message { grid-column: 1 / -1; } .maintenance-grid button { width: 100%; } .inventory { grid-template-columns: repeat(2, minmax(90px, 1fr)); } .panel-head { flex-direction: column; } .snapshot-bar { align-items: stretch; flex-direction: column; } .snapshot-bar label, .snapshot-bar select { width: 100%; } }
-  </style>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Coverage · Gaps and changes</title>
+<style>
+:root{font:15px/1.5 system-ui,sans-serif;color:#17252c;background:#f3f5f3;--muted:#59696d;--border:#d6ded9;--accent:#17654d}*{box-sizing:border-box}body{margin:0}main{max-width:1150px;margin:auto;padding:40px 28px}header{display:flex;justify-content:space-between;align-items:start;gap:24px}h1{font-size:32px;letter-spacing:-1px;margin:0 0 5px}p{margin:0;color:var(--muted)}.eyebrow{font-size:12px;font-weight:700;letter-spacing:2px;color:var(--accent);margin-bottom:12px}section{background:white;border:1px solid var(--border);border-radius:12px;padding:24px;margin-top:24px}label{display:flex;flex-direction:column;gap:6px;font-size:12px;font-weight:650;color:var(--muted)}input,select,textarea,button{font:inherit;border:1px solid var(--border);border-radius:6px;padding:10px;background:white;color:#17252c;min-width:0}button{cursor:pointer;font-weight:650}button.primary{background:var(--accent);color:white;border-color:var(--accent)}button:disabled{opacity:.5;cursor:wait}.fields{display:grid;grid-template-columns:2fr 2fr 1fr;gap:16px}.actions{display:flex;align-items:end;gap:12px;margin-top:16px}.actions label{flex:1}.note{font-size:13px;margin-top:12px}.summary{display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px}.summary strong{display:block;font-size:24px;letter-spacing:-.5px}.summary span{color:var(--muted);font-size:13px}h2{font-size:18px;margin:0 0 14px}h3{font-size:15px;margin:24px 0 8px}table{width:100%;border-collapse:collapse;text-align:left}td,th{padding:12px 8px;border-bottom:1px solid var(--border);vertical-align:top}th{font-size:12px;color:var(--muted)}code{font:12px/1.5 ui-monospace,monospace;overflow-wrap:anywhere}.function{display:block;margin-top:4px;color:var(--muted)}.error{color:#a32735;background:#fff0f0;padding:12px;border-radius:6px}.empty{padding:28px 0;color:var(--muted)}#message:empty{display:none}#message{margin-top:20px;white-space:pre-wrap}#more{margin-top:16px}.increment-summary{grid-template-columns:repeat(4,1fr)}.increment-summary strong{font-size:28px}.increment-note{background:#eef7f0;border-left:3px solid var(--accent);padding:12px}.estimate{background:#fff5dc;border-color:#b27b13}textarea{min-height:72px;resize:vertical;width:100%}details{margin-top:14px}summary{cursor:pointer;font-size:13px}.hidden{display:none}@media(max-width:700px){main{padding:24px 14px}.fields,.summary{grid-template-columns:1fr}header,.actions{flex-direction:column;align-items:stretch}section{padding:16px}td,th{padding:10px 4px}}
+</style>
 </head>
-<body>
-  <header>
-    <div class="brand"><div><h1>Coverage MCP</h1><p id="projectMeta">Choose a repository to inspect its coverage progression.</p></div><span id="liveState" class="live">connecting</span></div>
-    <div class="toolbar"><select id="projectSelect" aria-label="Project"></select><button id="refreshBtn" type="button">Refresh</button></div>
-  </header>
-  <main class="stack">
-    <section id="metricsGrid" class="metricsGrid" aria-label="Coverage metrics"></section>
-    <section class="panel graph-teaser">
-      <div class="panel-head"><div><h2>Source coverage graph</h2><p>A dedicated map for checking source hierarchy, LLVM-mapped functions, and resolved source-import edges.</p></div><a class="primary" href="/graph">Open source graph</a></div>
-      <div class="panel-body"><div id="graphTeaserStatus" class="graph-teaser-summary"><span>Choose a snapshot to see its source map.</span></div><span class="muted">Function nodes show line, region, branch, and execution completeness.</span></div>
-    </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>Production region coverage</h2><p id="compositeMeta">Combined immutable Rust, Python, and JavaScript production regions.</p></div><span id="compositeStatus" class="status">not measured</span></div>
-      <div class="snapshot-bar composite-bar"><label>Composite current <select id="compositeCurrentSelect" aria-label="Current composite snapshot"></select></label><label>Composite baseline <select id="compositeBaselineSelect" aria-label="Baseline composite snapshot"></select></label><span id="compositeSelectionStatus" class="muted"></span></div>
-      <div id="compositeBody" class="panel-body"></div>
-    </section>
-    <section class="overview">
-      <div class="panel"><div class="panel-head"><div><h2>Progress over time</h2><p id="progressMeta">The selected snapshot is the right edge; all four metric families stay visible.</p></div><span id="historyStatus" class="muted"></span></div><div class="chart-wrap"><svg id="progressChart" viewBox="0 0 900 230" role="img" aria-label="Coverage progression chart"></svg></div><div id="chartLegend" class="legend"></div></div>
-      <div class="panel"><div class="panel-head"><div><h2>Run activity</h2><p>Coverage evidence and execution status in one place.</p></div><span id="runSummary" class="muted"></span></div><div id="runActivity" class="panel-body"></div></div>
-    </section>
-    <section class="panel">
-      <div class="snapshot-bar"><label>Current artifacts <select id="currentSelect" aria-label="Current coverage artifacts" multiple size="3"></select></label><label>Baseline <select id="baselineSelect" aria-label="Baseline snapshot"></select></label><span id="selectionStatus" class="muted">Select one or more current artifacts</span></div>
-      <div class="panel-head"><div><h2>Selected measurement</h2><p>Suite, branch, commit, and execution identity are provenance. They are never treated as test identity.</p></div><span id="measurementStatus" class="status">unmeasured</span></div>
-      <div id="measurementFacts" class="panel-body provenance"></div>
-    </section>
-    <section class="panel">
-      <div class="panel-head"><div><h2>Incremental progression</h2><p>Primary coverage is the deduplicated base ∪ selected-run union; the raw snapshot diff is shown separately for diagnosis.</p></div><span id="incrementalSafety" class="pill">waiting for two snapshots</span></div>
-      <div id="incrementalBody" class="panel-body"></div>
-    </section>
-    <section class="panel">
-      <div class="files-head"><div><h2>Files needing attention</h2><span id="filesMeta" class="muted"></span></div><span class="muted">Click a row for line detail</span></div>
-      <div class="files-table-wrap"><table class="file-table"><thead><tr><th>Path</th><th class="num">Lines</th><th class="num">Branches</th><th class="num">Functions</th><th class="num">Regions</th><th>Delta</th><th>Retention</th></tr></thead><tbody id="fileRows"></tbody></table></div>
-    </section>
-    <section class="overview">
-      <div class="panel"><div class="panel-head"><div><h2>Compaction health</h2><p>Compressed payloads preserve incremental detail after relational rows are removed.</p></div><span id="compactionHealth" class="status">unknown</span></div><div class="panel-body"><div id="compactionInventory" class="inventory"></div><div class="maintenance-grid"><label class="check"><input id="compactionEnabled" type="checkbox"> Background compaction</label><label>After days<input id="compactionAfterDays" type="number" min="1" step="1"></label><label>Interval seconds<input id="compactionIntervalSeconds" type="number" min="60" step="60"></label><label>Batch size<input id="compactionBatchSize" type="number" min="1" step="1"></label><button id="saveCompactionBtn" class="primary" type="button">Save policy</button><button id="compactNowBtn" type="button">Compact now</button><span id="maintenanceMessage" class="maintenance-message" role="status"></span></div></div></div>
-      <div class="panel"><div class="panel-head"><div><h2>Snapshot timeline</h2><p id="timelineMeta">Newest measurements are shown first.</p></div></div><div class="panel-body" style="padding-top:4px"><table class="progress-table"><thead><tr><th>When / suite</th><th class="num">Lines</th><th class="num">Branches</th><th class="num">Functions</th><th class="num">Regions</th></tr></thead><tbody id="timelineRows"></tbody></table></div></div>
-    </section>
-  </main>
-  <div id="fileDrawer" class="drawer" hidden><aside class="drawer-card"><div class="drawer-head"><div><h2 id="drawerTitle">File detail</h2><code id="drawerPath"></code></div><button id="closeDrawer" type="button" aria-label="Close file detail">Close</button></div><div id="drawerSummary" class="panel-body" style="padding-left:0;padding-right:0"></div><div id="drawerLines"></div></aside></div>
-  <div id="toast" class="toast" hidden role="status"></div>
-  <script>
-    const SCHEMA_REVISION = 16;
-    const state = {projects:[], projectKey:null, repoPath:null, dashboard:null, currentId:null, currentIds:[], currentSelectionPinned:false, baselineId:null, compositeCurrentId:null, compositeBaselineId:null, refreshPending:false, refreshTimer:null, refreshing:false, refreshAgain:false, eventSource:null, streamRepoPath:null, toastTimer:null};
-    const $ = id => document.getElementById(id);
-    const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    const short = value => { const parts = String(value || '').split('/').filter(Boolean); return parts.length > 2 ? `…/${parts.slice(-2).join('/')}` : (value || '—'); };
-    const numeric = value => value === null || value === undefined || value === '' ? NaN : Number(value);
-    const pct = value => Number.isFinite(numeric(value)) ? `${(numeric(value) * 100).toFixed(1)}%` : '—';
-    const signedPct = value => Number.isFinite(numeric(value)) ? `${numeric(value) >= 0 ? '+' : ''}${(numeric(value) * 100).toFixed(1)} pp` : '—';
-    const int = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString() : '—';
-    const commit = value => value ? String(value).slice(0, 10) : '—';
-    const safeRate = value => Math.max(0, Math.min(1, Number(value) || 0));
-    const execution = snapshot => snapshot?.execution || {};
-    const currentProject = () => state.projects.find(project => project.repo_key === state.projectKey) || null;
-    const requestCurrentIds = () => state.currentSelectionPinned ? state.currentIds : [];
-    const isForeground = () => document.visibilityState === 'visible';
+<body><main>
+<header><div><div class="eyebrow">COVERAGE</div><h1>Find the next useful test.</h1><p>Locate a gap, investigate the code, and measure what changed.</p></div><button id="refresh">Refresh projects</button></header>
+<section aria-label="Measurement selection">
+<div class="fields"><label>Project<select id="project"><option value="">Select a project</option></select></label><label><span id="measurementLabel">Report path or saved measurement</span><input id="measurement" placeholder="target/coverage.json" list="history"><datalist id="history"></datalist></label><label>Metric<select id="metric"><option value="auto">Automatic</option><option value="regions">Regions</option><option value="branches">Branches</option><option value="lines">Lines</option></select></label></div>
+<div class="actions"><label>Path or function<input id="query" placeholder="Search a path or function"></label><button class="primary" id="find">Find gaps</button></div>
+<p class="note">Leave measurement empty only for a project with one saved suite. Use local code search at the returned locations.</p>
+</section>
 
-    async function apiEnvelope(url, options = {}, includeRepository = true) {
-      const request = {...options}; const headers = new Headers(request.headers || {});
-      if (includeRepository && state.repoPath) headers.set('X-Coverage-MCP-Repo', state.repoPath);
-      if (request.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-      request.headers = headers;
-      const response = await fetch(url, request); const payload = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
-      if (payload.context?.schema_revision !== SCHEMA_REVISION || !Object.hasOwn(payload, 'data')) throw new Error(`Dashboard needs schema revision ${SCHEMA_REVISION}; reload the current coverage-mcp daemon.`);
-      return payload;
-    }
-    async function api(url, options = {}, includeRepository = true) {
-      return (await apiEnvelope(url, options, includeRepository)).data;
-    }
-    async function apiCollection(url, options = {}, includeRepository = true) {
-      const values = [];
-      let cursor = null;
-      for (let page = 0; page < 20; page += 1) {
-        const separator = url.includes('?') ? '&' : '?';
-        const payload = await apiEnvelope(url + (cursor ? separator + 'cursor=' + encodeURIComponent(cursor) : ''), options, includeRepository);
-        if (Array.isArray(payload.data)) values.push(...payload.data);
-        cursor = payload.page?.next_cursor || null;
-        if (!cursor) break;
-      }
-      return values;
-    }
-    function notify(message) { const toast = $('toast'); toast.textContent = message; toast.hidden = false; clearTimeout(state.toastTimer); state.toastTimer = setTimeout(() => { toast.hidden = true; }, 3800); }
-    function setLive(label, mode = '') { const live = $('liveState'); live.textContent = label; live.className = `live ${mode}`; }
-    async function loadProjects() {
-      const data = await api('/api/projects?max_words=5000', {}, false); state.projects = Array.isArray(data) ? data : [];
-      if (!state.projectKey || !state.projects.some(project => project.repo_key === state.projectKey)) state.projectKey = (state.projects.find(project => Number(project.snapshot_count) > 0) || state.projects[0])?.repo_key || null;
-      state.repoPath = currentProject()?.repo_path || null; $('projectSelect').innerHTML = state.projects.map(project => `<option value="${esc(project.repo_key)}">${esc(short(project.repo_path))}</option>`).join('') || '<option value="">No projects</option>'; $('projectSelect').value = state.projectKey || '';
-    }
-    async function loadDashboard() {
-      if (!state.repoPath) { state.dashboard = null; renderEmpty('No repository is registered yet. Import or ingest a coverage report to start the timeline.'); return; }
-      const params = new URLSearchParams({repo_path:state.repoPath, history_limit:'18'}); const selectedIds = requestCurrentIds(); selectedIds.forEach(snapshotId => params.append('snapshot_id', snapshotId)); if (state.baselineId) params.set('baseline_snapshot_id', state.baselineId); if (state.compositeCurrentId) params.set('composite_snapshot_id', state.compositeCurrentId); if (state.compositeBaselineId) params.set('baseline_composite_snapshot_id', state.compositeBaselineId);
-      state.dashboard = await api(`/api/dashboard?${params}`, {}, false); state.currentIds = Array.isArray(state.dashboard.selection?.current_snapshot_ids) ? state.dashboard.selection.current_snapshot_ids : (state.dashboard.selection?.snapshot_id ? [state.dashboard.selection.snapshot_id] : []); state.currentId = state.currentIds[0] || null; state.compositeCurrentId = state.dashboard.selection?.composite_snapshot_id || null; if (!state.baselineId && state.dashboard.selection?.baseline_kind === 'explicit') state.baselineId = state.dashboard.selection.baseline_snapshot_id; if (!state.compositeBaselineId && state.dashboard.selection?.composite_baseline_kind === 'explicit') state.compositeBaselineId = state.dashboard.selection.baseline_composite_snapshot_id;
-      render(state.dashboard); connectStream();
-    }
-    async function refresh({silent = false} = {}) {
-      if (!isForeground()) return;
-      if (state.refreshing) { state.refreshAgain = true; return; } state.refreshing = true; if (!silent) setLive('refreshing', 'busy');
-      try { await loadProjects(); await loadDashboard(); setLive('live', 'on'); } catch (error) { setLive('error', 'busy'); notify(error.message); } finally { state.refreshing = false; if (state.refreshAgain) { state.refreshAgain = false; queueRefresh(); } }
-    }
-    function queueRefresh() { if (!isForeground() || state.refreshPending) return; state.refreshPending = true; state.refreshTimer = setTimeout(() => { state.refreshTimer = null; state.refreshPending = false; if (isForeground()) refresh({silent:true}); }, 180); }
-    function closeStream() { if (state.eventSource) state.eventSource.close(); state.eventSource = null; state.streamRepoPath = null; }
-    function connectStream() {
-      if (!isForeground() || !state.repoPath) { closeStream(); return; }
-      if (state.eventSource && state.streamRepoPath === state.repoPath) return;
-      closeStream(); state.streamRepoPath = state.repoPath;
-      state.eventSource = new EventSource(`/api/dashboard/events?repo_path=${encodeURIComponent(state.repoPath)}`);
-      state.eventSource.addEventListener('ready', () => setLive('live', 'on')); state.eventSource.addEventListener('refresh', () => { setLive('updated', 'busy'); queueRefresh(); }); state.eventSource.addEventListener('dashboard-error', event => { try { notify(JSON.parse(event.data).detail || 'Dashboard stream error'); } catch (_) { notify('Dashboard stream error'); } }); state.eventSource.onerror = () => setLive('reconnecting', 'busy');
-    }
-    function renderEmpty(message) {
-      $('metricsGrid').innerHTML = `<div class="panel empty" style="grid-column:1/-1">${esc(message)}</div>`; $('progressChart').innerHTML = ''; $('chartLegend').innerHTML = ''; $('runActivity').innerHTML = '<div class="empty">No run activity.</div>'; $('measurementFacts').innerHTML = '<div class="empty" style="grid-column:1/-1">No selected measurement.</div>'; $('incrementalBody').innerHTML = '<div class="empty">Ingest two compatible snapshots to see progression without rerunning the base.</div>'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot.</div>'; $('fileRows').innerHTML = '<tr><td colspan="7" class="empty">No coverage files.</td></tr>'; $('timelineRows').innerHTML = '<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; $('compactionInventory').innerHTML = '<div class="empty" style="grid-column:1/-1">No compaction inventory.</div>'; $('graphTeaserStatus').innerHTML = '<span>Choose a snapshot to see its source map.</span>'; $('projectMeta').textContent = message;
-    }
-    function metricCard(label, snapshot, definition, delta) { const rate = snapshot?.[definition.rate]; const deltaClass = Number(delta) > 0 ? 'good' : Number(delta) < 0 ? 'bad' : 'neutral'; return `<article class="metric"><div class="metric-top"><span>${label}</span><span class="delta ${deltaClass}">${signedPct(delta)}</span></div><div class="metric-value">${pct(rate)}</div><div class="metric-sub"><span>${int(snapshot?.[definition.covered])} / ${int(snapshot?.[definition.total])}</span><span>${definition.unit}</span></div></article>`; }
-    function renderMetrics(data) {
-      const snapshot = data.current; const delta = data.incremental?.status === 'measured' ? data.incremental.metric_deltas || {} : {};
-      const definitions = [['Lines',{rate:'line_rate',covered:'covered_lines',total:'total_lines',unit:'executable lines'},'line_rate_delta'],['Branches',{rate:'branch_rate',covered:'covered_branches',total:'total_branches',unit:'branch outcomes'},'branch_rate_delta'],['Functions',{rate:'function_rate',covered:'covered_functions',total:'total_functions',unit:'functions'},'function_rate_delta'],['Regions',{rate:'region_rate',covered:'covered_regions',total:'total_regions',unit:'regions'},'region_rate_delta']];
-      $('metricsGrid').innerHTML = snapshot ? definitions.map(([label, definition, key]) => metricCard(label, snapshot, definition, delta[key])).join('') : '<div class="panel empty" style="grid-column:1/-1">Select a snapshot to see metrics.</div>'; $('progressMeta').textContent = snapshot ? `${data.incremental?.status === 'measured' ? 'base ∪ selected run' : snapshot.suite || 'unknown suite'} · ${snapshot.branch || 'no branch'} · ${commit(snapshot.commit_sha)} · ${snapshot.detail_retention || 'compactable'}` : 'No selected measurement.'; $('graphTeaserStatus').innerHTML = snapshot ? `<span>${int(snapshot.total_functions)} report-level functions</span><span>·</span><span>${int(snapshot.total_regions)} LLVM/source regions</span><span>·</span><span>${int(snapshot.total_lines)} executable lines</span>` : '<span>Choose a snapshot to see its source map.</span>';
-    }
-    function renderControls(data) {
-      const points = [...(data.history?.points || [])]; const snapshots = new Map(points.map(point => [point.id, point])); if (data.current?.id) snapshots.set(data.current.id, data.current); if (data.baseline?.id) snapshots.set(data.baseline.id, data.baseline); const options = [...snapshots.values()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at))); const option = point => `<option value="${esc(point.id)}">${esc(new Date(point.created_at).toLocaleString())} · ${esc(point.suite || 'default')} · ${pct(point.line_rate)}</option>`; const baselineOptions = options.filter(point => execution(point).mode !== 'incremental'); if (data.baseline?.id && !baselineOptions.some(point => point.id === data.baseline.id)) baselineOptions.push(data.baseline);
-      $('currentSelect').innerHTML = options.map(option).join('') || '<option value="">No snapshots</option>'; $('baselineSelect').innerHTML = `<option value="">Automatic compatible full base</option>${baselineOptions.map(option).join('')}`; const selectedIds = state.currentSelectionPinned ? state.currentIds : (data.selection?.current_snapshot_ids || (data.current?.id ? [data.current.id] : [])); Array.from($('currentSelect').options).forEach(option => { option.selected = selectedIds.includes(option.value); }); $('baselineSelect').value = state.baselineId || ''; const kind = data.selection?.baseline_kind || 'none'; const selectedCount = selectedIds.length; $('selectionStatus').textContent = `${selectedCount || 0} current artifact${selectedCount === 1 ? '' : 's'} selected · ${kind === 'explicit' ? 'explicit fixed baseline' : kind === 'rolling_previous' ? 'automatic compatible full baseline' : 'no comparison baseline'}`;
-    }
-    function renderCompositeControls(data) {
-      const composite = data.composite || {}, points = [...(composite.history?.points || [])]; const snapshots = new Map(points.map(point => [point.id, point])); if (composite.current?.id) snapshots.set(composite.current.id, composite.current); if (composite.baseline?.id) snapshots.set(composite.baseline.id, composite.baseline); const options = [...snapshots.values()].sort((a,b) => String(a.created_at).localeCompare(String(b.created_at))); const option = point => `<option value="${esc(point.id)}">${esc(new Date(point.created_at).toLocaleString())} · ${pct(point.region_rate)} · ${esc(point.status || 'incomplete')}</option>`;
-      $('compositeCurrentSelect').innerHTML = options.map(option).join('') || '<option value="">No composite snapshots</option>'; $('compositeBaselineSelect').innerHTML = `<option value="">Rolling previous</option>${options.map(option).join('')}`; $('compositeCurrentSelect').value = state.compositeCurrentId || composite.current?.id || ''; $('compositeBaselineSelect').value = state.compositeBaselineId || ''; const kind = data.selection?.composite_baseline_kind || 'none'; $('compositeSelectionStatus').textContent = kind === 'explicit' ? 'Explicit fixed composite baseline' : kind === 'rolling_previous' ? 'Rolling previous composite context' : 'No composite comparison';
-    }
-    function renderChart(points) {
-      const svg = $('progressChart'); const legend = $('chartLegend'); const colors = {line_rate:'#176b63',branch_rate:'#2563eb',function_rate:'#6941c6',region_rate:'#b54708'}; const labels = {line_rate:'Lines',branch_rate:'Branches',function_rate:'Functions',region_rate:'Regions'}; legend.innerHTML = Object.entries(colors).map(([key,color]) => `<span><i style="background:${color}"></i>${labels[key]}</span>`).join(''); if (!points.length) { svg.innerHTML = '<text x="450" y="115" text-anchor="middle" class="chart-axis">No history yet</text>'; return; }
-      const width=900,height=230,pad={left:38,right:14,top:15,bottom:32},innerWidth=width-pad.left-pad.right,innerHeight=height-pad.top-pad.bottom; const x=index => points.length === 1 ? pad.left + innerWidth / 2 : pad.left + (index / (points.length - 1)) * innerWidth; const y=value => pad.top + (1-safeRate(value))*innerHeight; const grid=[0,.25,.5,.75,1].map(level => `<line class="chart-grid" x1="${pad.left}" x2="${width-pad.right}" y1="${y(level)}" y2="${y(level)}"></line><text class="chart-axis" x="${pad.left-7}" y="${y(level)+3}" text-anchor="end">${Math.round(level*100)}%</text>`).join(''); const step=Math.max(1,Math.ceil(points.length/6)); const xLabels=points.map((point,index) => index%step===0 ? `<text class="chart-axis" x="${x(index)}" y="${height-9}" text-anchor="middle">${esc(new Date(point.created_at).toLocaleDateString(undefined,{month:'short',day:'numeric'}))}</text>` : '').join('');
-      const lines=Object.entries(colors).map(([key,color]) => { const path=points.map((point,index) => `${index?'L':'M'} ${x(index).toFixed(1)} ${y(point[key]).toFixed(1)}`).join(' '); const dots=points.map((point,index) => `<circle class="chart-dot" cx="${x(index)}" cy="${y(point[key])}" r="3" fill="${color}"><title>${labels[key]} ${pct(point[key])}</title></circle>`).join(''); return `<path class="chart-line" stroke="${color}" d="${path}"></path>${dots}`; }).join(''); svg.innerHTML=`${grid}${xLabels}${lines}`;
-    }
-    function renderRuns(data) { const runs=data.active_runs||[],latest=data.latest_run; $('runSummary').textContent=runs.length?`${runs.length}${data.active_runs_truncated?'+':''} active`:latest?`last ${latest.status||'run'}`:'no runs'; const lines=[]; if(latest) lines.push(`<div class="run-line"><span class="status ${esc(latest.status)}">${esc(latest.status||'latest')}</span><span class="path">${esc(latest.command_name||latest.id||'latest run')}</span><span class="muted">${esc(latest.execution_mode||'')}</span></div>`); runs.forEach(run=>lines.push(`<div class="run-line"><span class="status ${esc(run.status)}">${esc(run.status||'active')}</span><span class="path">${esc(run.command_name||run.id)}</span><span class="muted">${run.queue_position==null?'running':`#${esc(run.queue_position)}`}</span></div>`)); $('runActivity').innerHTML=lines.join('')||'<div class="empty">No managed run activity.</div>'; }
-    function fact(label,value,isCode=false) { return `<div class="fact"><span>${esc(label)}</span>${isCode?`<code title="${esc(value)}">${esc(value||'—')}</code>`:`<strong title="${esc(value)}">${esc(value||'—')}</strong>`}</div>`; }
-    function renderMeasurement(data) { const current=data.current,base=data.baseline,inc=data.incremental||{},status=inc.status==='measured'?'measured':'unmeasured'; $('measurementStatus').textContent=status; $('measurementStatus').className=`status ${status==='measured'?'completed':''}`; if(!current){ $('measurementFacts').innerHTML='<div class="empty" style="grid-column:1/-1">No snapshot selected.</div>'; return; } const exec=execution(current); const currentIds=dashboardCurrentIds(data); const artifactLabel=currentIds.length>1?`${currentIds.length} · ${currentIds.map(id=>String(id).slice(0,10)).join(', ')}`:current.id; $('measurementFacts').innerHTML=[fact('Snapshot',current.id,true),fact('Current artifacts',artifactLabel,true),fact('Captured',new Date(current.created_at).toLocaleString()),fact('Suite',current.suite),fact('Format',current.format),fact('Branch',current.branch),fact('Commit',commit(current.commit_sha),true),fact('Execution mode',exec.mode||'not recorded'),fact('Execution identity',exec.identity||'not recorded',true),fact('Retention',current.detail_retention),fact('Report checkout',short(current.measurement_checkout_path),true),fact('Baseline',base?.id?`${base.suite} · ${commit(base.commit_sha)}`:'none'),fact('Baseline policy',data.selection?.baseline_kind||'none')].join(''); }
-    function renderCase(title,snapshot,source) { if(!snapshot) return `<div class="case"><h3>${title}</h3><div class="muted">No snapshot selected.</div></div>`; const exec=execution(snapshot); return `<div class="case"><h3>${title}</h3><dl><dt>suite</dt><dd>${esc(snapshot.suite)}</dd><dt>format</dt><dd>${esc(snapshot.format)}</dd><dt>branch</dt><dd>${esc(snapshot.branch||'—')}</dd><dt>commit</dt><dd><code>${esc(commit(snapshot.commit_sha))}</code></dd><dt>mode</dt><dd>${esc(exec.mode||'not recorded')}</dd><dt>identity</dt><dd title="${esc(exec.identity)}"><code>${esc(exec.identity||'not recorded')}</code></dd><dt>retention</dt><dd>${esc(snapshot.detail_retention)}</dd><dt>detail</dt><dd>${esc(source||'unknown')}</dd></dl></div>`; }
-    function rangeLabel(ranges) { return (ranges||[]).slice(0,4).map(range=>range[0]===range[1]?`${range[0]}`:`${range[0]}–${range[1]}`).join(', ')||'—'; }
-    // The incremental view is intentionally split into an additive result and
-    // a diagnostic replacement diff. The latter is useful for complete
-    // snapshots, but a selected case run must not make the union card look
-    // like coverage fell simply because it did not observe every base line.
-    function renderIncremental(data) {
-      const inc = data.incremental || {};
-      if (inc.status !== 'measured') {
-        $('incrementalSafety').textContent = inc.reason || 'Choose two compatible snapshots';
-        $('incrementalSafety').className = 'pill warn';
-        $('incrementalBody').innerHTML = `<div class="empty">${esc(inc.reason || 'Select a current measurement and baseline.')}</div>`;
-        return;
-      }
-      const measurement = data.current || {};
-      const run = inc.run || {};
-      const gain = inc.coverage_gain || {};
-      const diff = inc.diff || {};
-      const diffGain = diff.coverage_gain || {};
-      const scope = inc.measurement_scope || {};
-      const source = inc.detail_source || {};
-      const baseProtected = data.baseline?.detail_retention === 'incremental_base';
-      const automaticFullBase = data.selection?.baseline_kind === 'rolling_previous' && Boolean(data.baseline?.id);
-      const compacted = source.baseline === 'compacted_payload' || source.current === 'compacted_payload';
-      const selected = scope.kind === 'selected_subset';
-      const mergeExact = inc.merge?.exact;
-      const currentCount = Array.isArray(inc.current_snapshot_ids) ? inc.current_snapshot_ids.length : 1;
-      $('incrementalSafety').textContent = baseProtected ? 'fixed base protected' : automaticFullBase ? 'automatic full base' : selected ? (currentCount > 1 ? `union of base + ${currentCount} files` : 'union measured · diff limited') : compacted ? 'read after compaction' : 'stored union measured';
-      $('incrementalSafety').className = `pill ${baseProtected || automaticFullBase || compacted || !selected ? 'good' : 'warn'}`;
-      const regionsFor = groups => (groups || []).flatMap(group => Object.entries(group).filter(([key]) => key !== 'path').map(([key, ranges]) => `<div class="region"><code title="${esc(group.path)}">${esc(group.path)}</code><span class="region-ranges ${key === 'regressed' || key === 'removed' ? 'bad' : key === 'newly_covered' || key === 'added' ? 'good' : key === 'not_observed' ? 'neutral' : ''}">${esc(key.replaceAll('_', ' '))}: ${esc(rangeLabel(ranges))}</span></div>`));
-      const gainCategories = [
-        ['new lines', 'newly_covered_lines', 'good'],
-        ['new branches', 'newly_covered_branches', 'good'],
-        ['new functions', 'newly_covered_functions', 'good'],
-        ['new regions', 'newly_covered_regions', 'good'],
-        ['not observed', 'not_observed', 'neutral'],
-        ['regressions', 'regressed', 'bad'],
-      ];
-      const gainHtml = gainCategories.map(([label, key, tone]) => `<div class="category"><span>${label}</span><strong class="${tone}">${int(gain[key] || 0)}</strong></div>`).join('');
-      const diffCategories = [
-        ['newly covered', 'newly_covered', 'good'],
-        ['not observed', 'not_observed', 'neutral'],
-        ['regressed', 'regressed', 'bad'],
-        ['hit-only', 'hit_count_only', 'neutral'],
-        ['added', 'added', 'good'],
-        ['removed', 'removed', 'bad'],
-      ];
-      const diffHtml = diffCategories.map(([label, key, tone]) => `<div class="category"><span>${label}</span><strong class="${tone}">${int(diffGain[key] || 0)}</strong></div>`).join('');
-      const attribution = inc.test_attribution || {};
-      const tests = attribution.status === 'unavailable' ? `<div class="empty">${esc(attribution.reason || 'Named test attribution is unavailable for this format.')}</div>` : (attribution.affected_tests || []).map(test => `<div class="test"><code title="${esc(test.test_id)}">${esc(test.test_id)}</code><small>+${int(test.added?.length)} / −${int(test.removed?.length)} observations</small></div>`).join('') || '<div class="empty">No affected named test observations.</div>';
-      const delta = inc.metric_deltas || {};
-      const diffDelta = diff.metric_deltas || {};
-      const deltaFacts = [fact('Line rate', signedPct(delta.line_rate_delta)), fact('Branch rate', signedPct(delta.branch_rate_delta)), fact('Function rate', signedPct(delta.function_rate_delta)), fact('Region rate', signedPct(delta.region_rate_delta)), fact('Covered lines', `${Number(delta.covered_lines_delta) >= 0 ? '+' : ''}${int(delta.covered_lines_delta)}`), fact('Covered branches', `${Number(delta.covered_branches_delta) >= 0 ? '+' : ''}${int(delta.covered_branches_delta)}`)].join('');
-      const diffFacts = [fact('Line rate', signedPct(diffDelta.line_rate_delta)), fact('Branch rate', signedPct(diffDelta.branch_rate_delta)), fact('Function rate', signedPct(diffDelta.function_rate_delta)), fact('Region rate', signedPct(diffDelta.region_rate_delta))].join('');
-      const interpretation = selected ? 'This run is a selected subset. A base hit missing from the run is not a regression; it is shown as not observed in the diagnostic diff.' : 'This report is treated as complete, so the diagnostic diff can make regression claims.';
-      const regions = regionsFor(inc.regions);
-      const diffRegions = regionsFor(diff.regions);
-      $('incrementalBody').innerHTML = `<div class="scope-note ${selected ? 'limited' : ''}"><strong>Primary view: base ∪ selected run</strong> · ${esc(interpretation)}${mergeExact === false ? ' Some metric identities were unavailable, so the union marks those families as a conservative fallback.' : ''}</div><h3 style="margin:0 0 6px;font-size:11px">Final deduplicated coverage</h3><div class="provenance">${fact('Lines', `${int(measurement.covered_lines)}/${int(measurement.total_lines)} · ${pct(measurement.line_rate)}`)}${fact('Branches', `${int(measurement.covered_branches)}/${int(measurement.total_branches)} · ${pct(measurement.branch_rate)}`)}${fact('Functions', `${int(measurement.covered_functions)}/${int(measurement.total_functions)} · ${pct(measurement.function_rate)}`)}${fact('Regions', `${int(measurement.covered_regions)}/${int(measurement.total_regions)} · ${pct(measurement.region_rate)}`)}</div><div class="detail-source"><span class="pill good">canonical union measurement</span><span class="pill">${mergeExact === false ? 'conservative fallback' : 'canonical identities'}</span><span class="pill ${source.baseline === 'compacted_payload' ? 'good' : ''}">base: ${esc(source.baseline || 'unknown')}</span><span class="pill ${source.current === 'compacted_payload' ? 'good' : ''}">run: ${esc(source.current || 'unknown')}</span></div><h3 style="margin:12px 0 6px;font-size:11px">Incremental gain (from the selected run)</h3><div class="category-grid">${gainHtml}</div><div class="provenance" style="margin-top:9px">${deltaFacts}</div><div class="case-grid">${renderCase(currentCount > 1 ? `Selected files (${currentCount})` : 'Current case', run, source.current)}${renderCase('Baseline', data.baseline, source.baseline)}</div><div class="delta-layout" style="margin-top:10px"><div><h3 style="margin:0 0 6px;font-size:11px">New coverage regions</h3><div class="region-list">${regions.join('') || '<div class="empty">No newly covered regions.</div>'}</div></div><div><h3 style="margin:0 0 6px;font-size:11px">Affected test IDs</h3><div class="test-list">${tests}</div></div></div><div class="incremental-diff"><h3>Snapshot diff (diagnostic)</h3><p class="muted" style="margin:0 0 8px">Replacement-style evidence is kept separate from the union measurement. ${esc(selected ? 'Negative raw deltas are scope effects, not code regressions.' : 'Regression counts are valid for this complete report.')}</p><div class="category-grid">${diffHtml}</div><div class="provenance" style="margin-top:9px">${diffFacts}</div><div class="region-list" style="margin-top:9px">${diffRegions.join('') || '<div class="empty">No diagnostic changes.</div>'}</div></div>`;
-    }
-    function renderComposite(data) {
-      const composite = data.composite || {}, current = composite.current, inc = composite.incremental || {}, complete = current?.complete === true; $('compositeStatus').textContent = current ? (complete ? 'complete' : 'incomplete') : 'not measured'; $('compositeStatus').className = `status ${current ? (complete ? 'completed' : 'warning') : ''}`; renderCompositeControls(data); if (!current) { $('compositeMeta').textContent = 'Combined immutable Rust, Python, and JavaScript production regions.'; $('compositeBody').innerHTML = '<div class="empty">No composite production-region snapshot has been produced by a managed run.</div>'; return; }
-      const delta = inc.metric_deltas || {}, gain = inc.coverage_gain || {}, components = current.components || [], componentDeltas = new Map((inc.components || []).map(component => [component.component, component])); const componentRows = components.map(component => { const componentDelta = componentDeltas.get(component.component) || {}; const deltaText = Number.isFinite(Number(componentDelta.covered_regions_delta)) ? `${Number(componentDelta.covered_regions_delta) >= 0 ? '+' : ''}${int(componentDelta.covered_regions_delta)}` : '—'; return `<div class="component-row"><strong>${esc(component.component || 'other')}</strong><span>${pct(component.region_rate)} <small>${int(component.covered_regions)}/${int(component.total_regions)} regions</small></span><span class="delta ${Number(componentDelta.covered_regions_delta) > 0 ? 'good' : Number(componentDelta.covered_regions_delta) < 0 ? 'bad' : 'neutral'}">${deltaText}</span></div>`; }).join('') || '<div class="empty">No component summaries.</div>'; const categories = [['newly covered','newly_covered','good'],['regressed','regressed','bad'],['hit-only','hit_count_only','neutral'],['added','added','good'],['removed','removed','bad']].map(([label,key,tone]) => `<div class="category"><span>${label}</span><strong class="${tone}">${int(gain[key] || 0)}</strong></div>`).join(''); const reasons = (current.blocking_reasons || []).map(reason => `<span class="composite-reason">${esc(reason)}</span>`).join(''); const remediation = Object.entries(current.remediation || {}).map(([key,value]) => `<span class="pill">${esc(key)}: ${int(value)}</span>`).join(''); $('compositeMeta').textContent = `${int(current.covered_regions)}/${int(current.total_regions)} canonical regions · mapping ${esc(current.mapping_version || 'unknown')} · ${current.checkout_dirty ? 'dirty checkout' : `revision ${commit(current.checkout_revision)}`}`; $('compositeBody').innerHTML = `<div class="composite-grid"><div><div class="composite-summary">${fact('Coverage',pct(current.region_rate))}${fact('Covered',`${int(current.covered_regions)}/${int(current.total_regions)}`)}${fact('Delta',signedPct(delta.region_rate_delta))}${fact('Snapshot',current.id,true)}${fact('Inventory',current.inventory_hash ? String(current.inventory_hash).slice(0,10) : '—',true)}${fact('Source',inc.detail_source || 'stored')}</div>${reasons ? `<div class="composite-reasons">${reasons}</div>` : ''}${remediation ? `<div class="detail-source">${remediation}</div>` : ''}</div><div><h3 style="margin:0 0 6px;font-size:11px">Component coverage</h3><div class="component-list">${componentRows}</div></div></div><div class="category-grid" style="margin-top:10px">${categories}</div><div class="detail-source"><span class="pill ${inc.status === 'measured' ? 'good' : 'warn'}">${inc.status === 'measured' ? 'exact stored diff' : esc(inc.reason || 'no composite baseline')}</span><span class="pill">base: ${esc(inc.baseline?.id || 'none')}</span><span class="pill">current: ${esc(inc.current?.id || current.id)}</span><span class="pill">${inc.test_attribution?.status === 'unavailable' ? 'test IDs unavailable' : `${int(inc.test_attribution?.affected_test_count)} affected tests`}</span></div>`;
-    }
-function rateCell(rate,covered,total) { return `<div class="rate-cell"><div class="rate-line"><span>${pct(rate)}</span><span class="muted">${int(covered)}/${int(total)}</span></div><div class="bar"><i style="width:${safeRate(rate)*100}%"></i></div></div>`; }
+<section aria-label="Comparison"><h2>What do the new tests add?</h2><div class="fields"><label>Baseline report or measurement<input id="baseline" placeholder="target/baseline.json" list="history"></label><label>Comparison mode<select id="scope"><option value="incremental">Incremental · baseline + new tests</option><option value="selected_tests">Compare selected tests</option><option value="full">Compare full suites</option></select></label><button id="compare">Measure contribution</button></div><p class="note" id="comparisonHelp">Keep the baseline report, run only the new tests with the existing runner, then select their report above. Export each batch to a separate file.</p><details id="previousSection"><summary>Earlier accepted batches</summary><label>One report path or saved measurement per line (up to 16)<textarea id="previous" placeholder="target/batch-1.json"></textarea></label><p class="note">These are combined with the baseline before measuring the new batch. Repeated hits count once.</p></details></section>
+<section id="results" class="hidden" aria-live="polite"><div id="incrementalSummary" class="hidden"><h3 id="incrementalTitle">Combined coverage</h3><div class="summary increment-summary"><div><strong id="acceptedCoverage"></strong><span>Baseline + earlier batches</span></div><div><strong id="batchGain"></strong><span>Added by this batch</span></div><div><strong id="combinedCoverage"></strong><span>Combined · fixed denominator</span></div><div><strong id="gainPoints"></strong><span>Percentage-point gain</span></div></div><p id="incrementalNote" class="note increment-note"></p><button id="keepBatch">Keep this batch for the next comparison</button></div><div class="summary" id="measurementState"><div id="measurementCoverage"><strong id="coverage"></strong><span id="metricLabel"></span></div><div><strong id="status"></strong><span>Evidence status</span></div><div><strong id="source"></strong><span>Source identity</span></div></div><p class="note" id="guidance"></p><div id="groups"></div><button id="more" class="hidden">More gap groups</button></section>
+<div id="message" role="status"></div>
+</main><script>
+'use strict';
+const el=id=>document.getElementById(id);let nextOffset=null;let lastFind=null;let lastIncremental=null;
+function showError(error){el('results').classList.add('hidden');lastIncremental=null;el('message').className='error';el('message').textContent=error.message||String(error)}
+async function api(path,body){const selectedProject=el('project').value;const headers={};if(el('project').value)headers['x-coverage-mcp-repo']=el('project').value;if(body)headers['Content-Type']='application/json';const response=await fetch(path,{method:body?'POST':'GET',headers,body:body?JSON.stringify(body):undefined});const value=await response.json();if(selectedProject!==el('project').value)throw Error('Project selection changed. Run the query for the selected project.');if(!response.ok)throw Error(value.detail||value.error||'Coverage request failed');return value.data}
+function node(tag,text,cls){const n=document.createElement(tag);n.textContent=text;if(cls)n.className=cls;return n}
+function table(title,rows,total){const container=el('groups');container.append(node('h3',`${title} · ${rows.length} of ${total} groups`));if(!rows.length){container.append(node('p','No groups in this view. Check the evidence status and selected metric.','empty'));return}const table=node('table','');const head=node('tr','');['Location and function','Missing / changed observations','Exact locations'].forEach(s=>head.append(node('th',s)));table.append(head);rows.forEach(row=>{const tr=node('tr','');const location=node('td','');location.append(node('code',row.path));if(row.function)location.append(node('code',row.function,'function'));if(row.unmeasured_reason)location.append(node('p',`Evidence missing: ${row.unmeasured_reason}`,'note'));tr.append(location,node('td',String(row.count)));const ranges=node('td','');row.locations.forEach(loc=>ranges.append(node('div',`${loc.span[0]}:${loc.span[1]}–${loc.span[2]}:${loc.span[3]} ${loc.arm||''}`)));if(row.locations_omitted)ranges.append(node('p',`${row.locations_omitted} more locations; narrow the search`,'note'));tr.append(ranges);table.append(tr)});container.append(table)}
+function present(data){
+  el('message').textContent='';el('results').classList.remove('hidden');
+  const coverage=data.measurement.coverage;
+  el('measurementCoverage').classList.toggle('hidden',data.scope==='incremental');
+  el('coverage').textContent=`${coverage.covered.toLocaleString()} / ${coverage.total.toLocaleString()}`;
+  el('metricLabel').textContent=`${coverage.metric} covered · ${data.scope==='incremental'?'new batch report only':'report totals'}`;
+  el('status').textContent=data.status.replaceAll('_',' ');el('source').textContent=data.measurement.source.replaceAll('_',' ');
+  el('guidance').textContent=`Tests: ${data.measurement.tests}. ${data.reason||data.next_action||''}`;
+  if(data.warnings?.length)el('guidance').textContent+=' '+data.warnings.join(' ');
+  if(data.warnings_omitted)el('guidance').textContent+=` ${data.warnings_omitted} more warnings in the artifact.`;
+  const inc=data.incremental;el('incrementalSummary').classList.toggle('hidden',!inc);
+  if(inc){
+    const ratio=c=>`${c.covered.toLocaleString()} / ${c.total.toLocaleString()}`;
+    const verified=inc.evidence==='verified';
+    el('incrementalTitle').textContent=verified?'Combined coverage':'Unverified combined estimate';
+    el('acceptedCoverage').textContent=ratio(inc.accepted);el('batchGain').textContent=`+${inc.newly_covered.toLocaleString()}`;
+    el('combinedCoverage').textContent=ratio(inc.combined);el('gainPoints').textContent=`+${inc.gain_percentage_points.toFixed(2)} pp`;
+    el('incrementalNote').textContent=`Batch coverage: ${inc.batch_covered} ${inc.metric}; already covered: ${inc.already_covered}. Remaining baseline gaps: ${inc.combined.missing} (${inc.remaining_gap_reduction_percent.toFixed(1)}% of previous gaps closed). Baseline scope: ${inc.baseline_scope.replaceAll('_',' ')}; ${inc.previous_batches} earlier batches. Totals include the whole baseline; the search filters only locations. Full-suite regression: not checked.`;
+    el('incrementalNote').classList.toggle('estimate',!verified);el('keepBatch').disabled=!verified||data.status!=='improved'||inc.previous_batches>=16;
+  }else if(data.changes){
+    el('guidance').textContent+=` Newly observed: ${data.changes.newly_observed}. Not observed: ${data.changes.not_observed}. Added: ${data.changes.added}. Removed: ${data.changes.removed}.`;
+  }
+  el('groups').replaceChildren();if(data.groups)table('Gaps',data.groups,data.group_count);
+  if(data.gained&&(data.scope!=='incremental'||inc))table(inc?'Added by this batch':'Gained',data.gained,data.gained_group_count);
+  if(data.remaining&&(data.scope!=='incremental'||inc))table(inc?'Remaining after combining':'Remaining',data.remaining,data.remaining_group_count);
+  nextOffset=data.next_offset??null;el('more').classList.toggle('hidden',nextOffset===null);
+}
+function priorReports(){return el('previous').value.split('\n').map(s=>s.trim()).filter(Boolean)}
+function comparisonMode(){
+  const incremental=el('scope').value==='incremental';
+  el('previousSection').classList.toggle('hidden',!incremental);el('compare').textContent=incremental?'Measure contribution':'Compare';
+  el('measurementLabel').textContent=incremental?'New batch report or saved measurement':'Report path or saved measurement';
+  el('comparisonHelp').textContent=incremental?'Keep the baseline report, run only the new tests with the existing runner, then select their report above. Export each batch to a separate file.':'Run the existing repository test command first. Full-suite regression claims require matching full-scope source/build receipts.';
+}
 
-    function renderFunctionGraph() {
-      const svg = $('sourceGraph');
-      const files = state.graphFiles.length ? state.graphFiles : (state.dashboard?.files?.items || []);
-      const root = buildFunctionGraph(files, state.functions);
-      const leaves = graphFlatten(root).filter(node => !node.children.length);
-      const rowHeight = leaves.length > 180 ? 23 : leaves.length > 80 ? 27 : 34;
-      graphPlace(root, 0, {value:0}, rowHeight);
-      const nodes = graphFlatten(root);
-      const maxDepth = Math.max(...nodes.map(node => node.depth), 0);
-      const width = Math.max(1000, 290 + maxDepth * 210);
-      const height = Math.max(540, leaves.length * rowHeight + 80);
-      state.graphNodes = new Map(nodes.map(node => [node.id, node]));
-      if (!state.graphSelected || !state.graphNodes.has(state.graphSelected)) state.graphSelected = root.id;
-      $('graphStatus').textContent = files.length + ' files · ' + (state.functions.length ? state.functions.length + ' source functions' : 'no per-function LLVM records');
-      $('graphZoomLabel').textContent = 'Function map';
-      svg.style.width = width + 'px';
-      svg.style.height = height + 'px';
-      svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
-      svg.innerHTML = '';
-      svg.appendChild(svgElement('rect', {x:0, y:0, width, height, fill:'#f8fafc'}));
-      nodes.forEach(parent => parent.children.forEach(child => {
-        const startX = parent.x + 8;
-        const endX = child.x - 8;
-        const midpoint = startX + (endX - startX) / 2;
-        svg.appendChild(svgElement('path', {class:'graph-edge', d:'M ' + startX + ' ' + parent.y + ' C ' + midpoint + ' ' + parent.y + ', ' + midpoint + ' ' + child.y + ', ' + endX + ' ' + child.y}));
-      }));
-      nodes.forEach(node => appendGraphNode(svg, node));
-      renderGraphInspector(state.graphNodes.get(state.graphSelected));
-    }
-    function renderDependencyGraph() {
-      const svg = $('sourceGraph');
-      const files = state.graphFiles.length ? state.graphFiles : (state.dashboard?.files?.items || []);
-      const nodes = files.map((file, index) => {
-        const node = graphNode('file', String(file.file_path).split('/').pop() || file.file_path, file.file_path, file);
-        node.filePath = file.file_path;
-        node.files = [file];
-        node.metrics = graphFileMetrics(file);
-        const angle = files.length <= 1 ? 0 : (Math.PI * 2 * index / files.length) - Math.PI / 2;
-        const radius = files.length <= 1 ? 0 : Math.min(245, 75 + Math.sqrt(files.length) * 35);
-        node.x = 500 + Math.cos(angle) * radius;
-        node.y = 285 + Math.sin(angle) * radius;
-        return node;
-      });
-      state.graphNodes = new Map(nodes.map(node => [node.id, node]));
-      if (!state.graphSelected || !state.graphNodes.has(state.graphSelected)) state.graphSelected = nodes[0]?.id || null;
-      const nodeByPath = new Map(nodes.map(node => [node.filePath, node]));
-      const dependencies = state.dependencies.filter(edge => nodeByPath.has(edge.from) && nodeByPath.has(edge.to) && edge.from !== edge.to);
-      $('graphStatus').textContent = files.length + ' file circles · ' + dependencies.length + ' dependency edges';
-      $('graphZoomLabel').textContent = 'File dependencies';
-      const width = 1000;
-      const height = 570;
-      svg.style.width = '100%';
-      svg.style.height = height + 'px';
-      svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
-      svg.innerHTML = '';
-      svg.appendChild(svgElement('rect', {x:0, y:0, width, height, fill:'#f8fafc'}));
-      const defs = svgElement('defs');
-      const marker = svgElement('marker', {id:'graph-arrow', markerWidth:7, markerHeight:7, refX:6, refY:3.5, orient:'auto'});
-      marker.appendChild(svgElement('path', {d:'M 0 0 L 7 3.5 L 0 7 z', fill:'#94a3b8'}));
-      defs.appendChild(marker);
-      svg.appendChild(defs);
-      dependencies.forEach(edge => {
-        const from = nodeByPath.get(edge.from);
-        const to = nodeByPath.get(edge.to);
-        svg.appendChild(svgElement('path', {class:'graph-edge dependency', d:'M ' + from.x + ' ' + from.y + ' L ' + to.x + ' ' + to.y}));
-      });
-      nodes.forEach(node => appendGraphNode(svg, node));
-      renderGraphInspector(state.graphNodes.get(state.graphSelected));
-    }
-    function updateGraphZoomControls() {
-      $('graphZoom').value = state.graphZoom;
-      $('graphZoomLabel').textContent = state.graphZoom < 50 ? 'File dependencies' : 'Function map';
-    }
-    function setGraphZoom(value) {
-      state.graphZoom = Math.max(0, Math.min(100, Number(value) || 0));
-      updateGraphZoomControls();
-      renderSourceGraph();
-    }
-    function renderSourceGraph() {
-      updateGraphZoomControls();
-      const svg = $('sourceGraph');
-      const files = state.graphFiles.length ? state.graphFiles : (state.dashboard?.files?.items || []);
-      if (!state.currentId || !files.length) {
-        $('graphStatus').textContent = '';
-        svg.innerHTML = '<text x="500" y="270" text-anchor="middle" fill="#687385" font-size="12">Select a snapshot to build the source graph.</text>';
-        state.graphNodes = new Map();
-        renderGraphInspector(null);
-        return;
-      }
-      if (state.graphZoom < 50) renderDependencyGraph();
-      else renderFunctionGraph();
-    }
-    function selectGraphNode(nodeId) {
-      const node = state.graphNodes.get(nodeId);
-      if (!node) return;
-      state.graphSelected = nodeId;
-      renderSourceGraph();
-      if (node.kind === 'file' || node.kind === 'function') openFile(node.filePath);
-    }
-
-
-    function graphReasons(node) {
-      const metrics = node.metrics || {};
-      const reasons = [];
-      if (node.kind === 'function' && !metrics.executed) reasons.push({tone:'danger', text:'LLVM recorded zero executions for this function.'});
-      if (metrics.missingLines) reasons.push({tone:'danger', text:metrics.missingLines + ' executable line' + (metrics.missingLines === 1 ? '' : 's') + ' have no recorded hits.'});
-      if (metrics.missingRegions) reasons.push({tone:'warn', text:metrics.missingRegions + ' LLVM region' + (metrics.missingRegions === 1 ? '' : 's') + ' are not covered.'});
-      if (metrics.missingBranches) reasons.push({tone:'warn', text:metrics.missingBranches + ' branch outcome' + (metrics.missingBranches === 1 ? '' : 's') + ' are not covered.'});
-      if (!reasons.length) reasons.push({tone:'good', text:'No line, region, or branch gaps are reported for this selection.'});
-      return reasons.slice(0, 5);
-    }
-    function renderGraphInspector(node) {
-      const inspector = $('graphInspector');
-      if (!node) { inspector.innerHTML = '<span class="muted">Select a source node.</span>'; return; }
-      const metrics = node.metrics || {};
-      const path = node.kind === 'function' ? node.filePath : (node.path || 'all selected source files');
-      const title = node.kind === 'root' ? 'Project source' : node.name;
-      const kind = node.kind === 'function' ? 'Source function' : node.kind === 'file' ? 'File' : node.kind === 'root' ? 'Project' : 'Directory';
-      const html = ['<h3>Graph selection</h3>','<div class="graph-selection-title"><strong>',esc(title),'</strong><code title="',esc(path),'">',esc(path),'</code><span class="muted">',kind,' · ',node.files.length,' file',node.files.length === 1 ? '' : 's','</span></div>','<div class="graph-stat-grid">','<div class="graph-stat"><span>Completeness</span><strong>',esc(pct(graphCoverageRate(metrics))),'</strong></div>','<div class="graph-stat"><span>Missed lines</span><strong>',int(metrics.missingLines),'</strong></div>','<div class="graph-stat"><span>Region gaps</span><strong>',int(metrics.missingRegions),'</strong></div>','<div class="graph-stat"><span>Branch gaps</span><strong>',int(metrics.missingBranches),'</strong></div>','<div class="graph-stat"><span>',node.kind === 'function' ? 'Executed' : 'Functions','</span><strong>',node.kind === 'function' ? (metrics.executed ? 'yes' : 'no') : int(metrics.coveredFunctions) + '/' + int(metrics.totalFunctions),'</strong></div>','</div><ul class="graph-reasons">',graphReasons(node).map(reason => '<li class="graph-reason ' + reason.tone + '">' + esc(reason.text) + '</li>').join(''),'</ul>'];
-      inspector.innerHTML = html.join('');
-      if (node.kind === 'function' || node.kind === 'file') {
-        const button = document.createElement('button');
-        button.className = 'primary';
-        button.type = 'button';
-        button.textContent = 'Open source detail';
-        button.addEventListener('click', () => openFile(node.filePath));
-        inspector.appendChild(button);
-      }
-    }
-    function graphNodeClass(node) {
-      return 'graph-node ' + node.kind + ' ' + graphTone(graphCoverageRate(node.metrics)) + (state.graphSelected === node.id ? ' selected' : '');
-    }
-    function appendGraphNode(svg, node) {
-      const group = svgElement('g', {class:graphNodeClass(node), tabindex:0, role:'button', 'aria-label':node.kind + ' ' + (node.filePath || node.path || 'project') + ', ' + pct(graphCoverageRate(node.metrics)) + ' completeness'});
-      const title = svgElement('title');
-      title.textContent = node.kind === 'function' ? node.name + ' · ' + pct(graphCoverageRate(node.metrics)) + ' completeness · ' + node.filePath + ':' + (node.function?.start_line || '') : (node.path || 'project') + ' · ' + pct(graphCoverageRate(node.metrics)) + ' completeness · ' + graphNumber(node.metrics.missingLines) + ' missed lines';
-      group.appendChild(title);
-      const missing = graphNumber(node.metrics.missingLines) + graphNumber(node.metrics.missingRegions) + graphNumber(node.metrics.missingBranches);
-      const size = node.kind === 'function' ? Math.min(10, 4 + Math.sqrt(missing) * .55) : node.kind === 'file' ? Math.min(16, 5 + Math.sqrt(graphNumber(node.metrics.missingLines)) * .75) : Math.min(12, node.kind === 'root' ? 9 : 5 + Math.sqrt(graphNumber(node.metrics.missingLines)) * .35);
-      const shape = node.kind === 'directory' || node.kind === 'root' ? svgElement('rect', {class:'graph-node-shape', x:node.x-size, y:node.y-size, width:size*2, height:size*2, rx:3}) : svgElement('circle', {class:'graph-node-shape', cx:node.x, cy:node.y, r:size});
-      group.appendChild(shape);
-      const labelX = node.x + size + 8;
-      const label = svgElement('text', {class:'graph-label ' + node.kind, x:labelX, y:node.y+4});
-      label.textContent = graphNodeLabel(node);
-      group.appendChild(label);
-      const rate = svgElement('text', {class:'graph-label-rate', x:labelX, y:node.y+18});
-      rate.textContent = node.kind === 'function' ? 'L ' + graphNumber(node.metrics.coveredLines) + '/' + graphNumber(node.metrics.totalLines) + ' · R ' + graphNumber(node.metrics.coveredRegions) + '/' + graphNumber(node.metrics.totalRegions) + ' · B ' + graphNumber(node.metrics.coveredBranches) + '/' + graphNumber(node.metrics.totalBranches) : pct(graphCoverageRate(node.metrics)) + ' · ' + graphNumber(node.metrics.missingLines) + ' missed · ' + graphNumber(node.metrics.totalFunctions) + ' fn';
-      group.appendChild(rate);
-      group.addEventListener('click', () => selectGraphNode(node.id));
-      group.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectGraphNode(node.id); } });
-      svg.appendChild(group);
-    }
-
-
-    function graphMaybeRate(value) {
-      const number = Number(value);
-      return Number.isFinite(number) ? Math.max(0, Math.min(1, number)) : null;
-    }
-    function graphRate(total, covered) {
-      return total > 0 ? Math.max(0, Math.min(1, covered / total)) : null;
-    }
-    function graphMetricValue(file, key) {
-      return file[key];
-    }
-    function graphFileMetrics(file) {
-      const totalLines = graphNumber(graphMetricValue(file, 'total_lines'));
-      const coveredLines = Math.min(totalLines, graphNumber(graphMetricValue(file, 'covered_lines')));
-      const totalRegions = graphNumber(graphMetricValue(file, 'total_regions'));
-      const coveredRegions = Math.min(totalRegions, graphNumber(graphMetricValue(file, 'covered_regions')));
-      const totalBranches = graphNumber(graphMetricValue(file, 'total_branches'));
-      const coveredBranches = Math.min(totalBranches, graphNumber(graphMetricValue(file, 'covered_branches')));
-      const totalFunctions = graphNumber(graphMetricValue(file, 'total_functions'));
-      const coveredFunctions = Math.min(totalFunctions, graphNumber(graphMetricValue(file, 'covered_functions')));
-      const lineRate = graphMaybeRate(graphMetricValue(file, 'line_rate')) ?? graphRate(totalLines, coveredLines);
-      const regionRate = graphMaybeRate(graphMetricValue(file, 'region_rate')) ?? graphRate(totalRegions, coveredRegions);
-      const branchRate = graphMaybeRate(graphMetricValue(file, 'branch_rate')) ?? graphRate(totalBranches, coveredBranches);
-      const functionRate = graphMaybeRate(graphMetricValue(file, 'function_rate')) ?? graphRate(totalFunctions, coveredFunctions);
-      const rates = [lineRate, regionRate, branchRate, functionRate].filter(rate => rate !== null);
-      return {totalLines, coveredLines, totalRegions, coveredRegions, totalBranches, coveredBranches, totalFunctions, coveredFunctions, lineRate, regionRate, branchRate, functionRate, completenessRate: rates.length ? Math.min(...rates) : null, missingLines: Math.max(0, totalLines - coveredLines), missingRegions: Math.max(0, totalRegions - coveredRegions), missingBranches: Math.max(0, totalBranches - coveredBranches)};
-    }
-    function graphFunctionMetrics(coverage) {
-      const totalLines = graphNumber(coverage.total_lines);
-      const coveredLines = Math.min(totalLines, graphNumber(coverage.covered_lines));
-      const totalRegions = graphNumber(coverage.total_regions);
-      const coveredRegions = Math.min(totalRegions, graphNumber(coverage.covered_regions));
-      const totalBranches = graphNumber(coverage.total_branches);
-      const coveredBranches = Math.min(totalBranches, graphNumber(coverage.covered_branches));
-      const executed = Boolean(coverage.covered || graphNumber(coverage.execution_count) > 0);
-      const lineRate = graphMaybeRate(coverage.line_rate) ?? graphRate(totalLines, coveredLines);
-      const regionRate = graphMaybeRate(coverage.region_rate) ?? graphRate(totalRegions, coveredRegions);
-      const branchRate = graphMaybeRate(coverage.branch_rate) ?? graphRate(totalBranches, coveredBranches);
-      const functionRate = graphMaybeRate(coverage.function_rate) ?? (executed ? 1 : 0);
-      const rates = [lineRate, regionRate, branchRate].filter(rate => rate !== null);
-      return {totalLines, coveredLines, totalRegions, coveredRegions, totalBranches, coveredBranches, totalFunctions:1, coveredFunctions:executed ? 1 : 0, lineRate, regionRate, branchRate, functionRate, completenessRate: graphMaybeRate(coverage.completeness_rate) ?? (rates.length ? Math.min(...rates) : functionRate), missingLines: Math.max(0, totalLines - coveredLines), missingRegions: Math.max(0, totalRegions - coveredRegions), missingBranches: Math.max(0, totalBranches - coveredBranches), executed};
-    }
-    function graphCoverageRate(metrics) {
-      return metrics.completenessRate ?? [metrics.lineRate, metrics.regionRate, metrics.branchRate, metrics.functionRate].filter(rate => rate !== null && rate !== undefined).reduce((lowest, rate) => Math.min(lowest, rate), 1);
-    }
-    function graphTone(rate) {
-      if (rate === null || rate === undefined) return 'neutral';
-      return rate < 0.6 ? 'critical' : rate < 0.85 ? 'attention' : 'good';
-    }
-    function graphNode(kind, name, path, file = null) {
-      return {id: kind + ':' + (path || '/'), kind, name, path, file, filePath:path, function:null, children:[], childMap:new Map(), files:[], metrics:null, x:0, y:0, depth:0};
-    }
-    function buildFunctionGraph(files, functions) {
-      const root = graphNode('root', 'project', '');
-      const fileNodes = new Map();
-      for (const file of files) {
-        const parts = String(file.file_path || '').split('/').filter(Boolean);
-        if (!parts.length) continue;
-        let parent = root;
-        parts.forEach((part, index) => {
-          const path = parts.slice(0, index + 1).join('/');
-          let node = parent.childMap.get(path);
-          if (!node) {
-            const kind = index === parts.length - 1 ? 'file' : 'directory';
-            node = graphNode(kind, part, path, kind === 'file' ? file : null);
-            parent.childMap.set(path, node);
-            parent.children.push(node);
-          }
-          parent = node;
-          if (index === parts.length - 1) {
-            node.file = file;
-            node.filePath = file.file_path;
-            node.files = [file];
-            node.metrics = graphFileMetrics(file);
-            fileNodes.set(file.file_path, node);
-          }
-        });
-      }
-      for (const coverage of functions) {
-        const fileNode = fileNodes.get(coverage.file_path);
-        if (!fileNode) continue;
-        const name = coverage.function_name || coverage.llvm_name || 'anonymous function';
-        const key = coverage.function_key || coverage.llvm_name || String(coverage.start_line || name);
-        const node = graphNode('function', name, coverage.file_path + '#' + key, fileNode.file);
-        node.filePath = coverage.file_path;
-        node.function = coverage;
-        node.files = [fileNode.file];
-        node.metrics = graphFunctionMetrics(coverage);
-        fileNode.children.push(node);
-      }
-      function aggregate(node) {
-        if (node.kind === 'function') return node.metrics;
-        if (node.kind === 'file') {
-          if (node.children.length && node.metrics.totalFunctions === 0) {
-            node.metrics.totalFunctions = node.children.length;
-            node.metrics.coveredFunctions = node.children.filter(child => child.metrics.coveredFunctions > 0).length;
-            node.metrics.functionRate = graphRate(node.metrics.totalFunctions, node.metrics.coveredFunctions);
-            node.metrics.completenessRate = [node.metrics.lineRate, node.metrics.regionRate, node.metrics.branchRate, node.metrics.functionRate].filter(rate => rate !== null).reduce((lowest, rate) => Math.min(lowest, rate), 1);
-          }
-          return node.metrics;
-        }
-        const children = node.children.map(aggregate);
-        const total = key => children.reduce((sum, metrics) => sum + graphNumber(metrics[key]), 0);
-        const metrics = {totalLines:total('totalLines'), coveredLines:total('coveredLines'), totalRegions:total('totalRegions'), coveredRegions:total('coveredRegions'), totalBranches:total('totalBranches'), coveredBranches:total('coveredBranches'), totalFunctions:total('totalFunctions'), coveredFunctions:total('coveredFunctions')};
-        metrics.lineRate = graphRate(metrics.totalLines, metrics.coveredLines);
-        metrics.regionRate = graphRate(metrics.totalRegions, metrics.coveredRegions);
-        metrics.branchRate = graphRate(metrics.totalBranches, metrics.coveredBranches);
-        metrics.functionRate = graphRate(metrics.totalFunctions, metrics.coveredFunctions);
-        metrics.completenessRate = [metrics.lineRate, metrics.regionRate, metrics.branchRate, metrics.functionRate].filter(rate => rate !== null).reduce((lowest, rate) => Math.min(lowest, rate), 1);
-        metrics.missingLines = metrics.totalLines - metrics.coveredLines;
-        metrics.missingRegions = metrics.totalRegions - metrics.coveredRegions;
-        metrics.missingBranches = metrics.totalBranches - metrics.coveredBranches;
-        node.metrics = metrics;
-        node.files = children.flatMap(child => child.files);
-        return metrics;
-      }
-      aggregate(root);
-      return root;
-    }
-    function graphFlatten(node) {
-      return [node, ...node.children.flatMap(graphFlatten)];
-    }
-    function graphPlace(node, depth, cursor, rowHeight) {
-      node.depth = depth;
-      node.x = 100 + depth * 210;
-      if (!node.children.length) {
-        node.y = 44 + cursor.value * rowHeight;
-        cursor.value += 1;
-        return;
-      }
-      node.children.forEach(child => graphPlace(child, depth + 1, cursor, rowHeight));
-      node.y = node.children.reduce((sum, child) => sum + child.y, 0) / node.children.length;
-    }
-    function graphNodeLabel(node) {
-      if (node.kind === 'function') return String(node.name || 'anonymous').split('::').slice(-2).join('::');
-      if (node.kind === 'root') return 'project';
-      return node.name;
-    }
-    function svgElement(tag, attributes = {}) {
-      const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
-      Object.entries(attributes).forEach(([key, value]) => element.setAttribute(key, String(value)));
-      return element;
-    }
-
-
-    function graphNumber(value) {
-      const number = Number(value);
-      return Number.isFinite(number) ? number : 0;
-    }
-
-    function renderFiles(data) { const items=data.files?.items||[]; const measured=data.incremental?.status==='measured'; $('filesMeta').textContent=data.files?`${int(data.files.total)} files · ${data.files.source==='current_vs_baseline'?'sorted by delta':data.files.source==='current_union'?'sorted by union coverage':'lowest current coverage first'}${data.files.truncated?' · showing a bounded slice':''}`:''; if(!items.length){$('fileRows').innerHTML='<tr><td colspan="7" class="empty">No coverage files in the selected snapshot.</td></tr>';return;} $('fileRows').innerHTML=items.map(file=>{const delta=measured?file.line_rate_delta:null; return `<tr data-file="${esc(file.file_path)}"><td class="path"><code title="${esc(file.file_path)}">${esc(file.file_path)}</code></td><td>${rateCell(file.line_rate,file.covered_lines,file.total_lines)}</td><td class="num">${pct(file.branch_rate)}</td><td class="num">${pct(file.function_rate)}</td><td class="num">${pct(file.region_rate)}</td><td class="${Number(delta)<0?'bad':Number(delta)>0?'good':'neutral'}">${signedPct(delta)}</td><td>${esc(data.current?.detail_retention||'compactable')}</td></tr>`;}).join(''); }
-    function renderCompaction(data) { const policy=data.compaction?.policy||{},inventory=data.compaction?.inventory||{},ratio=Number.isFinite(Number(inventory.compression_ratio))?`${(Number(inventory.compression_ratio)*100).toFixed(0)}%`:'—'; $('compactionInventory').innerHTML=[fact('Snapshots',int(inventory.snapshot_count)),fact('Payloads',int(inventory.compacted_snapshot_count)),fact('Relational',int(inventory.relational_snapshot_count)),fact('Protected bases',int(inventory.retained_incremental_base_count)),fact('Eligible now',int(inventory.eligible_snapshot_count)),fact('Original bytes',`${int(inventory.original_bytes)} B`),fact('Compressed bytes',`${int(inventory.compressed_bytes)} B`),fact('Saved',`${int(inventory.bytes_saved)} B`),fact('Compression',ratio),fact('Orphans',int(inventory.orphan_payload_count)),fact('Last payload',inventory.last_compacted_at?new Date(inventory.last_compacted_at).toLocaleString():'never')].join(''); $('compactionEnabled').checked=Boolean(policy.compaction_enabled); $('compactionAfterDays').value=policy.compaction_after_days??''; $('compactionIntervalSeconds').value=policy.compaction_interval_seconds??''; $('compactionBatchSize').value=policy.compaction_batch_size??''; const consistent=inventory.payload_inventory_consistent!==false; $('compactionHealth').textContent=!consistent?'inventory error':inventory.compacted_snapshot_count?'payloads verified':'no payloads yet'; $('compactionHealth').className=`status ${consistent&&inventory.compacted_snapshot_count?'completed':consistent?'':'failed'}`; }
-    function renderTimeline(data) { const points=[...(data.history?.points||[])]; $('historyStatus').textContent=data.history?.truncated?`showing ${data.history.returned} of more snapshots`:`${data.history?.returned||0} snapshots`; $('timelineMeta').textContent=points.length?`${points.length} measurements · newest selected in the controls above`:'No measurements yet.'; $('timelineRows').innerHTML=points.slice().reverse().map(point=>`<tr class="${point.id===data.current?.id?'selected':''}"><td><strong>${esc(new Date(point.created_at).toLocaleString())}</strong><br><span class="suite">${esc(point.suite)} · ${esc(point.format)}</span></td><td class="num">${pct(point.line_rate)}<br><span class="muted">${int(point.covered_lines)}/${int(point.total_lines)}</span></td><td class="num">${pct(point.branch_rate)}<br><span class="muted">${int(point.covered_branches)}/${int(point.total_branches)}</span></td><td class="num">${pct(point.function_rate)}<br><span class="muted">${int(point.covered_functions)}/${int(point.total_functions)}</span></td><td class="num">${pct(point.region_rate)}<br><span class="muted">${int(point.covered_regions)}/${int(point.total_regions)}</span></td></tr>`).join('')||'<tr><td colspan="5" class="empty">No snapshots.</td></tr>'; }
-    function render(data) { const project=data.project||{}; $('projectMeta').textContent=`${short(project.repo_path)} · ${int(project.snapshot_count)} snapshots · ${int(project.composite_snapshot_count)} composite · ${int(project.run_count)} runs`; renderControls(data); renderMetrics(data); renderChart(data.history?.points||[]); renderRuns(data); renderMeasurement(data); renderIncremental(data); renderComposite(data); renderFiles(data); renderCompaction(data); renderTimeline(data); }
-    function dashboardIsAdditive(data = state.dashboard) { return data?.incremental?.status === 'measured' && data?.incremental?.comparison_mode === 'additive_union'; }
-    function dashboardCurrentIds(data = state.dashboard) { const selected = data?.selection?.current_snapshot_ids; if (Array.isArray(selected) && selected.length) return selected.filter(Boolean); if (state.currentIds.length) return state.currentIds; return state.currentId ? [state.currentId] : []; }
-    function mergeDashboardLines(details) {
-      const merged = new Map();
-      const maximum = (left, right) => Math.max(Number(left) || 0, Number(right) || 0);
-      for (const detail of details) for (const line of detail.lines || []) {
-        const number = Number(line.line_number);
-        if (!Number.isFinite(number)) continue;
-        const existing = merged.get(number);
-        if (!existing) { merged.set(number, {...line, line_number:number}); continue; }
-        merged.set(number, {...existing,
-          hits: maximum(existing.hits, line.hits),
-          covered: Boolean(existing.covered) || Boolean(line.covered),
-          count_line: Boolean(existing.count_line) || Boolean(line.count_line),
-          total_branches: maximum(existing.total_branches, line.total_branches),
-          covered_branches: maximum(existing.covered_branches, line.covered_branches),
-          total_functions: maximum(existing.total_functions, line.total_functions),
-          covered_functions: maximum(existing.covered_functions, line.covered_functions),
-        });
-      }
-      return [...merged.values()].sort((left, right) => Number(left.line_number) - Number(right.line_number));
-    }
-    async function openFile(filePath) {
-      const dashboard = state.dashboard;
-      const currentIds = dashboardCurrentIds(dashboard);
-      if (!currentIds.length || !filePath) return;
-      const additive = dashboardIsAdditive(dashboard);
-      const baselineId = dashboard?.baseline?.id || dashboard?.selection?.baseline_snapshot_id || state.baselineId;
-      const sourceIds = [...new Set((additive && baselineId ? [baselineId, ...currentIds] : [currentIds[0]]).filter(Boolean))];
-      $('fileDrawer').hidden=false; $('drawerTitle').textContent='Loading file detail…'; $('drawerPath').textContent=filePath; $('drawerSummary').innerHTML=''; $('drawerLines').innerHTML='';
-      try {
-        const details = await Promise.all(sourceIds.map(snapshotId => api(`/api/snapshots/${encodeURIComponent(snapshotId)}/files?file_path=${encodeURIComponent(filePath)}&max_words=5000`)));
-        const unionFile = additive ? (dashboard.files?.items || []).find(file => file.file_path === filePath) : null;
-        const file = unionFile || details.find(detail => detail.file)?.file || {};
-        const value = key => file[key];
-        const lineRate = value('line_rate');
-        $('drawerTitle').textContent=`${pct(lineRate)} line coverage${additive ? ' · base ∪ selected' : ''}`;
-        $('drawerSummary').innerHTML=`<div class="provenance">${fact('Lines',`${int(value('covered_lines'))}/${int(value('total_lines'))}`)}${fact('Branches',`${int(value('covered_branches'))}/${int(value('total_branches'))}`)}${fact('Functions',`${int(value('covered_functions'))}/${int(value('total_functions'))}`)}${fact('Regions',`${int(value('covered_regions'))}/${int(value('total_regions'))}`)}${additive ? fact('Evidence',`${sourceIds.length} stored report${sourceIds.length === 1 ? '' : 's'} merged`) : ''}</div>`;
-        const lines = additive ? mergeDashboardLines(details) : details[0]?.lines || [];
-        $('drawerLines').innerHTML=lines.length?`<table class="line-table"><thead><tr><th>Line</th><th>${additive ? 'Max hits' : 'Hits'}</th><th>State</th><th>Branches</th><th>Functions</th></tr></thead><tbody>${lines.slice(0,160).map(line=>`<tr><td class="line-no">${int(line.line_number)}</td><td>${int(line.hits)}</td><td class="${line.covered?'covered':'missed'}">${line.covered?'covered':'missed'}</td><td>${int(line.covered_branches)}/${int(line.total_branches)}</td><td>${int(line.covered_functions)}/${int(line.total_functions)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty">No line detail returned for this file.</div>';
-      } catch(error) { $('drawerTitle').textContent='File detail unavailable'; $('drawerLines').innerHTML=`<div class="empty">${esc(error.message)}</div>`; }
-    }
-    async function saveCompaction() { const body={compaction:{compaction_enabled:$('compactionEnabled').checked,compaction_after_days:Number($('compactionAfterDays').value),compaction_interval_seconds:Number($('compactionIntervalSeconds').value),compaction_batch_size:Number($('compactionBatchSize').value)}}; try { await api('/api/projects/project?repo_path='+encodeURIComponent(state.repoPath),{method:'PATCH',body:JSON.stringify(body)}); $('maintenanceMessage').textContent='Policy saved.'; queueRefresh(); } catch(error) { $('maintenanceMessage').textContent=error.message; } }
-    async function compactNow() { $('compactNowBtn').disabled=true; $('maintenanceMessage').textContent='Compaction pass running…'; try { const result=await api('/api/projects/project/compact?repo_path='+encodeURIComponent(state.repoPath),{method:'POST'}); $('maintenanceMessage').textContent=`${int(result.compacted_snapshots)} snapshot payload(s) written.`; queueRefresh(); } catch(error) { $('maintenanceMessage').textContent=error.message; } finally { $('compactNowBtn').disabled=false; } }
-    $('refreshBtn').addEventListener('click',()=>refresh()); $('projectSelect').addEventListener('change',()=>{state.projectKey=$('projectSelect').value||null;state.repoPath=currentProject()?.repo_path||null;state.currentId=null;state.currentIds=[];state.currentSelectionPinned=false;state.baselineId=null;state.compositeCurrentId=null;state.compositeBaselineId=null;refresh();}); $('currentSelect').addEventListener('change',event=>{state.currentIds=Array.from(event.target.selectedOptions).map(option=>option.value).filter(Boolean);state.currentSelectionPinned=state.currentIds.length>0;state.currentId=state.currentIds[0]||null;state.baselineId=$('baselineSelect').value||null;refresh();}); $('baselineSelect').addEventListener('change',()=>{state.baselineId=$('baselineSelect').value||null;refresh();}); $('compositeCurrentSelect').addEventListener('change',()=>{state.compositeCurrentId=$('compositeCurrentSelect').value||null;state.compositeBaselineId=$('compositeBaselineSelect').value||null;refresh();}); $('compositeBaselineSelect').addEventListener('change',()=>{state.compositeBaselineId=$('compositeBaselineSelect').value||null;refresh();}); $('saveCompactionBtn').addEventListener('click',saveCompaction); $('compactNowBtn').addEventListener('click',compactNow); $('closeDrawer').addEventListener('click',()=>{$('fileDrawer').hidden=true;}); $('fileDrawer').addEventListener('click',event=>{if(event.target===$('fileDrawer'))$('fileDrawer').hidden=true;}); $('fileRows').addEventListener('click',event=>{const row=event.target.closest('[data-file]');if(row)openFile(row.dataset.file);}); document.addEventListener('keydown',event=>{if(event.key==='Escape')$('fileDrawer').hidden=true;}); document.addEventListener('visibilitychange',()=>{if(isForeground()){refresh({silent:true});}else{if(state.refreshTimer)clearTimeout(state.refreshTimer);state.refreshTimer=null;state.refreshPending=false;closeStream();setLive('paused');}}); refresh();
-  </script>
-</body>
-</html>
+async function busy(button,fn){button.disabled=true;try{await fn()}catch(error){showError(error)}finally{button.disabled=false}}
+function inputs(){const args={metric:el('metric').value,limit:5};if(el('measurement').value.trim())args.measurement=el('measurement').value.trim();if(el('query').value.trim())args.query=el('query').value.trim();return args}
+el('find').onclick=()=>busy(el('find'),async()=>{lastIncremental=null;lastFind=inputs();const result=await api('/api/coverage/gaps',lastFind);lastFind.measurement=result.measurement.ref;present(result)});
+el('more').onclick=()=>busy(el('more'),async()=>present(await api('/api/coverage/gaps',{...lastFind,offset:nextOffset})));
+el('compare').onclick=()=>busy(el('compare'),async()=>{
+  lastIncremental=null;const args=inputs();args.baseline=el('baseline').value.trim();args.scope=el('scope').value;
+  if(args.scope==='incremental')args.previous=priorReports();
+  if(!args.measurement||!args.baseline)throw Error('Select a batch report and an explicit baseline.');
+  const result=await api('/api/coverage/compare',args);present(result);
+  if(result.incremental?.evidence==='verified'&&result.status==='improved')lastIncremental=args;
+});
+el('scope').onchange=comparisonMode;
+el('keepBatch').onclick=()=>{
+  if(!lastIncremental)return;
+  el('baseline').value=lastIncremental.baseline;
+  el('previous').value=[...new Set([...lastIncremental.previous,lastIncremental.measurement])].join('\n');
+  el('previousSection').open=true;el('measurement').value='';el('keepBatch').disabled=true;lastIncremental=null;
+  el('message').className='note';el('message').textContent='Batch retained. Run only the next new cases and select their separate report. The original baseline is unchanged.';
+};
+el('project').onchange=()=>busy(el('find'),async()=>{lastIncremental=null;el('previous').value='';el('history').replaceChildren();el('measurement').value='';el('baseline').value='';el('results').classList.add('hidden');if(!el('project').value)return;const values=await api('/api/snapshots');values.forEach(value=>{const option=document.createElement('option');option.value=value.id;option.label=`${value.suite} · ${value.created_at}`;el('history').append(option)});});
+async function projects(){const previous=el('project').value;el('project').value='';const values=await api('/api/projects');el('project').replaceChildren(node('option','Select a project'));el('project').firstChild.value='';values.forEach(value=>{const option=node('option',value.name||value.repo_path);option.value=value.repo_path;el('project').append(option)});el('project').value=previous}
+el('refresh').onclick=()=>busy(el('refresh'),projects);comparisonMode();projects().catch(showError);
+</script></body></html>

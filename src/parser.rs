@@ -37,7 +37,16 @@ pub const MAX_COVERAGE_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(test)]
 static FORCE_METADATA_FAILURE: AtomicBool = AtomicBool::new(false);
 
-/// Parses one supported coverage artifact into normalized rows.
+/// Parses a coverage artifact into normalized metrics and observation rows.
+///
+/// `format` accepts a supported format/alias or `auto` for detection. `repo_path`
+/// normalizes source filenames; it does not restrict which report file may be
+/// opened. Use [`crate::query::read_reports`] for repository-scoped queries.
+///
+/// # Errors
+///
+/// Returns an error for a missing/unreadable file, an artifact larger than
+/// [`MAX_COVERAGE_REPORT_BYTES`], an unknown format, or malformed coverage data.
 pub fn parse_coverage_report(
     path: &Path,
     format: &str,
@@ -56,12 +65,49 @@ pub fn parse_coverage_report(
             MAX_COVERAGE_REPORT_BYTES
         )));
     }
+    let bytes = read_report_bytes(path)?;
+    parse_coverage_bytes(path, &bytes, format, repo_path)
+}
+
+/// Parses one immutable byte buffer. `path` supplies format hints and report identity;
+/// no filesystem reads occur. The same 64 MiB cap and format validation apply.
+/// `repo_path` only supplies source-path normalization context.
+///
+/// # Errors
+///
+/// Returns an error when `bytes` exceeds [`MAX_COVERAGE_REPORT_BYTES`], format
+/// detection/selection fails, or the selected parser rejects the data.
+pub fn parse_coverage_bytes(
+    path: &Path,
+    bytes: &[u8],
+    format: &str,
+    repo_path: Option<&str>,
+) -> AppResult<CoverageReport> {
+    if bytes.len() as u64 > MAX_COVERAGE_REPORT_BYTES {
+        return Err(parse_error(
+            "coverage report exceeds the 64 MiB limit".to_owned(),
+        ));
+    }
     let selected = if format.trim().eq_ignore_ascii_case("auto") {
-        detect_format(path)?
+        detect_format(path, bytes)?
     } else {
         normalize_format(format)?
     };
-    parse_selected(&selected, path, repo_path)
+    parse_selected(&selected, path, bytes, repo_path)
+}
+
+pub(crate) fn read_report_bytes(path: &Path) -> AppResult<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_COVERAGE_REPORT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_COVERAGE_REPORT_BYTES {
+        return Err(parse_error(
+            "coverage report exceeds the 64 MiB limit".to_owned(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn report_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
@@ -75,16 +121,17 @@ fn report_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
 fn parse_selected(
     selected: &str,
     path: &Path,
+    bytes: &[u8],
     repo_path: Option<&str>,
 ) -> AppResult<CoverageReport> {
     match selected {
-        "lcov" => parse_lcov(path, repo_path),
-        "coveragepy" => parse_coveragepy_json(path, repo_path),
-        "cobertura" => parse_cobertura(path, repo_path),
-        "jacoco" => parse_jacoco(path, repo_path),
-        "istanbul" => parse_istanbul(path, repo_path),
-        "go" => parse_go(path, repo_path),
-        "llvm" => parse_llvm(path, repo_path),
+        "lcov" => parse_lcov(path, bytes, repo_path),
+        "coveragepy" => parse_coveragepy_json(path, bytes, repo_path),
+        "cobertura" => parse_cobertura(path, bytes, repo_path),
+        "jacoco" => parse_jacoco(path, bytes, repo_path),
+        "istanbul" => parse_istanbul(path, bytes, repo_path),
+        "go" => parse_go(path, bytes, repo_path),
+        "llvm" => parse_llvm(path, bytes, repo_path),
         other => Err(parse_error(format!("unsupported coverage format: {other}"))),
     }
 }
@@ -108,8 +155,7 @@ pub fn normalize_format(format: &str) -> AppResult<String> {
     }
 }
 
-fn detect_format(path: &Path) -> AppResult<String> {
-    let bytes = fs::read(path)?;
+fn detect_format(path: &Path, bytes: &[u8]) -> AppResult<String> {
     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
     let trimmed = head.trim_start();
     let extension = path
@@ -128,7 +174,7 @@ fn detect_format(path: &Path) -> AppResult<String> {
         return Ok("go".to_owned());
     }
     if extension == "xml" || trimmed.starts_with('<') {
-        let root = parse_xml(path)?;
+        let root = parse_xml(path, bytes)?;
         if root.name == "coverage" {
             return Ok("cobertura".to_owned());
         }
@@ -144,7 +190,7 @@ fn detect_format(path: &Path) -> AppResult<String> {
         )));
     }
     if extension == "json" || trimmed.starts_with('{') {
-        let data: Value = serde_json::from_slice(&bytes)?;
+        let data: Value = serde_json::from_slice(bytes)?;
         if let Value::Object(object) = &data {
             if object.contains_key("data") {
                 return Ok("llvm".to_owned());
@@ -175,12 +221,15 @@ fn detect_format(path: &Path) -> AppResult<String> {
     )))
 }
 
-fn parse_lcov(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
+fn parse_lcov(path: &Path, bytes: &[u8], repo_path: Option<&str>) -> AppResult<CoverageReport> {
     let mut builder = CoverageBuilder::new(repo_path);
     let mut current_test: Option<String> = None;
     let mut current_file: Option<String> = None;
     let mut function_lines: BTreeMap<String, i64> = BTreeMap::new();
-    for raw in fs::read_to_string(path)?.lines() {
+    for raw in std::str::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        .lines()
+    {
         let line = raw.trim();
         if line.is_empty() {
             continue;
@@ -311,8 +360,12 @@ fn add_lcov_branch(
     Ok(())
 }
 
-fn parse_coveragepy_json(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
-    let data: Value = serde_json::from_slice(&fs::read(path)?)?;
+fn parse_coveragepy_json(
+    path: &Path,
+    bytes: &[u8],
+    repo_path: Option<&str>,
+) -> AppResult<CoverageReport> {
+    let data: Value = serde_json::from_slice(bytes)?;
     let files = data
         .get("files")
         .and_then(Value::as_object)
@@ -426,8 +479,12 @@ fn numeric_line_numbers(values: &[Value]) -> AppResult<std::collections::BTreeSe
     values.iter().map(value_i64).collect()
 }
 
-fn parse_cobertura(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
-    let root = parse_xml(path)?;
+fn parse_cobertura(
+    path: &Path,
+    bytes: &[u8],
+    repo_path: Option<&str>,
+) -> AppResult<CoverageReport> {
+    let root = parse_xml(path, bytes)?;
     let mut builder = CoverageBuilder::new(repo_path);
     for class_node in find_nodes(&root, "class") {
         let file_path = class_node
@@ -467,8 +524,8 @@ fn parse_cobertura(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRe
     Ok(builder.build("cobertura", &path.to_string_lossy(), Vec::new(), json!({})))
 }
 
-fn parse_jacoco(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
-    let root = parse_xml(path)?;
+fn parse_jacoco(path: &Path, bytes: &[u8], repo_path: Option<&str>) -> AppResult<CoverageReport> {
+    let root = parse_xml(path, bytes)?;
     let mut builder = CoverageBuilder::new(repo_path);
     for package in find_nodes(&root, "package") {
         let prefix = package
@@ -510,8 +567,8 @@ fn parse_jacoco(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRepor
     Ok(builder.build("jacoco", &path.to_string_lossy(), Vec::new(), json!({})))
 }
 
-fn parse_istanbul(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
-    let data: Value = serde_json::from_slice(&fs::read(path)?)?;
+fn parse_istanbul(path: &Path, bytes: &[u8], repo_path: Option<&str>) -> AppResult<CoverageReport> {
+    let data: Value = serde_json::from_slice(bytes)?;
     let object = data
         .as_object()
         .ok_or_else(|| parse_error("Istanbul JSON must be an object".to_owned()))?;
@@ -667,8 +724,9 @@ fn parse_istanbul(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageRep
     ))
 }
 
-fn parse_go(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
-    let lines = fs::read_to_string(path)?;
+fn parse_go(path: &Path, bytes: &[u8], repo_path: Option<&str>) -> AppResult<CoverageReport> {
+    let lines = std::str::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut iter = lines.lines();
     if !iter.next().is_some_and(|line| line.starts_with("mode:")) {
         return Err(parse_error(
@@ -730,8 +788,8 @@ fn parse_go(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
     ))
 }
 
-fn parse_llvm(path: &Path, repo_path: Option<&str>) -> AppResult<CoverageReport> {
-    let data: Value = serde_json::from_slice(&fs::read(path)?)?;
+fn parse_llvm(path: &Path, bytes: &[u8], repo_path: Option<&str>) -> AppResult<CoverageReport> {
+    let data: Value = serde_json::from_slice(bytes)?;
     let mut builder = CoverageBuilder::new(repo_path);
     let units = data
         .get("data")
@@ -932,8 +990,8 @@ struct XmlNode {
     children: Vec<XmlNode>,
 }
 
-fn parse_xml(path: &Path) -> AppResult<XmlNode> {
-    let mut reader = Reader::from_file(path).map_err(|error| parse_error(error.to_string()))?;
+fn parse_xml(path: &Path, bytes: &[u8]) -> AppResult<XmlNode> {
+    let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let mut stack: Vec<XmlNode> = Vec::new();
@@ -1223,6 +1281,24 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn immutable_buffers_have_the_same_bounds_and_format_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(parse_coverage_report(directory.path(), "auto", None).is_err());
+        assert!(read_report_bytes(&directory.path().join("missing")).is_err());
+        assert!(
+            parse_coverage_bytes(
+                Path::new("r.json"),
+                &vec![0; MAX_COVERAGE_REPORT_BYTES as usize + 1],
+                "auto",
+                None
+            )
+            .is_err()
+        );
+        assert!(parse_coverage_bytes(Path::new("r.lcov"), b"\xff", "lcov", None).is_err());
+        assert!(parse_coverage_bytes(Path::new("r.out"), b"\xff", "go", None).is_err());
+    }
+
+    #[test]
     fn lcov_parser_preserves_lines_and_branch_counts() {
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
         writeln!(
@@ -1498,10 +1574,10 @@ mod tests {
         let metadata_probe = write("metadata-probe.lcov", "TN:\n");
         FORCE_METADATA_FAILURE.store(true, Ordering::SeqCst);
         assert!(parse_coverage_report(&metadata_probe, "lcov", None).is_err());
-        assert!(detect_format(directory.path()).is_err());
+        assert!(detect_format(directory.path(), b"").is_err());
         let invalid_json = write("invalid-json.json", "{");
-        assert!(detect_format(&invalid_json).is_err());
-        assert!(parse_selected("lcov", directory.path(), None).is_err());
+        assert!(detect_format(&invalid_json, &fs::read(&invalid_json).unwrap()).is_err());
+        assert!(parse_selected("lcov", directory.path(), b"\xff", None).is_err());
         for format in [
             "coveragepy",
             "cobertura",
@@ -1510,7 +1586,7 @@ mod tests {
             "go",
             "llvm",
         ] {
-            assert!(parse_selected(format, directory.path(), None).is_err());
+            assert!(parse_selected(format, directory.path(), b"\xff", None).is_err());
         }
         let oversized = directory.path().join("oversized.lcov");
         std::fs::File::create(&oversized)
@@ -2146,20 +2222,26 @@ mod tests {
         );
         let invalid_xml = write("invalid.xml", "<root attr='unterminated>");
         assert!(parse_coverage_report(&invalid_xml, "xml", None).is_err());
-        assert!(parse_xml(&invalid_xml).is_err());
-        assert!(parse_xml(directory.path()).is_err());
-        assert!(parse_xml(Path::new("\0")).is_err());
+        assert!(parse_xml(&invalid_xml, &fs::read(&invalid_xml).unwrap()).is_err());
+        assert!(parse_xml(directory.path(), b"").is_err());
+        assert!(parse_xml(Path::new("\0"), b"").is_err());
         let invalid_attribute = write("invalid-attribute.xml", "<root =\"bad\"/>");
-        assert!(parse_xml(&invalid_attribute).is_err());
+        assert!(parse_xml(&invalid_attribute, &fs::read(&invalid_attribute).unwrap()).is_err());
         let invalid_start_attribute =
             write("invalid-start-attribute.xml", "<root =\"bad\">x</root>");
-        assert!(parse_xml(&invalid_start_attribute).is_err());
+        assert!(
+            parse_xml(
+                &invalid_start_attribute,
+                &fs::read(&invalid_start_attribute).unwrap()
+            )
+            .is_err()
+        );
         let invalid_escape = write("invalid-escape.xml", "<root attr=\"&not-an-entity;\"/>");
-        assert!(parse_xml(&invalid_escape).is_err());
+        assert!(parse_xml(&invalid_escape, &fs::read(&invalid_escape).unwrap()).is_err());
         let comment_xml = write("comment.xml", "<!-- comment -->");
-        assert!(parse_xml(&comment_xml).is_err());
+        assert!(parse_xml(&comment_xml, &fs::read(&comment_xml).unwrap()).is_err());
         let unmatched_end = write("unmatched-end.xml", "</root>");
-        assert!(parse_xml(&unmatched_end).is_err());
+        assert!(parse_xml(&unmatched_end, &fs::read(&unmatched_end).unwrap()).is_err());
         let mut empty_stack = Vec::new();
         let mut empty_root = None;
         append_xml_end(&mut empty_stack, &mut empty_root);
@@ -2167,7 +2249,7 @@ mod tests {
 
         let unsupported = write("unsupported.lcov", "TN:\n");
         assert!(parse_coverage_report(&unsupported, "lcov", None).is_ok());
-        assert!(parse_selected("unsupported", &unsupported, None).is_err());
+        assert!(parse_selected("unsupported", &unsupported, b"", None).is_err());
     }
 
     #[test]

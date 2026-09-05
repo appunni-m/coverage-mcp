@@ -20,8 +20,9 @@ credit reporters who want attribution. Please allow time for a release before pu
 
 ## Trust boundary
 
-Coverage MCP is a local developer tool. Registered test commands execute local code with the user's permissions.
-Loopback binding is not permission isolation, and repositories, coverage reports, logs, and commands should be treated
+Coverage MCP is a local developer tool. Its 0.16 MCP/HTTP query surface does not execute tests.
+Legacy Rust execution-adapter APIs can still run authorized local code when explicitly used by embedders.
+Loopback binding is not permission isolation, and repositories, coverage reports, historical logs, and metadata should be treated
 as potentially hostile inputs. Remote binding is unsupported. The server validates loopback Host headers, does not
 enable CORS, and serves no third-party dashboard assets, but other processes running as the same user remain inside the
 local trust boundary.

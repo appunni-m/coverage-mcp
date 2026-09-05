@@ -318,7 +318,9 @@ jobs:
           mkdir -p release-binary
           mkdir -p "release-binary/${directory}"
           cp target/release/coverage-mcp "release-binary/${directory}/coverage-mcp"
-          cp LICENSE README.md "release-binary/${directory}/"
+          cp LICENSE README.md SECURITY.md SUPPORT.md "release-binary/${directory}/"
+          mkdir -p "release-binary/${directory}/docs"
+          cp docs/user-guide.md docs/mcp-reference.md docs/http-api.md docs/operations.md "release-binary/${directory}/docs/"
           tar -C release-binary -czf "release-binary/${directory}.tar.gz" "${directory}"
       - name: Upload binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -452,6 +454,7 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Download verified release bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -464,6 +467,20 @@ jobs:
             bundle/coverage-mcp-*.tar.gz
             bundle/coverage-mcp-*.crate
             bundle/SHA256SUMS
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          from pathlib import Path
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          text = Path("CHANGELOG.md").read_text()
+          match = re.search(r"^## " + re.escape(version) + r" - [^\n]+\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+          if match is None:
+              raise SystemExit("Missing dated changelog for release version")
+          Path("release-notes.md").write_text(match.group(1).strip() + "\n")
+          PYTHON
       - name: Publish immutable release assets
         shell: bash
         run: |
@@ -472,7 +489,7 @@ jobs:
             bundle/coverage-mcp-*.crate \
             bundle/SHA256SUMS \
             --verify-tag \
-            --generate-notes \
+            --notes-file release-notes.md \
             --title "${GITHUB_REF_NAME}"
         env:
           GH_TOKEN: ${{ github.token }}

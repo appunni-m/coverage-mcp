@@ -1,106 +1,210 @@
 {
-  "schema": "coverage-mcp/eval-cases@1",
-  "purpose": "Golden, outcome-oriented MCP tasks used by the opt-in local evaluation runner.",
+  "schema": "coverage-mcp/questions@2",
   "cases": [
     {
-      "id": "next-coverage",
-      "category": "outcome",
-      "prompt": "What should I attack next?",
-      "first_tool": "coverage_review",
-      "view": "task=insight",
-      "outcome": "A ranked list of uncovered red regions with compact evidence.",
-      "required_terms": ["ranked", "red", "regions"],
-      "follow_up_tools": ["coverage_review"]
+      "id": "next-gap",
+      "question": "Which part of parse should I inspect?",
+      "tool": "coverage_gaps",
+      "arguments": {
+        "measurement": "base.json",
+        "query": "parse"
+      },
+      "expect": {
+        "/data/status": "measured",
+        "/data/group_count": 1,
+        "/data/groups/0/locations/0/span/0": 2,
+        "/data/measurement/coverage/total": 3
+      }
     },
     {
-      "id": "previous-impact",
-      "category": "outcome",
-      "prompt": "What got impacted since the previous session?",
-      "first_tool": "coverage_review",
-      "view": "task=change",
-      "outcome": "Grouped regressions and improvements without returning every covered line.",
-      "required_terms": ["grouped", "red", "source"],
-      "follow_up_tools": ["coverage_review"]
+      "id": "targeted-line",
+      "question": "Is line 1 missing?",
+      "tool": "coverage_gaps",
+      "arguments": {
+        "measurement": "base.json",
+        "line": 1
+      },
+      "expect": {
+        "/data/group_count": 0
+      }
     },
     {
-      "id": "red-file",
-      "category": "outcome",
-      "prompt": "Show the red portions in one file.",
-      "first_tool": "coverage_review",
-      "view": "task=audit",
-      "outcome": "GitHub-like red ranges first, with exact selected lines only when requested.",
-      "required_terms": ["red", "exact", "audit"],
-      "follow_up_tools": ["coverage_review"]
+      "id": "missing-branch-detail",
+      "question": "Which branch outcome is missing?",
+      "tool": "coverage_gaps",
+      "arguments": {
+        "measurement": "base.json",
+        "metric": "branches"
+      },
+      "expect": {
+        "/data/status": "detail_unavailable"
+      }
     },
     {
-      "id": "source-range",
-      "category": "outcome",
-      "prompt": "Show the source around this uncovered range.",
-      "first_tool": "coverage_review",
-      "view": "task=source",
-      "outcome": "Numbered source lines annotated red, green, yellow, or gray for one contiguous range or a bounded batch.",
-      "required_terms": ["bounded", "source", "ranges"],
-      "follow_up_tools": []
+      "id": "subset-helped",
+      "question": "Did this selected test add anything, ignoring unrelated absences?",
+      "tool": "coverage_compare",
+      "arguments": {
+        "measurement": "candidate.json",
+        "baseline": "base.json"
+      },
+      "expect": {
+        "/data/status": "improved",
+        "/data/changes/newly_observed": 1,
+        "/data/changes/not_observed": 1,
+        "/data/changes/regressed": null,
+        "/data/scope": "selected_tests"
+      }
     },
     {
-      "id": "unchanged-run",
-      "category": "workflow",
-      "prompt": "The checkout and test command are unchanged. Should I rerun the test?",
-      "first_tool": "run_test",
-      "view": "reuse_if_unchanged",
-      "outcome": "The server returns the latest compatible terminal run instead of launching duplicate work.",
-      "required_terms": ["reuse_if_unchanged", "submission_reused", "unchanged"],
-      "follow_up_tools": ["run_review"]
+      "id": "full-regressed",
+      "question": "Did the full measurement lose covered behavior?",
+      "tool": "coverage_compare",
+      "arguments": {
+        "measurement": "candidate.json",
+        "baseline": "base.json",
+        "scope": "full"
+      },
+      "expect": {
+        "/data/status": "regression",
+        "/data/changes/regressed": 1
+      }
     },
     {
-      "id": "line-history",
-      "category": "outcome",
-      "prompt": "How has this line behaved over time?",
-      "first_tool": "coverage_review",
-      "view": "task=history",
-      "outcome": "A compact history for one file and line, with detailed mode reserved for an audit.",
-      "required_terms": ["line over time", "detailed"],
-      "follow_up_tools": []
+      "id": "zero-gain",
+      "question": "Did an identical test measurement help?",
+      "tool": "coverage_compare",
+      "arguments": {
+        "measurement": "identical.json",
+        "baseline": "base.json"
+      },
+      "expect": {
+        "/data/status": "no_gain",
+        "/data/changes/newly_observed": 0
+      }
     },
     {
-      "id": "change-review",
-      "category": "outcome",
-      "prompt": "Did the new code get covered after the test run?",
-      "first_tool": "coverage_review",
-      "view": "task=change",
-      "outcome": "One bounded review with baseline/current metrics, changed regions, and optional source context.",
-      "required_terms": ["changed", "source", "bounded"],
-      "follow_up_tools": ["coverage_review"]
+      "id": "tests-failed",
+      "question": "Can this successful coverage change be accepted when tests failed?",
+      "tool": "coverage_compare",
+      "arguments": {
+        "measurement": "failed.json",
+        "baseline": "base.json"
+      },
+      "expect": {
+        "/data/status": "tests_failed",
+        "/data/measurement/tests": "failed"
+      }
     },
     {
-      "id": "history-review",
-      "category": "outcome",
-      "prompt": "Show the last two coverage runs and summarize the last ten.",
-      "first_tool": "coverage_review",
-      "view": "task=history",
-      "outcome": "Two detailed points plus an aggregate historical window without dumping every file.",
-      "required_terms": ["history", "aggregate", "snapshots"],
-      "follow_up_tools": []
+      "id": "unverified-report",
+      "question": "Can a raw report establish a full regression?",
+      "tool": "coverage_compare",
+      "arguments": {
+        "measurement": "unverified.json",
+        "baseline": "base.json",
+        "scope": "full"
+      },
+      "expect": {
+        "/data/status": "limited",
+        "/data/changes/regressed": null
+      }
     },
     {
-      "id": "approved-run",
-      "category": "workflow",
-      "prompt": "Run the approved test and show the relevant failure evidence.",
-      "first_tool": "project_context",
-      "view": "approved asynchronous run",
-      "outcome": "Discover approved commands, submit asynchronously, respect polling, then search targeted logs.",
-      "required_terms": ["approved", "poll", "targeted"],
-      "follow_up_tools": ["register_test_command", "run_test", "run_review"]
+      "id": "missing-report",
+      "question": "What happens when the test runner did not produce a report?",
+      "tool": "coverage_gaps",
+      "arguments": {
+        "measurement": "missing.json"
+      },
+      "error": true
     },
     {
-      "id": "latest-run-selector",
-      "category": "confusion",
-      "prompt": "Do I need a run_id to read the last run, or can run_review select it automatically?",
-      "first_tool": "project_context",
-      "view": "latest_run.id → run_review(run_id)",
-      "outcome": "The agent understands that project_context exposes latest_run.id and run_review requires that explicit id.",
-      "required_terms": ["latest_run", "run_id", "run_review", "no implicit latest"],
-      "follow_up_tools": ["run_review"]
+      "id": "removed-workflow",
+      "question": "Does the server still execute registered commands?",
+      "tool": "run_test",
+      "arguments": {},
+      "error": true
+    },
+    {
+      "id": "invalid-budget",
+      "question": "Are impossible display limits rejected?",
+      "tool": "coverage_gaps",
+      "arguments": {
+        "measurement": "base.json",
+        "limit": 0
+      },
+      "error": true
+    },
+    {
+      "id": "unknown-input",
+      "question": "Are mistaken arguments rejected rather than ignored?",
+      "tool": "coverage_gaps",
+      "arguments": {
+        "measurement": "base.json",
+        "task": "source"
+      },
+      "error": true
+    },
+    {
+      "id": "incremental-union",
+      "tool": "coverage_compare",
+      "arguments": {
+        "baseline": "base.json",
+        "measurement": "candidate.json",
+        "scope": "incremental"
+      },
+      "expect": {
+        "/data/status": "improved",
+        "/data/incremental/newly_covered": 1,
+        "/data/incremental/combined/covered": 3,
+        "/data/incremental/combined/total": 3,
+        "/data/remaining_group_count": 0,
+        "/data/regression_checked": false
+      }
+    },
+    {
+      "id": "incremental-repeat",
+      "tool": "coverage_compare",
+      "arguments": {
+        "baseline": "base.json",
+        "measurement": "candidate.json",
+        "scope": "incremental",
+        "previous": [
+          "candidate.json"
+        ]
+      },
+      "expect": {
+        "/data/status": "no_gain",
+        "/data/incremental/newly_covered": 0,
+        "/data/incremental/combined/covered": 3
+      }
+    },
+    {
+      "id": "incremental-failed",
+      "tool": "coverage_compare",
+      "arguments": {
+        "baseline": "base.json",
+        "measurement": "failed.json",
+        "scope": "incremental"
+      },
+      "expect": {
+        "/data/status": "tests_failed",
+        "/data/incremental": null
+      }
+    },
+    {
+      "id": "incremental-estimate",
+      "tool": "coverage_compare",
+      "arguments": {
+        "baseline": "base.json",
+        "measurement": "unverified.json",
+        "scope": "incremental"
+      },
+      "expect": {
+        "/data/status": "limited",
+        "/data/incremental/evidence": "unverified"
+      }
     }
   ]
 }

@@ -5101,6 +5101,19 @@ mod tests {
                 .get("incremental_review")
                 .is_none()
         );
+        let missing_artifact = service.attach_automatic_incremental_review(json!({
+            "execution":{"mode":"incremental","baseline":{"snapshot_id":"base"}},
+            "terminal":true,"coverage_ingest":{"snapshot_ids":[]}
+        }));
+        assert_eq!(
+            missing_artifact["incremental_review"]["status"],
+            "not_measured"
+        );
+        assert!(
+            service
+                .coverage_import("coverage.lcov", "lcov", "unit", None, None, None, 600, 999)
+                .is_err()
+        );
         let pending = service.attach_automatic_incremental_review(json!({
             "execution":{"mode":"incremental","baseline":{"snapshot_id":"base"}}
         }));
@@ -7044,6 +7057,17 @@ mod tests {
                 representation,
             )
         };
+        assert!(review("change", 2, 10, 10, 10, 3, 120, 50, 12_000, "review").is_err());
+        assert!(
+            service
+                .source(current_id, "src/a.py", 1, 2, Some("bad-cursor"), 600)
+                .is_err()
+        );
+        assert!(
+            service
+                .file_detail(current_id, "src/a.py", Some("bad-cursor"), 600, false)
+                .is_err()
+        );
         assert!(review("invalid", 2, 10, 10, 10, 3, 120, 600, 12_000, "review").is_err());
         assert!(review("change", 0, 10, 10, 10, 3, 120, 600, 12_000, "review").is_err());
         assert!(review("change", 2, 1, 10, 10, 3, 120, 600, 12_000, "review").is_err());
@@ -7882,6 +7906,9 @@ mod tests {
             12_000
         ));
         service_query_sweep!(service.file_detail(current_id, "src/a.py", None, 600, false));
+        service_query_sweep!(
+            service.find_duplicate_coverage_tests(None, None, None, 10, 10, 600, 12_000)
+        );
         service_query_sweep!(service.snapshot_summary(current_id, 600, false));
         service_query_sweep!(service.run_review(
             terminal["data"]["id"].as_str().unwrap(),

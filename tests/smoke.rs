@@ -82,9 +82,14 @@ fn spawn_shared_connector(repo: &Path, common_db: &Path, port: u16) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    std::fs::write(
+        repo.join("coverage.lcov"),
+        "TN:\nSF:marker.txt\nDA:1,0\nend_of_record\n",
+    )
+    .unwrap();
     let input = concat!(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"project_context\",\"arguments\":{\"detailed\":false}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"coverage_gaps\",\"arguments\":{\"measurement\":\"coverage.lcov\"}}}\n"
     );
     child
         .stdin
@@ -434,104 +439,14 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
     let initialize: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(initialize["result"]["serverInfo"]["name"], "coverage-mcp");
 
-    let register = |id, name: &str, command: &str| {
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":id,
-            "method":"tools/call",
-            "params":{
-                "name":"register_test_command",
-                "arguments":{
-                    "name":name,
-                    "command":command,
-                    "cwd":repository,
-                    "shell":"/bin/sh",
-                    "human_approved":true,
-                    "approved_by":"smoke-test",
-                    "approval_note":"approved daemon-restart recovery fixture"
-                }
-            }
-        })
-    };
-    let running_command = connector_request(
-        &mut stdin,
-        &mut stdout,
-        register(
-            2,
-            "restart-running",
-            "while [ ! -f release-running ]; do sleep 0.05; done",
-        ),
-    );
-    let running_command_id = running_command["result"]["structuredContent"]["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let queued_command = connector_request(
-        &mut stdin,
-        &mut stdout,
-        register(3, "restart-queued", "printf resumed"),
-    );
-    let queued_command_id = queued_command["result"]["structuredContent"]["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let submit = |id, command_ref: &str, key: &str| {
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":id,
-            "method":"tools/call",
-            "params":{
-                "name":"run_test",
-                "arguments":{
-                    "command_ref":command_ref,
-                    "wait":false,
-                    "idempotency_key":key
-                }
-            }
-        })
-    };
-    let running_submission = connector_request(
-        &mut stdin,
-        &mut stdout,
-        submit(4, &running_command_id, "restart-running"),
-    );
-    let running_id = running_submission["result"]["structuredContent"]["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let queued_submission = connector_request(
-        &mut stdin,
-        &mut stdout,
-        submit(5, &queued_command_id, "restart-queued"),
-    );
-    let queued_id = queued_submission["result"]["structuredContent"]["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let run_state = |id, run_id: &str| {
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":id,
-            "method":"tools/call",
-            "params":{"name":"run_review","arguments":{"run_id":run_id,"view":"status"}}
-        })
-    };
-    let state_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let running = connector_request(&mut stdin, &mut stdout, run_state(6, &running_id));
-        let queued = connector_request(&mut stdin, &mut stdout, run_state(7, &queued_id));
-        if running["result"]["structuredContent"]["data"]["status"] == "running"
-            && queued["result"]["structuredContent"]["data"]["status"] == "queued"
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < state_deadline,
-            "managed runs did not reach running/queued restart fixture state: running={running}, queued={queued}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-
+    std::fs::write(
+        repository.join("coverage.lcov"),
+        "TN:\nSF:marker.txt\nDA:1,0\nend_of_record\n",
+    )
+    .unwrap();
+    let query = serde_json::json!({"id":2,"method":"tools/call","params":{"name":"coverage_gaps","arguments":{"measurement":"coverage.lcov"}}});
+    let before = connector_request(&mut stdin, &mut stdout, query.clone());
+    assert_eq!(before["result"]["isError"], false);
     wait_for_health(port);
     let first_pid = guard.pid().expect("first daemon pid");
     let status = Command::new("kill")
@@ -539,7 +454,6 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         .status()
         .unwrap();
     assert!(status.success());
-    std::fs::write(repository.join("release-running"), "release\n").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let listener_gone = TcpStream::connect(("127.0.0.1", port)).is_err();
@@ -560,36 +474,13 @@ fn existing_stdio_connector_recovers_a_crashed_daemon_and_stale_lock_file() {
         &mut stdout,
         serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/list"}),
     );
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 2);
     wait_for_health(port);
     let second_pid = guard.pid().expect("replacement daemon pid");
     assert_ne!(first_pid, second_pid);
 
-    let interrupted = connector_request(&mut stdin, &mut stdout, run_state(9, &running_id));
-    assert_eq!(
-        interrupted["result"]["structuredContent"]["data"]["status"],
-        "interrupted"
-    );
-    assert_eq!(
-        interrupted["result"]["structuredContent"]["data"]["terminal"],
-        true
-    );
-    let resume_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let resumed = connector_request(&mut stdin, &mut stdout, run_state(10, &queued_id));
-        if resumed["result"]["structuredContent"]["data"]["terminal"] == true {
-            assert_eq!(
-                resumed["result"]["structuredContent"]["data"]["status"],
-                "passed"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < resume_deadline,
-            "queued run did not resume after daemon restart"
-        );
-        thread::sleep(Duration::from_secs(1));
-    }
+    let after = connector_request(&mut stdin, &mut stdout, query);
+    assert_eq!(before["result"], after["result"]);
 
     drop(stdin);
     assert!(connector.wait().unwrap().success());
@@ -684,4 +575,110 @@ fn connector_refuses_to_replace_an_unlocked_health_lookalike() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("automatic recovery refused"));
     assert!(stderr.contains("does not hold the expected ownership lease"));
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_cli_stdio_and_http_share_combined_coverage() {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    init_git_repository(&repo, "incremental");
+    std::fs::write(
+        repo.join("base.lcov"),
+        "TN:\nSF:marker.txt\nDA:1,1\nDA:2,0\nDA:3,0\nend_of_record\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("batch.lcov"),
+        "TN:\nSF:marker.txt\nDA:2,1\nend_of_record\n",
+    )
+    .unwrap();
+    let sha = |bytes: &[u8]| {
+        let mut output = String::new();
+        const HEX: &[u8] = b"0123456789abcdef";
+        for byte in Sha256::digest(bytes) {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 15) as usize] as char);
+        }
+        output
+    };
+    for report in ["base.lcov", "batch.lcov"] {
+        std::fs::write(repo.join(format!("{report}.context.json")),json!({"report_sha256":sha(&std::fs::read(repo.join(report)).unwrap()),"source_hashes":{"marker.txt":sha(&std::fs::read(repo.join("marker.txt")).unwrap())},"build_id":"fixed-build","scope":if report=="base.lcov"{"full"}else{"selected_tests"},"test_status":"passed"}).to_string()).unwrap();
+    }
+    let args = json!({"baseline":"base.lcov","measurement":"batch.lcov","scope":"incremental"});
+    let cli = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+        .args(["compare", "--repo"])
+        .arg(&repo)
+        .args([
+            "--baseline",
+            "base.lcov",
+            "--measurement",
+            "batch.lcov",
+            "--scope",
+            "incremental",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_eq!(
+        cli["data"]["incremental"]["combined"],
+        json!({"covered":2,"total":3,"missing":1})
+    );
+    let common = dir.path().join("daemon/common.duckdb");
+    let _guard = DaemonGuard {
+        lock_path: common.parent().unwrap().join("daemon.lock"),
+        armed: true,
+    };
+    let port = unused_loopback_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+        .args(["connect", "--repo"])
+        .arg(&repo)
+        .env("COVERAGE_MCP_PORT", port.to_string())
+        .env("COVERAGE_MCP_COMMON_DB", &common)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coverage_compare","arguments":args}});
+    writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
+    let responses = connector_responses(child.wait_with_output().unwrap());
+    assert_eq!(responses[0]["result"]["structuredContent"], cli);
+    let response = loopback_request(
+        port,
+        "POST",
+        &format!("/api/coverage/compare?repo_path={}", repo.display()),
+        &args.to_string(),
+    )
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(&cli.to_string()), "{response}");
+    let repeat = Command::new(env!("CARGO_BIN_EXE_coverage-mcp"))
+        .args(["compare", "--repo"])
+        .arg(&repo)
+        .args([
+            "--baseline",
+            "base.lcov",
+            "--measurement",
+            "batch.lcov",
+            "--scope",
+            "incremental",
+            "--previous",
+            "batch.lcov",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeat.status.success());
+    let repeat: serde_json::Value = serde_json::from_slice(&repeat.stdout).unwrap();
+    assert_eq!(repeat["data"]["status"], "no_gain");
+    assert_eq!(repeat["data"]["incremental"]["newly_covered"], 0);
 }

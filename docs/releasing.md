@@ -1,149 +1,65 @@
-# Releasing
+# Release preparation
 
-Use this checklist to publish a crates.io package, native release archives, and
-the matching codegen-marketplace runtime pin without sending users to a source
-checkout. It is for maintainers with release permissions.
+This guide is for maintainers publishing the existing crates.io package and
+native binaries. The executable release definition is
+[`.github/workflows/release.yml`](https://github.com/appunni-m/coverage-mcp/blob/main/.github/workflows/release.yml).
+Local builds and a development marketplace pin are not published-release evidence.
 
-Releases are Rust binaries and crates.io packages built from an annotated Git
-tag. The release workflow must reproduce the local gate before publishing an
-artifact.
+## Prepare a candidate
 
-## Maintainer checklist
+1. Update `Cargo.toml`, `Cargo.lock`, and the dated changelog. The tag must be
+   `v<package-version>`. Use a clean checkout and the pinned Rust 1.85.1 toolchain.
+2. Run `make ci` and `make package`. The latter verifies the clean source package
+   using prebuilt DuckDB; the release build still bundles DuckDB. Retain the
+   generated migration report and check for `not_proven` lanes.
+3. Check `coverage-mcp --version`, `--help`, `/health`, and `tools/list` through
+   HTTP and stdio. Test both file queries and saved history. The 0.16 contract is
+   schema 18 with two read-only tools; it must match the marketplace digest.
+4. Verify the daemon lifecycle smoke tests: shared ownership, crash recovery,
+   upgrade from a verified older owner, unknown-owner/downgrade refusal, and
+   database reopen. Both queued and running legacy jobs must become interrupted
+   without execution. Preserve stores and WALs throughout upgrade testing.
+5. Review the package and archive contents, user documentation, and release notes.
+   Include storage changes, compatibility limits, and evidence scope. Never
+   describe an unexecuted target as verified.
 
-1. Confirm the working tree is clean, the default branch is protected, and all
-   required checks pass. Confirm `rust-toolchain.toml`, the CI toolchain, and
-   the release workflow all select Rust 1.85.1.
-2. Update `Cargo.toml` and `Cargo.lock` to the release version. Move the
-   corresponding `CHANGELOG.md` entries into a dated release section.
-3. Run `make ci`, including strict clippy, all-target tests, fixture-backed
-   migration lanes, region/line/function coverage, generated migration status, and
-   rustdoc warnings. The verification lanes use the exact prebuilt DuckDB
-   release; the all-target test lane exposes compilation and execution as
-   separate steps, uses one Cargo compilation job, and retains line-table debug
-   information. Runtime execution is split into library, binary,
-   migration-status, migration parity, compaction benchmark, and daemon/stdio
-   smoke steps with a retained log for each target. Migration correctness cases
-   run in fresh processes with three-minute GitHub step deadlines so a managed
-   child cannot escape a parent-process timeout; branch and tag test jobs both
-   use a 15-minute recovery bound. The `make ci` release phase is the required
-   bundled-linkage check.
-   Retain `target/migration/status-report.json` and the generated pages as
-   release evidence; a dirty or missing lane is `not_proven`.
-4. Inspect the bundled binary produced by `make ci` with
-   `target/release/coverage-mcp --version` and
-   `target/release/coverage-mcp --help`. If the build output was cleaned, rerun
-   `make release`. The tag workflow must additionally build and execute native
-   archives for `x86_64-unknown-linux-gnu`,
-   `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and
-   `aarch64-apple-darwin` on matching hosted runners; do not substitute an
-   unexecuted cross-compile for native evidence.
-5. Verify the binary in clean checkouts: start two default `connect` processes
-   for different repositories, confirm they return stdio
-   `initialize`/`tools/list` through one daemon PID on port `59471`, and confirm
-   the daemon remains healthy after both bridges exit. Keep one bridge open,
-   kill that daemon, and require the next `tools/list` request to recreate one
-   daemon with a new PID through the unlocked stale lease file. Also verify HTTP
-   `tools/list`, the dashboard, report ingest, a project policy edit, a manual
-   compaction pass, and a database reopen. Simulate an ungraceful exit with one
-   persisted `running` job and one `queued` job; require the former to become
-   terminal `interrupted` without execution and the latter to resume through
-   the normal worker limit.
-6. Verify lifecycle hardening: start two daemons against one common database
-   and confirm the second exits with `resource busy`; open one project database
-   twice and confirm the second owner is rejected. Start the previous released
-   daemon, connect with the candidate binary, and confirm the connector verifies
-   ownership, stops the older daemon, starts the candidate on the same port,
-   and preserves the database. Also verify authenticated handoff, refusal of an
-   unknown port occupant, downgrade/equal-version refusal, a bounded query,
-   pool saturation, and SIGTERM shutdown; verify that the database and WAL are
-   left untouched after each failure.
-7. Run `make package` from the clean release tree; it uses Cargo's
-   `--no-default-features` package-verification mode, matching the release
-   workflow. Use
-   `cargo package --locked --allow-dirty --no-verify` only when a dirty package
-   inspection is intentional; it is not release evidence.
-8. Create an annotated immutable `v<version>` tag and publish through the
-   configured crates.io/asset workflow. For the first crates.io version, use
-   the bootstrap procedure below before pushing the tag. The workflow
-   reproduces quality, all-target tests, coverage, clean package verification,
-   four native bundled release builds, and migration-evidence validation on
-   isolated hosted runners before it mints the trusted-publishing token. After
-   crates.io succeeds, it creates the GitHub Release with checksums and signed
-   build provenance. Feature selection accelerates only package verification;
-   the packaged crate and native archives still bundle DuckDB. Pin every
-   third-party action, including the crates.io authenticator and provenance
-   action, to a reviewed full commit SHA. Never move a published tag.
-9. After propagation, download every target archive and `SHA256SUMS` from the
-   exact GitHub Release. Verify each digest, extract it, and execute
-   `coverage-mcp --version` on its matching native host. Also install the exact
-   crate into an empty temporary root with `cargo install coverage-mcp
-   --version =<version> --locked --bin coverage-mcp --root <temporary-root>` as
-   fallback evidence. Verify both MCP transports; a checkout or Git install is
-   not release evidence.
-10. Update the downstream testing plugin's pinned version only after the
-    published crate passes that clean install. Start two required plugin MCP
-    connectors against one empty runtime cache and confirm both download,
-    checksum, version-check, and atomically install the same target archive.
-    Confirm an unsupported target can use the exact Cargo fallback, the
-    bootstrap contains no custom installer or client-connection lock, and it
-    does no daemon work before `exec coverage-mcp connect`. Then confirm both
-    stdio bridges and a direct HTTP client connect concurrently while only the
-    daemon process holds its ownership lease.
-    Exercise each claimed bootstrap platform; record native Windows as
-    unsupported until a Windows bootstrap and its clean-machine test exist.
-11. Record the artifact checksums and release evidence. Do not publish a
-    marketplace pin for an absent, yanked, or moving runtime source.
+## Publish and verify
 
-## First crates.io release
+Create an annotated immutable tag only when the release is authorized. Pushing
+it triggers quality, tests, coverage, package, evidence, and native-build jobs.
+The workflow publishes through configured crates.io trusted publishing, then
+creates a GitHub Release with checksums and build attestations. Repository
+permissions and registry publisher configuration must already be in place.
 
-Trusted Publishing cannot create a crate. Bootstrap the first version with a
-maintainer API token, then use short-lived OIDC credentials for later tags:
+The workflow builds and executes bundled binaries on matching hosts for:
 
-1. Verify the maintainer email in the crates.io profile. Create a short-lived
-   API token with permission to publish new crates and no crate-name
-   restriction. Keep it out of the repository and CI secrets; install it with
-   `cargo login` and protect `~/.cargo/credentials.toml` as mode `0600`.
-2. Push the release commit and require its normal branch CI to pass. From a
-   separate clean checkout of that exact commit, run the clean package gate and
-   `cargo publish --locked`. Never use `--allow-dirty` for a release.
-3. Wait until `cargo info coverage-mcp@<version> --registry crates-io` succeeds.
-   Configure the crates.io Trusted Publisher for repository
-   `appunni-m/coverage-mcp`, workflow `release.yml`, and environment
-   `crates-io`.
-4. Create and push the annotated tag. The workflow recognizes the exact
-   manually published bootstrap version and skips a duplicate upload while
-   still reproducing every build, test, coverage, package, and evidence lane.
+- `aarch64-apple-darwin` and `x86_64-apple-darwin`;
+- `aarch64-unknown-linux-gnu` and `x86_64-unknown-linux-gnu`.
 
-Revoke the bootstrap token after the first release. Do not store a long-lived
-`CARGO_REGISTRY_TOKEN` in GitHub; subsequent releases use the ephemeral output
-from `rust-lang/crates-io-auth-action`.
+Native Windows is not part of this archive/bootstrap matrix. Verify every
+published `coverage-mcp-<version>-<target>.tar.gz` against `SHA256SUMS`, extract it,
+and run its version/help commands on the matching host. Inspect the shipped
+README, guides, and license. Separately install the exact published crate in an
+empty temporary root with `cargo install coverage-mcp --version =<version>
+--locked --bin coverage-mcp --root <temporary-root>`. A source-checkout install
+does not establish registry availability.
 
-## Release evidence
+Distribute the marketplace update only after those checks. Verify its exact
+version, schema, tool count, and digest; exercise a clean bootstrap cache and
+concurrent connectors. Unsupported archive targets may use the exact Cargo
+fallback when a suitable toolchain exists. Record the tested platforms and
+checksums; do not promise untested installations.
 
-A release note must identify the exact Rust version, target triple, schema
-revision, test command, coverage dimension and denominator, storage migration
-state, and any unsupported platform or feature. “100% coverage” is meaningful
-only when it names the measured dimension and target set.
+## Recover a partial release
 
-The runtime defaults and override ranges for pool size, connection checkout,
-DuckDB query, and HTTP request deadlines are part of the release contract and
-are reported by `/health`.
+If crates.io succeeds but GitHub Release creation fails, keep the tag and crate.
+The [release asset recovery workflow](https://github.com/appunni-m/coverage-mcp/blob/main/.github/workflows/release-assets-recovery.yml)
+uses a completed Release run for that exact tag/commit, validates the retained
+bundle against `SHA256SUMS`, re-attests it, and creates the missing release.
+It also accepts an explicit tag and optional source-run ID through manual
+dispatch. An existing GitHub Release makes recovery a no-op.
 
-## Recovery
-
-If crates.io publication succeeds but GitHub Release creation fails, do not
-move or recreate the tag and do not publish another crate. The
-`Release asset recovery` workflow resolves the existing tag to its immutable
-commit, accepts only a completed `Release` run for that exact tag and commit,
-downloads its retained `coverage-mcp-v<version>` bundle, verifies all four
-native archives and the crate against `SHA256SUMS`, re-attests those files, and
-creates the missing GitHub Release. It is also available through
-`workflow_dispatch` with an explicit tag and optional source run ID. If the
-release already exists, recovery is a no-op.
-
-If an artifact is bad, revoke or yank it according to the registry policy and
-publish a corrected version. Do not overwrite a database schema or retarget a
-release tag. A user-visible storage migration requires an upgrade note and a
-backup/restore procedure before release. Never delete a lock or WAL as a
-startup workaround: stop the owner, preserve the evidence, and restore from a
-verified backup if DuckDB cannot replay the WAL.
+For a bad artifact, follow registry withdrawal policy and publish a corrected
+version; do not move a released tag. Storage changes need a backup/restore note.
+Stop the owner before restoring a verified backup. Deleting a lease or WAL to
+force startup is not a recovery procedure.

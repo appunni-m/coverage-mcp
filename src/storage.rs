@@ -618,8 +618,8 @@ fn rollback_transaction(connection: &Connection, error: AppError) -> AppError {
 }
 
 impl CoverageStore {
-    /// Opens or creates a repository database, reconciles interrupted/queued
-    /// managed runs, and starts maintenance workers.
+    /// Opens or creates a repository database and starts storage maintenance.
+    /// Legacy running/queued jobs become interrupted; opening storage never executes them.
     pub fn open(db_path: PathBuf, config: ServerConfig) -> AppResult<Self> {
         if !(1..=MAX_RUN_CONCURRENCY).contains(&config.run_concurrency) {
             return Err(AppError::Validation(format!(
@@ -669,42 +669,18 @@ impl CoverageStore {
         let ready = store
             .init_schema()
             .and_then(|_| store.reconcile_persisted_run_jobs())
-            .map(|queued_runs| store.resume_queued_runs(queued_runs))
             .and_then(|_| store.start_compaction_worker());
         ready.map(|_| store)
     }
 
-    fn reconcile_persisted_run_jobs(&self) -> AppResult<Vec<String>> {
-        let ended = Utc::now();
+    fn reconcile_persisted_run_jobs(&self) -> AppResult<()> {
         self.with_connection(|connection| {
-            connection
-                .execute(
-                    "UPDATE run_jobs SET status = 'interrupted', ended_at = ?, error = 'Coverage MCP restarted before this managed run reported a terminal result.' WHERE status = 'running'",
-                    params![ended],
-                )
-                .map_err(AppError::from)
-                .and_then(|_| {
-                    connection
-                        .prepare("SELECT id FROM run_jobs WHERE status = 'queued' ORDER BY queued_at, id")
-                        .map_err(AppError::from)
-                })
-                .and_then(|mut statement| {
-                    statement
-                        .query_map([], |row| row.get::<_, String>(0))
-                        .map_err(AppError::from)
-                        .and_then(|rows| {
-                            rows.map(|row| row.map_err(AppError::from)).collect()
-                        })
-                })
+            connection.execute(
+                "UPDATE run_jobs SET status = 'interrupted', ended_at = ?, error = 'Coverage MCP restarted. Run tests with the repository runner; queued commands are no longer resumed.' WHERE status IN ('running', 'queued')",
+                params![Utc::now()],
+            )?;
+            Ok(())
         })
-    }
-
-    fn resume_queued_runs(&self, run_ids: Vec<String>) {
-        for run_id in run_ids {
-            if let Err(error) = self.start_run_worker(&run_id) {
-                eprintln!("coverage-mcp could not resume queued run {run_id}: {error}");
-            }
-        }
     }
 
     /// Database path owned by this store.
@@ -5519,6 +5495,33 @@ impl CoverageStore {
                 .optional()?
                 .ok_or_else(|| AppError::NotFound(format!("snapshot not found: {snapshot_id}")))
         })
+    }
+
+    /// Restores a complete ordinary measurement for the query engine.
+    /// Collection display limits do not truncate the evidence used by queries.
+    pub(crate) fn measurement_report(
+        &self,
+        snapshot_id: &str,
+    ) -> AppResult<(Value, CoverageReport)> {
+        let snapshot = self.snapshot(snapshot_id)?;
+        // Compaction publishes its payload and deletes relational detail atomically.
+        // Checking the payload after reading rows also handles compaction between reads.
+        let rows = self.detail_payload(snapshot_id)?;
+        let detail = self.compacted_detail(snapshot_id)?.unwrap_or(rows);
+        let report = CoverageReport {
+            format: snapshot["format"].as_str().unwrap_or_default().to_owned(),
+            report_path: snapshot["report_path"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            files: serde_json::from_value(detail["files"].clone())?,
+            lines: serde_json::from_value(detail["lines"].clone())?,
+            test_names: Vec::new(),
+            test_coverage: Vec::new(),
+            warnings: serde_json::from_value(snapshot["warnings"].clone())?,
+            metadata: snapshot["metadata"].clone(),
+        };
+        Ok((snapshot, report))
     }
 
     /// Reads one immutable composite coverage snapshot.
@@ -11741,7 +11744,6 @@ mod tests {
             let _guard = retain_threads.lock().unwrap();
             panic!("injected run-thread registry poison");
         }));
-        retain_store.resume_queued_runs(vec!["missing-resumed-run".to_owned()]);
         assert!(
             retain_store
                 .submit_command(retain_command["id"].as_str().unwrap(), None, None, 20)
@@ -16877,13 +16879,29 @@ mod tests {
         let (runs_store, runs_command) = open_store("managed-persist-runs");
         let runs_job = insert_job(&runs_store, &runs_command, "managed-persist-runs");
         make_readonly_view(&runs_store, "runs");
-        FORCE_COMPOSITE_PERSIST_FAILURE.store(true, Ordering::SeqCst);
         assert!(
             runs_store
                 .execute_run_with_claimed_job("managed-persist-runs", &runs_job, Utc::now())
                 .is_err()
         );
         runs_store.close().unwrap();
+
+        let (injected_store, injected_command) = open_store("managed-persist-injected");
+        let injected_job = insert_job(
+            &injected_store,
+            &injected_command,
+            "managed-persist-injected",
+        );
+        FORCE_COMPOSITE_PERSIST_FAILURE.store(true, Ordering::SeqCst);
+        let failure = injected_store
+            .execute_run_with_claimed_job("managed-persist-injected", &injected_job, Utc::now())
+            .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("injected managed run persistence")
+        );
+        injected_store.close().unwrap();
 
         let (baseline_store, baseline_command) = open_store("managed-persist-baselines");
         let baseline_job = insert_job(
@@ -17070,6 +17088,8 @@ mod tests {
                 }
             }};
         }
+        sweep_query_boundaries!(store.reconcile_persisted_run_jobs());
+        sweep_query_boundaries!(store.measurement_report(snapshot_id));
         sweep_query_boundaries!(store.project_settings());
         sweep_query_boundaries!(store.update_project_settings(ProjectSettingsPatch::default()));
         sweep_query_boundaries!(store.project_summary());
@@ -17125,7 +17145,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_store_interrupts_running_jobs_and_resumes_queued_jobs() {
+    fn reopening_a_store_interrupts_legacy_jobs_without_execution() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("restart-recovery.duckdb");
         let store = CoverageStore::open(database.clone(), test_config()).unwrap();
@@ -17185,19 +17205,17 @@ mod tests {
         assert_eq!(interrupted["status"], "interrupted");
         assert!(interrupted["error"].as_str().unwrap().contains("restarted"));
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let resumed = loop {
-            let result = reopened.run_result(&queued_id, 20).unwrap();
-            if result["terminal"] == true {
-                break result;
-            }
-            Instant::now()
-                .lt(&deadline)
-                .then_some(())
-                .expect("queued run did not resume");
-            thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(resumed["status"], "passed");
+        let queued = reopened.run_result(&queued_id, 20).unwrap();
+        assert_eq!(queued["status"], "interrupted");
+        assert_eq!(queued["terminal"], true);
+        assert!(
+            !directory
+                .path()
+                .join("runs")
+                .join(queued_id)
+                .join("stdout.log")
+                .exists()
+        );
         reopened.close().unwrap();
     }
 
@@ -21429,5 +21447,141 @@ mod tests {
                 .unwrap();
             assert!(output.status.success());
         }
+    }
+    #[test]
+    fn retained_measurement_readers_reject_corrupt_detail_and_command_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_git(dir.path());
+        let store = CoverageStore::open(dir.path().join("readers.duckdb"), test_config()).unwrap();
+        let project = store.ensure_project(dir.path()).unwrap();
+        stop_compaction_worker(&store);
+        let report = dir.path().join("r.lcov");
+        std::fs::write(&report, "TN:\nSF:src/a.py\nDA:1,0\nend_of_record\n").unwrap();
+        let snapshot = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(dir.path()),
+                Some("main"),
+                None,
+                None,
+                "unit",
+            )
+            .unwrap();
+        let id = snapshot["id"].as_str().unwrap();
+        let attribution = store
+            .incremental_test_attribution_many(id, &[id], 10)
+            .unwrap();
+        assert_eq!(attribution["status"], "unavailable");
+        assert!(
+            store
+                .register_command(
+                    "bad",
+                    "true",
+                    Some(dir.path()),
+                    "sh",
+                    Some(json!(1)),
+                    true,
+                    "tester",
+                    "invalid artifact",
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .submit_command_with_execution(
+                    "missing",
+                    None,
+                    None,
+                    20,
+                    false,
+                    None,
+                    Some(&json!({})),
+                    None
+                )
+                .is_err()
+        );
+        let worktree = store
+            .ensure_lineage_baseline(dir.path(), "main", None)
+            .unwrap();
+        let fallback = store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(dir.path()),
+                Some("main"),
+                Some("unmatched"),
+                None,
+                "fallback",
+            )
+            .unwrap();
+        store
+            .ingest_report(
+                &report,
+                "lcov",
+                Some(dir.path()),
+                Some("other"),
+                Some("other"),
+                None,
+                "fallback",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .worktree_baseline_snapshot(worktree["id"].as_str().unwrap(), "fallback")
+                .unwrap()
+                .unwrap()["id"],
+            fallback["id"]
+        );
+        store.inject_query_fault_after(0);
+        assert!(
+            store
+                .snapshot_for_commit(&project.repo_path, None, "unit", "missing")
+                .is_err()
+        );
+        store.clear_query_fault();
+        let original = store.detail_payload(id).unwrap();
+        store
+            .compact_snapshot_detail(&project.repo_key, id)
+            .unwrap();
+        for field in ["files", "lines"] {
+            let mut malformed = original.clone();
+            malformed[field] = json!({});
+            let encoded = serde_json::to_vec(&malformed).unwrap();
+            let compressed = zstd::stream::encode_all(encoded.as_slice(), 3).unwrap();
+            store
+                .with_connection(|connection| {
+                    connection
+                        .execute(
+                            "UPDATE coverage_compacted_payloads SET payload=? WHERE snapshot_id=?",
+                            params![compressed, id],
+                        )
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            assert!(store.measurement_report(id).is_err());
+        }
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let compressed = zstd::stream::encode_all(encoded.as_slice(), 3).unwrap();
+        store
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE coverage_compacted_payloads SET payload=? WHERE snapshot_id=?",
+                        params![compressed, id],
+                    )
+                    .unwrap();
+                connection
+                    .execute("UPDATE snapshots SET warnings='{}' WHERE id=?", params![id])
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.measurement_report(id).is_err());
+        store.execute_sql_for_test("CREATE TABLE old_jobs AS SELECT * FROM run_jobs; DROP TABLE run_jobs CASCADE; CREATE VIEW run_jobs AS SELECT * FROM old_jobs").unwrap();
+        assert!(store.reconcile_persisted_run_jobs().is_err());
+        store.close().unwrap();
     }
 }

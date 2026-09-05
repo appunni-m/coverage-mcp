@@ -1,126 +1,95 @@
 # Contributing
 
-Use this guide to build Coverage MCP from source, make a focused change, and
-run the same checks used by CI. If you only want to install or use Coverage MCP,
-follow [Getting started](docs/getting-started.md); a source checkout is not the
-normal installation path.
+Use a Git checkout for development. For installation and a first query, see the
+[README](README.md). This project is maintained by Appunni M; proposals and
+reviews happen through issues and pull requests. Discuss significant changes to
+public contracts, storage, security, licensing, or governance before implementation.
+Follow the [code of conduct](CODE_OF_CONDUCT.md).
 
-The repository is a Rust workspace with a public REST/MCP contract, persistent
-DuckDB behavior, and an embedded dashboard. Keep those surfaces synchronized
-when changing behavior.
+## Build and verify
 
-## Prerequisites
-
-- Rustup. The checked-in `rust-toolchain.toml` installs Rust 1.85.1, Cargo,
-  rustfmt, Clippy, and LLVM tools so plain `cargo` commands match CI and enforce
-  the declared Rust 1.85 MSRV;
-- Git;
-- `cargo-llvm-cov` for the required coverage gate. Install it with a current
-  stable toolchain because recent releases require Rust newer than the
-  project's 1.85 MSRV:
-
-  ```sh
-  rustup toolchain install stable --profile minimal
-  cargo +stable install cargo-llvm-cov --locked --version 0.8.7
-  ```
-- optional `cargo-deny` and `cargo-audit` for supply-chain checks.
-
-Build from a checkout:
+Install Rustup, Git, GNU Make 3.81 or newer, and a C++ build toolchain. The checked-in
+`rust-toolchain.toml` selects Rust 1.85.1, rustfmt, Clippy, and LLVM tools. Install
+the coverage tool using the same version as CI:
 
 ```sh
+rustup toolchain install stable --profile minimal
+cargo +stable install cargo-llvm-cov --locked --version 0.8.7
 cargo build --locked
+make ci
 ```
 
-## Change workflow
+`make ci` checks formatting, Clippy, tests, library coverage, rustdoc, fixture
+evidence, and the bundled release build. The coverage gate requires 100% lines,
+functions, and regions for the library; `src/main.rs` is tested through subprocess
+smoke tests and excluded from LLVM's aggregate. This is a verification policy,
+not proof that every input or platform works.
 
-1. Read [`docs/architecture.md`](docs/architecture.md) and the relevant
-   module documentation.
-2. For MCP tool, resource, instruction, schema, or safety changes, update
-   `src/mcp.rs`, the affected service/storage layer, tests,
-   [`docs/mcp-reference.md`](docs/mcp-reference.md), and any affected user
-   journey together.
-3. For REST changes, update route tests and
-   [`docs/http-api.md`](docs/http-api.md).
-4. For dashboard changes, keep the embedded document dependency-free and run
-   its JavaScript syntax check.
-5. For storage changes, add migration-safe tests and verify compaction,
-   lineage, and database reopen behavior.
-6. Keep public Rust APIs documented with errors, panic behavior, and safety
-   invariants where relevant. Prefer `Result` for recoverable failures.
-7. Update the changelog for user-visible changes.
+For a focused check, use `make lint`, `make test`, `make coverage`, `make docs`,
+`make release`, or `make check-diff`. `make help` lists the full interface.
+`make test-ci-compile` and `make test-ci` separate compilation from serial test
+phases; their default compilation limit is one Cargo job. Increase
+`COVERAGE_MCP_TEST_BUILD_JOBS` only when memory permits.
 
-Documentation changes should preserve the split between audiences: the root
-README is the short front door, `docs/getting-started.md` is the first-success
-tutorial, `docs/user-guide.md` explains tasks and concepts, and technical
-contracts belong in the MCP, HTTP, operations, or architecture references.
+Verification commands use `DUCKDB_DOWNLOAD_LIB=1` and `--no-default-features` to
+load the matching prebuilt DuckDB library; a cold cache needs network access.
+Default builds and installations bundle DuckDB. Run `make test-bundled` when
+changing linkage. Do not substitute a faster verification build for the bundled
+release check. CI definitions in `.github/workflows/` are the executable authority.
 
-## Required local gate
+## Source map and contracts
 
-Run the same commands used by CI before opening a pull request. Do not override
-the pinned checkout toolchain for these commands:
-
-```sh
-cargo fmt --all -- --check
-DUCKDB_DOWNLOAD_LIB=1 cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
-DUCKDB_DOWNLOAD_LIB=1 cargo test --workspace --all-targets --no-default-features --locked -- --test-threads=1
-DUCKDB_DOWNLOAD_LIB=1 cargo llvm-cov --lib --no-default-features --locked \
-  --ignore-filename-regex '/src/main\.rs$' \
-  --fail-under-lines 100 --fail-under-functions 100 --fail-under-regions 100 \
-  --fail-uncovered-lines 0 --fail-uncovered-functions 0 --fail-uncovered-regions 0 -- --test-threads=1
-DUCKDB_DOWNLOAD_LIB=1 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-default-features --no-deps --locked
-cargo build --release --locked
-git diff --check
+```text
+Existing test runner → coverage report → query engine → CLI / MCP / HTTP / dashboard
 ```
 
-The Makefile requires GNU Make 3.81 or newer and a POSIX shell. Convenience
-aliases are available through `make build`, `make lint`, `make test`,
-`make coverage`, `make migration-parity`, `make migration-benchmark`,
-`make migration-status`, `make docs`, `make package`, and `make release`.
-`make package` is a clean-tree Cargo package check using the same
-`--no-default-features` verification mode as the release workflow; `make
-release` separately proves the bundled binary. `make ci` runs the complete
-local gate, including the fixture-backed migration lanes, generated evidence
-status, and the bundled release build.
-`make test-ci-compile` bounds Cargo compilation to one job, and `make test-ci`
-runs the same library, binary, migration-status, migration parity, and smoke
-targets as separate serial phases with per-target retained diagnostics; the
-compaction benchmark is a separate phase from migration correctness. `make ci`
-runs every phase. Override `COVERAGE_MCP_TEST_BUILD_JOBS` only when the host has
-enough memory for concurrent Rust links.
+- `src/query.rs` reads complete artifacts or saved measurements, groups native
+  observations, and bounds results. It never executes tests or returns source.
+- `src/mcp.rs` owns tool schemas, initialization guidance, and the dispatcher
+  shared by HTTP and stdio. Update the [MCP reference](docs/mcp-reference.md),
+  lowest-layer test, and a public transport test when this contract changes.
+- `src/http.rs` and `src/dashboard.html` expose the same query results plus
+  optional archival administration. Update the [HTTP reference](docs/http-api.md)
+  and exercise the dashboard when its behavior changes.
+- `src/parser.rs`, `src/models.rs`, and `src/composite.rs` retain provider metrics,
+  identities, and missing-evidence states. Display groups do not redefine totals.
+- `src/storage.rs` owns DuckDB history and compaction. `src/service.rs` and storage
+  also retain public Rust compatibility APIs for embedders, including execution
+  and source projections; those APIs have no 0.16 MCP/REST routes. Reopening a
+  store interrupts unfinished legacy jobs without running them.
+- `src/main.rs`, `src/lock.rs`, and `src/pool.rs` own connector recovery, process
+  leases, and database access. Test reopen, compaction, and ownership when changing
+  storage or lifecycle behavior.
 
-The fast quality, test, coverage, and documentation commands download the
-official DuckDB release matching `libduckdb-sys` once and use it only while
-Cargo runs the command. This avoids repeatedly compiling DuckDB's large C++
-amalgamation. A cold cache therefore needs network access. Default builds,
-installs, and the required `make build`/`make release` builds retain the
-`bundled-duckdb` feature and produce a self-contained binary. Run
-`make test-bundled` when changing the linkage feature itself.
+Document public Rust inputs, errors, side effects, and invariants at their
+entry points. Run `cargo test --doc --no-default-features --locked` with
+`DUCKDB_DOWNLOAD_LIB=1` when changing examples. Repository docs describe the
+server contract; test execution uses the existing repository commands.
 
-GitHub Actions runs quality, tests, coverage, and the release build as
-independent lanes. The test lane uses one Cargo process for every target and
-runs each harness with one test thread. This keeps database and signal state
-deterministic; the dedicated release lane separately compiles and verifies the
-bundled native build. Migration evidence is assembled after the test and
-coverage artifacts are uploaded.
+## Fixtures and evaluations
 
-The coverage threshold is a region, line, and function coverage gate. The report also displays
-function and region data; do not describe a percentage without naming its
-dimension and measured target set.
+`tests/fixtures/manifest.yaml` is the input-only conformance specification.
+`make migration-parity` records a manifest/revision-bound marker;
+`make migration-benchmark` checks compaction correctness before timing fresh
+stores. `make migration-status` combines those results with coverage into
+`target/migration/status-report.json` and ignored `docs/generated/` pages.
+Missing, stale, dirty, or independently unverified evidence stays `not_proven`.
+Passing Rust conformance is not proof of parity with an unavailable source oracle.
 
-## Contract and safety review
+`make mcp-evals` runs deterministic query outcomes. The `evals/` directory contains
+its cases, the existing-test trial, and a dated measurement note. Reports and logs
+belong under `target/`, not in commits. Name the measured dimension, target set,
+and command when reporting coverage or performance.
 
-MCP tools must document purpose, inputs, pagination/budget behavior, errors,
-and the next workflow step. Safety annotations must describe actual side
-effects. Never turn a mutating operation into a read-only annotation merely
-to simplify client approval.
+## Pull requests and releases
 
-Command execution must retain the human approval record, exact command, cwd,
-shell, and declared artifacts. Tests must not depend on private paths,
-network services, or a pre-existing user database.
+Explain the user-visible change, contract/storage impact, and checks run. Update
+[the changelog](CHANGELOG.md) for user-visible changes. Exclude credentials,
+private source/reports, `.coverage-mcp/`, database/WAL files, and build output.
+Security reports follow [SECURITY.md](SECURITY.md).
 
-## Pull requests
-
-Pull requests should state the user-visible result, storage/schema impact,
-security impact, and exact verification commands. Keep commits focused and do
-not include `.coverage-mcp/`, DuckDB WAL files, build output, credentials, or
-private coverage reports.
+Maintainers publish using [the release guide](docs/releasing.md). Release tags
+are immutable; documentation and the marketplace pin must match the released
+runtime. Maintainer changes are announced publicly unless private safety details
+prevent that. If maintenance ends, identify a successor or mark the project
+unmaintained.
