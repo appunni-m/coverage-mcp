@@ -129,7 +129,7 @@ jobs:
         run: ./target/debug/migration-status --record-parity .
       - name: Upload test diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-test-diagnostics
           path: |
@@ -146,7 +146,7 @@ jobs:
           cp target/migration/benchmark-result.json release-test-evidence/target/migration/benchmark-result.json
           cp target/migration/parity-run.json release-test-evidence/target/migration/parity-run.json
       - name: Upload test evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-test-evidence
           path: release-test-evidence/
@@ -220,7 +220,7 @@ jobs:
           fi
       - name: Upload coverage diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-coverage-diagnostics
           path: |
@@ -235,7 +235,7 @@ jobs:
           mkdir -p release-coverage-evidence/target/migration
           cp target/migration/coverage-raw.json release-coverage-evidence/target/migration/coverage-raw.json
       - name: Upload coverage evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-coverage-evidence
           path: release-coverage-evidence/
@@ -264,7 +264,7 @@ jobs:
           mkdir -p release-package
           cp "target/package/coverage-mcp-${GITHUB_REF_NAME#v}.crate" release-package/
       - name: Upload crate artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-package
           path: release-package/
@@ -323,7 +323,7 @@ jobs:
           cp docs/user-guide.md docs/mcp-reference.md docs/http-api.md docs/operations.md "release-binary/${directory}/docs/"
           tar -C release-binary -czf "release-binary/${directory}.tar.gz" "${directory}"
       - name: Upload binary artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-binary-${{ matrix.target }}
           path: release-binary/*.tar.gz
@@ -359,7 +359,7 @@ jobs:
           cp -R target/migration release-evidence/target/migration
           cp -R docs/generated release-evidence/docs/generated
       - name: Upload migration evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-evidence
           path: release-evidence/
@@ -391,7 +391,7 @@ jobs:
         working-directory: bundle
         run: sha256sum coverage-mcp-*.tar.gz "coverage-mcp-${GITHUB_REF_NAME#v}.crate" > SHA256SUMS
       - name: Upload release bundle
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-mcp-${{ github.ref_name }}
           path: bundle/

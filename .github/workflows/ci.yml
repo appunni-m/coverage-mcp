@@ -142,7 +142,7 @@ jobs:
         run: ./target/debug/migration-status --record-parity .
       - name: Upload test diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ci-test-diagnostics
           path: |
@@ -159,7 +159,7 @@ jobs:
           cp target/migration/benchmark-result.json ci-evidence/target/migration/benchmark-result.json
           cp target/migration/parity-run.json ci-evidence/target/migration/parity-run.json
       - name: Upload test evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ci-test-evidence
           path: ci-evidence/
@@ -245,7 +245,7 @@ jobs:
           fi
       - name: Upload coverage diagnostics
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-diagnostics
           path: |
@@ -260,7 +260,7 @@ jobs:
           test -s target/migration/coverage-raw.json
           cp target/migration/coverage-raw.json ci-evidence/target/migration/coverage-raw.json
       - name: Upload coverage evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ci-coverage-evidence
           path: ci-evidence/
@@ -313,7 +313,7 @@ jobs:
           chmod +x target/debug/migration-status
           ./target/debug/migration-status .
       - name: Upload migration evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: migration-evidence
           path: |
